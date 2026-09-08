@@ -8,4 +8,6 @@ workspace = true
 
 [dependencies]
 interfaces.workspace = true
+tracing = { version = "0.1.44", default-features = false }
+wayfinder-link-utils = { path = "../wayfinder-link-utils" }
 zerocopy = { version = "0.8.48", features = ["derive"] }

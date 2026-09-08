@@ -2,8 +2,8 @@
 //! in the two forms the two targets can supply. A board has no `std::sync`; a
 //! host has no registered `critical-section` implementation.
 //!
-//! Masking interrupts is not free on a board running the SoftDevice, whose radio
-//! timing depends on prompt servicing. Every [`Lock`] here is therefore taken
+//! Masking interrupts is not free on a board servicing a radio, and under
+//! `critical-section-single-core` a section is a bare `cpsid i`. Every [`Lock`] here is therefore taken
 //! *after* the lock-free level gate in [`crate::filter`] — only for records
 //! already committed to being formatted and written, which costs more than the
 //! lock does. Rejected records never reach a [`Lock`] at all.

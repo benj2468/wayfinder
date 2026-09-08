@@ -175,6 +175,12 @@ impl<A, const MAX_REASSEMBLIES: usize, const FRAG_PAYLOAD: usize, const MAX_REAS
     pub fn new() -> Self {
         const { assert!(MAX_REASSEMBLIES > 0) };
         const { assert!(MAX_REASSEMBLED_LEN <= MAX_FRAGMENTS * FRAG_PAYLOAD) };
+        // Catches the one transposition the assert above misses: swapping
+        // `FRAG_PAYLOAD` and `MAX_REASSEMBLED_LEN` still satisfies it, then
+        // places fragment `n` at `n * FRAG_PAYLOAD` in a buffer smaller than
+        // one fragment — every multi-fragment message is refused, silently
+        // and totally.
+        const { assert!(FRAG_PAYLOAD <= MAX_REASSEMBLED_LEN) };
         Self {
             entries: heapless::Vec::new(),
         }

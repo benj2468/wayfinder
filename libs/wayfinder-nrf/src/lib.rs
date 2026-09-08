@@ -22,10 +22,9 @@ pub mod stack;
 pub mod usb_link;
 pub mod usb_mgmt;
 
-use embassy_nrf::interrupt::InterruptExt;
-use embassy_nrf::interrupt::Priority;
-use embassy_nrf::pac::Interrupt;
+use embassy_nrf::config::HfclkSource;
 use embedded_alloc::LlffHeap as Heap;
+use tracing::debug;
 use tracing::info;
 
 wayfinder::define_profile! {
@@ -33,10 +32,13 @@ wayfinder::define_profile! {
     /// routing core's const-generic tables to this mesh rather than a gateway's.
     ///
     /// Two figures come from hardware: `interfaces` is the board's link count
-    /// (LoRa + BLE + the CDC-NCM USB link), and `max_frame_len` is the largest
-    /// frame any link can deliver — `rylr998` reassembly caps at 512, `blue` at
-    /// 350 — so lowering it would silently drop reassembled LoRa frames. The
-    /// rest carry headroom for a handful-of-nodes mesh; `originators` and
+    /// (LoRa + 802.15.4 + the CDC-NCM USB link), and `max_frame_len` is the
+    /// largest frame any link can deliver — `rylr998` reassembly caps at 512
+    /// and `ieee802154`'s `MAX_REASSEMBLED_LEN` is pinned to this very number
+    /// — so lowering it would silently drop reassembled frames from either
+    /// radio. **Raising it means raising `ieee802154::MAX_REASSEMBLED_LEN`
+    /// too**, or the 802.15.4 link refuses frames the router considers legal.
+    /// The rest carry headroom for a handful-of-nodes mesh; `originators` and
     /// `ident_table` must stay powers of two.
     ///
     /// `max_frame_len` deliberately does *not* rise for the USB link, which
@@ -61,6 +63,13 @@ wayfinder::define_profile! {
     }
 }
 
+/// The 802.15.4 link cannot reassemble a frame larger than this crate's
+/// capacity profile allows the router to hold, and must not refuse one it
+/// does. Both `CLAUDE.md` and the profile's own doc comment say to keep them
+/// in sync; this is what makes forgetting a build error instead of a silent
+/// drop of every oversized frame.
+const _: () = assert!(ieee802154::MAX_REASSEMBLED_LEN == nrf52840::MAX_FRAME_LEN);
+
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
@@ -75,18 +84,29 @@ const HEAP_SIZE_BYTES: usize = 32 * 1024;
 
 /// Bring the chip up to the point a board can start wiring peripherals:
 /// stack painting, the heap, logging, any retained fault report, and the
-/// interrupt priorities the SoftDevice demands.
+/// clock sources its radio and USB depend on.
 ///
 /// **Call as the first statement of `main`.** [`stack::paint`] measures only
 /// what happens after it runs and must see the stack at its shallowest.
 /// `ram_floor` is the board's `ORIGIN(RAM)` from its `memory.x` — see
 /// [`stack::paint`] for why it cannot be read from a linker symbol.
 ///
-/// The SoftDevice reserves NVIC priority levels 0 and 1 and rejects
-/// `sd_softdevice_enable()` outright if any interrupt is already enabled there.
-/// `embassy_nrf`'s defaults put GPIOTE and the RTC1 time driver at `P0`, and
-/// UARTE0/USBD sit at the hardware reset default (highest) until set, so all
-/// four drop to `P2` here.
+/// # Clocks
+///
+/// **HFCLK is switched to the external crystal**, which `embassy-nrf` does not
+/// do by default (it assumes a board may not have one). Both are hard
+/// requirements, not accuracy preferences: the `RADIO` peripheral is only
+/// specified running from the HFXO, and USBD cannot clock the bus without it.
+/// Every board this crate supports has a 32 MHz crystal.
+///
+/// LFCLK is left on the internal RC oscillator. The DK has a 32.768 kHz
+/// crystal and the dongle does not, so `InternalRC` is the only setting that
+/// works on both; nothing here needs the accuracy an LFXO would add.
+///
+/// Interrupt priorities are left at `embassy-nrf`'s defaults. They used to be
+/// forced to `P2` because the SoftDevice reserved levels 0 and 1 and refused
+/// to enable if anything was already there; with it gone, nothing is
+/// reserved.
 pub fn init_platform(ram_floor: usize) -> embassy_nrf::Peripherals {
     stack::paint(ram_floor);
 
@@ -107,13 +127,19 @@ pub fn init_platform(ram_floor: usize) -> embassy_nrf::Peripherals {
     // Before anything this boot could push it out of the log ring.
     fault::report_retained();
 
-    Interrupt::UARTE0.set_priority(Priority::P2);
-    Interrupt::USBD.set_priority(Priority::P2);
-
     let mut config = embassy_nrf::config::Config::default();
-    config.gpiote_interrupt_priority = Priority::P2;
-    config.time_interrupt_priority = Priority::P2;
-    embassy_nrf::init(config)
+    config.hfclk_source = HfclkSource::ExternalXtal;
+
+    // `embassy_nrf::init` spins on `EVENTS_HFCLKSTARTED` with no timeout, and
+    // both the radio and USB are dead without the crystal — so a board whose
+    // HFXO never starts hangs here, before any link or management port
+    // exists, with no fault record (a hang is not a panic). Logging is
+    // already up, so bracket the spin: the last line in the ring then names
+    // the suspect instead of leaving a node that looks bricked.
+    debug!("starting HFXO (both the radio and USB need it)");
+    let peripherals = embassy_nrf::init(config);
+    debug!("HFXO running");
+    peripherals
 }
 
 /// `'static` scratch buffers for a board's [`BufferedUarte`], whose `rx` length

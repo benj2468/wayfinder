@@ -39,10 +39,11 @@ sim_builder_image := "wayfinder-sim-builder:latest"
 # be compiled for a macOS *host* at all, and any root-workspace command that
 # includes it fails there before reaching anything else.
 #
-# Dropping it on macOS costs its two unit tests locally and nothing else: the
-# coverage that matters is `build-loose-drivers`/`clippy-loose-drivers`, which
-# cross-compile it for `bare_metal_target` — the only target it ever runs on —
-# and work on every host. CI is Linux, so it stays fully covered there.
+# Dropping it on macOS costs its unit tests locally and nothing else: the
+# coverage that matters is `build-embedded`, which cross-compiles both nRF
+# boards (and so this crate, which they link) for `bare_metal_target` — the
+# only target it ever runs on — and works on every host. CI is Linux, so it
+# stays fully covered there.
 host_workspace_excludes := if os() == "macos" { "--exclude nrf-ieee802154" } else { "" }
 
 [doc("List the available recipes.")]
@@ -398,15 +399,22 @@ build-stm32f411:
 clippy-stm32f411:
     cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings
 
-# `nrf-ieee802154` is unwired because 802.15.4 and BLE contend for the same RADIO
-# peripheral; building it here keeps it from rotting unnoticed.
+# `blue`'s nRF backend is unwired: both nRF boards moved to 802.15.4, which
+# contends with BLE for the same RADIO peripheral, so nothing links
+# `NrfBleLink` or the SoftDevice any more. Building it here keeps it from
+# rotting unnoticed — the host (BlueZ) half of `blue` is still very much in
+# use by `bins/wayfinder-tap` and is covered by the workspace build.
+#
+# This used to cover `nrf-ieee802154`, for the mirror-image reason.
 [doc("Cross-compile the embedded drivers no board currently links.")]
 build-loose-drivers:
-    cargo build --locked -p nrf-ieee802154 --target {{ bare_metal_target }}
+    cargo build --locked -p blue --no-default-features \
+        --features hardware,softdevice-log --target {{ bare_metal_target }}
 
 [doc("Lint the embedded drivers no board currently links.")]
 clippy-loose-drivers:
-    cargo clippy --locked -p nrf-ieee802154 --target {{ bare_metal_target }} -- -D warnings
+    cargo clippy --locked -p blue --no-default-features \
+        --features hardware,softdevice-log --target {{ bare_metal_target }} -- -D warnings
 
 # ---------------------------------------------------------------------------
 # Python test suite

@@ -632,6 +632,16 @@ async fn send_on<L: LinkT, const N: usize, R: RouterOps>(
             Err(LinkError::NotPresent) => {
                 trace!(iface = idx, "drop: no radio on this link")
             }
+            // A contended medium is not an operator-actionable event, and it
+            // is reachable from ambient RF: with carrier-sense CCA, any
+            // neighbour transmitting — or a co-channel Wi-Fi AP, or a
+            // microwave — makes `try_send` report the channel busy. `warn!`
+            // here would evict the rest of the bounded log ring, which on a
+            // probe-less board is the only observability there is. The
+            // persistent case is the alarm board's job, not the log's.
+            Err(LinkError::TransmitFailed) => {
+                trace!(iface = idx, "drop: medium busy")
+            }
             Err(e) => warn!(iface = idx, error = ?e, "drop: link send failed"),
         }
     }

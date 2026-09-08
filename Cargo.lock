@@ -2165,6 +2165,8 @@ name = "ieee802154"
 version = "0.1.0"
 dependencies = [
  "interfaces",
+ "tracing",
+ "wayfinder-link-utils",
  "zerocopy",
 ]
 
@@ -2935,9 +2937,13 @@ dependencies = [
 name = "nrf-ieee802154"
 version = "0.1.0"
 dependencies = [
+ "embassy-executor",
+ "embassy-futures",
  "embassy-nrf",
+ "embassy-sync",
  "ieee802154",
  "interfaces",
+ "tracing",
  "wayfinder",
 ]
 

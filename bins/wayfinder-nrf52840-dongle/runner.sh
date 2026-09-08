@@ -13,11 +13,17 @@ set -euo pipefail
 # flash (`device program`) runs natively; only package generation is
 # emulated.
 #
-# `--sd-req 0x123` is S140 7.3.0's documented firmware ID (from `nrfutil
-# nrf5sdk-tools pkg generate --help`), declaring this app compatible with the
-# SoftDevice already on the device. Omitting `sd-req` entirely (as nrfdfu-rs
-# does, and the reason it's not used here) makes the bootloader conclude the
-# app doesn't need a SoftDevice and overwrite it before placing the app.
+# `--sd-req 0x00` declares that this app needs no SoftDevice, which is now
+# true: the radio is driven through `embassy-nrf` and no S140 is linked or
+# flashed. The bootloader reacts by erasing any SoftDevice it still finds and
+# placing the app directly above the MBR, at 0x1000 — which is exactly what
+# `memory.x` links for, and the two must agree. It used to be `0x123` (S140
+# 7.3.0's documented firmware ID, from `nrfutil nrf5sdk-tools pkg generate
+# --help`), pairing with a 0x27000 origin.
+#
+# `--sd-req` is still passed explicitly rather than omitted: nrfdfu-rs omits it
+# and that is the reason it is not used here, since an absent field and an
+# explicit 0x00 are not treated the same by every bootloader build.
 ELF_FILE=$1
 HEX_FILE="${ELF_FILE%.*}.hex"
 PACKAGE="${ELF_FILE%.*}.zip"
@@ -31,7 +37,7 @@ nrfutil-nrf5sdk-tools pkg generate \
   --application "$HEX_FILE" \
   --application-version 1 \
   --hw-version 52 \
-  --sd-req 0x123 \
+  --sd-req 0x00 \
   "$PACKAGE"
 
 nrfutil device program --firmware "$PACKAGE" --traits nordicDfu

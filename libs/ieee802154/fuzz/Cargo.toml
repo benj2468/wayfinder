@@ -13,13 +13,16 @@ libfuzzer-sys = "0.4"
 [dependencies.ieee802154]
 path = ".."
 
+[dependencies.interfaces]
+path = "../../interfaces"
+
 # Use independent workspace for fuzzers
 [workspace]
 members = ["."]
 
 [[bin]]
-name = "decode"
-path = "fuzz_targets/decode.rs"
+name = "accept_fragment"
+path = "fuzz_targets/accept_fragment.rs"
 test = false
 doc = false
 bench = false
