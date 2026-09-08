@@ -30,6 +30,7 @@ use wayfinder_protos::wayfinder::v1alpha::Alarm;
 use wayfinder_protos::wayfinder::v1alpha::AlarmKind;
 use wayfinder_protos::wayfinder::v1alpha::AlarmSeverity;
 use wayfinder_protos::wayfinder::v1alpha::Alarms;
+use wayfinder_protos::wayfinder::v1alpha::ClockPosture;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::PingProbe;
@@ -341,11 +342,34 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(tabs, area);
 }
 
+/// Render a node's clock posture as *which certificate windows it judges*.
+///
+/// A different question from the `Clock` row above, and the reason both are
+/// shown: `clock_trusted` is "will this node act on a credential", this is
+/// "which validity windows does its router enforce". They come apart in both
+/// directions — a host can hold an authoritative reading while refusing
+/// credential decisions on an undisciplined NTP verdict, and a board can judge
+/// expiry from a floor while having no NTP concept at all.
+///
+/// `none` is the one an operator has to be able to see: the node routes and
+/// verifies every signature, and enforces no expiry at all. Nothing else on
+/// this pane says so, and the node otherwise looks — and is — healthy
+/// (design 20 §7).
+fn clock_windows(posture: i32) -> String {
+    match ClockPosture::try_from(posture) {
+        Ok(ClockPosture::At) => "both ends".to_string(),
+        Ok(ClockPosture::AtLeast) => "expiry only".to_string(),
+        Ok(ClockPosture::Unknown) => "NONE (no anchor)".to_string(),
+        // A node too old to report the field, not a fourth state.
+        Ok(ClockPosture::Unspecified) | Err(_) => "—".to_string(),
+    }
+}
+
 /// Draw the overview pane: node identity, capacity, and connection details.
 fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
-    let (node_id, num_orig, locked, clock) = match &app.snapshot.node_info {
+    let (node_id, num_orig, locked, clock, windows) = match &app.snapshot.node_info {
         Some(info) => (
             format_id(&info.node_id),
             info.num_originators.to_string(),
@@ -359,9 +383,11 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 "NOT SYNCHRONIZED".to_string()
             },
+            clock_windows(info.clock_posture),
         ),
         None => (
             "(waiting for data)".to_string(),
+            "—".to_string(),
             "—".to_string(),
             "—".to_string(),
             "—".to_string(),
@@ -372,6 +398,7 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(field("Originators", &num_orig));
     lines.push(field("Locked", &locked));
     lines.push(field("Clock", &clock));
+    lines.push(field("Cert windows", &windows));
     lines.push(field(
         "Routing entries",
         &app.snapshot.routing.entries.len().to_string(),
@@ -1710,6 +1737,15 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                     &m.ogm_refloods_suppressed.to_string(),
                 ),
                 field("Proofs swept", &m.proofs_swept.to_string()),
+                // Nonzero means this node has been routing on credentials it
+                // could not date. It sits beside the counts rather than the
+                // rates for the same reason they do — what an operator wants
+                // is "has this ever happened", which a decaying rate answers
+                // with zero a minute later.
+                field(
+                    "Certs admitted undated",
+                    &m.unjudged_cert_admissions.to_string(),
+                ),
             ]
         }
     };
@@ -2297,6 +2333,7 @@ mod tests {
             cert_reply_rate: 1.5,
             untaggable_drop_rate: 0.0,
             seqno_resyncs: 0,
+            unjudged_cert_admissions: 0,
             ogm_refloods_suppressed: 0,
             proofs_swept: 0,
             ..Default::default()

@@ -11,6 +11,7 @@ use zerocopy::Unaligned;
 use zerocopy::byteorder::network_endian::U32;
 use zerocopy::byteorder::network_endian::U64;
 
+use crate::clock::Clocked;
 use crate::error::AuthError;
 use crate::key::verify_signature;
 use crate::mac::derive_mac;
@@ -335,7 +336,7 @@ impl TrustAnchor {
         })
     }
 
-    /// Verify `cert` against this anchor as of `now_unix` (unix seconds).
+    /// Verify `cert` against this anchor under the time posture `now`.
     ///
     /// Checks, in order: the version byte, that the cert is for *this* mesh, the
     /// root signature, that the subject MAC is one a node can actually route
@@ -353,10 +354,16 @@ impl TrustAnchor {
     /// address is never reserved — and "the CA bound a broadcast address" names
     /// the mistake where "the MAC does not match the key" describes a symptom
     /// of it.
+    ///
+    /// **Only the window depends on `now`** (design 20 §4.2). Everything above
+    /// it — the real trust boundary, which segregates one mesh from another and
+    /// binds a key to a MAC — is performed identically under all three
+    /// postures, so a verifier that cannot tell the time is not a verifier that
+    /// admits anybody. See [`Clocked`] for the table.
     pub fn verify_cert(
         &self,
         cert: &MembershipCert,
-        now_unix: u64,
+        now: Clocked,
     ) -> Result<VerifiedCert, AuthError> {
         if cert.version != CERT_VERSION {
             return Err(AuthError::BadVersion);
@@ -387,10 +394,10 @@ impl TrustAnchor {
         // Copy out of the packed struct before comparing (no refs into packed).
         let not_before = cert.not_before.get();
         let not_after = cert.not_after.get();
-        if now_unix < not_before {
+        if now.proves_before(not_before) {
             return Err(AuthError::NotYetValid);
         }
-        if now_unix > not_after {
+        if now.proves_past(not_after) {
             return Err(AuthError::Expired);
         }
         Ok(VerifiedCert {
@@ -445,7 +452,10 @@ mod tests {
             200,
         );
 
-        let verified = authority.trust_anchor().verify_cert(&cert, 150).unwrap();
+        let verified = authority
+            .trust_anchor()
+            .verify_cert(&cert, Clocked::At(150))
+            .unwrap();
         assert!(verified.member, "an enrolled device is a member");
         assert!(!verified.admin);
         assert!(!verified.viewer);
@@ -470,7 +480,10 @@ mod tests {
                 200,
                 admin,
             );
-            let verified = authority.trust_anchor().verify_cert(&cert, 150).unwrap();
+            let verified = authority
+                .trust_anchor()
+                .verify_cert(&cert, Clocked::At(150))
+                .unwrap();
             assert!(!verified.member, "a user session is not a device");
             assert!(verified.user);
             assert_eq!(verified.admin, admin);
@@ -497,7 +510,10 @@ mod tests {
             0,
         );
 
-        let verified = authority.trust_anchor().verify_cert(&legacy, 150).unwrap();
+        let verified = authority
+            .trust_anchor()
+            .verify_cert(&legacy, Clocked::At(150))
+            .unwrap();
         assert!(!verified.member);
         assert!(!verified.admin);
         assert!(!verified.viewer);
@@ -518,7 +534,10 @@ mod tests {
             200,
         );
 
-        let verified = authority.trust_anchor().verify_cert(&cert, 150).unwrap();
+        let verified = authority
+            .trust_anchor()
+            .verify_cert(&cert, Clocked::At(150))
+            .unwrap();
         assert_eq!(verified.mac, node.derived_mac());
         assert_eq!(verified.ed_pubkey, node.ed_pubkey());
         assert_eq!(verified.x_pubkey, node.x_pubkey());
@@ -547,7 +566,7 @@ mod tests {
             200,
         );
         assert!(
-            !anchor.verify_cert(&member, 150).unwrap().admin,
+            !anchor.verify_cert(&member, Clocked::At(150)).unwrap().admin,
             "a plain membership cert must not be an admin"
         );
 
@@ -561,7 +580,7 @@ mod tests {
             true,
         );
         assert!(
-            anchor.verify_cert(&admin, 150).unwrap().admin,
+            anchor.verify_cert(&admin, Clocked::At(150)).unwrap().admin,
             "an admin-issued cert must carry the admin capability once verified"
         );
     }
@@ -581,7 +600,7 @@ mod tests {
             200,
         );
         assert_eq!(
-            ours.trust_anchor().verify_cert(&cert, 150),
+            ours.trust_anchor().verify_cert(&cert, Clocked::At(150)),
             Err(AuthError::BadSignature)
         );
     }
@@ -600,7 +619,10 @@ mod tests {
         );
         let mut anchor = authority.trust_anchor();
         anchor.mesh_id = 0x2222;
-        assert_eq!(anchor.verify_cert(&cert, 150), Err(AuthError::WrongMesh));
+        assert_eq!(
+            anchor.verify_cert(&cert, Clocked::At(150)),
+            Err(AuthError::WrongMesh)
+        );
     }
 
     /// The validity window is enforced at both ends.
@@ -616,30 +638,27 @@ mod tests {
             200,
         );
         let anchor = authority.trust_anchor();
-        assert_eq!(anchor.verify_cert(&cert, 99), Err(AuthError::NotYetValid));
-        assert_eq!(anchor.verify_cert(&cert, 201), Err(AuthError::Expired));
-        assert!(anchor.verify_cert(&cert, 100).is_ok());
-        assert!(anchor.verify_cert(&cert, 200).is_ok());
+        assert_eq!(
+            anchor.verify_cert(&cert, Clocked::At(99)),
+            Err(AuthError::NotYetValid)
+        );
+        assert_eq!(
+            anchor.verify_cert(&cert, Clocked::At(201)),
+            Err(AuthError::Expired)
+        );
+        assert!(anchor.verify_cert(&cert, Clocked::At(100)).is_ok());
+        assert!(anchor.verify_cert(&cert, Clocked::At(200)).is_ok());
     }
 
-    /// **A verifier with no clock refuses every certificate a real authority
-    /// issues.**
+    /// **`Unknown` checks everything but the window.**
     ///
-    /// Not a corner case. `CertAuthority` stamps `not_before` from its own
-    /// clock and refuses to issue at all without one, so every genuine
-    /// certificate carries a real Unix timestamp — and the window check above
-    /// has no zero-clock bypass, so `0 < not_before` is `NotYetValid`.
-    ///
-    /// Pinned because nothing else did: every other fixture in this workspace
-    /// issues with `not_before = 0` (see the test below), which is why a
-    /// bare-metal node — permanently at `now_unix == 0`, since no board calls
-    /// `OgmAuth::set_time` — being unable to admit *anyone* went unnoticed.
-    ///
-    /// This characterises today's behaviour rather than asserting a fix. The
-    /// "Auth on Embedded" epic owns choosing what an unclocked node should do
-    /// instead, and this is the test that has to change when it does.
+    /// The replacement for `an_unclocked_verifier_refuses_a_certificate_from_a_real_authority`,
+    /// which characterised the behaviour design 20 §4.2 exists to change: a
+    /// verifier with no clock now admits a signature-valid certificate whose
+    /// window it cannot judge, and still refuses every certificate that fails
+    /// a clock-free check. "Signature always, window when known."
     #[test]
-    fn an_unclocked_verifier_refuses_a_certificate_from_a_real_authority() {
+    fn an_unclocked_verifier_checks_everything_except_the_window() {
         const ISSUED_AT: u64 = 1_700_000_000;
         const A_YEAR: u64 = 365 * 24 * 60 * 60;
 
@@ -654,43 +673,87 @@ mod tests {
         );
         let anchor = authority.trust_anchor();
 
-        assert_eq!(
-            anchor.verify_cert(&cert, 0),
-            Err(AuthError::NotYetValid),
-            "an unclocked verifier refuses a certificate that is valid right now"
+        assert!(
+            anchor.verify_cert(&cert, Clocked::Unknown).is_ok(),
+            "an unclocked verifier must admit a certificate that is valid right now"
         );
 
-        // The control: the certificate is fine and the anchor is fine. The
-        // clock is the whole difference.
-        assert!(
-            anchor.verify_cert(&cert, ISSUED_AT + 1).is_ok(),
-            "the same certificate verifies the moment the verifier knows the time"
+        // ...and the window really is the only thing it skips.
+        let mut forged = cert;
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            anchor.verify_cert(&forged, Clocked::Unknown),
+            Err(AuthError::BadSignature),
+            "an unclocked verifier still refuses a forgery"
+        );
+
+        let other = Authority::from_seed(&[9u8; 32], 0xBEEF);
+        let foreign = other.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+        );
+        assert_eq!(
+            anchor.verify_cert(&foreign, Clocked::Unknown),
+            Err(AuthError::WrongMesh),
+            "an unclocked verifier still refuses another mesh's certificate"
+        );
+
+        let mut misbound = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+        );
+        misbound.node_mac = mac(7).0;
+        assert_eq!(
+            anchor.verify_cert(&misbound, Clocked::Unknown),
+            Err(AuthError::BadSignature),
+            "rewriting the subject breaks the signature that covers it"
         );
     }
 
-    /// The contrast that explains the blind spot: a certificate issued with
-    /// `not_before = 0` verifies happily on an unclocked verifier, because zero
-    /// is not below zero.
+    /// **`AtLeast(f)` enforces expiry and never reports `NotYetValid`.**
     ///
-    /// That is the shape every test fixture in this workspace uses, and no
-    /// authority ever produces it — `CertAuthority` refuses to issue without a
-    /// clock. So the fixtures agreed with each other and with nothing that
-    /// ships.
+    /// A board's clock is a floor, not a point, and the floor can be
+    /// arbitrarily far behind — a checkpoint cannot measure powered-off time.
+    /// The guarantee that makes that safe is that no floor whatever can make
+    /// this verifier reject a healthy peer for being "too early" (design 20
+    /// §4.2), so it is asserted across the whole range rather than at one
+    /// convenient value.
     #[test]
-    fn a_zero_not_before_is_what_hid_the_unclocked_gap() {
+    fn a_lower_bound_enforces_expiry_and_never_earliness() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
         let cert = authority.issue_cert(
             node.derived_mac(),
             node.ed_pubkey(),
             node.x_pubkey(),
-            0,
+            100,
             200,
         );
+        let anchor = authority.trust_anchor();
 
-        assert!(
-            authority.trust_anchor().verify_cert(&cert, 0).is_ok(),
-            "the fixture shape verifies at time zero, which a real one does not"
+        for floor in [0, 1, 99, 100, 150, 200] {
+            assert!(
+                anchor.verify_cert(&cert, Clocked::AtLeast(floor)).is_ok(),
+                "a floor at or below not_after must admit the certificate ({floor})"
+            );
+        }
+        for floor in [201, 1_000, u64::MAX] {
+            assert_eq!(
+                anchor.verify_cert(&cert, Clocked::AtLeast(floor)),
+                Err(AuthError::Expired),
+                "a floor past not_after proves expiry ({floor})"
+            );
+        }
+        // The contrast: only `At` reports not-yet-validity at all.
+        assert_eq!(
+            anchor.verify_cert(&cert, Clocked::At(99)),
+            Err(AuthError::NotYetValid)
         );
     }
 
@@ -709,7 +772,9 @@ mod tests {
         // Flip the bound MAC; the signature no longer covers these bytes.
         cert.node_mac = mac(6).0;
         assert_eq!(
-            authority.trust_anchor().verify_cert(&cert, 150),
+            authority
+                .trust_anchor()
+                .verify_cert(&cert, Clocked::At(150)),
             Err(AuthError::BadSignature)
         );
     }
@@ -728,7 +793,12 @@ mod tests {
         );
         let bytes = cert.as_bytes().to_vec();
         let (parsed, _) = MembershipCert::ref_from_prefix(&bytes).unwrap();
-        assert!(authority.trust_anchor().verify_cert(parsed, 150).is_ok());
+        assert!(
+            authority
+                .trust_anchor()
+                .verify_cert(parsed, Clocked::At(150))
+                .is_ok()
+        );
     }
 
     /// The fingerprint is deterministic: hashing the same cert bytes twice
@@ -809,7 +879,7 @@ mod tests {
         ] {
             let cert = authority.issue_cert(reserved, node.ed_pubkey(), node.x_pubkey(), 100, 200);
             assert_eq!(
-                anchor.verify_cert(&cert, 150),
+                anchor.verify_cert(&cert, Clocked::At(150)),
                 Err(AuthError::ReservedAddress),
                 "reserved address {reserved:?} must not verify",
             );
@@ -840,7 +910,7 @@ mod tests {
                 200,
             );
             assert!(
-                anchor.verify_cert(&cert, 150).is_ok(),
+                anchor.verify_cert(&cert, Clocked::At(150)).is_ok(),
                 "a derived address from seed {seed} must verify",
             );
         }
@@ -887,7 +957,7 @@ mod tests {
             200,
         );
         assert_eq!(
-            anchor.verify_cert(&impersonation, 150),
+            anchor.verify_cert(&impersonation, Clocked::At(150)),
             Err(AuthError::MacKeyMismatch),
             "a cert naming another key's address must not verify",
         );
@@ -896,7 +966,7 @@ mod tests {
         let invented =
             authority.issue_cert(mac(5), attacker.ed_pubkey(), attacker.x_pubkey(), 100, 200);
         assert_eq!(
-            anchor.verify_cert(&invented, 150),
+            anchor.verify_cert(&invented, Clocked::At(150)),
             Err(AuthError::MacKeyMismatch),
             "a cert naming an address no key derives must not verify",
         );
@@ -923,7 +993,7 @@ mod tests {
             100,
             200,
         );
-        assert!(anchor.verify_cert(&cert, 150).is_ok());
+        assert!(anchor.verify_cert(&cert, Clocked::At(150)).is_ok());
     }
 
     /// A reserved address is reported as reserved, not as a key mismatch.
@@ -942,7 +1012,7 @@ mod tests {
         let cert =
             authority.issue_cert(Mac([0xFF; 6]), node.ed_pubkey(), node.x_pubkey(), 100, 200);
         assert_eq!(
-            anchor.verify_cert(&cert, 150),
+            anchor.verify_cert(&cert, Clocked::At(150)),
             Err(AuthError::ReservedAddress),
         );
     }
@@ -966,7 +1036,10 @@ mod tests {
         // Repoint the subject at an address the key does not derive, which also
         // invalidates the signature over the body.
         cert.node_mac = mac(6).0;
-        assert_eq!(anchor.verify_cert(&cert, 150), Err(AuthError::BadSignature));
+        assert_eq!(
+            anchor.verify_cert(&cert, Clocked::At(150)),
+            Err(AuthError::BadSignature)
+        );
     }
 
     use crate::key::Keypair;
@@ -1032,8 +1105,8 @@ mod tests {
         assert!(cert.expired(1401));
         // The two predicates agree with verification on the same instants.
         let anchor = authority.trust_anchor();
-        assert!(anchor.verify_cert(&cert, 1400).is_ok());
-        assert!(anchor.verify_cert(&cert, 1401).is_err());
+        assert!(anchor.verify_cert(&cert, Clocked::At(1400)).is_ok());
+        assert!(anchor.verify_cert(&cert, Clocked::At(1401)).is_err());
     }
 
     /// A zero-length window (`not_before == not_after`) must not divide by zero.

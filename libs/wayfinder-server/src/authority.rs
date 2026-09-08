@@ -31,8 +31,6 @@ use wayfinder_protos::service::TokenUpdate;
 use wayfinder_protos::service::UserAuthOutcome;
 use zerocopy::IntoBytes;
 
-use crate::clock_trust::ClockSync;
-use crate::clock_trust::ClockTrust;
 use crate::persistence::CaLog;
 use crate::persistence::TokenOverride;
 use crate::provider::MeshAuthority;
@@ -44,6 +42,16 @@ use crate::users::MAX_USERNAME_LEN;
 use crate::users::UserInvite;
 use crate::users::UserRecord;
 use crate::users::UserRole;
+// The earliest unix second this build will believe from a host clock, hoisted
+// into `wayfinder-auth` (design 20 §4.2) so the authority stamping a validity
+// window and every verifier judging one share *one* definition of "plausible".
+// Two components reading the host clock with different floors is how they end
+// up disagreeing about whether a certificate is inside its window. A reading
+// below it is mapped onto zero here, which is the value every issuing path in
+// this module already refuses.
+use wayfinder::wayfinder_auth::MIN_PLAUSIBLE_UNIX;
+use wayfinder_clock_trust::ClockSync;
+use wayfinder_clock_trust::ClockTrust;
 
 /// How this mesh names itself in an authenticator app's account list.
 ///
@@ -276,30 +284,6 @@ fn check_approval_ttl(cert_ttl_secs: u64, allow_unbounded: bool) -> Result<(), S
     check_cert_ttl(cert_ttl_secs, allow_unbounded)
 }
 
-/// Whether an invitation is still capable of producing an account.
-///
-/// The two states expire on different clocks: a `Pending` invitation dies at
-/// its own expiry, while a `Started` one dies when its handle window closes —
-/// its original expiry is superseded the moment the secret is revealed.
-///
-/// Shared by [`CertAuthority::evict_expired_invites`] and
-/// [`CertAuthority::list_user_invites`] so the sweep and the admin's listing
-/// cannot drift apart about what counts as an invitation.
-/// The earliest unix second this build will believe from a host clock.
-///
-/// 2025-01-01T00:00:00Z. A host whose real-time clock has died, or which booted
-/// before NTP answered, reports a time near the epoch — and unlike an unset
-/// clock, that reading *looks* like a valid instant. Certificates stamped from
-/// it would carry validity windows decades in the past, and every expiry check
-/// in this module would read "not yet expired" forever.
-///
-/// So a reading below this floor is mapped onto zero, which is the value every
-/// issuing path here already refuses. The floor only has to be late enough that
-/// no real deployment predates it and early enough never to reject a working
-/// clock; the gap between those is decades wide, so the exact value is not
-/// delicate.
-const MIN_PLAUSIBLE_UNIX: u64 = 1_735_689_600;
-
 /// Where a [`CertAuthority`] reads wall-clock time from.
 ///
 /// Time is a trust input here: it decides a certificate's validity window, when
@@ -353,7 +337,7 @@ impl Clock {
             // Nothing vouches for this reading, so it is worth exactly as much
             // as no reading at all. Checked before the clock is read at all: an
             // untrusted reading is not wanted even to log.
-            Clock::System(trust) if !crate::clock_trust::read(trust).is_trusted() => 0,
+            Clock::System(trust) if !wayfinder_clock_trust::read(trust).is_trusted() => 0,
             Clock::System(_) => plausible_or_zero(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -374,7 +358,7 @@ impl Clock {
     fn sync(self) -> ClockSync {
         match self {
             Clock::Fixed(_) => ClockSync::Unsupported,
-            Clock::System(trust) => crate::clock_trust::read(trust),
+            Clock::System(trust) => wayfinder_clock_trust::read(trust),
         }
     }
 }
@@ -391,6 +375,15 @@ pub(crate) fn plausible_or_zero(secs: u64) -> u64 {
     if secs < MIN_PLAUSIBLE_UNIX { 0 } else { secs }
 }
 
+/// Whether an invitation is still capable of producing an account.
+///
+/// The two states expire on different clocks: a `Pending` invitation dies at
+/// its own expiry, while a `Started` one dies when its handle window closes —
+/// its original expiry is superseded the moment the secret is revealed.
+///
+/// Shared by [`CertAuthority::evict_expired_invites`] and
+/// [`CertAuthority::list_user_invites`] so the sweep and the admin's listing
+/// cannot drift apart about what counts as an invitation.
 fn invite_is_live(invite: &UserInvite, now_unix: u64) -> bool {
     match invite.status {
         InviteStatus::Pending => !invite.is_expired(now_unix),
@@ -2592,7 +2585,9 @@ mod tests {
 
         let anchor = TrustAnchor::from_bytes(&data.trust_anchor).unwrap();
         let cert = MembershipCert::from_bytes(&data.cert).unwrap();
-        let verified = anchor.verify_cert(&cert, 500).expect("verifies in window");
+        let verified = anchor
+            .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(500))
+            .expect("verifies in window");
 
         assert!(verified.user, "a session certificate carries the user bit");
         assert!(
@@ -2632,7 +2627,10 @@ mod tests {
         };
         let anchor = TrustAnchor::from_bytes(&data.trust_anchor).unwrap();
         let verified = anchor
-            .verify_cert(&MembershipCert::from_bytes(&data.cert).unwrap(), 500)
+            .verify_cert(
+                &MembershipCert::from_bytes(&data.cert).unwrap(),
+                wayfinder::wayfinder_auth::Clocked::At(500),
+            )
             .unwrap();
         assert!(verified.viewer && !verified.admin && verified.user);
     }
@@ -3308,7 +3306,9 @@ mod tests {
 
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         let cert = MembershipCert::from_bytes(&cert_bytes).unwrap();
-        let verified = anchor.verify_cert(&cert, 500).expect("verifies in window");
+        let verified = anchor
+            .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(500))
+            .expect("verifies in window");
         assert_eq!(verified.mac.0, node_mac(2));
         assert_eq!(verified.ed_pubkey, ed);
     }
@@ -3365,11 +3365,13 @@ mod tests {
     /// real deployment it is a Unix timestamp, never zero.
     ///
     /// The other half of the pair with
-    /// `an_unclocked_verifier_refuses_a_certificate_from_a_real_authority` in
-    /// `wayfinder-auth`: that one shows a verifier at `now_unix == 0` refuses a
-    /// certificate whose `not_before` is real, and this one shows that is the
-    /// only kind an authority produces. Together they are why a bare-metal node
-    /// cannot hold a membership credential today.
+    /// `an_unclocked_verifier_checks_everything_except_the_window` in
+    /// `wayfinder-auth`: that one shows a verifier with no clock admitting a
+    /// certificate whose `not_before` it cannot judge, and this one shows that
+    /// a real `not_before` is the only kind an authority produces — so the
+    /// window being skipped is the *common* case on a board, not a corner.
+    /// Before design 20 this pair read the opposite way, and was the reason a
+    /// bare-metal node could not hold a membership credential at all.
     #[test]
     fn an_issued_certificates_not_before_is_the_issuing_clock() {
         const ISSUED_AT: u64 = 1_700_000_000;
@@ -3685,7 +3687,9 @@ mod tests {
         };
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         let cert = MembershipCert::from_bytes(&cert).unwrap();
-        let verified = anchor.verify_cert(&cert, 500).unwrap();
+        let verified = anchor
+            .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(500))
+            .unwrap();
         assert_eq!(verified.not_after, 100 + 50_000);
     }
 
@@ -3716,7 +3720,9 @@ mod tests {
         };
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         let cert = MembershipCert::from_bytes(&cert).unwrap();
-        let verified = anchor.verify_cert(&cert, 40_000).unwrap();
+        let verified = anchor
+            .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(40_000))
+            .unwrap();
         assert_eq!(
             verified.not_after, 90_000,
             "renewed for the 50000s this device was admitted for, from now"
@@ -3969,7 +3975,14 @@ mod tests {
         // The issued cert verifies and is recorded for ListCerts.
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         let cert = MembershipCert::from_bytes(&first).unwrap();
-        assert_eq!(anchor.verify_cert(&cert, 500).unwrap().mac.0, mac);
+        assert_eq!(
+            anchor
+                .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(500))
+                .unwrap()
+                .mac
+                .0,
+            mac
+        );
         assert_eq!(ca.list_certs().len(), 1);
 
         // A later poll returns the *same* bytes (stable collection).

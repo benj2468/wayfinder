@@ -16,6 +16,9 @@ workspace = true
 [dependencies]
 wayfinder-driver-core.workspace = true
 wayfinder.workspace = true
+# The `Clocked` posture the router's auth clock is set with. `no_std` — the
+# `std` feature (the certificate authority) stays a dev-dependency below.
+wayfinder-auth.workspace = true
 interfaces.workspace = true
 zerocopy.workspace = true
 # Pinned directly (not workspace inheritance, which can't override

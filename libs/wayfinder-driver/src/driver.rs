@@ -80,13 +80,16 @@ enum AuthClock {
     /// certificate-validity check stayed offset by the original error. A clock
     /// that never consults a stored epoch cannot go stale that way.
     ///
-    /// **Deliberately not gated on the NTP verdict.** This clock feeds the
-    /// router's own `OgmAuth`, which judges every peer certificate's validity
-    /// window against it. Handing it the fail-closed zero would make
-    /// `verify_cert` return `NotYetValid` for every certificate ever issued, so
-    /// an authenticated mesh would verify no peer and be verified by none —
-    /// a total partition, and precisely the self-inflicted outage this feature
-    /// exists to avoid. The gate belongs on *credential decisions*
+    /// **Deliberately not gated on the NTP verdict**, though no longer for the
+    /// reason it once was. Under design 20 §4.2 a gated reading would hand the
+    /// router [`Clocked::Unknown`](wayfinder::wayfinder_auth::Clocked), which
+    /// is not a partition at all — every signature is still checked and the
+    /// node still routes. What it *would* do is switch expiry enforcement off:
+    /// a correctly-synchronised stock Linux host commonly reads as
+    /// unsynchronised (chrony clears `STA_UNSYNC` only under `rtcsync`, which
+    /// nothing sets on a workstation), so gating here would disable passive
+    /// revocation-by-expiry across the whole host fleet to guard against an
+    /// error of hours. The gate belongs on *credential decisions*
     /// ([`Driver::credential_unix`]), not on the router's view of time.
     Host,
     /// `epoch + the loop's elapsed time`, in unix seconds.
@@ -111,6 +114,51 @@ impl AuthClock {
             // `Clock::System`, rather than a second host-clock read here with a
             // different floor.
             Self::Host => wayfinder_server::host_unix_now(),
+        }
+    }
+
+    /// The router's wall-clock **posture** at `elapsed` (design 20 §4.2).
+    ///
+    /// [`Host`](Self::Host) reads the system clock through `host_unix_now`,
+    /// which floors an implausible reading to zero — an unset RTC reading as
+    /// 1970, which *looks* like a valid instant. Judged as `At`, such a reading
+    /// precedes every real certificate's `not_before`, so the node would refuse
+    /// every peer as `NotYetValid`. Zero is not a time, so it is reported as
+    /// `Clocked::Unknown` and the node routes while judging no validity window
+    /// instead.
+    ///
+    /// Still deliberately **not** gated on the NTP verdict — see
+    /// [`Host`](Self::Host). A plausible reading a host cannot vouch for is
+    /// worse than no reading for a *credential decision*
+    /// ([`Driver::credential_unix`] handles that), but for the router's own
+    /// view of time it is far better than nothing: rounding every ordinary
+    /// Linux node whose chrony lacks `rtcsync` down to `Unknown` would switch
+    /// passive revocation-by-expiry off across the whole host fleet to guard
+    /// against an error of hours.
+    ///
+    /// A non-zero [`Epoch`](Self::Epoch) is a value its caller chose, so it is
+    /// reported verbatim; the floor exists for the reading nobody chose. An
+    /// `Epoch(0)` is the "no epoch pinned" state and reports `Unknown` on the
+    /// same terms as an implausible host reading.
+    fn wall(self, elapsed: Duration) -> wayfinder::wayfinder_auth::Clocked {
+        use wayfinder::wayfinder_auth::Clocked;
+        // `Epoch(0)` is checked on the *epoch*, not on the sum: an unpinned
+        // epoch plus a running loop is `At(elapsed)` — a handful of seconds
+        // past 1970, which precedes every real certificate's `not_before` and
+        // would refuse every peer as `NotYetValid`. It is the "no epoch
+        // pinned" state and belongs with the implausible host reading below.
+        if matches!(self, Self::Epoch(0)) {
+            return Clocked::Unknown;
+        }
+        match self {
+            // One spelling of "below 2025 is not a time", shared with every
+            // other host that has to make this call. `host_unix_now` already
+            // floors the reading, so this is belt and braces — but a second
+            // hand-rolled comparison here is how the two end up disagreeing.
+            Self::Host => Clocked::from_unix(self.now_unix(elapsed)),
+            // A chosen epoch is reported verbatim: flooring it would make a
+            // test asking about second 1000 silently ask about something else.
+            Self::Epoch(_) => Clocked::At(self.now_unix(elapsed)),
         }
     }
 }
@@ -139,20 +187,23 @@ const CLOCK_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
 ///
 /// Distinct from [`AuthClock::now_unix`], which is the router's own view of
 /// time and is deliberately never gated. See [`AuthClock::Host`] for why gating
-/// that one partitions an authenticated mesh.
+/// that one would switch expiry enforcement off across the host fleet.
 fn credential_unix(clock: AuthClock, trusted: bool, now: Duration) -> u64 {
     if trusted { clock.now_unix(now) } else { 0 }
 }
 
 fn epoch_offset(clock: AuthClock, trusted: bool, now: Duration) -> Duration {
     if !trusted {
-        // Fail closed, deliberately. The adapter recovers `epoch + now`, so a
-        // zero offset makes its `unix_now()` the loop's monotonic `now` — a few
-        // seconds past 1970, which precedes every real certificate's
-        // `not_before`, so a `SetAuth` install is refused as not-yet-valid.
-        // There is no offset that recovers an exact zero, so this is the
-        // fail-closed value rather than the sentinel itself; do not "fix" the
-        // saturation below into something that produces a plausible time.
+        // Fail closed, deliberately — though what enforces that is no longer
+        // this value. The adapter recovers `epoch + now`, and since design 20
+        // `RouterAdapter::wall()` reports `Clocked::Unknown` whenever
+        // `clock_trusted` is false, so a `SetAuth` on an untrusted host clock
+        // is verified without a validity window rather than refused as
+        // not-yet-valid. This offset is what that `unix_now()` would have been;
+        // it is kept at the fail-closed value so nothing downstream reads a
+        // plausible-looking time out of an untrusted clock. There is no offset
+        // that recovers an exact zero, so do not "fix" the saturation below
+        // into something that produces one.
         return Duration::ZERO;
     }
     Duration::from_secs(credential_unix(clock, trusted, now)).saturating_sub(now)
@@ -623,7 +674,7 @@ impl<Local: FrameIo> Driver<Local> {
             // proofs have to be swept in the same breath or a route reports
             // healthy while every frame over it is dropped for want of that
             // key (design 09 §8.10).
-            guard.router.set_auth_time(now, unix.as_secs());
+            guard.router.set_auth_time(now, self.clock.wall(now));
             guard.router.auth().is_some()
         };
         // Published to whatever holds the other half — an authority task that
@@ -1215,6 +1266,12 @@ impl<Local: FrameIo> Driver<Local> {
             &renewed.cert,
             &renewed.trust_anchor,
             Some(renewed.provider),
+            // This node *is* the installer here, and it has no `WallClock` to
+            // anchor — it reads its own host clock. `credential_unix` is
+            // nonetheless the honest value to stamp: it is the same reading,
+            // under the same trust gate, that every other credential decision
+            // on this node is made against.
+            credential_unix(self.clock, clock_trusted, now),
         ) {
             // `info!`: a lifecycle event an observer wants, once per certificate
             // lifetime rather than per frame.
@@ -1952,6 +2009,34 @@ async fn send_on_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The router's wall-clock posture, pinned on both variants.
+    ///
+    /// Two deliberate policy decisions live in this two-line function and
+    /// neither is obvious from reading it (design 20 §11): a `Host` reading is
+    /// **not** gated on the NTP verdict, and an implausible one — or an
+    /// unpinned `Epoch` — reports `Unknown` rather than an instant in 1970.
+    #[test]
+    fn auth_clock_reports_its_posture() {
+        use wayfinder::wayfinder_auth::Clocked;
+
+        // A pinned epoch is a value its caller chose, reported verbatim.
+        assert_eq!(
+            AuthClock::Epoch(1_000).wall(Duration::from_secs(5)),
+            Clocked::At(1_005),
+            "a chosen epoch is not floored — a test asking about second 1000 \
+             must not silently be asked about something else"
+        );
+
+        // An unpinned one is the "no epoch" state, *not* a 1970 instant: as
+        // `At`, `elapsed` seconds precedes every real `not_before` and would
+        // refuse every peer as NotYetValid.
+        assert_eq!(
+            AuthClock::Epoch(0).wall(Duration::from_secs(5)),
+            Clocked::Unknown
+        );
+        assert_eq!(AuthClock::Epoch(0).wall(Duration::ZERO), Clocked::Unknown);
+    }
     // Only to mint a certificate for a `SetAuth`; the driver no longer holds an
     // authority of its own.
     use wayfinder_server::CertAuthority;
@@ -2494,6 +2579,7 @@ mod tests {
                         cert,
                         trust_anchor: anchor,
                         provider: None,
+                        installer_unix: 0,
                     },
                 ),
             ),
@@ -2600,6 +2686,7 @@ mod tests {
                     node_key: vec![9u8; 32],
                     enrollment_token: "s3cret".into(),
                 })),
+                installer_unix: 0,
             })
         };
 
@@ -2783,7 +2870,7 @@ mod tests {
                 // After `set_auth`, not before: installing auth brings its own
                 // clock, so a time set first is discarded and the certificate
                 // reads as fresh against a zero clock.
-                r.set_auth_time(Duration::ZERO, NOW);
+                r.set_auth_time(Duration::ZERO, wayfinder::wayfinder_auth::Clocked::At(NOW));
             })
             .await;
         let recorded = RenewalProviderData {
@@ -2881,7 +2968,10 @@ mod tests {
                 // After `set_auth`: installing auth brings its own clock, so a
                 // time set before it is discarded and every certificate reads
                 // fresh against a zero clock.
-                r.set_auth_time(Duration::ZERO, judged_at);
+                r.set_auth_time(
+                    Duration::ZERO,
+                    wayfinder::wayfinder_auth::Clocked::At(judged_at),
+                );
             })
             .await;
         driver.set_renewal_provider(provider).await;

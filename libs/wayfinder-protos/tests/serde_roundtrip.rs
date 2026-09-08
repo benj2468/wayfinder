@@ -33,6 +33,7 @@ fn node_info_round_trips_through_json() {
         auth_locked: false,
         runtime_config_active: true,
         clock_trusted: true,
+        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
     };
 
     let json = serde_json::to_string(&original).unwrap();
@@ -98,6 +99,7 @@ fn response_oneof_round_trips_through_json() {
             auth_locked: true,
             runtime_config_active: false,
             clock_trusted: true,
+            clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
         })),
     };
 

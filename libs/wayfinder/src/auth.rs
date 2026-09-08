@@ -41,6 +41,7 @@ use batman::wire::BatmanTvlvHdr;
 use batman::wire::TvlvType;
 use batman::wire::find_tvlv;
 use batman::wire::iter_tvlv;
+use core::time::Duration;
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
 use wayfinder_alarm::AlarmKind;
@@ -49,6 +50,7 @@ use wayfinder_alarm::Severity;
 use wayfinder_alarm::Subject;
 use wayfinder_alarm::alarm;
 use wayfinder_auth::AuthError;
+use wayfinder_auth::Clocked;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::RevocationRecord;
@@ -89,24 +91,31 @@ const KEEPALIVE_SIG_DOMAIN: &[u8] = b"wf-keepalive-sig-v1";
 /// those can be replayed as one.
 const FANOUT_SIG_DOMAIN: &[u8] = b"wf-mcast-fanout-sig-v1";
 
-/// Width, in seconds, of the coarse time bucket a keep-alive signs over.
-/// Keep-alives carry no sequence number ([`batman::wire::BatmanKeepAlivePacket`]
-/// is deliberately minimal), so this — together with
-/// [`KEEPALIVE_TOLERANCE_BUCKETS`] — bounds how long a captured, genuinely
-/// signed heartbeat can be replayed to fake a since-silenced neighbor's
-/// liveness, without needing per-neighbor replay counters. Checked against the
-/// same wall clock ([`OgmAuth::now_unix`]) cert-validity checks already rely
-/// on, so this adds no new cross-node clock-sync assumption.
-const KEEPALIVE_BUCKET_SECS: u64 = 30;
-
-/// How many buckets into the past a keep-alive's signed bucket remains
-/// acceptable (beyond the current one), absorbing clock skew and network
-/// jitter near a bucket boundary. Total replay window:
-/// `(KEEPALIVE_TOLERANCE_BUCKETS + 1) * KEEPALIVE_BUCKET_SECS`.
-const KEEPALIVE_TOLERANCE_BUCKETS: u64 = 1;
+/// Bit set on the eight-byte counter a keep-alive carries, marking the trailer
+/// as this build's rather than the coarse **time bucket** the previous one put
+/// in the same eight bytes (design 20 §4.3, §6.2).
+///
+/// The trailer did not change size, only meaning, so a mixed mesh would
+/// otherwise drop keep-alives between mismatched nodes with nothing to say why.
+/// Every bucket the old build emitted was `now_unix / 30` — around 5.8e7 in
+/// 2026, or zero on a node with no clock — so the top bit was always clear;
+/// setting it here is enough for a receiver to name which of the two it is
+/// holding, and to say so in the drop.
+///
+/// **Stripped before the counter reaches the replay guard.** The value on the
+/// wire is tagged, but `accept_recv_counter` keys on `src` alone and shares one
+/// high-water mark with directed and fan-out frames — feeding it a tagged
+/// counter would push that mark past 2^63 and make every subsequent directed
+/// frame look stale. The tag is a wire-format marker, not part of the sequence.
+const KEEPALIVE_COUNTER_TAG: u64 = 1 << 63;
 
 /// Length of the trailer [`OgmAuth::augment_keepalive`] appends: an 8-byte
-/// big-endian time bucket followed by the 64-byte signature.
+/// big-endian replay counter (tagged with [`KEEPALIVE_COUNTER_TAG`]) followed
+/// by the 64-byte signature.
+///
+/// Identical to [`FANOUT_TRAILER_LEN`], which is not a coincidence: a
+/// keep-alive is now the fan-out shape — the sender's counter plus its
+/// signature, checked against the certificate the receiver already holds.
 const KEEPALIVE_TRAILER_LEN: usize = 8 + SIG_LEN;
 
 /// Length of the directed-frame authentication trailer appended to unicast and
@@ -227,12 +236,16 @@ const MAX_REVOKE_PER_OGM: usize = 4;
 /// fingerprint misses) can pin.
 pub(crate) const MAX_IN_FLIGHT_CERT_REQUESTS: usize = 16;
 
-/// Minimum spacing (seconds) between retransmissions of the same outstanding
+/// Minimum spacing between retransmissions of the same outstanding
 /// `CertReq` — the requester-side retry backstop for a dropped request or
 /// reply (design doc §3.5): a pending-query list at the responder is the
 /// primary optimization, but a lost packet anywhere must not wedge the fetch
 /// forever.
-const CERT_REQUEST_RETRY_SECS: u64 = 5;
+///
+/// Measured on [`OgmAuth::now`], the monotonic clock: this is a duration, and
+/// a duration must not be perturbed by an NTP step — nor, more sharply, be
+/// unmeasurable on a node that has no wall clock at all (design 20 §3(b)).
+const CERT_REQUEST_RETRY: Duration = Duration::from_secs(5);
 
 /// Maximum retransmission attempts for one outstanding `CertReq` before it is
 /// abandoned. A live OGM stream simply raises the miss again on its next
@@ -249,13 +262,14 @@ const CERT_REQ_SIG_DOMAIN: &[u8] = b"wf-certreq-sig-v1";
 pub(crate) const MAX_PENDING_REPLIES: usize = 16;
 
 /// How long a parked pending reply is kept before it is evicted as stale.
-const PENDING_REPLY_TTL_SECS: u64 = 30;
+/// Measured on the monotonic clock — see [`CERT_REQUEST_RETRY`].
+const PENDING_REPLY_TTL: Duration = Duration::from_secs(30);
 
-/// Minimum spacing (seconds) between `CertReq`s this node will act on from
-/// the same requester — bounds the verification/airtime cost a single
-/// member (even a legitimate, self-authenticating one) can impose (design
-/// doc §8).
-const CERT_REQ_RATE_LIMIT_SECS: u64 = 2;
+/// Minimum spacing between `CertReq`s this node will act on from the same
+/// requester — bounds the verification/airtime cost a single member (even a
+/// legitimate, self-authenticating one) can impose (design doc §8).
+/// Measured on the monotonic clock — see [`CERT_REQUEST_RETRY`].
+const CERT_REQ_RATE_LIMIT: Duration = Duration::from_secs(2);
 
 /// One verified requester whose `CertReply` is parked because this node had
 /// no route back to them at request time.
@@ -263,8 +277,9 @@ const CERT_REQ_RATE_LIMIT_SECS: u64 = 2;
 struct PendingReply {
     /// The requester to reply to once a route appears.
     requester: Mac,
-    /// `now_unix` this entry was last (re)parked, for TTL eviction.
-    parked_unix: u64,
+    /// The monotonic instant this entry was last (re)parked, for TTL
+    /// eviction.
+    parked: Duration,
 }
 
 /// One outstanding lazy-cert-distribution fetch: the originator whose cert is
@@ -282,8 +297,8 @@ struct InFlightCertRequest {
     first_hop: Mac,
     /// Retransmissions sent so far, bounded by [`MAX_CERT_REQUEST_ATTEMPTS`].
     attempts: u8,
-    /// Earliest `now_unix` at which another retransmission is allowed.
-    next_attempt_unix: u64,
+    /// Earliest monotonic instant at which another retransmission is allowed.
+    next_attempt: Duration,
 }
 
 /// Size of the reused scratch buffer for assembling the OGM signed message
@@ -467,11 +482,35 @@ pub struct OgmAuth<
     cert: MembershipCert,
     /// The mesh trust anchor, against which incoming certs are verified.
     anchor: TrustAnchor,
-    /// Current wall-clock time in unix seconds, refreshed by the driver; used
-    /// for certificate validity-window checks.  Zero until first set, which (as
-    /// the unix epoch) treats every not-yet-current cert as not-yet-valid, so
-    /// the driver must set a real time before auth is meaningful.
-    now_unix: u64,
+    /// What this node knows about the wall clock, refreshed by the driver;
+    /// the input to every certificate validity-window check.
+    ///
+    /// A *posture*, not a reading (design 20 §4.2). A host that can tell the
+    /// time supplies [`Clocked::At`]; a board free-running from an anchor
+    /// supplies [`Clocked::AtLeast`], a floor it can prove but not a point;
+    /// a node with no usable clock supplies [`Clocked::Unknown`] and judges no
+    /// window at all. The rule is "signature always, window when known" — the
+    /// signature check is the real trust boundary and is entirely clock-free,
+    /// while the window check is a revocation optimisation the mesh enforces
+    /// collectively (§5.1).
+    ///
+    /// This was a bare `now_unix: u64` whose zero meant "no clock", which four
+    /// sites read as *judge no window* and two read as *fail closed*; the
+    /// half that was enforced was the half that partitioned the node (§2.2,
+    /// Bug A). A type that cannot be read two ways is the fix.
+    wall: Clocked,
+    /// Current *monotonic* time, refreshed by the driver in the same breath as
+    /// [`now_unix`](Self::now_unix), and the clock every **duration** in this
+    /// module is measured on: retry backoff, rate limits, parked-reply TTL.
+    ///
+    /// Kept separate from the wall clock deliberately (design 20 §3(b)).
+    /// Elapsed-time logic and absolute-time logic are different questions, and
+    /// tangling them means the absence of absolute time disables bookkeeping
+    /// that never needed it — which is exactly the denial `reclaim_bookkeeping`
+    /// exists to prevent, live on every bare-metal node while the two shared
+    /// one field. It is also simply more correct on a host: an NTP step must
+    /// not perturb a rate limit.
+    now: Duration,
     /// Revocations known to this node, learned from the management API or
     /// flooded in an OGM tail.  Their originators' OGMs are dropped even while
     /// the cert has not yet expired, and each is re-advertised on this node's
@@ -544,9 +583,9 @@ pub struct OgmAuth<
     /// Verified `CertReq` requesters this node (the responder) has no route
     /// to yet, parked for opportunistic flush once one appears.
     pending_replies: HVec<PendingReply, MAX_PENDING_REPLIES>,
-    /// Per-requester last-accepted-`CertReq` instant (responder-side rate
-    /// limit), keyed by requester MAC.
-    cert_req_rate: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
+    /// Per-requester last-accepted-`CertReq` monotonic instant
+    /// (responder-side rate limit), keyed by requester MAC.
+    cert_req_rate: HVec<(Mac, Duration), MAX_NEIGHBOR_KEYS>,
     /// Monotonic counter feeding the nonce PRF, so no two challenges this node
     /// issues are ever over the same nonce.
     challenge_counter: u64,
@@ -596,6 +635,21 @@ pub struct OgmAuth<
     /// as a segment grows is *per distinct OGM*, not per copy; a test that
     /// only asserted verdicts could not tell the two apart.
     ogm_crypto_ops: u64,
+    /// Certificates admitted while this node was judging no validity window —
+    /// the direct measure of how much passive revocation-by-expiry is *not*
+    /// being enforced here (design 20 §7).
+    ///
+    /// A count rather than a rate, and deliberately: what an operator wants is
+    /// "has this node ever admitted a certificate it could not date", which a
+    /// time-decayed rate answers with zero a minute after the fact. Saturates
+    /// rather than wrapping — the distinction between "many" and "many plus
+    /// one" is not one anybody acts on, but a counter that silently returned to
+    /// zero would read as the healthy state.
+    ///
+    /// Counts *admissions*, not distinct certificates: a re-verified peer bumps
+    /// it again. That is the honest reading — each admission is an occasion on
+    /// which a window went unchecked.
+    unjudged_admissions: u32,
 }
 
 impl<
@@ -615,7 +669,8 @@ impl<
             keypair,
             cert,
             anchor,
-            now_unix: 0,
+            wall: Clocked::Unknown,
+            now: Duration::ZERO,
             revocations: HVec::new(),
             neighbors: HVec::new(),
             sign_scratch: [0u8; SIGN_SCRATCH_LEN],
@@ -631,6 +686,7 @@ impl<
             restart_candidate: None,
             in_progress: HVec::new(),
             ogm_crypto_ops: 0,
+            unjudged_admissions: 0,
         }
     }
 
@@ -639,7 +695,7 @@ impl<
     /// `None` — leaving the record latched for a later call — when:
     ///
     /// * no record naming this node has been ingested;
-    /// * this node has **no clock** (`now_unix == 0`). It cannot judge the
+    /// * this node has **no clock** ([`Clocked::Unknown`]). It cannot judge the
     ///   record's window at all, and `verify_revocation`'s expiry test passes
     ///   everything at zero, so acting here would let a long-dead record no
     ///   live peer still holds brick a freshly booted board — with no way to
@@ -659,10 +715,11 @@ impl<
     /// Drains on success, so the router acts exactly once.
     pub fn take_self_revoked(&mut self) -> Option<RevocationRecord> {
         let record = self.self_revocation?;
-        if self.now_unix == 0 {
+        if !self.wall.judges_windows() {
             return None;
         }
-        if record.not_after.get() <= self.now_unix {
+        let now = self.wall.unix_or_zero();
+        if record.not_after.get() <= now {
             // Expired before this node could ever judge it. Drop it: holding it
             // would leave a record no peer enforces armed against a future
             // clock adjustment.
@@ -670,7 +727,7 @@ impl<
             self.self_revocation = None;
             return None;
         }
-        if record.not_before.get() > self.now_unix {
+        if record.not_before.get() > now {
             return None;
         }
         self.self_revocation = None;
@@ -696,11 +753,19 @@ impl<
         core::mem::take(&mut self.trickle_reset_hint)
     }
 
-    /// Update the current wall-clock time (unix seconds) used for cert validity
-    /// checks.  Called by the driver before serving traffic.  Also garbage-
-    /// collects revocations whose `not_after` has passed: the cancelled cert has
-    /// expired too, so passive expiry now covers the node and the record can be
-    /// forgotten, freeing a slot in the bounded revocation set.
+    /// Advance both of this node's clocks: `now` is monotonic (every duration
+    /// in this module is measured on it) and `wall` is what the node knows
+    /// about absolute time (certificate validity windows, revocation records).
+    /// Called by the driver before serving traffic.  Also garbage-collects revocations whose
+    /// `not_after` has passed: the cancelled cert has expired too, so passive
+    /// expiry now covers the node and the record can be forgotten, freeing a
+    /// slot in the bounded revocation set.
+    ///
+    /// The two are taken together rather than through separate setters because
+    /// a caller that advanced one and not the other would silently reintroduce
+    /// the tangle they were split to remove (design 20 §3). A node with no wall
+    /// clock passes [`Clocked::Unknown`] and a real value for `now`; everything
+    /// that does not need to know the year keeps working.
     ///
     /// **A router's clock is advanced through
     /// `CentralRouter::set_auth_time`, not here.** Evicting a lapsed member's
@@ -710,20 +775,46 @@ impl<
     /// (`docs/design/implemented/09-mesh-auth-gaps.md` §8.10). This stays
     /// public for tests and benches that drive an `OgmAuth` with no router
     /// around it.
-    pub fn set_time(&mut self, now_unix: u64) {
-        self.now_unix = now_unix;
+    pub fn set_time(&mut self, now: Duration, wall: Clocked) {
+        self.now = now;
+        self.wall = wall;
+        self.reclaim_bookkeeping();
         self.prune_expired();
         self.evict_expired_neighbors();
     }
 
-    /// Drop revocations that have passed their `not_after`.  A no-op until the
-    /// clock has been set (`now_unix == 0`), since expiry cannot be judged
-    /// before a real time is known.
+    /// Reclaim the bounded tables whose entries age out on **elapsed** time:
+    /// parked pending replies past their TTL, and in-flight cert requests
+    /// whose retry budget is exhausted.
+    ///
+    /// Runs unconditionally, with no reference to the wall clock. That is the
+    /// whole point (design 20 §2.2, Bug B): while this sat behind
+    /// [`prune_expired`](Self::prune_expired)'s wall-clock guard, a node
+    /// with no wall clock — every bare-metal node — never reclaimed anything,
+    /// so a target that never answers (unreachable, or an attacker flooding
+    /// `NeedCert` misses for fake originator MACs it never backs with a real
+    /// reply) permanently pinned a slot: `build_cert_request` returns `None`
+    /// before incrementing `attempts` once exhausted, so the entry sat at
+    /// [`MAX_CERT_REQUEST_ATTEMPTS`] forever, and
+    /// `MAX_IN_FLIGHT_CERT_REQUESTS` such dead entries permanently blocked
+    /// fetching any further originator's cert.
+    fn reclaim_bookkeeping(&mut self) {
+        let now = self.now;
+        self.pending_replies
+            .retain(|p| now.saturating_sub(p.parked) < PENDING_REPLY_TTL);
+        self.in_flight
+            .retain(|r| r.attempts < MAX_CERT_REQUEST_ATTEMPTS);
+    }
+
+    /// Drop revocations that have passed their `not_after`.  A no-op under
+    /// [`Clocked::Unknown`], since expiry cannot be judged without a real
+    /// time; under [`Clocked::AtLeast`] the floor only ever *under*-reports
+    /// expiry, so a record dropped here is provably dead.
     fn prune_expired(&mut self) {
-        if self.now_unix == 0 {
+        if !self.wall.judges_windows() {
             return;
         }
-        let now = self.now_unix;
+        let now = self.wall.unix_or_zero();
         let mut i = 0;
         while i < self.revocations.len() {
             if self.revocations[i].record.not_after.get() <= now {
@@ -732,18 +823,6 @@ impl<
                 i += 1;
             }
         }
-        self.pending_replies
-            .retain(|p| now.saturating_sub(p.parked_unix) < PENDING_REPLY_TTL_SECS);
-        // Reclaim in-flight requests whose retry budget is exhausted. Without
-        // this, a target that never answers (unreachable, or an attacker
-        // flooding NeedCert misses for fake originator MACs it never backs
-        // with a real reply) permanently pins a slot: `build_cert_request`
-        // returns `None` before incrementing `attempts` once exhausted, so
-        // the entry would otherwise sit at `MAX_CERT_REQUEST_ATTEMPTS`
-        // forever, and `MAX_IN_FLIGHT_CERT_REQUESTS` such dead entries would
-        // permanently block fetching any further originator's cert.
-        self.in_flight
-            .retain(|r| r.attempts < MAX_CERT_REQUEST_ATTEMPTS);
     }
 
     /// Ingest a signed revocation record — from the management API (a local
@@ -759,9 +838,12 @@ impl<
         // Verification takes the clock: an already-expired record is refused by
         // the anchor itself (`AuthError::Expired`), so this loop never has to
         // remember to check the half of validity that bounds the set's size. A
-        // `now_unix` of zero — clock never set — expires nothing, which is the
+        // `now_unix` of zero — no clock at all — expires nothing, which is the
         // behaviour a freshly booted board needs and had before.
-        let mac = match self.anchor.verify_revocation(record, self.now_unix) {
+        let mac = match self
+            .anchor
+            .verify_revocation(record, self.wall.unix_or_zero())
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::trace!(error = ?e, "auth: dropping a revocation that failed verification");
@@ -866,7 +948,7 @@ impl<
             // (`not_after <= now` → `false`) before live, then by budget.  With
             // `MAX_REVOKED` *simultaneously live* revocations this still drops a
             // live one — a hard bound worth surfacing rather than hiding.
-            let now = self.now_unix;
+            let now = self.wall.unix_or_zero();
             tracing::debug!("auth: revocation set full; evicting an entry to admit a new purge");
             if let Some(slot) = self
                 .revocations
@@ -899,8 +981,15 @@ impl<
     /// Outside the enforcement window — not yet effective, or expired (where
     /// the cancelled cert has also expired) — nothing is dropped on this basis.
     fn is_revoked(&self, cert: &VerifiedCert) -> bool {
-        let now = self.now_unix;
-        self.revocations.iter().any(|r| r.record.cancels(cert, now))
+        // Through the posture, not a bare reading. A node with no clock has
+        // `unix_or_zero() == 0`, and no valid record has `not_before <= 0`
+        // (`verify_revocation` refuses a zero instant), so the old spelling
+        // enforced *nothing* on such a node — it evicted the named neighbour
+        // once on ingest, which looks like it worked, then re-admitted them on
+        // their next OGM. Design 20 §5.1 promises the opposite.
+        self.revocations
+            .iter()
+            .any(|r| r.record.cancels_under(cert, self.wall))
     }
 
     /// The revocation records this node currently holds.
@@ -988,7 +1077,7 @@ impl<
                 self.neighbors
                     .iter()
                     .find(|n| n.cert.mac == mac)
-                    .is_none_or(|n| r.record.cancels(&n.cert, self.now_unix))
+                    .is_none_or(|n| r.record.cancels_under(&n.cert, self.wall))
             })
     }
 
@@ -1069,9 +1158,32 @@ impl<
     }
 
     /// The wall-clock instant (unix seconds) the auth clock was last set to, for
-    /// computing "expires in" in the security view.  Zero until first set.
+    /// computing "expires in" in the security view.  Zero when this node has no
+    /// usable clock, and a *floor* rather than a reading when it is
+    /// free-running from an anchor — see [`wall`](Self::wall) for which.
     pub fn now_unix(&self) -> u64 {
-        self.now_unix
+        self.wall.unix_or_zero()
+    }
+
+    /// Certificates admitted while this node was judging no validity window —
+    /// the direct measure of how much passive revocation-by-expiry is not
+    /// being enforced here (design 20 §7).
+    ///
+    /// Counts *admissions*, not distinct certificates, and every verified OGM
+    /// re-caches its originator — so under a sustained [`Clocked::Unknown`]
+    /// this tracks OGM receptions rather than peers. Read it as "has this node
+    /// been routing on credentials it could not date, and roughly how much",
+    /// not as a population count. See [`wall`](Self::wall) for the posture it
+    /// is counting.
+    pub fn unjudged_admissions(&self) -> u32 {
+        self.unjudged_admissions
+    }
+
+    /// What this node knows about the wall clock, for the paths that must not
+    /// round three states down to one number: certificate verification, and
+    /// the management API's honest report of the posture.
+    pub fn wall(&self) -> Clocked {
+        self.wall
     }
 
     /// Whether a *usable* pairwise key is held for `mac` — the precondition
@@ -1084,7 +1196,7 @@ impl<
     /// against this has to enumerate the ways, and the ways are not a closed
     /// set.
     ///
-    /// An unclocked node (`now_unix == 0`) judges no validity window at all, so
+    /// An unclocked node ([`Clocked::Unknown`]) judges no validity window at all, so
     /// a lapsed certificate still reads live there —
     /// [`live_neighbor`](Self::live_neighbor)'s escape hatch. That is right for
     /// this caller too: a node that cannot tell the time must not tear down its
@@ -1658,7 +1770,7 @@ impl<
                 // rather than as it was when this certificate was admitted.
                 let not_before = known.raw_cert.not_before.get();
                 let not_after = known.raw_cert.not_after.get();
-                if self.now_unix < not_before || self.now_unix > not_after {
+                if self.wall.proves_before(not_before) || self.wall.proves_past(not_after) {
                     tracing::trace!(
                         "auth: dropping OGM whose cached certificate is outside its validity window"
                     );
@@ -1669,7 +1781,7 @@ impl<
             }
             None => {
                 self.ogm_crypto_ops += 1;
-                let verified = match self.anchor.verify_cert(cert, self.now_unix) {
+                let verified = match self.anchor.verify_cert(cert, self.wall) {
                     Ok(v) => v,
                     Err(e) => {
                         // A `MacKeyMismatch` is not an ordinary verification
@@ -1771,98 +1883,129 @@ impl<
     }
 
     /// Build the canonical signed message for a keep-alive: a domain prefix,
-    /// this node's MAC, and the coarse time bucket ([`KEEPALIVE_BUCKET_SECS`]).
+    /// this node's MAC, and the tagged replay counter exactly as it appears on
+    /// the wire.
+    ///
     /// Mirrors [`signed_message`](Self::signed_message)'s shape but with its
     /// own domain separator and no cert — the receiver checks the signature
     /// against its neighbor cache instead of a cert carried on the wire (see
     /// [`verify_keepalive`](Self::verify_keepalive)). Returns the filled
     /// prefix of `out`.
+    ///
+    /// The **tagged** bytes are signed, not the stripped counter, so
+    /// [`KEEPALIVE_COUNTER_TAG`] cannot be flipped off in flight to make a
+    /// current keep-alive present as a legacy one.
     fn keepalive_signed_message<'a>(
         src: &[u8; 6],
-        bucket: &[u8; 8],
+        counter: &[u8; 8],
         out: &'a mut [u8],
     ) -> Option<&'a [u8]> {
-        let total = KEEPALIVE_SIG_DOMAIN.len() + src.len() + bucket.len();
+        let total = KEEPALIVE_SIG_DOMAIN.len() + src.len() + counter.len();
         let buf = out.get_mut(..total)?;
         let (a, rest) = buf.split_at_mut(KEEPALIVE_SIG_DOMAIN.len());
         a.copy_from_slice(KEEPALIVE_SIG_DOMAIN);
         let (b, c) = rest.split_at_mut(src.len());
         b.copy_from_slice(src);
-        c.copy_from_slice(bucket);
+        c.copy_from_slice(counter);
         Some(&out[..total])
     }
 
     /// Append a signed liveness trailer to a keep-alive heartbeat the engine
-    /// has just built in `buf[..len]`: an 8-byte coarse time bucket and a
-    /// 64-byte Ed25519 signature over it and this node's own MAC. Unlike
+    /// has just built in `buf[..len]`: an 8-byte replay counter and a 64-byte
+    /// Ed25519 signature over it and this node's own MAC. Unlike
     /// [`augment_ogm`](Self::augment_ogm), no cert or fingerprint is attached
     /// — a keep-alive is only ever exchanged with a neighbor whose OGM (and
     /// thus cert) this node has already verified and cached, and
     /// [`verify_keepalive`](Self::verify_keepalive) checks against that cache
     /// rather than identity carried on the wire, so resending it on every
-    /// heartbeat would be pure overhead. Returns `None` if `buf` lacks room
-    /// for the trailer.
+    /// heartbeat would be pure overhead.
+    ///
+    /// The counter comes from [`send_counter`](Self::send_counter), the node's
+    /// single outgoing sequence, shared with directed and fan-out frames.
+    /// Keep-alives carry no sequence number of their own
+    /// ([`batman::wire::BatmanKeepAlivePacket`] is deliberately minimal), and
+    /// this is what bounds replay of a captured, genuinely-signed heartbeat:
+    /// a monotonic high-water mark, which is both strictly tighter than the
+    /// 30-second window it replaces and needs no clock on either end
+    /// (design 20 §4.3).
+    ///
+    /// Returns `None` — and the caller must not send the frame — if `buf`
+    /// lacks room for the trailer or no counter can be allocated. Never an
+    /// unsigned or counter-reused keep-alive.
     pub fn augment_keepalive(&mut self, buf: &mut [u8], len: usize) -> Option<usize> {
-        let src = self.cert.node_mac;
-        let bucket = (self.now_unix / KEEPALIVE_BUCKET_SECS).to_be_bytes();
-        let signature = {
-            let signed = Self::keepalive_signed_message(&src, &bucket, &mut self.sign_scratch)?;
-            self.keypair.sign(signed)
-        };
         let new_len = len.checked_add(KEEPALIVE_TRAILER_LEN)?;
         if new_len > buf.len() {
             return None;
         }
-        buf[len..len + 8].copy_from_slice(&bucket);
+        let src = self.cert.node_mac;
+        let counter = (self.next_send_counter()? | KEEPALIVE_COUNTER_TAG).to_be_bytes();
+        let signature = {
+            let signed = Self::keepalive_signed_message(&src, &counter, &mut self.sign_scratch)?;
+            self.keypair.sign(signed)
+        };
+        buf[len..len + 8].copy_from_slice(&counter);
         buf[len + 8..new_len].copy_from_slice(&signature);
         Some(new_len)
     }
 
     /// Verify an incoming keep-alive's [`augment_keepalive`] trailer, claimed
-    /// to be from `src`. Checks, in order: the signed time bucket is within
-    /// [`KEEPALIVE_TOLERANCE_BUCKETS`] of now (bounding replay of a captured,
-    /// genuinely-signed heartbeat); `src`'s cert is cached (from a
+    /// to be from `src`. Checks, in order: the trailer is this build's format
+    /// rather than the superseded time bucket; `src`'s cert is cached (from a
     /// previously-verified OGM — a neighbor never OGM-verified fails closed,
-    /// the same as an unresolvable OGM fingerprint) and has not expired on
-    /// this node's clock; `src` is not revoked; and the signature itself.
-    /// Returns `true` only if every check passes.
+    /// the same as an unresolvable OGM fingerprint) and has not expired under
+    /// this node's clock posture; `src` is not revoked; the signature itself;
+    /// and finally the replay counter. Returns `true` only if every check
+    /// passes.
+    ///
+    /// The counter is checked **after** the signature, matching
+    /// [`verify_fanout`](Self::verify_fanout): admitting it earlier would let
+    /// anyone on the medium advance this node's high-water mark for `src` with
+    /// a forged trailer, and that mark is shared with `src`'s directed frames.
     pub fn verify_keepalive(&mut self, src: Mac, payload: &[u8]) -> bool {
         let Some(trailer_start) = payload.len().checked_sub(KEEPALIVE_TRAILER_LEN) else {
-            tracing::trace!("auth: dropping keep-alive shorter than its auth trailer");
+            tracing::trace!(?src, "auth: drop: keep-alive shorter than its auth trailer");
             return false;
         };
         let trailer = &payload[trailer_start..];
-        let mut bucket_bytes = [0u8; 8];
-        bucket_bytes.copy_from_slice(&trailer[..8]);
-        let bucket = u64::from_be_bytes(bucket_bytes);
-        let now_bucket = self.now_unix / KEEPALIVE_BUCKET_SECS;
-        if bucket > now_bucket || now_bucket - bucket > KEEPALIVE_TOLERANCE_BUCKETS {
-            tracing::trace!("auth: dropping keep-alive with an out-of-window time bucket");
+        let mut counter_bytes = [0u8; 8];
+        counter_bytes.copy_from_slice(&trailer[..8]);
+        let tagged = u64::from_be_bytes(counter_bytes);
+        if tagged & KEEPALIVE_COUNTER_TAG == 0 {
+            // A peer still emitting the pre-design-20 time bucket. Named
+            // rather than left to fail as a signature mismatch, which is what
+            // an operator would otherwise have to diagnose from.
+            tracing::trace!(?src, "auth: drop: legacy time-bucket keep-alive trailer");
             return false;
         }
+        let counter = tagged & !KEEPALIVE_COUNTER_TAG;
         let Some(neighbor) = self.neighbors.iter().find(|n| n.cert.mac == src).copied() else {
-            tracing::trace!("auth: dropping keep-alive from an unverified neighbor");
+            tracing::trace!(?src, "auth: drop: keep-alive from an unverified neighbor");
             return false;
         };
-        if self.now_unix > neighbor.cert.not_after {
-            tracing::trace!("auth: dropping keep-alive whose cached cert has expired");
+        if self.wall.proves_past(neighbor.cert.not_after) {
+            tracing::trace!(?src, "auth: drop: keep-alive whose cached cert has expired");
             return false;
         }
         if self.is_revoked(&neighbor.cert) {
-            tracing::trace!("auth: dropping keep-alive from a revoked neighbor");
+            tracing::trace!(?src, "auth: drop: keep-alive from a revoked neighbor");
             return false;
         }
         let mut signature = [0u8; SIG_LEN];
         signature.copy_from_slice(&trailer[8..KEEPALIVE_TRAILER_LEN]);
         let signed_ok =
-            match Self::keepalive_signed_message(&src.0, &bucket_bytes, &mut self.sign_scratch) {
+            match Self::keepalive_signed_message(&src.0, &counter_bytes, &mut self.sign_scratch) {
                 Some(signed) => verify_signature(&neighbor.cert.ed_pubkey, signed, &signature),
                 None => false,
             };
         if !signed_ok {
-            tracing::trace!("auth: dropping keep-alive with an invalid signature");
+            tracing::trace!(?src, "auth: drop: keep-alive with an invalid signature");
+            return false;
         }
-        signed_ok
+        if self.accept_recv_counter(src, counter) != CounterVerdict::Accepted {
+            tracing::trace!(?src, counter, "auth: drop: replayed keep-alive counter");
+            return false;
+        }
+        true
     }
 
     /// On a fingerprint miss/mismatch for `orig` (an [`OgmVerdict::NeedCert`]),
@@ -1890,9 +2033,9 @@ impl<
                 // resolved: restart tracking for the new target.
                 existing.fp = fp;
                 existing.attempts = 0;
-                existing.next_attempt_unix = 0;
+                existing.next_attempt = Duration::ZERO;
             }
-            if self.now_unix < existing.next_attempt_unix {
+            if self.now < existing.next_attempt {
                 return None; // still within backoff
             }
             if existing.attempts >= MAX_CERT_REQUEST_ATTEMPTS {
@@ -1900,7 +2043,7 @@ impl<
                 return None;
             }
             existing.attempts += 1;
-            existing.next_attempt_unix = self.now_unix.saturating_add(CERT_REQUEST_RETRY_SECS);
+            existing.next_attempt = self.now.saturating_add(CERT_REQUEST_RETRY);
             existing.first_hop = first_hop;
         } else {
             let entry = InFlightCertRequest {
@@ -1908,7 +2051,7 @@ impl<
                 fp,
                 first_hop,
                 attempts: 1,
-                next_attempt_unix: self.now_unix.saturating_add(CERT_REQUEST_RETRY_SECS),
+                next_attempt: self.now.saturating_add(CERT_REQUEST_RETRY),
             };
             if self.in_flight.push(entry).is_err() {
                 tracing::debug!(?orig, "auth: in-flight cert-request table full");
@@ -1943,7 +2086,7 @@ impl<
             tracing::trace!("auth: dropping malformed cert reply");
             return false;
         };
-        let verified = match self.anchor.verify_cert(cert, self.now_unix) {
+        let verified = match self.anchor.verify_cert(cert, self.wall) {
             Ok(v) => v,
             Err(e) => {
                 tracing::trace!(error = ?e, "auth: dropping cert reply that failed verification");
@@ -1988,7 +2131,7 @@ impl<
     /// Verifies the requester's cert against the trust anchor and the
     /// self-authenticating signature against that cert's own key (proving
     /// they hold the matching private key), rate-limits repeated requests
-    /// from the same MAC ([`CERT_REQ_RATE_LIMIT_SECS`], §8), and caches the
+    /// from the same MAC ([`CERT_REQ_RATE_LIMIT`], §8), and caches the
     /// requester's cert (a free, verified exchange that also lets this node
     /// verify the requester's own OGMs sooner). Returns the requester's MAC
     /// on success, or `None` (dropped, `trace!`-logged) on any failure —
@@ -2004,7 +2147,7 @@ impl<
             tracing::trace!("auth: dropping cert request with malformed requester cert");
             return None;
         };
-        let verified = match self.anchor.verify_cert(cert, self.now_unix) {
+        let verified = match self.anchor.verify_cert(cert, self.wall) {
             Ok(v) => v,
             Err(e) => {
                 tracing::trace!(error = ?e, "auth: dropping cert request whose requester cert failed verification");
@@ -2045,7 +2188,7 @@ impl<
         // presented certificate, so a second CA-signed certificate for a live
         // member's address arrives here naming *that member* — and a limiter
         // spent on it is the real member's slot, denying their genuine
-        // requests for `CERT_REQ_RATE_LIMIT_SECS` at a time. Checking first
+        // requests for `CERT_REQ_RATE_LIMIT` at a time. Checking first
         // means a contested address costs the member nothing.
         if self.identity_conflict(requester, &verified.ed_pubkey) {
             Self::report_identity_conflict(requester, &verified.ed_pubkey);
@@ -2071,24 +2214,24 @@ impl<
     }
 
     /// Accept a `CertReq` from `requester` only if at least
-    /// [`CERT_REQ_RATE_LIMIT_SECS`] has passed since the last one accepted
+    /// [`CERT_REQ_RATE_LIMIT`] has passed since the last one accepted
     /// from them, recording the acceptance on success. The first request
     /// from a requester is always accepted.
     fn accept_cert_request_rate(&mut self, requester: Mac) -> bool {
         if let Some(entry) = self.cert_req_rate.iter_mut().find(|(m, _)| *m == requester) {
-            if self.now_unix.saturating_sub(entry.1) < CERT_REQ_RATE_LIMIT_SECS {
+            if self.now.saturating_sub(entry.1) < CERT_REQ_RATE_LIMIT {
                 return false;
             }
-            entry.1 = self.now_unix;
+            entry.1 = self.now;
             return true;
         }
-        if self.cert_req_rate.push((requester, self.now_unix)).is_err() {
+        if self.cert_req_rate.push((requester, self.now)).is_err() {
             // Table full: overwrite the first entry rather than refusing a
             // legitimate new requester outright (bounded, simple eviction —
             // mirrors `cache_neighbor`'s table-full policy).
             tracing::debug!("auth: cert-request rate-limit table full; evicting an entry");
             if let Some(first) = self.cert_req_rate.first_mut() {
-                *first = (requester, self.now_unix);
+                *first = (requester, self.now);
             }
         }
         true
@@ -2104,7 +2247,7 @@ impl<
 
     /// Park (or refresh) a verified requester's reply, to be sent once a
     /// route to them appears. Bounded ([`MAX_PENDING_REPLIES`]) and TTL'd
-    /// ([`PENDING_REPLY_TTL_SECS`], garbage-collected by
+    /// ([`PENDING_REPLY_TTL`], garbage-collected by
     /// [`set_time`](Self::set_time)); the requester's own retry
     /// ([`build_cert_request`](Self::build_cert_request) backoff) is the
     /// backstop if this node is never flushed or the entry is evicted.
@@ -2114,12 +2257,12 @@ impl<
             .iter_mut()
             .find(|p| p.requester == requester)
         {
-            entry.parked_unix = self.now_unix;
+            entry.parked = self.now;
             return;
         }
         let entry = PendingReply {
             requester,
-            parked_unix: self.now_unix,
+            parked: self.now,
         };
         if self.pending_replies.push(entry).is_err() {
             // Table full: overwrite the first (bounded, simple eviction).
@@ -2166,14 +2309,16 @@ impl<
     /// its route is gone. Certificate expiry is this mesh's passive
     /// revocation mechanism; it has to actually revoke something.
     ///
-    /// `now_unix == 0` means the clock was never set, so expiry cannot be
-    /// judged at all; every cached entry is treated as live rather than as
-    /// expired, matching [`prune_expired`](Self::prune_expired).
+    /// An entry is dropped only when the posture can **prove** its
+    /// `not_after` has passed, so a node that cannot tell the time judges
+    /// nothing and a node free-running from a floor judges only what its floor
+    /// establishes. A node that cannot tell the time must not tear down its own
+    /// routes on a guess (design 20 §4.2), and its clocked peers enforce the
+    /// expiry on its behalf (§5.1).
     fn live_neighbor(&self, mac: Mac) -> Option<&NeighborKeys> {
-        let now = self.now_unix;
         self.neighbors
             .iter()
-            .find(|n| n.cert.mac == mac && (now == 0 || n.cert.not_after >= now))
+            .find(|n| n.cert.mac == mac && !self.wall.proves_past(n.cert.not_after))
     }
 
     // --- next-hop proof: challenge/response ----------------------------
@@ -2402,15 +2547,17 @@ impl<
     /// [`live_neighbor`](Self::live_neighbor) already makes an expired entry
     /// unusable; this reclaims the slot it occupies, so a long-lived node's
     /// bounded neighbor table cannot fill with lapsed members and start
-    /// evicting live ones. A no-op until the clock has been set, for the same
-    /// reason `live_neighbor` is permissive then.
+    /// evicting live ones. Evicts exactly what
+    /// [`live_neighbor`](Self::live_neighbor) treats as gone — nothing under
+    /// [`Clocked::Unknown`] — so the two cannot disagree about what is live.
     fn evict_expired_neighbors(&mut self) {
-        if self.now_unix == 0 {
+        if !self.wall.judges_windows() {
             return;
         }
-        let now = self.now_unix;
+        let wall = self.wall;
         let before = self.neighbors.len();
-        self.neighbors.retain(|n| n.cert.not_after >= now);
+        self.neighbors
+            .retain(|n| !wall.proves_past(n.cert.not_after));
         if self.neighbors.len() != before {
             self.key_generation = self.key_generation.wrapping_add(1);
             // Reported here, at the branch point, because this is the only
@@ -2479,29 +2626,27 @@ impl<
     /// Two edges are decided here rather than inherited:
     ///
     /// - **An unset clock admits the new key.** `live_neighbor` calls
-    ///   everything live when `now_unix == 0`, so mirroring it would leave an
+    ///   everything live under [`Clocked::Unknown`], so mirroring it would leave an
     ///   unclocked node pinning an address *forever* on an entry it cannot
     ///   judge. Such a node cannot judge certificate validity in the first
     ///   place, and the authority itself fails closed on a zero clock rather
     ///   than locking addresses on one.
     ///
-    ///   **The cost is that this rule does not protect an unclocked node at
-    ///   all**, and no embedded target sets the clock today — no board path
-    ///   calls [`set_time`](Self::set_time). That is latent rather than
-    ///   exploitable, because no board constructs an `OgmAuth` in the first
-    ///   place: a bare-metal node cannot hold a membership credential yet, and
-    ///   at `now_unix == 0` `verify_cert` would refuse every certificate a real
-    ///   authority issues (`not_before` is stamped from the CA's clock, and the
-    ///   window check has no zero-clock bypass). So this is a blocker to
-    ///   *enabling* embedded auth rather than a hole in a shipped one — see the
-    ///   "Auth on Embedded" epic, which tracks it.
+    ///   **The cost is that this rule does not protect a node under
+    ///   [`Clocked::Unknown`]**, which since design 20 is a *supported running
+    ///   state* rather than an unreachable one: a board with no anchor routes
+    ///   and admits peers on their signatures. What keeps it latent rather than
+    ///   exploitable is narrower than it used to be — no board constructs an
+    ///   `OgmAuth` at all, because a bare-metal node cannot hold a membership
+    ///   credential until #52 persists one.
     ///
-    ///   It does mean the rule has to be revisited when that epic lands. If
-    ///   boards gain a usable wall clock it closes for free; if they do not, the
-    ///   candidate is a rule keyed on *recency* — the shared uptime clock every
-    ///   target already has — which needs a per-entry timestamp `NeighborKeys`
-    ///   does not carry, and at 64 × 272 bytes that is a real budget on exactly
-    ///   the node it would protect.
+    ///   An *anchored* board is [`Clocked::AtLeast`], which judges windows, so
+    ///   the rule does apply there and closes as boards gain anchors. It stays
+    ///   open for an unanchored one, and the candidate if that ever matters is
+    ///   a rule keyed on *recency* — the shared uptime clock every target
+    ///   already has — which needs a per-entry timestamp `NeighborKeys` does
+    ///   not carry, and at 64 × 272 bytes that is a real budget on exactly the
+    ///   node it would protect.
     /// - **The comparison is on `ed_pubkey` alone**, matching the authority's
     ///   issued-certificate lock. An agreement-key-only rotation is something
     ///   the CA will sign for a live member, so a rule keyed on anything wider
@@ -2524,6 +2669,13 @@ impl<
         if self.identity_conflict(keys.cert.mac, &keys.cert.ed_pubkey) {
             Self::report_identity_conflict(keys.cert.mac, &keys.cert.ed_pubkey);
             return Cached::RefusedLiveIdentity;
+        }
+        if !self.wall.judges_windows() {
+            // Counted here rather than in `verify_cert`, which is in another
+            // crate and has no state to count into — and here is the point of
+            // *admission*, which is what the number is about. Saturating: see
+            // the field.
+            self.unjudged_admissions = self.unjudged_admissions.saturating_add(1);
         }
 
         if let Some(slot) = self
@@ -2568,17 +2720,21 @@ impl<
     /// question *before* it spends the requester's rate-limit slot — see the
     /// note there.
     ///
-    /// `now_unix == 0` answers `false`: an unclocked node cannot judge
-    /// validity at all. [`cache_neighbor`](Self::cache_neighbor)'s doc has the
-    /// argument, and the security cost that comes with it.
+    /// [`Clocked::Unknown`] answers `false`: a node that cannot judge validity
+    /// cannot tell a live holder of an address from a lapsed one, so it has no
+    /// grounds to call a second identity a conflict.
+    /// [`cache_neighbor`](Self::cache_neighbor)'s doc has the argument, and the
+    /// security cost that comes with it. Under design 20 §4.2 this stops being
+    /// an accident of sentinel choice and becomes a stated rule.
     fn identity_conflict(&self, mac: Mac, ed_pubkey: &[u8; 32]) -> bool {
-        let now = self.now_unix;
-        if now == 0 {
+        if !self.wall.judges_windows() {
             return false;
         }
-        self.neighbors
-            .iter()
-            .any(|n| n.cert.mac == mac && n.cert.not_after >= now && n.cert.ed_pubkey != *ed_pubkey)
+        self.neighbors.iter().any(|n| {
+            n.cert.mac == mac
+                && !self.wall.proves_past(n.cert.not_after)
+                && n.cert.ed_pubkey != *ed_pubkey
+        })
     }
 
     /// Record a refused second identity for `mac`, on both channels.
@@ -2678,7 +2834,7 @@ mod tests {
         let kp = Keypair::from_seed(&[seed; 32]);
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, valid_to);
         let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(Duration::from_secs(100), Clocked::At(100));
         auth
     }
 
@@ -2705,7 +2861,7 @@ mod tests {
             authority.issue_cert(kp.derived_mac(), kp.ed_pubkey(), kp.x_pubkey(), 0, valid_to);
         let mut cert = authority
             .trust_anchor()
-            .verify_cert(&raw, 100)
+            .verify_cert(&raw, Clocked::At(100))
             .expect("the colliding key's own certificate is perfectly valid");
         // The collision itself: the same key, reached at another address.
         cert.mac = at;
@@ -2725,7 +2881,7 @@ mod tests {
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), issued_at, 1_000_000);
         authority
             .trust_anchor()
-            .verify_cert(&cert, issued_at)
+            .verify_cert(&cert, Clocked::At(issued_at))
             .expect("a freshly issued cert verifies at its own issuance instant")
     }
 
@@ -2739,12 +2895,12 @@ mod tests {
         m: Mac,
         issued_at: u64,
         valid_to: u64,
-        now: u64,
+        wall: Clocked,
     ) -> OgmAuth {
         let kp = Keypair::from_seed(&[seed; 32]);
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), issued_at, valid_to);
         let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(now);
+        auth.set_time(Duration::from_secs(wall.unix_or_zero()), wall);
         auth
     }
 
@@ -2790,7 +2946,7 @@ mod tests {
         );
 
         // a's certificate lapses.
-        b.set_time(2000);
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000));
 
         assert!(
             b.tag_directed(mac(2), b"frame", &mut trailer).is_none(),
@@ -2825,17 +2981,16 @@ mod tests {
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         assert_eq!(b.neighbors().len(), 1);
 
-        b.set_time(2000);
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000));
         assert!(
             b.neighbors().is_empty(),
             "the slot is reclaimed, not just made unusable"
         );
     }
 
-    /// A clock that was never set (`now_unix == 0`) cannot judge expiry, so it
-    /// must not be read as "everything has expired" — matching how
-    /// `prune_expired` already treats an unset clock. An embedded node has no
-    /// wall-clock source at all today, so this is the live case, not a corner.
+    /// A node with no clock cannot judge expiry, so it must not be read as
+    /// "everything has expired". An embedded node has no wall-clock source at
+    /// all today, so this is the live case, not a corner.
     #[test]
     fn an_unset_clock_evicts_nothing() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
@@ -2846,30 +3001,28 @@ mod tests {
         let len = a.augment_ogm(&mut buf, len).expect("augment");
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
 
-        b.set_time(0);
+        b.set_time(Duration::from_secs(0), Clocked::Unknown);
         assert_eq!(b.neighbors().len(), 1, "an unset clock judges nothing");
         assert!(b.neighbor_cert(mac(2)).is_some());
     }
 
-    /// The node-level consequence of the unclocked verifier: **a node with no
-    /// clock admits nobody at all.**
+    /// **A node with no clock admits a member whose certificate is valid, and
+    /// keeps admitting them on the cached-certificate fast path.**
     ///
-    /// Both nodes here hold certificates shaped the way a real authority issues
-    /// them — a `not_before` of a real Unix timestamp — and the receiver simply
-    /// never had its clock set, which is the permanent condition of every board
-    /// today (no target calls [`set_time`](OgmAuth::set_time); only the host
-    /// tokio driver does). Every OGM is `Rejected` at the certificate's window
-    /// check before anything else is considered.
+    /// The replacement for `an_unclocked_node_cannot_admit_a_member_certified_by_a_real_authority`,
+    /// which characterised what design 20 §4.2 exists to change. Both nodes
+    /// hold certificates shaped the way a real authority issues them — a
+    /// `not_before` of a real Unix timestamp — and the receiver has no clock,
+    /// which is the permanent condition of every board today.
     ///
-    /// So membership auth cannot be switched on for a bare-metal node until it
-    /// has a usable clock — which is the blocker the "Auth on Embedded" epic
-    /// exists for, and the reason the identity lock in `cache_neighbor` being
-    /// inert at `now_unix == 0` is latent rather than exploitable: there is no
-    /// embedded auth for it to fail to protect.
-    ///
-    /// Characterises today's behaviour; the epic owns changing it.
+    /// The *second* OGM is the half that is Bug A (§2.2). The first goes
+    /// through `verify_cert`; the second takes `verify_ogm`'s cached-cert fast
+    /// path, which re-checked the same window against the raw clock and so
+    /// rejected every OGM from a neighbour it had already admitted. Two
+    /// codepaths asking one question have to agree, and only an explicit
+    /// posture makes them.
     #[test]
-    fn an_unclocked_node_cannot_admit_a_member_certified_by_a_real_authority() {
+    fn an_unclocked_node_admits_a_member_and_keeps_admitting_them() {
         const ISSUED_AT: u64 = 1_700_000_000;
         const A_YEAR: u64 = 365 * 24 * 60 * 60;
 
@@ -2880,35 +3033,188 @@ mod tests {
             mac(2),
             ISSUED_AT,
             ISSUED_AT + A_YEAR,
-            ISSUED_AT,
+            Clocked::At(ISSUED_AT),
         );
         // The receiver: same mesh, same shape of certificate, no clock.
-        let mut b = member_issued_at(&authority, 3, mac(3), ISSUED_AT, ISSUED_AT + A_YEAR, 0);
+        let mut b = member_issued_at(
+            &authority,
+            3,
+            mac(3),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::Unknown,
+        );
 
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).expect("augment");
-
-        assert_eq!(
-            b.verify_ogm(&buf[..len]),
-            OgmVerdict::Rejected,
-            "an unclocked node rejects a member whose certificate is valid right now"
-        );
-        assert!(
-            b.neighbors().is_empty(),
-            "and learns nothing from it — no keys, no route, no data plane"
-        );
-
-        // The control: the same OGM and the same certificates, once the
-        // receiver knows the time.
-        b.set_time(ISSUED_AT + 1);
         assert_eq!(
             b.verify_ogm(&buf[..len]),
             OgmVerdict::Verified,
-            "the clock is the only difference"
+            "an unclocked node admits a member whose certificate is valid right now"
         );
-        assert_eq!(b.neighbors().len(), 1);
+        assert_eq!(b.neighbors().len(), 1, "and learns their keys");
+
+        // The fast path: a fresh seqno from a neighbour whose certificate is
+        // already cached, so the window is re-checked without re-verifying.
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Verified,
+            "the cached-certificate fast path must judge the window the same way"
+        );
     }
 
+    /// **A node with no clock still enforces an active revocation.**
+    ///
+    /// Design 20 §5.1 promises exactly this — "an all-board segment keeps
+    /// active revocation and loses passive" — and §6.1 lists active revocation
+    /// under *Unchanged*. It is the one guarantee the design says survives a
+    /// node that cannot tell the time, and the whole argument for advisory
+    /// windows being safe rests on it.
+    ///
+    /// It has to be asserted here because the path only became *reachable*
+    /// when §4.2 opened it: before, an unclocked node refused every
+    /// certificate at `verify_cert`, so a revoked peer was dropped for having
+    /// no admissible certificate rather than for being revoked, and the
+    /// revocation gate behind it was never consulted.
+    #[test]
+    fn an_unclocked_node_still_enforces_an_active_revocation() {
+        const ISSUED_AT: u64 = 1_700_000_000;
+        const A_YEAR: u64 = 365 * 24 * 60 * 60;
+
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::At(ISSUED_AT),
+        );
+        let mut b = member_issued_at(
+            &authority,
+            3,
+            mac(3),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::Unknown,
+        );
+
+        // The board holds a root-signed revocation naming a's certificate.
+        let record = authority.revoke(mac(2), ISSUED_AT + 10, ISSUED_AT + A_YEAR);
+        assert!(b.ingest_revocation(&record), "the record is admitted");
+
+        // ...so a's OGM must be refused, and must stay refused: ingesting the
+        // record evicts the neighbour once, which looks like it worked. The
+        // next OGM is where a broken gate re-admits them.
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Rejected,
+            "an unclocked node must not route for a node it holds a revocation for"
+        );
+        assert!(
+            b.neighbors().is_empty(),
+            "and must not re-cache the revoked peer's keys"
+        );
+        assert!(b.is_shunned(mac(2)), "the security view must say so too");
+    }
+
+    /// The other side of the same rule: a certificate issued *after* the
+    /// revocation instant is a deliberate re-admission and survives, on a node
+    /// with no clock exactly as on one with a clock.
+    ///
+    /// This is what stops "treat a held record as in force" from becoming
+    /// "this address is banned forever": the cancellation test compares two
+    /// CA-signed instants, and needs no clock to do it.
+    #[test]
+    fn an_unclocked_node_admits_a_certificate_issued_after_the_revocation() {
+        const ISSUED_AT: u64 = 1_700_000_000;
+        const A_YEAR: u64 = 365 * 24 * 60 * 60;
+
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member_issued_at(
+            &authority,
+            3,
+            mac(3),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::Unknown,
+        );
+        let record = authority.revoke(mac(2), ISSUED_AT + 10, ISSUED_AT + A_YEAR);
+        assert!(b.ingest_revocation(&record));
+
+        // Re-admitted: a fresh certificate whose `not_before` is past the
+        // revocation instant.
+        let mut a = member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            ISSUED_AT + 20,
+            ISSUED_AT + A_YEAR,
+            Clocked::At(ISSUED_AT + 20),
+        );
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Verified,
+            "a re-issued certificate is not cancelled, clock or no clock"
+        );
+    }
+
+    /// A node with no clock reports a lapsed neighbour's key as live.
+    ///
+    /// The pairwise data plane is keyed off `live_neighbor`, so treating
+    /// "cannot judge" as "expired" would tear down the node's own links on a
+    /// guess. An unclocked node judges no window at all (design 20 §4.2), and
+    /// its clocked peers enforce the expiry on its behalf (§5.1).
+    #[test]
+    fn an_unclocked_node_reports_a_lapsed_neighbour_live() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        assert!(b.has_live_key(mac(2)));
+
+        // Well past a's not_after of 1000 — but b cannot prove it.
+        b.set_time(Duration::from_secs(5000), Clocked::Unknown);
+        assert!(
+            b.has_live_key(mac(2)),
+            "a node that cannot tell the time must not tear down its own routes"
+        );
+
+        // The control: the same instant, known.
+        b.set_time(Duration::from_secs(5000), Clocked::At(5000));
+        assert!(!b.has_live_key(mac(2)), "a known instant does judge it");
+    }
+
+    /// A lower bound past a cached neighbour's `not_after` still expires it:
+    /// `AtLeast` gives up not-yet-validity, not expiry.
+    #[test]
+    fn a_lower_bound_past_a_neighbours_expiry_still_evicts_it() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        b.set_time(Duration::from_secs(2000), Clocked::AtLeast(2000));
+        assert!(
+            b.neighbors().is_empty(),
+            "a floor past not_after proves the neighbour's certificate has lapsed"
+        );
+    }
+
+    /// A node augments its OGM; a peer on the same mesh accepts it and learns
+    /// the originator's keys.
     /// A node augments its OGM; a peer on the same mesh accepts it and learns
     /// the originator's keys.
     #[test]
@@ -3021,7 +3327,7 @@ mod tests {
         let len = a.augment_ogm(&mut buf, len).expect("augment");
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
 
-        b.set_time(2000);
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000));
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
@@ -3112,7 +3418,7 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut b = member(&authority, 3, mac(3), 1000);
-        b.set_time(2000); // past a's not_after = 1000
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000)); // past a's not_after = 1000
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
@@ -3145,7 +3451,7 @@ mod tests {
         // Not yet effective, so the OGM is still accepted.
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         // Once the clock reaches the effective instant, the node is dropped.
-        b.set_time(500);
+        b.set_time(Duration::from_secs(500), Clocked::At(500));
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = a.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
@@ -3161,8 +3467,8 @@ mod tests {
     fn a_certificate_issued_after_the_revocation_is_not_cancelled() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         // a's certificate is issued at 600, after the revocation instant 500.
-        let mut a = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
-        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+        let mut a = member_issued_at(&authority, 2, mac(2), 600, 100_000, Clocked::At(700));
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, Clocked::At(700));
 
         let record = authority.revoke(mac(2), 500, 100_000);
         assert!(b.ingest_revocation(&record));
@@ -3183,8 +3489,8 @@ mod tests {
     #[test]
     fn a_certificate_issued_at_the_revocation_instant_is_cancelled() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = member_issued_at(&authority, 2, mac(2), 500, 100_000, 700);
-        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+        let mut a = member_issued_at(&authority, 2, mac(2), 500, 100_000, Clocked::At(700));
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, Clocked::At(700));
 
         let record = authority.revoke(mac(2), 500, 100_000);
         assert!(b.ingest_revocation(&record));
@@ -3211,8 +3517,8 @@ mod tests {
     #[test]
     fn a_re_approved_node_is_trusted_again_under_the_same_mac() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut old = member_issued_at(&authority, 2, mac(2), 0, 100_000, 700);
-        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+        let mut old = member_issued_at(&authority, 2, mac(2), 0, 100_000, Clocked::At(700));
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, Clocked::At(700));
 
         // Trusted to begin with, which also caches its certificate on `b`.
         let (mut buf, len) = bare_ogm(mac(2), 7);
@@ -3228,7 +3534,8 @@ mod tests {
 
         // Re-approved: the same key and the same MAC, a certificate issued
         // after the revocation instant.
-        let mut readmitted = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let mut readmitted =
+            member_issued_at(&authority, 2, mac(2), 600, 100_000, Clocked::At(700));
         let (mut buf, len) = bare_ogm(mac(2), 9);
         let len = readmitted.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(
@@ -3252,14 +3559,15 @@ mod tests {
     #[test]
     fn a_re_admitted_node_can_be_revoked_a_second_time() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, Clocked::At(700));
 
         // Revoked at 500, cancelling the certificate issued at 0.
         let first = authority.revoke(mac(2), 500, 100_000);
         assert!(b.ingest_revocation(&first));
 
         // Re-admitted at 600, and routing again.
-        let mut readmitted = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let mut readmitted =
+            member_issued_at(&authority, 2, mac(2), 600, 100_000, Clocked::At(700));
         let (mut buf, len) = bare_ogm(mac(2), 9);
         let len = readmitted.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
@@ -3290,12 +3598,13 @@ mod tests {
     #[test]
     fn a_re_admitted_node_is_not_purged_by_an_unrelated_revocation() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, Clocked::At(700));
 
         // Node 2 revoked at 500, then re-admitted with a cert issued at 600 and
         // re-verified, so `b` caches the surviving certificate.
         assert!(b.ingest_revocation(&authority.revoke(mac(2), 500, 100_000)));
-        let mut readmitted = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let mut readmitted =
+            member_issued_at(&authority, 2, mac(2), 600, 100_000, Clocked::At(700));
         let (mut buf, len) = bare_ogm(mac(2), 9);
         let len = readmitted.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
@@ -3319,8 +3628,8 @@ mod tests {
     #[test]
     fn a_certificate_issued_before_the_revocation_is_cancelled() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = member_issued_at(&authority, 2, mac(2), 400, 100_000, 700);
-        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+        let mut a = member_issued_at(&authority, 2, mac(2), 400, 100_000, Clocked::At(700));
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, Clocked::At(700));
 
         let record = authority.revoke(mac(2), 500, 100_000);
         assert!(b.ingest_revocation(&record));
@@ -3456,7 +3765,7 @@ mod tests {
     fn a_revocation_of_a_superseded_certificate_does_not_latch() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         // This node's certificate was issued at 600, after the record's 500.
-        let mut a = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let mut a = member_issued_at(&authority, 2, mac(2), 600, 100_000, Clocked::At(700));
         let stale = authority.revoke(mac(2), 500, 100_000);
         assert!(!a.ingest_revocation(&stale));
         assert_eq!(a.take_self_revoked().map(|r| r.node_mac), None);
@@ -3468,7 +3777,7 @@ mod tests {
     #[test]
     fn self_revocation_waits_for_its_effective_instant() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = member_issued_at(&authority, 2, mac(2), 0, 100_000, 100);
+        let mut a = member_issued_at(&authority, 2, mac(2), 0, 100_000, Clocked::At(100));
         let record = authority.revoke(mac(2), 500, 100_000);
         assert!(!a.ingest_revocation(&record));
         assert_eq!(
@@ -3477,7 +3786,7 @@ mod tests {
             "not yet in force"
         );
 
-        a.set_time(500);
+        a.set_time(Duration::from_secs(500), Clocked::At(500));
         assert_eq!(
             a.take_self_revoked().map(|r| r.node_mac),
             Some(record.node_mac),
@@ -3503,7 +3812,7 @@ mod tests {
             "no clock, no judgement"
         );
 
-        a.set_time(600);
+        a.set_time(Duration::from_secs(600), Clocked::At(600));
         assert_eq!(
             a.take_self_revoked().map(|r| r.node_mac),
             Some(record.node_mac)
@@ -3523,7 +3832,7 @@ mod tests {
         let kp = Keypair::from_seed(&[2; 32]);
         let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 100_000);
         let mut a = OgmAuth::new(kp, cert, authority.trust_anchor());
-        a.set_time(400);
+        a.set_time(Duration::from_secs(400), Clocked::At(400));
 
         // Held: its instant is still in the future.
         assert!(!a.ingest_revocation(&authority.revoke(mac(2), 1_000, 100_000)));
@@ -3532,7 +3841,7 @@ mod tests {
         // An older record, replayed. It must not replace the held one.
         assert!(!a.ingest_revocation(&authority.revoke(mac(2), 500, 100_000)));
 
-        a.set_time(600);
+        a.set_time(Duration::from_secs(600), Clocked::At(600));
         assert_eq!(
             a.take_self_revoked().map(|r| r.node_mac),
             None,
@@ -3540,7 +3849,7 @@ mod tests {
         );
 
         // The originally-held instant still governs.
-        a.set_time(1_000);
+        a.set_time(Duration::from_secs(1_000), Clocked::At(1_000));
         assert!(a.take_self_revoked().is_some());
     }
 
@@ -3562,7 +3871,7 @@ mod tests {
         assert!(!a.ingest_revocation(&record));
 
         // The clock arrives long after the record's window closed.
-        a.set_time(5_000);
+        a.set_time(Duration::from_secs(5_000), Clocked::At(5_000));
         assert_eq!(
             a.take_self_revoked().map(|r| r.node_mac),
             None,
@@ -3570,22 +3879,76 @@ mod tests {
         );
     }
 
-    /// A node whose clock is unset (`now_unix == 0`) does not enforce a
-    /// revocation whose `not_before` is in the future, even though the record is
-    /// stored — timing is honoured rather than failing open.
+    /// **A node with no clock enforces a held revocation it cannot place in
+    /// time, including one whose `not_before` is still ahead.**
+    ///
+    /// This inverts what the test here used to assert, and the inversion is
+    /// deliberate (design 20 §5.1). The old rule read as "timing is honoured
+    /// rather than failing open", but on a node with `now == 0` it was not
+    /// honouring timing — `verify_revocation` refuses a zero `not_before`, so
+    /// *no* record ever satisfied `not_before <= 0` and such a node enforced
+    /// nothing at all, ever. That was invisible while an unclocked node also
+    /// refused every certificate; §4.2 opened that door and made it live.
+    ///
+    /// Enforcing early is the right direction of error for a revocation, and
+    /// the asymmetry is the opposite of a certificate's: admitting a
+    /// certificate slightly early is benign, while *failing* to drop a revoked
+    /// peer is the harm the mechanism exists to prevent. The cost is bounded —
+    /// the record is root-signed, the authority has already decided, and
+    /// `names_cert` means only the credential it was aimed at is affected.
     #[test]
-    fn unset_clock_does_not_enforce_future_revocation() {
+    fn a_node_with_no_clock_enforces_a_revocation_it_cannot_place_in_time() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let kp = Keypair::from_seed(&[3; 32]);
         let cert = authority.issue_cert(mac(3), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
-        // Note: no set_time, so now_unix == 0.
+        // Note: no set_time, so the posture is `Unknown`.
         let mut b = OgmAuth::new(kp, cert, authority.trust_anchor());
 
         let record = authority.revoke(mac(2), 500, 1000); // effective at 500
         assert!(b.ingest_revocation(&record));
-        // now_unix is 0, which is below not_before (500), so mac(2) is not yet
-        // revoked: the check is a window, not "stored ⇒ dropped".
-        assert!(!b.is_revoked(&verified_cert(&authority, 2, mac(2), 0)));
+        assert!(
+            b.is_revoked(&verified_cert(&authority, 2, mac(2), 0)),
+            "a node that cannot place the window must enforce, not ignore"
+        );
+
+        // The control: a node that *can* place it honours the window exactly as
+        // before — `At` is untouched by this rule.
+        let kp = Keypair::from_seed(&[4; 32]);
+        let cert = authority.issue_cert(mac(4), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
+        let mut clocked = OgmAuth::new(kp, cert, authority.trust_anchor());
+        clocked.set_time(Duration::from_secs(100), Clocked::At(100));
+        assert!(clocked.ingest_revocation(&record));
+        assert!(
+            !clocked.is_revoked(&verified_cert(&authority, 2, mac(2), 0)),
+            "at 100, the record's 500 has not arrived and a clocked node knows it"
+        );
+    }
+
+    /// A floor that has already passed a record's `not_after` proves it spent,
+    /// so an `AtLeast` node stops enforcing it — the half of the window a floor
+    /// genuinely can judge.
+    #[test]
+    fn a_floor_past_a_revocations_end_stops_enforcing_it() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(3), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
+        let mut b = OgmAuth::new(kp, cert, authority.trust_anchor());
+        b.set_time(Duration::ZERO, Clocked::AtLeast(600));
+
+        let record = authority.revoke(mac(2), 500, 1000);
+        assert!(b.ingest_revocation(&record));
+        assert!(
+            b.is_revoked(&verified_cert(&authority, 2, mac(2), 0)),
+            "a floor inside the window enforces"
+        );
+
+        // Past `not_after`: provably spent, so it stops applying — and
+        // `prune_expired` will reclaim the slot on the next advance.
+        b.set_time(Duration::ZERO, Clocked::AtLeast(1_000));
+        assert!(
+            !b.is_revoked(&verified_cert(&authority, 2, mac(2), 0)),
+            "a floor at or past not_after proves the record spent"
+        );
     }
 
     /// Once a revocation's `not_after` passes, `set_time` garbage-collects it,
@@ -3598,7 +3961,7 @@ mod tests {
         assert!(b.ingest_revocation(&record));
         assert_eq!(b.revoked_macs().count(), 1);
         // Advance past not_after: the record is pruned on the clock update.
-        b.set_time(1001);
+        b.set_time(Duration::from_secs(1001), Clocked::At(1001));
         assert_eq!(b.revoked_macs().count(), 0);
     }
 
@@ -3623,7 +3986,7 @@ mod tests {
         );
 
         // Pruned at expiry: the window goes with the record it described.
-        b.set_time(1001);
+        b.set_time(Duration::from_secs(1001), Clocked::At(1001));
         assert_eq!(b.revocation_not_after(mac(2)), None);
     }
 
@@ -3659,7 +4022,7 @@ mod tests {
     fn already_expired_revocation_ignored() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut b = member(&authority, 3, mac(3), 1_000_000);
-        b.set_time(2000);
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000));
         let record = authority.revoke(mac(2), 50, 1000); // not_after 1000 < now 2000
         assert!(!b.ingest_revocation(&record));
         assert_eq!(b.revoked_macs().count(), 0);
@@ -4103,9 +4466,8 @@ mod tests {
     }
 
     /// A keep-alive is rejected once the sender's cached cert has expired on
-    /// the verifier's clock, even though the signed time bucket is still
-    /// within the replay-tolerance window — cert expiry and bucket freshness
-    /// are independent checks.
+    /// the verifier's clock, even though its replay counter is perfectly
+    /// fresh — cert expiry and replay freshness are independent checks.
     #[test]
     fn keepalive_with_expired_cached_cert_rejected() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
@@ -4116,32 +4478,164 @@ mod tests {
         let (mut buf, len) = bare_keepalive(); // a signs at now_unix = 100
         let len = a.augment_keepalive(&mut buf, len).unwrap();
 
-        b.set_time(140); // one bucket later (within tolerance), past a's not_after = 131
+        b.set_time(Duration::from_secs(140), Clocked::At(140)); // past a's not_after = 131
         assert!(!b.verify_keepalive(mac(2), &buf[..len]));
     }
 
-    /// A keep-alive signed one bucket in the past is still accepted — the
-    /// tolerance window absorbs normal clock skew and network jitter near a
-    /// bucket boundary.
+    /// **A keep-alive crosses between a clocked node and an unclocked one, in
+    /// both directions.**
+    ///
+    /// The interoperability claim design 20 §4.3 rests on, and the pair that
+    /// could not both pass under the time bucket: an unclocked sender signed
+    /// bucket 0, which every clocked receiver read as astronomically stale,
+    /// and computed `now_bucket` 0 itself, so every real bucket a clocked peer
+    /// sent looked like the future. Both directions failed, and no amount of
+    /// local skipping could rescue it — the bucket is a *signature input
+    /// carried on the wire*, not a local policy check, which is why the
+    /// mechanism had to be replaced rather than made advisory.
     #[test]
-    fn keepalive_bucket_within_tolerance_accepted() {
+    fn a_keepalive_crosses_between_a_clocked_node_and_an_unclocked_one() {
+        const ISSUED_AT: u64 = 1_700_000_000;
+        const A_YEAR: u64 = 365 * 24 * 60 * 60;
+
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        // The board: a real certificate, no clock at all.
+        let mut board = member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::Unknown,
+        );
+        // The host: the same mesh, and it knows the time.
+        let mut host = member_issued_at(
+            &authority,
+            3,
+            mac(3),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::At(ISSUED_AT + 60),
+        );
+        mutual_verify(&mut board, mac(2), &mut host, mac(3));
+
+        let (mut buf, len) = bare_keepalive();
+        let len = board.augment_keepalive(&mut buf, len).expect("augment");
+        assert!(
+            host.verify_keepalive(mac(2), &buf[..len]),
+            "a clocked node must accept an unclocked peer's keep-alive"
+        );
+
+        let (mut buf, len) = bare_keepalive();
+        let len = host.augment_keepalive(&mut buf, len).expect("augment");
+        assert!(
+            board.verify_keepalive(mac(3), &buf[..len]),
+            "an unclocked node must accept a clocked peer's keep-alive"
+        );
+    }
+
+    /// A captured keep-alive replayed at its recipient is refused on the
+    /// counter — a high-water mark, which bounds replay strictly harder than
+    /// the 30-second window it replaces as well as needing no clock.
+    #[test]
+    fn keepalive_replay_is_rejected() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1_000_000);
         let mut b = member(&authority, 3, mac(3), 1_000_000);
         mutual_verify(&mut a, mac(2), &mut b, mac(3));
 
-        let (mut buf, len) = bare_keepalive(); // a signs at now_unix = 100
+        let (mut buf, len) = bare_keepalive();
         let len = a.augment_keepalive(&mut buf, len).unwrap();
+        assert!(b.verify_keepalive(mac(2), &buf[..len]));
+        assert!(
+            !b.verify_keepalive(mac(2), &buf[..len]),
+            "the same keep-alive must not verify twice"
+        );
 
-        b.set_time(100 + KEEPALIVE_BUCKET_SECS);
+        // ...and a fresh one still does.
+        let (mut fresh, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut fresh, len).unwrap();
+        assert!(b.verify_keepalive(mac(2), &fresh[..len]));
+    }
+
+    /// Keep-alives draw from the **same** outgoing counter as directed and
+    /// fan-out frames, and mixing the three does not make any of them look
+    /// stale.
+    ///
+    /// This is the property that let the trailer change cost no receiver
+    /// change at all (design 20 §4.3): `accept_recv_counter` keys on `src`
+    /// alone, and any subsequence of a strictly increasing sequence is
+    /// strictly increasing, so a third class drawing from one sequence is just
+    /// another subsequence.
+    #[test]
+    fn keepalives_share_one_counter_sequence_with_directed_frames() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1_000_000);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let frame = [0xAAu8; 32];
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+
+        for _ in 0..3 {
+            let (mut buf, len) = bare_keepalive();
+            let len = a.augment_keepalive(&mut buf, len).unwrap();
+            assert!(b.verify_keepalive(mac(2), &buf[..len]));
+
+            let n = a.tag_directed(mac(3), &frame, &mut trailer).unwrap();
+            assert!(
+                b.verify_directed(mac(2), &frame, &trailer[..n]),
+                "a directed frame interleaved with keep-alives is not stale"
+            );
+        }
+    }
+
+    /// **The format tag is a signed input, not just a wire marker.**
+    ///
+    /// `keepalive_signed_message` covers the *tagged* bytes, so flipping
+    /// `KEEPALIVE_COUNTER_TAG` in flight breaks the signature. Without that,
+    /// the tag would be a free-floating bit an attacker could set on a captured
+    /// pre-design-20 keep-alive to make it present as this build's format —
+    /// and every other test on this path would still pass, because they all
+    /// build their frames through `augment_keepalive`, which always sets it.
+    #[test]
+    fn the_keepalive_format_tag_is_covered_by_the_signature() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1_000_000);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let (mut buf, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+        let trailer_start = len - KEEPALIVE_TRAILER_LEN;
+
+        // Clear the tag and nothing else. If the signature covered only the
+        // stripped counter this would still verify — as a *legacy* trailer,
+        // which is precisely the frame the tag exists to tell apart.
+        buf[trailer_start] &= 0x7f;
+        assert!(
+            !b.verify_keepalive(mac(2), &buf[..len]),
+            "clearing the format tag must break the signature that covers it"
+        );
+
+        // The control: restoring the bit restores a frame that verifies, so the
+        // refusal above is the tag and not some other damage.
+        buf[trailer_start] |= 0x80;
         assert!(b.verify_keepalive(mac(2), &buf[..len]));
     }
 
-    /// A keep-alive signed further in the past than the tolerance window is
-    /// rejected — this bounds how long a captured, genuinely-signed heartbeat
-    /// can be replayed to fake a since-silenced neighbor's liveness.
+    /// A keep-alive carrying the **old** time-bucket trailer is refused, and
+    /// distinguishably so.
+    ///
+    /// The eight bytes did not change size, only meaning, so a mixed mesh
+    /// would otherwise drop keep-alives between mismatched nodes with nothing
+    /// to say why (design 20 §6.2). The high bit is set on every counter this
+    /// build puts on the wire and clear on every bucket the previous one did,
+    /// which is enough for a receiver to name what it is holding. Stripped
+    /// before the counter reaches the replay guard, so the tagged value never
+    /// enters the sequence directed frames share.
     #[test]
-    fn keepalive_bucket_beyond_tolerance_rejected() {
+    fn a_legacy_time_bucket_trailer_is_refused() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1_000_000);
         let mut b = member(&authority, 3, mac(3), 1_000_000);
@@ -4149,25 +4643,83 @@ mod tests {
 
         let (mut buf, len) = bare_keepalive();
         let len = a.augment_keepalive(&mut buf, len).unwrap();
+        assert!(
+            buf[len - KEEPALIVE_TRAILER_LEN] & 0x80 != 0,
+            "every counter this build emits carries the format tag"
+        );
 
-        b.set_time(100 + KEEPALIVE_BUCKET_SECS * 2);
-        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+        // What the previous build put here: a bucket, whose high bit is clear.
+        // Signed by `a` over the bucket bytes, exactly as the old build did, so
+        // this frame is *only* refusable on its format — a test that left the
+        // signature broken would pass whether the tag check ran or not, and
+        // would keep passing if the tag check were removed entirely.
+        let trailer_start = len - KEEPALIVE_TRAILER_LEN;
+        let bucket = (100u64 / 30).to_be_bytes();
+        let mut scratch = [0u8; SIGN_SCRATCH_LEN];
+        let signed = <OgmAuth>::keepalive_signed_message(&mac(2).0, &bucket, &mut scratch)
+            .expect("scratch fits");
+        let sig = a.keypair.sign(signed);
+        buf[trailer_start..trailer_start + 8].copy_from_slice(&bucket);
+        buf[trailer_start + 8..len].copy_from_slice(&sig);
+
+        assert!(
+            !b.verify_keepalive(mac(2), &buf[..len]),
+            "a legacy time-bucket trailer must not be admitted even when its own \
+             signature is perfectly valid"
+        );
     }
 
-    /// A keep-alive claiming a time bucket newer than the verifier's own
-    /// clock is rejected rather than accepted early.
+    /// The counter of certificates admitted without a window check moves only
+    /// when a window actually went unchecked.
+    ///
+    /// The metric §7 asks for, and one whose failure mode is silence: reading
+    /// zero forever is exactly what an operator would expect from a healthy
+    /// node, so a counter that never increments is indistinguishable from
+    /// nothing being wrong.
     #[test]
-    fn keepalive_future_bucket_rejected() {
-        let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = member(&authority, 2, mac(2), 1_000_000);
-        let mut b = member(&authority, 3, mac(3), 1_000_000);
-        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+    fn unjudged_admissions_counts_only_undated_ones() {
+        const ISSUED_AT: u64 = 1_700_000_000;
+        const A_YEAR: u64 = 365 * 24 * 60 * 60;
 
-        a.set_time(1000); // a's clock is far ahead of b's
-        let (mut buf, len) = bare_keepalive();
-        let len = a.augment_keepalive(&mut buf, len).unwrap();
-        // b is still at now_unix = 100
-        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::At(ISSUED_AT),
+        );
+
+        // A clocked receiver judges the window, so nothing is unjudged.
+        let mut clocked = member_issued_at(
+            &authority,
+            3,
+            mac(3),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::At(ISSUED_AT + 60),
+        );
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(clocked.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        assert_eq!(
+            clocked.unjudged_admissions(),
+            0,
+            "a node that judged the window admitted nothing undated"
+        );
+
+        // An unclocked one admits the same certificate without dating it.
+        let mut board = member_issued_at(
+            &authority,
+            4,
+            mac(4),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            Clocked::Unknown,
+        );
+        assert_eq!(board.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        assert_eq!(board.unjudged_admissions(), 1);
     }
 
     /// Augmentation fails closed (rather than truncating) when the buffer has
@@ -4340,7 +4892,7 @@ mod tests {
         let misissued =
             authority.issue_cert(mac(2), eve_kp.ed_pubkey(), eve_kp.x_pubkey(), 0, 1000);
         let mut eve = OgmAuth::new(eve_kp, misissued, authority.trust_anchor());
-        eve.set_time(100);
+        eve.set_time(Duration::from_secs(100), Clocked::At(100));
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = eve.augment_ogm(&mut buf, len).unwrap();
 
@@ -4375,7 +4927,7 @@ mod tests {
         let misissued =
             authority.issue_cert(mac(2), eve_kp.ed_pubkey(), eve_kp.x_pubkey(), 0, 1000);
         let mut eve = OgmAuth::new(eve_kp, misissued, authority.trust_anchor());
-        eve.set_time(100);
+        eve.set_time(Duration::from_secs(100), Clocked::At(100));
 
         let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
         wayfinder_alarm::with_board(&board, || {
@@ -4442,7 +4994,7 @@ mod tests {
         let misissued =
             authority.issue_cert(mac(2), eve_kp.ed_pubkey(), eve_kp.x_pubkey(), 0, 1000);
         let mut eve = OgmAuth::new(eve_kp, misissued, authority.trust_anchor());
-        eve.set_time(100);
+        eve.set_time(Duration::from_secs(100), Clocked::At(100));
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = eve.augment_ogm(&mut buf, len).unwrap();
 
@@ -4509,7 +5061,7 @@ mod tests {
         let rotated_x = Keypair::from_seed(&[9; 32]).x_pubkey();
         let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), rotated_x, 0, 1000);
         let mut a2 = OgmAuth::new(kp, cert, authority.trust_anchor());
-        a2.set_time(100);
+        a2.set_time(Duration::from_secs(100), Clocked::At(100));
 
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = a2.augment_ogm(&mut buf, len).unwrap();
@@ -4544,7 +5096,7 @@ mod tests {
         // Past a1's `not_after`: the entry is gone, and a different key may
         // take the address. The pin must release, or a lapsed member would hold
         // its address against every later claimant forever.
-        b.set_time(2000);
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000));
         let a2 = colliding_neighbor(&authority, 9, mac(2), 100_000, &b);
         assert_eq!(b.cache_neighbor(a2), Cached::Stored);
 
@@ -4587,7 +5139,7 @@ mod tests {
         // free. (A real re-admission is same-key — a different key is a
         // different address now — so this exercises the pin's release, not a
         // flow an operator drives.)
-        b.set_time(700);
+        b.set_time(Duration::from_secs(700), Clocked::At(700));
         let a2 = colliding_neighbor(&authority, 9, mac(2), 100_000, &b);
         assert_eq!(b.cache_neighbor(a2), Cached::Stored);
 
@@ -4601,17 +5153,16 @@ mod tests {
         );
     }
 
-    /// An unclocked node (`now_unix == 0`) cannot judge whether the entry it
-    /// holds is still live, and `live_neighbor` calls everything live then — so
-    /// mirroring that here would leave such a node pinning an address *forever*
-    /// on an entry it cannot judge. It admits instead, matching the authority,
-    /// which fails closed on a zero clock rather than locking an address on
-    /// one.
+    /// A node with no clock cannot judge whether the entry it holds is still
+    /// live, and `live_neighbor` calls everything live then — so mirroring that
+    /// here would leave such a node pinning an address *forever* on an entry it
+    /// cannot judge. It admits instead, matching the authority, which fails
+    /// closed on a zero clock rather than locking an address on one.
     #[test]
     fn an_unclocked_node_admits_a_new_key() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut b = member(&authority, 3, mac(3), 1000);
-        b.set_time(0);
+        b.set_time(Duration::from_secs(0), Clocked::Unknown);
 
         let mut a1 = member(&authority, 2, mac(2), 1000);
         let (mut buf, len) = bare_ogm(mac(2), 7);
@@ -4728,7 +5279,7 @@ mod tests {
             let rotated_x = Keypair::from_seed(&[9; 32]).x_pubkey();
             let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), rotated_x, 0, 5000);
             let mut a3 = OgmAuth::new(kp, cert, authority.trust_anchor());
-            a3.set_time(100);
+            a3.set_time(Duration::from_secs(100), Clocked::At(100));
             let (mut buf, len) = bare_ogm(mac(2), 9);
             let len = a3.augment_ogm(&mut buf, len).unwrap();
             assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
@@ -4951,7 +5502,7 @@ mod tests {
         let len = a.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
 
-        b.set_time(2000); // past a's not_after = 1000
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000)); // past a's not_after = 1000
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = augment_ogm_with_certfp(&mut a, &mut buf, len);
         // The expired entry is evicted the moment the clock passes it, so the
@@ -5025,7 +5576,10 @@ mod tests {
         );
 
         // Once the backoff interval elapses, a retry is allowed again.
-        b.set_time(b.now_unix + CERT_REQUEST_RETRY_SECS);
+        b.set_time(
+            b.now + CERT_REQUEST_RETRY,
+            Clocked::At(b.now_unix() + CERT_REQUEST_RETRY.as_secs()),
+        );
         assert!(
             b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
                 .is_some(),
@@ -5051,7 +5605,10 @@ mod tests {
             // advance has had a chance to reclaim the slot (see
             // `in_flight_table_reclaims_exhausted_entries` for that case).
             if round + 1 < MAX_CERT_REQUEST_ATTEMPTS {
-                b.set_time(b.now_unix + CERT_REQUEST_RETRY_SECS);
+                b.set_time(
+                    b.now + CERT_REQUEST_RETRY,
+                    Clocked::At(b.now_unix() + CERT_REQUEST_RETRY.as_secs()),
+                );
             }
         }
         assert!(
@@ -5236,7 +5793,10 @@ mod tests {
             "an immediate repeat must be rate-limited"
         );
 
-        a.set_time(a.now_unix + CERT_REQ_RATE_LIMIT_SECS);
+        a.set_time(
+            a.now + CERT_REQ_RATE_LIMIT,
+            Clocked::At(a.now_unix() + CERT_REQ_RATE_LIMIT.as_secs()),
+        );
         assert_eq!(
             a.verify_cert_request(&buf[..len]),
             Some(mac(3)),
@@ -5298,7 +5858,10 @@ mod tests {
                 );
             }
             if round + 1 < MAX_CERT_REQUEST_ATTEMPTS {
-                b.set_time(b.now_unix + CERT_REQUEST_RETRY_SECS);
+                b.set_time(
+                    b.now + CERT_REQUEST_RETRY,
+                    Clocked::At(b.now_unix() + CERT_REQUEST_RETRY.as_secs()),
+                );
             }
         }
         // The table is now full of exhausted entries: a new originator is
@@ -5312,11 +5875,94 @@ mod tests {
         // Advancing the clock (any amount, since these entries never retry
         // again on their own) must reclaim the exhausted slots via the
         // periodic prune.
-        b.set_time(b.now_unix + 1);
+        b.set_time(
+            b.now + Duration::from_secs(1),
+            Clocked::At(b.now_unix() + 1),
+        );
         assert!(
             b.build_cert_request(mac(200), [0; 8], mac(9), &mut buf)
                 .is_some(),
             "a reclaimed slot must admit a new originator"
+        );
+    }
+
+    /// Bug B (design 20 §2.2): reclaiming an exhausted in-flight slot is
+    /// *elapsed*-time bookkeeping, so it must work on a node that has never
+    /// had a wall clock — which is every bare-metal node.
+    ///
+    /// While the reclamation sat behind `prune_expired`'s `now_unix == 0`
+    /// guard, the exact denial the `retain` exists to prevent was live on
+    /// every board: `MAX_IN_FLIGHT_CERT_REQUESTS` targets that never answer
+    /// pinned every slot permanently, blocking any further originator's cert
+    /// fetch.
+    #[test]
+    fn in_flight_table_reclaims_exhausted_entries_without_a_clock() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(3), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
+        let mut b = OgmAuth::new(kp, cert, authority.trust_anchor());
+        // No wall clock, ever: the posture stays `Unknown`, as on a board.
+        let mut mono = Duration::ZERO;
+        b.set_time(mono, Clocked::Unknown);
+        let mut buf = [0u8; 512];
+
+        // Fill the table with originators that never answer, advancing them
+        // in lockstep so every one exhausts its budget in the same round.
+        for round in 0..MAX_CERT_REQUEST_ATTEMPTS {
+            for n in 1..=MAX_IN_FLIGHT_CERT_REQUESTS as u8 {
+                assert!(
+                    b.build_cert_request(mac(n), [n; 8], mac(9), &mut buf)
+                        .is_some(),
+                    "an unclocked node must still be able to retry a cert fetch"
+                );
+            }
+            if round + 1 < MAX_CERT_REQUEST_ATTEMPTS {
+                mono += CERT_REQUEST_RETRY;
+                b.set_time(mono, Clocked::Unknown);
+            }
+        }
+        assert!(
+            b.build_cert_request(mac(200), [0; 8], mac(9), &mut buf)
+                .is_none(),
+            "table full of exhausted entries must refuse a new originator"
+        );
+
+        mono += Duration::from_secs(1);
+        b.set_time(mono, Clocked::Unknown);
+        assert!(
+            b.build_cert_request(mac(200), [0; 8], mac(9), &mut buf)
+                .is_some(),
+            "an unclocked node must still reclaim exhausted in-flight slots"
+        );
+    }
+
+    /// The `CertReq` rate limit is a duration, so it is measured on the
+    /// monotonic clock: a wall-clock step (an NTP correction, or the first
+    /// real time reaching a node that booted without one) neither opens nor
+    /// closes the window (design 20 §3(b)).
+    #[test]
+    fn cert_request_rate_limit_is_unaffected_by_a_wall_clock_step() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mono = Duration::from_secs(100);
+        assert!(
+            a.accept_cert_request_rate(mac(3)),
+            "the first request from a requester is always accepted"
+        );
+
+        // A large wall-clock step with no elapsed time must not open the
+        // window.
+        a.set_time(mono, Clocked::At(100 + CERT_REQ_RATE_LIMIT.as_secs() * 10));
+        assert!(
+            !a.accept_cert_request_rate(mac(3)),
+            "a wall-clock step must not open the rate-limit window"
+        );
+
+        // Real elapsed time does, even with the wall clock stepped backwards.
+        a.set_time(mono + CERT_REQ_RATE_LIMIT, Clocked::Unknown);
+        assert!(
+            a.accept_cert_request_rate(mac(3)),
+            "elapsed monotonic time must open the rate-limit window"
         );
     }
 
@@ -5341,7 +5987,10 @@ mod tests {
         let mut a = member(&authority, 2, mac(2), 1000);
         a.park_pending_reply(mac(3));
         assert!(a.has_pending_reply(mac(3)));
-        a.set_time(a.now_unix + PENDING_REPLY_TTL_SECS);
+        a.set_time(
+            a.now + PENDING_REPLY_TTL,
+            Clocked::At(a.now_unix() + PENDING_REPLY_TTL.as_secs()),
+        );
         assert!(
             !a.has_pending_reply(mac(3)),
             "a stale pending reply must be evicted after its TTL"
@@ -5355,9 +6004,15 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         a.park_pending_reply(mac(3));
-        a.set_time(a.now_unix + PENDING_REPLY_TTL_SECS - 1);
+        a.set_time(
+            a.now + PENDING_REPLY_TTL - Duration::from_secs(1),
+            Clocked::At(a.now_unix() + PENDING_REPLY_TTL.as_secs() - 1),
+        );
         a.park_pending_reply(mac(3)); // refresh before it would expire
-        a.set_time(a.now_unix + PENDING_REPLY_TTL_SECS - 1);
+        a.set_time(
+            a.now + PENDING_REPLY_TTL - Duration::from_secs(1),
+            Clocked::At(a.now_unix() + PENDING_REPLY_TTL.as_secs() - 1),
+        );
         assert!(
             a.has_pending_reply(mac(3)),
             "the refreshed entry must not have expired yet"
@@ -5447,7 +6102,7 @@ mod tests {
         let kp = Keypair::from_seed(&[seed; 32]);
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, valid_to);
         let mut auth = TinyAuth::with_capacities(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(Duration::from_secs(100), Clocked::At(100));
         auth
     }
 
@@ -6115,7 +6770,7 @@ mod tests {
         admit_each_other(&mut a, mac(2), &mut b, mac(3));
         assert!(b.issue_challenge(mac(2)).is_some(), "live while valid");
 
-        b.set_time(2000);
+        b.set_time(Duration::from_secs(2000), Clocked::At(2000));
         assert!(
             b.issue_challenge(mac(2)).is_none(),
             "an expired neighbor must not be challengeable"

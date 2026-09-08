@@ -6,6 +6,7 @@ use crate::wayfinder::v1alpha::AllInterfacesEgress;
 use crate::wayfinder::v1alpha::AuthenticateUserResponse;
 use crate::wayfinder::v1alpha::BeginUserRegistrationResponse;
 use crate::wayfinder::v1alpha::CancelPingResponse;
+use crate::wayfinder::v1alpha::ClockPosture;
 use crate::wayfinder::v1alpha::CreateUserInviteResponse;
 use crate::wayfinder::v1alpha::CreateUserResponse;
 use crate::wayfinder::v1alpha::CsrIssued;
@@ -280,6 +281,39 @@ pub enum TokenUpdate {
     Set(SharedSecret),
 }
 
+/// What a node knows about the wall clock, in the shape this crate's providers
+/// speak.
+///
+/// A parallel to `wayfinder-auth`'s `Clocked`, without its payload: an operator
+/// needs to know *which* of the three postures a node is in, not the floor it
+/// derived. Kept separate from the generated proto enum for the same reason
+/// every other `…Data` type here is — the adapter that implements this trait is
+/// `no_std` + `alloc` and does not speak prost — and separate from `Clocked`
+/// because this crate must not depend on `wayfinder-auth`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClockPostureData {
+    /// No usable clock: every signature still checked, no validity window
+    /// judged. The default, so a provider that forgets to report claims the
+    /// weakest posture rather than the strongest.
+    #[default]
+    Unknown,
+    /// A lower bound. Expiry enforced where the floor proves it;
+    /// not-yet-validity never judged.
+    AtLeast,
+    /// An authoritative reading. Both ends of every window enforced.
+    At,
+}
+
+impl From<ClockPostureData> for ClockPosture {
+    fn from(posture: ClockPostureData) -> ClockPosture {
+        match posture {
+            ClockPostureData::Unknown => ClockPosture::Unknown,
+            ClockPostureData::AtLeast => ClockPosture::AtLeast,
+            ClockPostureData::At => ClockPosture::At,
+        }
+    }
+}
+
 /// A secret that several parties hold in common — today, the shared enrollment
 /// token.
 ///
@@ -440,6 +474,10 @@ pub struct NodeMetricsData {
     /// Count of next-hop proofs dropped because the pairwise key they were
     /// answered with stopped being usable. Zero when auth is disabled.
     pub proofs_swept: u32,
+    /// Count of certificates admitted while judging no validity window at all
+    /// — how much passive revocation-by-expiry this node is not enforcing.
+    /// Zero when auth is disabled.
+    pub unjudged_cert_admissions: u32,
 }
 
 /// Egress decision a router would make for a destination.  Mirrors
@@ -932,6 +970,21 @@ pub trait RouterReads {
     /// explicitly, and says so.
     fn clock_trusted(&self) -> bool;
 
+    /// What this node knows about the wall clock, and therefore which of a
+    /// certificate's guarantees it can check.
+    ///
+    /// A different question from [`clock_trusted`](Self::clock_trusted), and
+    /// the two genuinely come apart: that one is "may this node make a
+    /// credential decision", this one is "which validity windows does the
+    /// router judge". A host can hold an authoritative reading while refusing
+    /// credential decisions on an undisciplined NTP verdict; a bare-metal node
+    /// has no NTP concept at all while still holding a usable floor.
+    ///
+    /// Required rather than defaulted for the same reason `clock_trusted` is:
+    /// a defaulted answer on a security posture is a claim the next implementor
+    /// makes without noticing.
+    fn clock_posture(&self) -> ClockPostureData;
+
     /// Recent log records from this node's bounded in-memory ring, from
     /// `since_seq` onward and at most `max_records` of them (0 meaning the
     /// node's default batch size).
@@ -1000,13 +1053,38 @@ pub trait RouterWrites {
     /// credential has been enrolled by whoever handed it over, and continuing to
     /// renew against the previous authority — which may be one this node has
     /// just left — is the one outcome worse than not renewing at all.
+    ///
+    /// `installer_unix` is the wall clock of the *machine performing the
+    /// install*, in unix seconds, and is the only way an absolute time reaches
+    /// a node that has none of its own (design 20 §4.7). It is not the
+    /// issuer's: in the out-of-band flow the certificate may have been minted
+    /// weeks earlier and hand-carried.
+    ///
+    /// Zero means the installer could not vouch for its own clock. It does not
+    /// mean the node's estimate is untouched: the anchor is
+    /// `max(estimate, installer_unix, verified_cert.not_before)`, so a zero
+    /// stamp simply contributes nothing of its own and leaves the certificate's
+    /// CA-signed start to carry the anchor. Only a certificate whose
+    /// `not_before` is also behind the node's current estimate leaves it
+    /// unmoved.
     fn set_auth(
         &mut self,
         seed: &[u8],
         cert: &[u8],
         trust_anchor: &[u8],
         provider: Option<RenewalProviderData>,
+        installer_unix: u64,
     ) -> Result<(), String>;
+
+    /// Anchor the node's wall clock at `installer_unix` (unix seconds) without
+    /// re-issuing its certificate — the maintenance half of the same value
+    /// [`set_auth`](Self::set_auth) carries.
+    ///
+    /// Same rules: refused below the plausibility floor, taken as `max` against
+    /// the estimate the node already holds so it can never roll backwards, and
+    /// floored against the `not_before` of the certificate the node currently
+    /// runs under.
+    fn set_time(&mut self, installer_unix: u64) -> Result<(), String>;
 
     /// Apply a partial update to the node's runtime configuration. Only the
     /// fields present in `config` are changed; unset fields are left as they
@@ -1786,6 +1864,7 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
             auth_locked: provider.auth_locked(),
             runtime_config_active: provider.runtime_config_active(),
             clock_trusted: provider.clock_trusted(),
+            clock_posture: ClockPosture::from(provider.clock_posture()) as i32,
         }),
         Some(RequestKind::GetRoutingTable(_)) => {
             let entries = provider
@@ -1974,6 +2053,7 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 seqno_resyncs: m.seqno_resyncs,
                 ogm_refloods_suppressed: m.ogm_refloods_suppressed,
                 proofs_swept: m.proofs_swept,
+                unjudged_cert_admissions: m.unjudged_cert_admissions,
             })
         }
         Some(RequestKind::GetSecurityStatus(_)) => {
@@ -2110,11 +2190,16 @@ pub fn handle_router_write<P: RouterWrites + ?Sized>(
                 &set_auth.cert,
                 &set_auth.trust_anchor,
                 renewal,
+                set_auth.installer_unix,
             ) {
                 Ok(_) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             }
         }
+        Some(RequestKind::SetTime(set_time)) => match provider.set_time(set_time.installer_unix) {
+            Ok(()) => ResponseKind::Empty(Empty {}),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
         Some(RequestKind::Ping(ping)) => {
             match provider.start_ping(
                 &ping.destination,
@@ -2611,6 +2696,7 @@ mod tests {
         /// `None` that clears a recorded one, which is why this is a nested
         /// option rather than a flat one.
         last_set_auth_provider: Option<Option<RenewalProviderData>>,
+        last_installer_unix: u64,
         /// What `logs` reports back.
         logs: LogsData,
         /// The `(since_seq, max_records)` the last `logs` call was given, so a
@@ -2705,6 +2791,10 @@ mod tests {
             self.runtime_config_active
         }
 
+        fn clock_posture(&self) -> ClockPostureData {
+            ClockPostureData::At
+        }
+
         fn clock_trusted(&self) -> bool {
             true
         }
@@ -2734,8 +2824,15 @@ mod tests {
             _cert: &[u8],
             _trust_anchor: &[u8],
             provider: Option<RenewalProviderData>,
+            installer_unix: u64,
         ) -> Result<(), String> {
             self.last_set_auth_provider = Some(provider);
+            self.last_installer_unix = installer_unix;
+            Ok(())
+        }
+
+        fn set_time(&mut self, installer_unix: u64) -> Result<(), String> {
+            self.last_installer_unix = installer_unix;
             Ok(())
         }
 
@@ -3468,6 +3565,54 @@ mod tests {
         }
     }
 
+    /// **`installer_unix` reaches the provider from the wire, on both request
+    /// kinds that carry it.**
+    ///
+    /// The one field in design 20 that a regression could drop in complete
+    /// silence: credentials would install normally, `SetTime` would answer
+    /// `Empty`, and every board would sit permanently at `Clocked::Unknown` —
+    /// no error, no failed RPC, and a router that looks healthy because it is.
+    /// The only thing that would say so is the alarm, which an operator has to
+    /// go and look at.
+    #[test]
+    fn the_installer_clock_reaches_the_provider_from_the_wire() {
+        use crate::wayfinder::v1alpha::SetAuthRequest;
+        use crate::wayfinder::v1alpha::SetTimeRequest;
+
+        let mut service = WayfinderService::new(MockProvider::default());
+        service.handle(WayfinderRequest {
+            request: Some(RequestKind::SetAuth(SetAuthRequest {
+                seed: Vec::new(),
+                cert: vec![1, 2, 3],
+                trust_anchor: vec![4, 5, 6],
+                provider: None,
+                installer_unix: 1_800_000_000,
+            })),
+        });
+        assert_eq!(
+            service.provider.last_installer_unix, 1_800_000_000,
+            "SetAuth must hand the installer's clock to the node"
+        );
+
+        let mut service = WayfinderService::new(MockProvider::default());
+        match service
+            .handle(WayfinderRequest {
+                request: Some(RequestKind::SetTime(SetTimeRequest {
+                    installer_unix: 1_900_000_000,
+                })),
+            })
+            .response
+            .expect("service always sets response")
+        {
+            ResponseKind::Empty(_) => {}
+            other => panic!("expected Empty, got {:?}", proto_kind_name(&other)),
+        }
+        assert_eq!(
+            service.provider.last_installer_unix, 1_900_000_000,
+            "SetTime's entire content must reach the node"
+        );
+    }
+
     /// The fail-closed gate reaches the provider as a present `require_auth`,
     /// distinct from the "leave it alone" that every other request carries.
     #[test]
@@ -3517,6 +3662,7 @@ mod tests {
                     node_key: vec![7u8; 32],
                     enrollment_token: "s3cret".into(),
                 })),
+                installer_unix: 0,
             })),
         });
 
@@ -3547,6 +3693,7 @@ mod tests {
                 cert: vec![1, 2, 3],
                 trust_anchor: vec![4, 5, 6],
                 provider: None,
+                installer_unix: 0,
             })),
         });
 
@@ -3572,6 +3719,7 @@ mod tests {
                     node_key: vec![7u8; 31],
                     enrollment_token: String::new(),
                 })),
+                installer_unix: 0,
             })),
         });
 
@@ -4086,6 +4234,7 @@ mod tests {
                 seqno_resyncs: 7,
                 ogm_refloods_suppressed: 11,
                 proofs_swept: 3,
+                unjudged_cert_admissions: 0,
             },
             ..Default::default()
         };
@@ -4165,6 +4314,7 @@ mod tests {
                 cert: Vec::new(),
                 trust_anchor: Vec::new(),
                 provider: None,
+                installer_unix: 0,
             }))
         );
         assert_eq!(

@@ -17,8 +17,14 @@
 //!
 //! At its core this is a **radio relay**: it drives the mesh interfaces (OGM
 //! exchange, forwarding, per-link Trickle timers).  There is no local host
-//! device or IGMP snoop yet, and OGM authentication time is not wired (a board
-//! can still enable auth via [`Driver::router_mut`]).  The optional `mgmt`
+//! device or IGMP snoop yet.  Authentication *time* is wired — the driver owns
+//! a [`WallClock`] and feeds the router its posture on every pass, so a board
+//! judges certificate windows to whatever extent it can prove them (design 20
+//! §4.4) — but nothing persists that clock's checkpoint across a reset yet, so
+//! an unanchored board comes up
+//! [`Unknown`](wayfinder::wayfinder_auth::Clocked::Unknown) after every power
+//! cycle.  Persisting it belongs with the credential (#52).  A board can enable
+//! auth via [`Driver::router_mut`].  The optional `mgmt`
 //! feature adds a management-API arm to the event loop (`run_with_mgmt`) that
 //! serves read-only/config queries forwarded from a `wayfinder-server` `serve`
 //! loop, so an embedded node is inspectable over a debug transport (e.g. a UART)
@@ -45,6 +51,7 @@ use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::LinkT;
 use wayfinder::router_ops::RouterOps;
+use wayfinder::wayfinder_auth::WallClock;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
 use wayfinder_driver_core::OutgoingFrame;
@@ -218,6 +225,16 @@ pub struct Driver<
     mac: Mac,
     tx_buffer: [u8; FRAME_LEN],
     stage: StageSink<N, FRAME_LEN>,
+    /// The node's monotone floor on absolute time.
+    ///
+    /// A board has no RTC and no NTP, so this is the whole of what it knows
+    /// about the year: an anchor an installer stamped (`SetAuth`'s
+    /// `installer_unix`, or `SetTime`) plus elapsed monotonic time, and
+    /// [`Clocked::Unknown`](wayfinder::wayfinder_auth::Clocked) until one
+    /// arrives. Fed to the router on every pass of the loop, so certificate
+    /// validity is judged under a posture that says what the node can actually
+    /// prove rather than against a counter that reads 1970 (design 20 §4.4).
+    wall: WallClock,
     /// Each link's declared native fan-out, cached at construction.
     ///
     /// Read here rather than at use: the receive arm holds a borrow of `links`
@@ -316,22 +333,11 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
             links,
             clock,
             mac,
+            wall: WallClock::new(),
             tx_buffer: [0u8; FRAME_LEN],
             stage: StageSink::default(),
             fan_out,
         }
-    }
-
-    /// The underlying router, for inspecting routing state (originator tables,
-    /// link quality, route resolution).
-    pub fn router(&self) -> &R {
-        &self.router
-    }
-
-    /// The underlying router, mutably — lets a board enable OGM authentication
-    /// or inject crafted state before/while running the loop.
-    pub fn router_mut(&mut self) -> &mut R {
-        &mut self.router
     }
 
     /// Run the event loop forever.  Never returns; the board spawns this on its
@@ -384,9 +390,18 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
             fan_out,
             clock,
             mac,
+            wall,
             tx_buffer,
             stage,
         } = self;
+        // Advanced before anything reads it, and through the router rather than
+        // straight at the auth state: advancing the clock can evict a lapsed
+        // peer's key, and the engine's next-hop proofs were answered *with*
+        // that key, so the two must move together (design 09 §8.10). Until an
+        // installer anchors this node the posture is `Unknown` — every
+        // signature is still checked, no validity window is judged, and the
+        // node routes (design 20 §4.2).
+        router.set_auth_time(now, wall.posture(now));
         stage.frames.clear();
 
         // Build one `recv` future per link and race them against the OGM timer.
@@ -502,9 +517,14 @@ impl<
             fan_out,
             clock,
             mac,
+            wall,
             tx_buffer,
             stage,
         } = self;
+        // Same reason as `run_once`: advanced before anything reads it, and
+        // through the router so an eviction and the proofs behind it move
+        // together.
+        router.set_auth_time(now, wall.posture(now));
         stage.frames.clear();
 
         let recv_futs = links.each_mut().map(|link| link.recv());
@@ -519,13 +539,17 @@ impl<
                 // it back to the waiting serve loop. `None` — an embedded node is
                 // never a provider-mode certificate authority.
                 //
-                // No `.with_epoch_unix(...)`: `Clock` (above) is monotonic only,
-                // with no wall-clock source to supply one from. `SetAuth`'s
-                // certificate-validity check needs real unix time (see
-                // `RouterAdapter::with_epoch_unix`'s doc), so it will reject
-                // every certificate as "not yet valid" if ever reached this
-                // way — consistent with `SetAuth` over this management port
-                // not being wired up yet.
+                // No `.with_epoch_unix(...)`: `Clock` (above) is monotonic
+                // only, with no wall-clock source to supply one from. What
+                // goes in instead is `with_wall_clock`, the node's own
+                // monotone floor — so `SetAuth` verifies the certificate under
+                // `Clocked::AtLeast`/`Unknown` (signature, mesh id and key↔MAC
+                // binding all checked; the window judged only where the floor
+                // proves it) and then *anchors* that floor from the
+                // installer's stamp and the certificate's own `not_before`.
+                // Before design 20 this path rejected every certificate ever
+                // issued as not-yet-valid, which is why `SetAuth` over a
+                // board's management port was not wired up at all.
                 // `handle_router`, not the combined service: an embedded node
                 // has no certificate authority, so the router half is all it
                 // can answer. The audit record is emitted explicitly because
@@ -538,13 +562,16 @@ impl<
                 // credential and drops the target, and `GetSecurityStatus` here
                 // reports none. Wire one through if an embedded node ever grows
                 // the ability to renew itself.
-                let response = handle_router(&mut RouterAdapter::new(&mut *router, now), request)
-                    // `handle_unowned`, not the not-a-provider message: an
-                    // embedded node genuinely is not a provider, but a repeated
-                    // `Authenticate` is a client protocol error and saying
-                    // "not a certificate-authority provider" points its author
-                    // at the wrong thing entirely.
-                    .unwrap_or_else(wayfinder_protos::service::handle_unowned);
+                let response = handle_router(
+                    &mut RouterAdapter::new(&mut *router, now).with_wall_clock(wall),
+                    request,
+                )
+                // `handle_unowned`, not the not-a-provider message: an
+                // embedded node genuinely is not a provider, but a repeated
+                // `Authenticate` is a client protocol error and saying
+                // "not a certificate-authority provider" points its author
+                // at the wrong thing entirely.
+                .unwrap_or_else(wayfinder_protos::service::handle_unowned);
                 mgmt.reply(response).await;
             }
         }

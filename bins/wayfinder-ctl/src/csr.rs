@@ -134,6 +134,12 @@ pub enum CsrCommand {
         /// see [`RenewalArgs`].
         #[command(flatten)]
         renewal: RenewalArgs,
+        /// This install carries this host's wall clock to the node, which —
+        /// being the out-of-band flow, whose whole premise is a node that
+        /// cannot reach its authority — is very likely a node with none of its
+        /// own.
+        #[command(flatten)]
+        clock: crate::clock::ClockArgs,
     },
 }
 
@@ -226,6 +232,7 @@ pub async fn run(cmd: CsrCommand, client: &mut Client) -> anyhow::Result<String>
             cert,
             trust_anchor,
             renewal,
+            clock,
         } => {
             // Validated here rather than trusted to the node: the node's own
             // checks are the backstop, but a swapped pair of filenames is worth
@@ -235,12 +242,20 @@ pub async fn run(cmd: CsrCommand, client: &mut Client) -> anyhow::Result<String>
             // node still holds the credential it had.
             let provider = renewal.provider()?;
             let renewal_note = renewal_note(provider.as_ref());
+            // Resolved before the call, for the same reason as the provider
+            // pin: refuse while the node still holds the credential it had.
+            let (installer_unix, clock_note) = clock.stamp()?;
             client
-                .install_cert(&credential.cert_bytes, &credential.anchor_bytes, provider)
+                .install_cert(
+                    &credential.cert_bytes,
+                    &credential.anchor_bytes,
+                    provider,
+                    installer_unix,
+                )
                 .await
                 .context("installing the certificate on the node failed")?;
             format!(
-                "installed certificate for {} (mesh {:#x}), valid until {}{renewal_note}",
+                "installed certificate for {} (mesh {:#x}), valid until {}{renewal_note}{clock_note}",
                 output::format_mac(&credential.cert.node_mac),
                 credential.anchor.mesh_id,
                 credential.cert.not_after.get()

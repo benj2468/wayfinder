@@ -377,6 +377,19 @@ rpc_table! {
         access: [Admin, SelfKey],
         limit: Unmetered,
     }
+    /// Same tier as `SetAuth`, and for a reason rather than by analogy: anyone
+    /// who can lie to a node about the time can already install an arbitrary
+    /// credential on it, which is strictly more powerful. A separate kind
+    /// rather than a field on `SetAuth` because the operational need is
+    /// separate — correcting a board that has drifted, or re-anchoring one
+    /// that lost its checkpoint, is local maintenance that install-only
+    /// anchoring would make the certificate authority a participant in
+    /// (design 20 §4.7).
+    SetTime(SetTimeRequest) {
+        owner: RouterWrite, audit: Mutation,
+        access: [Admin, SelfKey],
+        limit: Unmetered,
+    }
     SetConfig(SetConfigRequest) {
         owner: RouterWrite, audit: Mutation,
         access: [Admin, SelfKey],

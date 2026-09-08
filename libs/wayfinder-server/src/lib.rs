@@ -159,20 +159,22 @@ mod persistence;
 /// Whether the host's system clock is disciplined enough to make credential
 /// decisions with — the gate that keeps a plausible-but-wrong clock from
 /// minting or accepting dated credentials.
+///
+/// Lives in `wayfinder-clock-trust` so `wayfinder-client` can reach the *same*
+/// verdict without depending on this crate (design 20 §4.6); re-exported here
+/// so existing callers keep their path.
 #[cfg(feature = "std")]
-mod clock_trust;
+pub use wayfinder_clock_trust::ClockSync;
 #[cfg(feature = "std")]
-pub use clock_trust::ClockSync;
+pub use wayfinder_clock_trust::ClockTrust;
 #[cfg(feature = "std")]
-pub use clock_trust::ClockTrust;
-#[cfg(feature = "std")]
-pub use clock_trust::DEFAULT_MAX_CLOCK_ERROR_US;
+pub use wayfinder_clock_trust::DEFAULT_MAX_CLOCK_ERROR_US;
 /// Ask the host what it thinks of its own clock, under the given policy.
 ///
 /// Re-exported under a qualified name because `read` alone says nothing at a
 /// call site in another crate.
 #[cfg(feature = "std")]
-pub use clock_trust::read as clock_sync;
+pub use wayfinder_clock_trust::read as clock_sync;
 /// The host's wall clock in unix seconds, or zero if it reads before 2025.
 ///
 /// The plausibility floor on its own, without the NTP trust gate — for the

@@ -1371,7 +1371,10 @@ mod tests {
         let kp = Keypair::from_seed(&[seed; 32]);
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder::wayfinder_auth::Clocked::At(100),
+        );
         auth
     }
 

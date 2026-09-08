@@ -6,6 +6,7 @@
 
 use clap::ValueEnum;
 use serde::Serialize;
+use wayfinder_protos::wayfinder::v1alpha::ClockPosture;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::IssuedCert;
 use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
@@ -114,7 +115,8 @@ pub fn format_timestamp(unix_secs: u64) -> String {
 pub fn node_info(v: &NodeInfo, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {
         format!(
-            "node {}\noriginators: {}\nlocked: {}\nruntime config: {}\nclock: {}",
+            "node {}\noriginators: {}\nlocked: {}\nruntime config: {}\nclock: {}\n\
+             cert windows: {}",
             format_mac(&v.node_id),
             v.num_originators,
             if v.auth_locked { "yes" } else { "no" },
@@ -123,6 +125,19 @@ pub fn node_info(v: &NodeInfo, fmt: OutputFormat) -> anyhow::Result<String> {
                 "trusted"
             } else {
                 "NOT SYNCHRONIZED (credential operations refused)"
+            },
+            // A different question from the line above — "will this node act
+            // on a credential" versus "which validity windows does its router
+            // judge" — and the two come apart in both directions. `none` is
+            // the one an operator must be able to see: the node routes and
+            // verifies every signature while enforcing no expiry at all
+            // (design 20 §7).
+            match ClockPosture::try_from(v.clock_posture) {
+                Ok(ClockPosture::At) => "both ends",
+                Ok(ClockPosture::AtLeast) => "expiry only (free-running from an anchor)",
+                Ok(ClockPosture::Unknown) => "NONE (no anchor; expiry not enforced here)",
+                // A node too old to report it, not a fourth state.
+                Ok(ClockPosture::Unspecified) | Err(_) => "not reported",
             }
         )
     })

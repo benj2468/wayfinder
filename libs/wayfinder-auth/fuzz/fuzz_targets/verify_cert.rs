@@ -5,6 +5,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use wayfinder_auth::Clocked;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
@@ -18,6 +19,6 @@ fuzz_target!(|data: &[u8]| {
         root_pubkey: Keypair::from_seed(&[1; 32]).ed_pubkey(),
     };
     if let Ok((cert, _)) = MembershipCert::ref_from_prefix(data) {
-        let _ = anchor.verify_cert(cert, 1_000_000_000);
+        let _ = anchor.verify_cert(cert, Clocked::At(1_000_000_000));
     }
 });

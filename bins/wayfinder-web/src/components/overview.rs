@@ -6,6 +6,7 @@
 //! each number live one tab away.
 
 use leptos::prelude::*;
+use wayfinder_protos::wayfinder::v1alpha::ClockPosture;
 
 use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::Empty;
@@ -60,6 +61,27 @@ pub fn Overview() -> impl IntoView {
                                         "OK"
                                     } else {
                                         "Not synchronized — sign-in and enrollment are paused"
+                                    }
+                                />
+                                // A different question from the row above, and
+                                // phrased for the same audience: "Clock" is
+                                // whether this node will act on a credential,
+                                // this is whether it checks that other nodes'
+                                // credentials have expired. A node with no
+                                // anchor routes perfectly well while checking
+                                // neither, which is exactly why it needs
+                                // saying out loud (design 20 §7).
+                                <Field
+                                    label="Certificate expiry"
+                                    value=match ClockPosture::try_from(info.clock_posture) {
+                                        Ok(ClockPosture::At) => "Checked",
+                                        Ok(ClockPosture::AtLeast) => {
+                                            "Checked (this node estimates the time)"
+                                        }
+                                        Ok(ClockPosture::Unknown) => {
+                                            "Not checked — this node has never been told the time"
+                                        }
+                                        Ok(ClockPosture::Unspecified) | Err(_) => "Not reported",
                                     }
                                 />
                             }

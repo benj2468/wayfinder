@@ -17,6 +17,7 @@ std = [
     "dep:tokio-rustls",
     "dep:rustls",
     "dep:wayfinder-tls-mgmt",
+    "dep:wayfinder-clock-trust",
     "dep:futures",
     "dep:bytes",
     "dep:anyhow",
@@ -86,6 +87,7 @@ rustls = { workspace = true, optional = true }
 # The Ed25519-identity <-> rustls-raw-public-key bridge shared with
 # `wayfinder-client`; neither management-TLS crate depends on the other.
 wayfinder-tls-mgmt = { workspace = true, optional = true }
+wayfinder-clock-trust = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 bytes = { version = "1", optional = true }
 anyhow = { workspace = true, optional = true }

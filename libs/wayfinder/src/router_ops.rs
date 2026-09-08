@@ -304,6 +304,21 @@ pub trait RouterOps {
 
     /// This router's authentication state, or `None` when auth is off.
     fn auth_mut(&mut self) -> Option<&mut Self::Auth>;
+
+    /// Advance both of the router's clocks and reconcile the engine's next-hop
+    /// proofs against the key material behind them.
+    ///
+    /// On the trait rather than reached through
+    /// [`auth_mut`](Self::auth_mut) for the reason `CentralRouter`'s own
+    /// version documents: advancing the auth clock can evict a lapsed peer's
+    /// key, and the engine's proofs were answered *with* that key, so the two
+    /// have to move together or a route reports healthy while every frame over
+    /// it is dropped for want of the key.
+    ///
+    /// `wall` is a posture, not a reading: a shell with no absolute time passes
+    /// [`Clocked::Unknown`](wayfinder_auth::Clocked) and the node keeps routing
+    /// while judging no validity window (design 20 §4.2).
+    fn set_auth_time(&mut self, now: Duration, wall: wayfinder_auth::Clocked);
 }
 
 impl<
@@ -470,6 +485,10 @@ impl<
 
     fn set_auth(&mut self, auth: Self::Auth) {
         Self::set_auth(self, auth);
+    }
+
+    fn set_auth_time(&mut self, now: Duration, wall: wayfinder_auth::Clocked) {
+        CentralRouter::set_auth_time(self, now, wall);
     }
 
     fn auth_mut(&mut self) -> Option<&mut Self::Auth> {

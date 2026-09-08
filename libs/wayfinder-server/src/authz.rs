@@ -26,6 +26,7 @@
 //! operator approving the request. What this grants is the ability to *ask*.
 
 use wayfinder::wayfinder_auth::AuthError;
+use wayfinder::wayfinder_auth::Clocked;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder::wayfinder_auth::VerifiedCert;
@@ -177,7 +178,7 @@ pub fn decide_access(
     cert: Option<&MembershipCert>,
     anchor: Option<&TrustAnchor>,
     own_key: Option<&[u8; 32]>,
-    now_unix: u64,
+    now: Clocked,
     is_revoked: impl FnOnce(&VerifiedCert) -> bool,
 ) -> MgmtAccess {
     if own_key == Some(handshake_key) {
@@ -193,7 +194,7 @@ pub fn decide_access(
     let Some(cert) = cert else {
         return MgmtAccess::GrantedEnrollment;
     };
-    let verified = match anchor.verify_cert(cert, now_unix) {
+    let verified = match anchor.verify_cert(cert, now) {
         Ok(v) => v,
         Err(e) => return MgmtAccess::Denied(MgmtDenied::CertInvalid(e)),
     };
@@ -440,7 +441,7 @@ mod tests {
                 None,
                 None,
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| { false }
             ),
             MgmtAccess::GrantedSelfKey
@@ -451,7 +452,7 @@ mod tests {
                 None,
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::GrantedSelfKey,
@@ -479,17 +480,24 @@ mod tests {
         let anchor = authority.trust_anchor();
 
         assert_eq!(
-            decide_access(&[0u8; 32], None, None, None, 100, |_| false),
+            decide_access(&[0u8; 32], None, None, None, Clocked::At(100), |_| false),
             MgmtAccess::GrantedEnrollment,
             "an all-zero handshake key against a seedless node is a stranger, not the node"
         );
         assert_eq!(
-            decide_access(&[0u8; 32], None, Some(&anchor), None, 100, |_| false),
+            decide_access(
+                &[0u8; 32],
+                None,
+                Some(&anchor),
+                None,
+                Clocked::At(100),
+                |_| false
+            ),
             MgmtAccess::GrantedEnrollment,
             "and an installed anchor does not change that"
         );
         assert_eq!(
-            decide_access(&[9u8; 32], None, None, None, 100, |_| false),
+            decide_access(&[9u8; 32], None, None, None, Clocked::At(100), |_| false),
             MgmtAccess::GrantedEnrollment,
             "nor does any other key stand in for an absent one"
         );
@@ -508,7 +516,7 @@ mod tests {
                 None,
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::GrantedEnrollment
@@ -519,7 +527,7 @@ mod tests {
                 None,
                 None,
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::GrantedEnrollment
@@ -588,7 +596,7 @@ mod tests {
                 Some(&admin_cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::GrantedAdmin
@@ -605,7 +613,7 @@ mod tests {
                 Some(&admin_cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::Denied(MgmtDenied::KeyMismatch)
@@ -629,7 +637,7 @@ mod tests {
             Some(&member_cert),
             Some(&anchor),
             Some(&own.ed_pubkey()),
-            100,
+            Clocked::At(100),
             |_| false,
         );
         assert_eq!(decision, MgmtAccess::GrantedMember);
@@ -651,7 +659,7 @@ mod tests {
                 Some(&admin_cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |c: &VerifiedCert| c.mac == admin_kp.derived_mac()
             ),
             MgmtAccess::Denied(MgmtDenied::Revoked)
@@ -665,7 +673,7 @@ mod tests {
                 Some(&admin_cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                999,
+                Clocked::At(999),
                 |_| false
             ),
             MgmtAccess::Denied(MgmtDenied::CertInvalid(
@@ -703,7 +711,7 @@ mod tests {
                 Some(&member_cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             &ReqKind::GetSecurityStatus(GetSecurityStatusRequest {})
@@ -715,7 +723,7 @@ mod tests {
                 None,
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             &ReqKind::GetSecurityStatus(GetSecurityStatusRequest {})
@@ -941,6 +949,11 @@ mod tests {
             let refused = matches!(
                 request,
                 ReqKind::SetAuth(_)
+                    // Anchoring a node's clock is a mutation, and one a
+                    // read-only grant must not reach: a wrong anchor is
+                    // enforced until an operator corrects it, and the node has
+                    // no way to second-guess it.
+                    | ReqKind::SetTime(_)
                     | ReqKind::SetConfig(_)
                     | ReqKind::SetLogLevel(_)
                     // Starting a ping is not the read its status is. It puts
@@ -1109,7 +1122,7 @@ mod tests {
                 Some(&viewer_cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::GrantedViewer
@@ -1131,7 +1144,7 @@ mod tests {
             Some(&device_cert),
             Some(&anchor),
             Some(&own.ed_pubkey()),
-            100,
+            Clocked::At(100),
             |_| false,
         );
         assert_eq!(decision, MgmtAccess::GrantedMember);
@@ -1200,7 +1213,7 @@ mod tests {
                     cert,
                     None,
                     Some(&own.ed_pubkey()),
-                    now,
+                    Clocked::At(now),
                     |_| false
                 ),
                 MgmtAccess::GrantedEnrollment,
@@ -1215,7 +1228,7 @@ mod tests {
                 Some(&admin_cert),
                 None,
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::GrantedSelfKey
@@ -1253,7 +1266,7 @@ mod tests {
                 Some(&cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::Denied(MgmtDenied::CertInvalid(AuthError::WrongMesh))
@@ -1276,7 +1289,7 @@ mod tests {
                 Some(&cert),
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
-                100,
+                Clocked::At(100),
                 |_| false
             ),
             MgmtAccess::Denied(MgmtDenied::CertInvalid(AuthError::BadSignature))
@@ -1484,7 +1497,7 @@ mod tests {
                 Some(&cert),
                 Some(&anchor),
                 Some(&ca_own.ed_pubkey()),
-                150,
+                Clocked::At(150),
                 |_| false
             ),
             MgmtAccess::GrantedMember
@@ -1498,7 +1511,7 @@ mod tests {
                 Some(&cert),
                 Some(&anchor),
                 Some(&ca_own.ed_pubkey()),
-                150,
+                Clocked::At(150),
                 |c: &VerifiedCert| c.mac == node.derived_mac()
             ),
             MgmtAccess::Denied(MgmtDenied::Revoked)
@@ -1512,7 +1525,7 @@ mod tests {
                 Some(&cert),
                 Some(&anchor),
                 Some(&ca_own.ed_pubkey()),
-                150,
+                Clocked::At(150),
                 |_| false
             ),
             MgmtAccess::Denied(MgmtDenied::KeyMismatch)

@@ -587,6 +587,7 @@ impl RouterReads for Mock {
             seqno_resyncs: 0,
             ogm_refloods_suppressed: 0,
             proofs_swept: 0,
+            unjudged_cert_admissions: 0,
         }
     }
 
@@ -610,6 +611,12 @@ impl RouterReads for Mock {
 
     fn runtime_config_active(&self) -> bool {
         false
+    }
+
+    fn clock_posture(&self) -> wayfinder_protos::service::ClockPostureData {
+        // A mock with no clock policy to report: `At` matches the `true` it
+        // reports for `clock_trusted`, so the two do not contradict.
+        wayfinder_protos::service::ClockPostureData::At
     }
 
     fn clock_trusted(&self) -> bool {
@@ -648,6 +655,10 @@ impl RouterReads for Mock {
 }
 
 impl RouterWrites for Mock {
+    fn set_time(&mut self, _installer_unix: u64) -> Result<(), String> {
+        Ok(())
+    }
+
     fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
         // Applied to the reported status, so the dashboard's next poll shows
         // the change — a mock that accepted every write and reported the same
@@ -722,6 +733,7 @@ impl RouterWrites for Mock {
         cert: &[u8],
         trust_anchor: &[u8],
         provider: Option<wayfinder_protos::service::RenewalProviderData>,
+        _installer_unix: u64,
     ) -> Result<(), String> {
         let anchor = wayfinder_auth::TrustAnchor::from_bytes(trust_anchor)
             .ok_or_else(|| "unable to parse trust anchor".to_string())?;

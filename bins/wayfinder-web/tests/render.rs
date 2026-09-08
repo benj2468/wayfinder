@@ -63,6 +63,7 @@ fn seeded_snapshot() -> NodeSnapshot {
             auth_locked: false,
             runtime_config_active: false,
             clock_trusted: true,
+            clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
         }),
         // Explicit, because `Default` gives `logs: None` — which now means "a
         // read-only poll withheld the ring", not "an empty batch". A fixture

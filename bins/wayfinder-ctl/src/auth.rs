@@ -57,6 +57,10 @@ pub enum AuthCommand {
         /// the node had recorded — see [`RenewalArgs`].
         #[command(flatten)]
         renewal: RenewalArgs,
+        /// This install carries this host's wall clock to the node, which may
+        /// have none of its own.
+        #[command(flatten)]
+        clock: crate::clock::ClockArgs,
     },
     /// Enroll with a provider: generate a keypair, submit a CSR, and write the
     /// returned certificate and trust anchor (online enrollment).
@@ -148,6 +152,7 @@ pub async fn run(
             cert,
             trust_anchor,
             renewal,
+            clock,
         } => {
             let credential = cert::read_credential(&cert, &trust_anchor)?;
             // Length-checked like the other two inputs rather than read raw: a
@@ -159,17 +164,22 @@ pub async fn run(
             // the node still holds the identity it had.
             let provider = renewal.provider()?;
             let renewal_note = renewal_note(provider.as_ref());
+            // Resolved before the call, like the provider pin: a host that
+            // cannot vouch for its clock is refused while the node still holds
+            // the identity it had, rather than halfway through the install.
+            let (installer_unix, clock_note) = clock.stamp()?;
             client
                 .set_auth(
                     &seed_bytes,
                     &credential.cert_bytes,
                     &credential.anchor_bytes,
                     provider,
+                    installer_unix,
                 )
                 .await
                 .context("failed to set auth")?;
             format!(
-                "identity replaced; installed certificate for {} (mesh {:#x}), valid until {}{renewal_note}",
+                "identity replaced; installed certificate for {} (mesh {:#x}), valid until {}{renewal_note}{clock_note}",
                 output::format_mac(&credential.cert.node_mac),
                 credential.anchor.mesh_id,
                 credential.cert.not_after.get(),

@@ -22,6 +22,14 @@ pub use addr::NodeAddr;
 #[cfg(feature = "cli")]
 pub use args::ConnectArgs;
 pub use target::ConnectTarget;
+pub use wayfinder_clock_trust::ClockSync;
+pub use wayfinder_clock_trust::ClockTrust;
+/// Ask the host what it thinks of its own clock, under the given policy.
+///
+/// Re-exported under a qualified name — `read` alone says nothing at a call
+/// site in another crate — mirroring `wayfinder-server`'s spelling of the same
+/// re-export, so a reader who knows one knows the other.
+pub use wayfinder_clock_trust::read as clock_sync;
 
 use anyhow::Context;
 use anyhow::anyhow;
@@ -38,6 +46,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_serial::SerialStream;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
+use wayfinder_auth::MIN_PLAUSIBLE_UNIX;
 use wayfinder_protos::service::NO_MEMBERSHIP_CERT;
 use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest;
@@ -107,6 +116,7 @@ use wayfinder_protos::wayfinder::v1alpha::RuntimeConfig;
 use wayfinder_protos::wayfinder::v1alpha::SetAuthRequest;
 use wayfinder_protos::wayfinder::v1alpha::SetConfigRequest;
 use wayfinder_protos::wayfinder::v1alpha::SetLogLevelRequest;
+use wayfinder_protos::wayfinder::v1alpha::SetTimeRequest;
 use wayfinder_protos::wayfinder::v1alpha::SetUserEnabledRequest;
 use wayfinder_protos::wayfinder::v1alpha::SetUserPasswordRequest;
 use wayfinder_protos::wayfinder::v1alpha::SetUserRoleRequest;
@@ -821,12 +831,23 @@ impl Client {
     /// no longer holds is worse off than one that waits for an operator. A
     /// caller that *does* know — anything that just talked to the provider —
     /// should say so.
+    ///
+    /// `installer_unix` is **this machine's** clock, and the only way an
+    /// absolute time reaches a node that has none of its own (design 20 §4.7).
+    /// It is not the issuer's: the certificate may have been minted weeks
+    /// earlier and hand-carried, which is the intended out-of-band flow rather
+    /// than an edge case. Pass [`stamp_unix`]'s value so a host that cannot
+    /// vouch for its own clock sends the fail-closed zero — which drops *this
+    /// machine's claim*, not the anchoring: the node takes the maximum of its
+    /// current estimate, this value and the verified certificate's own
+    /// `not_before`, so a zero simply leaves the CA-signed instant to carry it.
     pub async fn set_auth(
         &mut self,
         seed: &[u8],
         cert: &[u8],
         trust_anchor: &[u8],
         provider: Option<RenewalProvider>,
+        installer_unix: u64,
     ) -> anyhow::Result<()> {
         match self
             .request(RequestKind::SetAuth(SetAuthRequest {
@@ -837,6 +858,7 @@ impl Client {
                 // request enum stays small; the box is an encoding detail and
                 // does not belong in this signature.
                 provider: provider.map(Box::new),
+                installer_unix,
             }))
             .await?
         {
@@ -858,13 +880,18 @@ impl Client {
     /// See [`set_auth`](Self::set_auth) for what a `None` provider means. An
     /// enroller has just spoken to the authority that issued these bytes and is
     /// exactly the caller that can name it.
+    ///
+    /// `installer_unix` carries this machine's clock, exactly as in
+    /// [`set_auth`](Self::set_auth).
     pub async fn install_cert(
         &mut self,
         cert: &[u8],
         trust_anchor: &[u8],
         provider: Option<RenewalProvider>,
+        installer_unix: u64,
     ) -> anyhow::Result<()> {
-        self.set_auth(&[], cert, trust_anchor, provider).await
+        self.set_auth(&[], cert, trust_anchor, provider, installer_unix)
+            .await
     }
 
     /// Set the Trickle/OGM emission bounds for one mesh interface at runtime.
@@ -1588,9 +1615,106 @@ fn explain_auth_denial(server_message: &str, presented_cert: bool) -> String {
     }
 }
 
+/// This host's wall clock in unix seconds, ready to stamp onto a node — or the
+/// fail-closed **zero** when it cannot be vouched for, together with the
+/// verdict that decided it.
+///
+/// The honesty of the whole anchoring scheme rests on the operator machine's
+/// clock (design 20 §4.6), and a node with no clock of its own has no way to
+/// second-guess what it is told. Two checks, catching two different wrong
+/// clocks and both required:
+///
+/// * [`ClockSync`] asks whether anything is *disciplining* this clock — the
+///   case of a host that booted before NTP reached it, whose reading is
+///   plausible and hours out.
+/// * [`MIN_PLAUSIBLE_UNIX`] catches a clock that was never set at all, which
+///   reads as 1970 and *looks* like a valid instant.
+///
+/// Either failing yields the same zero, because to the node they are the same
+/// fact: there is no usable time here. What the node drops is *this machine's
+/// claim* — on a `SetAuth` the anchor is a maximum that still includes the
+/// verified certificate's CA-signed `not_before`, so a zero stamp is not the
+/// same as leaving the node undated; on a `SetTime`, whose entire content is
+/// the claim, it is refused outright. Either way nothing moves the node
+/// somewhere wrong, and — because a node with no clock still routes and still
+/// verifies credentials (§4.2) — refusing to stamp costs at worst the anchor.
+///
+/// The verdict is returned alongside so a caller can *say* which it acted on.
+/// A correctly-synchronised stock Ubuntu or Fedora machine commonly reads as
+/// [`ClockSync::Unsynchronized`] because `chronyd` clears the kernel's
+/// `STA_UNSYNC` bit only when its `rtcsync` directive is set, and nothing on an
+/// operator's laptop sets it — so a refusal here has to be diagnostic rather
+/// than merely a failure.
+pub fn stamp_unix(trust: ClockTrust) -> (u64, ClockSync) {
+    let sync = wayfinder_clock_trust::read(trust);
+    if !sync.is_trusted() {
+        return (0, sync);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        // A system clock before the unix epoch is as unusable as one that was
+        // never set, and lands in the same place.
+        .unwrap_or(0);
+    if secs < MIN_PLAUSIBLE_UNIX {
+        (0, sync)
+    } else {
+        (secs, sync)
+    }
+}
+
+impl Client {
+    /// Anchor the node's wall clock at `installer_unix`, without re-issuing its
+    /// certificate.
+    ///
+    /// The maintenance half of the same value `set_auth` carries: a board
+    /// free-running on an internal RC oscillator drifts about 20 seconds a day,
+    /// and one that lost its persisted checkpoint comes up with no estimate at
+    /// all. Both are local, and making them go through the certificate
+    /// authority would make it a participant in something it has no part in
+    /// (design 20 §4.7).
+    ///
+    /// Pass [`stamp_unix`]'s value, not a raw host reading: a zero is the
+    /// fail-closed stamp and the node leaves its estimate alone.
+    pub async fn set_time(&mut self, installer_unix: u64) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::SetTime(SetTimeRequest { installer_unix }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("SetTime", &other)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An untrusted clock yields a stamp of zero, not a host reading.**
+    ///
+    /// The whole of the client half of design 20 §4.6: a node with no clock of
+    /// its own cannot second-guess the time it is handed, so a host that cannot
+    /// vouch for its own must hand over nothing rather than its best guess.
+    /// Zero is the value every credential path already refuses, so an old
+    /// client and an undisciplined one fail the same way.
+    #[test]
+    fn an_untrusted_clock_stamps_zero() {
+        let (stamp, sync) = stamp_unix(ClockTrust::Never);
+        assert_eq!(stamp, 0, "verdict was {}", sync.name());
+    }
+
+    /// The opt-out reaches the host reading, which is what makes it an opt-out
+    /// rather than a no-op — and the reading is past the plausibility floor on
+    /// any machine that can build this.
+    #[test]
+    fn assuming_trust_stamps_the_host_reading() {
+        let (stamp, _) = stamp_unix(ClockTrust::Assume);
+        assert!(
+            stamp >= wayfinder_auth::MIN_PLAUSIBLE_UNIX,
+            "the build machine's clock reads before 2025: {stamp}"
+        );
+    }
 
     /// A client that presented no certificate is admitted only for enrollment,
     /// so what it is short of is the credential everything else needs. That is

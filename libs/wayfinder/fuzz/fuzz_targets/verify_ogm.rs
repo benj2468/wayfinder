@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use interfaces::frame::Mac;
 use libfuzzer_sys::fuzz_target;
 use wayfinder::auth::OgmAuth;
+use wayfinder::wayfinder_auth::Clocked;
 use wayfinder_auth::Authority;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
@@ -58,6 +59,9 @@ fuzz_target!(|data: &[u8]| {
     // Mid-range unix time, well inside the wide-open validity windows this
     // harness's certs/revocations are issued with, so cert-expiry checks don't
     // trivially reject every input before reaching the interesting logic.
-    auth.set_time(1_000_000_000);
+    auth.set_time(
+        core::time::Duration::from_secs(1_000_000_000),
+        Clocked::At(1_000_000_000),
+    );
     let _ = auth.verify_ogm(data);
 });

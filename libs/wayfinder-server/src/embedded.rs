@@ -314,6 +314,7 @@ mod tests {
                     auth_locked: false,
                     runtime_config_active: false,
                     clock_trusted: true,
+                    clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
                 })),
             })
             .await;
@@ -411,6 +412,8 @@ mod tests {
                         auth_locked: false,
                         runtime_config_active: false,
                         clock_trusted: true,
+                        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At
+                            as i32,
                     })),
                 })
                 .await;
@@ -470,6 +473,7 @@ mod tests {
                     auth_locked: false,
                     runtime_config_active: false,
                     clock_trusted: true,
+                    clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
                 })),
             })
             .await;

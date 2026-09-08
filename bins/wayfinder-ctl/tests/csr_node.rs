@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use wayfinder_auth::Clocked;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
@@ -166,6 +167,7 @@ impl RouterReads for NodeMock {
             seqno_resyncs: 0,
             ogm_refloods_suppressed: 0,
             proofs_swept: 0,
+            unjudged_cert_admissions: 0,
         }
     }
 
@@ -182,6 +184,12 @@ impl RouterReads for NodeMock {
 
     fn runtime_config_active(&self) -> bool {
         false
+    }
+
+    fn clock_posture(&self) -> wayfinder_protos::service::ClockPostureData {
+        // A mock with no clock policy to report: `At` matches the `true` it
+        // reports for `clock_trusted`, so the two do not contradict.
+        wayfinder_protos::service::ClockPostureData::At
     }
 
     fn clock_trusted(&self) -> bool {
@@ -243,6 +251,7 @@ impl RouterWrites for NodeMock {
         cert: &[u8],
         trust_anchor: &[u8],
         provider: Option<RenewalProviderData>,
+        _installer_unix: u64,
     ) -> Result<(), String> {
         #[allow(clippy::unwrap_used)]
         self.set_auth_calls.lock().unwrap().push(SetAuthCall {
@@ -251,6 +260,10 @@ impl RouterWrites for NodeMock {
             trust_anchor: trust_anchor.to_vec(),
             provider,
         });
+        Ok(())
+    }
+
+    fn set_time(&mut self, _installer_unix: u64) -> Result<(), String> {
         Ok(())
     }
 
@@ -504,6 +517,15 @@ async fn spawn_provider_node() -> Endpoint {
 /// The three fields it writes are exactly the three a `SubmitCsrRequest`
 /// carries, so the file it produces is the same one `cert approve` already
 /// signs; only where the keys came from has changed.
+/// A test host's clock is disciplined by nothing this suite controls, so every
+/// command that stamps a time uses the opt-out — which is exactly the machine
+/// the flag exists for.
+fn untrustworthy_clock() -> wayfinderctl::clock::ClockArgs {
+    wayfinderctl::clock::ClockArgs {
+        unsafe_allow_untrustworthy_clock: true,
+    }
+}
+
 #[tokio::test]
 async fn csr_request_names_the_identity_the_node_reports() {
     let (endpoint, _calls) = spawn_node(true).await;
@@ -657,6 +679,7 @@ async fn csr_install_carries_the_renewal_target_to_the_node() {
                 renew_provider_key: Some("0a".repeat(32)),
                 renew_token: Some("s3cret".into()),
             },
+            clock: untrustworthy_clock(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -693,6 +716,7 @@ async fn csr_install_certifies_the_identity_the_node_already_holds() {
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
             renewal: Default::default(),
+            clock: untrustworthy_clock(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -738,6 +762,7 @@ async fn auth_set_replaces_the_nodes_identity() {
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
             renewal: Default::default(),
+            clock: untrustworthy_clock(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -781,6 +806,7 @@ async fn auth_set_refuses_a_cross_mesh_pair_without_transmitting() {
             cert: cert_path,
             trust_anchor: anchor_path,
             renewal: Default::default(),
+            clock: untrustworthy_clock(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -816,6 +842,7 @@ async fn auth_set_refuses_a_short_seed() {
             cert: cert_path,
             trust_anchor: anchor_path,
             renewal: Default::default(),
+            clock: untrustworthy_clock(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -886,6 +913,7 @@ async fn an_operator_without_the_seed_can_enroll_a_node_offline() {
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
             renewal: Default::default(),
+            clock: untrustworthy_clock(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -897,7 +925,7 @@ async fn an_operator_without_the_seed_can_enroll_a_node_offline() {
     let installed = MembershipCert::from_bytes(&calls[0].cert).unwrap();
     let anchor = TrustAnchor::from_bytes(&calls[0].trust_anchor).unwrap();
     let verified = anchor
-        .verify_cert(&installed, 500)
+        .verify_cert(&installed, Clocked::At(500))
         .expect("the certificate the node is handed must verify against the anchor beside it");
 
     let node = Keypair::from_seed(&[9u8; 32]);
