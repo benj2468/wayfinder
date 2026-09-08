@@ -300,6 +300,131 @@ cargo nextest run -p wayfinder-web --features mock-node     # all of the below
   is the only thing that proves the feature's actual claim — a bundle sign-in
   that quietly asked the provider anyway would pass every other test here.
 
+## Narrow viewports
+
+Everything that changes for a small screen is in **two `@media` blocks at the
+end of `style/main.css`**, not scattered through it, so "what does this look
+like on a phone" is one place to read. There are two because the page's
+furniture and its contents give out at different widths:
+
+- **`<= 720px`, the chrome.** Where the tab bar stops fitting — seven router
+  tabs need about 630px of row — and where the header stops fitting once it
+  carries the scope switch and a signed-in name.
+- **`<= 600px`, the tables.** Where a four-column row of MACs and intervals
+  genuinely stops fitting: about 520px of content plus the panel's and the
+  page's padding. Between the two, `.wf-table-scroll` keeps its sideways
+  scroll, which is the right answer on a screen wide enough to show there is
+  more.
+
+Collapsing both at 720 was tried and is wrong in both directions: a 700px
+window got a column of `label ... value` lines with a hand's width of gap down
+the middle, for a table that fitted perfectly well as a table.
+
+Three things were broken, and each failed quietly rather than visibly:
+
+- **The header overflowed the page.** It is a flex row of five things, and a
+  flex item does not shrink below its content, so the surplus went *outside* the
+  header: its background and its bottom rule stopped at the viewport while its
+  contents ran on past them, and the whole document gained a sideways scroll.
+  It wraps now, **at a place the stylesheet chooses** — `order`s plus a
+  zero-height `::after` that fills the line. Left to wrap naturally the break
+  moves with the text: at 390px the alarm strip fell to the second row, at 500px
+  it just fitted on the first, and the second row was left holding a name and a
+  dot pushed to the far right by their own auto margin, over a hand's width of
+  empty header. Three spans exist so the header can give ground in order —
+  `.wf-brand-name`, `.wf-status-text` (dropped, the word kept as the dot's
+  `title`) and `.wf-alarm-headline` (truncated, since the severity mark keeps
+  its full meaning at any width).
+- **The tab bar hid half its tabs.** `overflow-x: auto` renders four tabs and
+  puts Metrics, Security and Logs behind a sideways scroll nothing announces.
+  `TabBar` now renders a menu as well — a `.wf-tabs-toggle` naming the tab you
+  are on, over a collapsible `.wf-tab-list` — and the stylesheet picks. **Both
+  halves are always rendered**, because the server cannot know how wide the
+  screen is and a bar that waited for wasm to find out would flash the wrong one
+  on exactly the slow devices that are narrow. The open/closed state is a local
+  signal seeded `false`, so both halves agree on the first paint.
+- **Every table scrolled sideways inside its own card.** Each row is stacked
+  into `label: value` lines, the label coming from a **`data-label` on every
+  `<td>`** — without which a phone shows a column of bare values, a MAC with
+  nothing saying it is the neighbour. `tests/render.rs`'s
+  `every_table_cell_names_its_column_for_a_stacked_row` walks every tab and
+  fails on a cell that has none, so a column added later cannot forget one.
+
+Stacking alone trades one problem for another — four lines per row is forty
+lines for ten destinations — so each row marks its secondary columns
+`.wf-cell-detail` and carries a `<RowMore />` cell that unfolds them. That
+control is a **checkbox in a `<label>`, never a signal**: which row is open is
+state about the document, so there is nothing for the server and the browser to
+disagree about on hydration, nothing to reset on a route change, and the rows
+still open on the page whose hydration failed. `:has()` does the rest.
+
+**A chosen row is marked with a rule down its leading edge, never a fill, at
+every width.** Selection used to be an accent wash across the row while the
+chosen path was a side rule — two ways of saying the same thing, on two panels
+sitting side by side on the Routing tab. The rule is the one that survived, for
+the reason the alarm list a few hundred lines up is built the same way: a filled
+block reads as a *state* — an error, a warning — rather than as a mark on the
+row you picked, and it says it louder the taller the row gets. That is what made
+the wash unbearable once a narrow viewport turned a row into a four-line card,
+and it was never right on a wide one either.
+
+**Hover stays a fill, and the split is deliberate**: hover is a transient answer
+to "where is my pointer" that wants to follow the eye across the whole row,
+where selection is durable state the panel beside it is showing. It is neutral
+grey rather than the accent, so the two cannot be confused.
+
+### Two rules about hover, and both are checkable
+
+**A row highlights on hover if and only if clicking it does something.** Only
+two tables in the dashboard have interactive rows — Routing's Destinations and
+Links' Interfaces, both `.wf-row`, both `cursor: pointer`, both driving the
+detail panel beside them. Every other table's rows are inert and have neither a
+highlight nor a pointer cursor: Routing's Paths, both Link Quality tables,
+Metrics' per-interface, Security's Nodes, Members, and Accounts' two. A row that
+lit up without being clickable would be the same broken promise as a button that
+fails when pressed.
+
+The one exception is `.wf-log-row`, deliberately. A log line is read across four
+columns of monospace and the tint is what keeps the eye on one record's time,
+level and message; it keeps `cursor: auto`, so nothing claims it is clickable,
+and it wears the neutral grey rather than the accent, so it cannot be read as
+the "this row is chosen" mark.
+
+**Every `:hover` in the sheet is guarded on `@media (hover: hover)`.** A touch
+screen has no hover: browsers fire it on tap and leave it applied to whatever
+was tapped last, so an unguarded hover does not fail on a phone, it *lies* — a
+tab keeping the full-strength ink of the current tab after you navigated away
+from it, a gate staying lit after you flipped it, a row staying highlighted
+because you once touched it. The worst was `.wf-row-more`, which the narrow
+layout draws borderless: a tap made a border appear and stay.
+
+Two rules sit outside the guard on purpose, and both are marked where they are:
+the alarm card and the viewer card *open* on hover, and their touch path is the
+`:focus-within` half of the same pair — which is exactly what the media query
+would exclude. Splitting those two selectors is why each is written out
+separately from its `:hover` twin rather than sharing one rule.
+
+Four traps in that stylesheet, all of which fail by looking almost right:
+
+- **Qualify every cell and row rule with `td` or `.wf-table tr`.** `.wf-table
+  td` is one class and one element, which outranks a bare `.wf-cell-detail` — so
+  the bare selector loses to the `display: flex` that turns a cell into a line
+  and every row renders permanently open. The row highlights above have the same
+  hazard against `.wf-table tr`.
+- **A stacked row needs horizontal padding.** A `display: block` row paints its
+  background across the panel's whole content box, so without it every value
+  sits flush against the edge of its own highlight and the disclosure button is
+  clipped by it.
+- **A cell can hold more than one thing.** `justify-content: space-between` on
+  the row spread the Routing tab's "in use" tag to the far edge, a hand's width
+  from the address it is a tag on. `margin-right: auto` on the `::before` label
+  pins it left and leaves everything after it packed together on the right.
+- **The header's dropdowns are anchored to the header, not to their trigger.**
+  Both triggers go `position: static` there so `.wf-header` becomes the
+  containing block. Left on the triggers, an absolutely positioned card has
+  nothing to clamp it to the page: one was squeezed to a 150px column and the
+  other hung off the left edge with its labels cut in half.
+
 ## Charts
 
 Read the `dataviz` skill before touching `components/chart.rs`. The two series

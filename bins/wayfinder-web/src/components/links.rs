@@ -22,6 +22,8 @@ use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Field;
 use crate::components::widgets::Panel;
+use crate::components::widgets::RowMore;
+use crate::components::widgets::RowMoreHeader;
 use crate::format;
 
 /// Render the Links tab.
@@ -66,6 +68,7 @@ pub fn Links() -> impl IntoView {
                                         <th>"Carrying"</th>
                                         <th class="wf-num">"Announces every"</th>
                                         <th class="wf-num">"Heartbeat"</th>
+                                        <RowMoreHeader />
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -90,10 +93,33 @@ pub fn Links() -> impl IntoView {
                                                     }
                                                     on:click=move |_| set_selected.set(Some(idx))
                                                 >
-                                                    <td>{label}</td>
-                                                    <td class=status.css_class()>{status.label()}</td>
-                                                    <td class="wf-num">{interval}</td>
-                                                    <td class="wf-num">{keepalive}</td>
+                                                    <td data-label="Interface">{label}</td>
+                                                    <td
+                                                        class=status.css_class()
+                                                        data-label="Carrying"
+                                                    >
+                                                        {status.label()}
+                                                    </td>
+                                                    // The two cadences fold
+                                                    // away: what an interface
+                                                    // is allowed to carry is
+                                                    // the question this table
+                                                    // is opened with, and how
+                                                    // often it says so is the
+                                                    // follow-up.
+                                                    <td
+                                                        class="wf-num wf-cell-detail"
+                                                        data-label="Announces every"
+                                                    >
+                                                        {interval}
+                                                    </td>
+                                                    <td
+                                                        class="wf-num wf-cell-detail"
+                                                        data-label="Heartbeat"
+                                                    >
+                                                        {keepalive}
+                                                    </td>
+                                                    <RowMore />
                                                 </tr>
                                             }
                                         })

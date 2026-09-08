@@ -1558,3 +1558,147 @@ fn the_scannable_code_and_the_copy_button_carry_the_same_uri() {
         "which is also the text beside it, HTML-escaped as any text node is"
     );
 }
+
+/// Every opening tag named `tag` in `html`, as the raw text from `<tag` up to
+/// (not including) its closing `>`.
+///
+/// A scan rather than a parser: these tests assert on attributes that are
+/// written literally in the `view!` macro a few lines away, and pulling an HTML
+/// parser into the dev-dependency graph to read them back would be a heavier
+/// dependency than the thing it checks.
+fn opening_tags<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}");
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(&open) {
+        rest = &rest[i..];
+        // `<th` is a prefix of `<thead`, so a match only counts where the name
+        // actually ends — otherwise every table header would be read as a cell.
+        let ends_name = rest[open.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace());
+        let end = rest.find('>').expect("a closed tag");
+        if ends_name {
+            out.push(&rest[..end]);
+        }
+        rest = &rest[end + 1..];
+    }
+    out
+}
+
+/// Every body cell names the column it came from.
+///
+/// On a narrow screen a table cannot stay a table: four columns of MACs and
+/// intervals need about twice the width a phone has, and the old treatment —
+/// `overflow-x: auto` on the panel — answered that by cutting the last columns
+/// off behind a sideways scroll inside a card. So each row is stacked into a
+/// list of `label: value` lines instead, and the label is the column header
+/// carried on the cell.
+///
+/// The header row is `display: none` there, which is what makes this
+/// load-bearing rather than decorative: a cell with no `data-label` renders on
+/// a phone as a bare value with nothing saying what it is a value *of* — a MAC
+/// with no "Neighbour" in front of it, a duration that could be either of the
+/// two the row carries.
+#[test]
+fn every_table_cell_names_its_column_for_a_stacked_row() {
+    let snapshot = seeded_snapshot();
+    let provider = provider_snapshot();
+    let tabs: Vec<(&str, String)> = vec![
+        (
+            "routing",
+            render_with(Some(snapshot.clone()), || view! { <Routing /> }),
+        ),
+        (
+            "link quality",
+            render_with(Some(snapshot.clone()), || view! { <LinkQuality /> }),
+        ),
+        (
+            "links",
+            render_with(Some(snapshot.clone()), || view! { <Links /> }),
+        ),
+        (
+            "metrics",
+            render_with(Some(snapshot.clone()), || view! { <Metrics /> }),
+        ),
+        (
+            "security",
+            render_with(Some(snapshot.clone()), || view! { <Security /> }),
+        ),
+        (
+            "members",
+            render_with(Some(provider.clone()), || view! { <Members /> }),
+        ),
+        // The roster rather than the whole tab: `Accounts` fetches its rows
+        // rather than reading them off the snapshot, so the tab alone renders
+        // "Reading the accounts…" and no table at all.
+        ("accounts", {
+            let account = UserAccount {
+                username: "watcher".into(),
+                admin: false,
+                session_ttl_secs: 900,
+                totp_enrolled: true,
+                disabled: false,
+                locked: false,
+            };
+            render_with(Some(provider), move || {
+                view! {
+                    <UserTable
+                        users=vec![account.clone()]
+                        on_revoke=Callback::new(|_| {})
+                        on_remove=Callback::new(|_| {})
+                    />
+                }
+            })
+        }),
+    ];
+
+    for (tab, html) in tabs {
+        let cells = opening_tags(&html, "td");
+        assert!(!cells.is_empty(), "{tab} rendered no rows to check: {html}");
+        for cell in cells {
+            // Two cells carry no column: the disclosure that opens the row, and
+            // the per-row controls under a blank header. Neither is a value,
+            // so neither has a name to put in front of it.
+            let unlabelled = cell.contains("wf-cell-more") || cell.contains("wf-row-actions");
+            assert!(
+                unlabelled || cell.contains("data-label=\""),
+                "{tab} has a cell with no column name: {cell}"
+            );
+        }
+    }
+}
+
+/// A row's secondary columns collapse behind a disclosure, and the disclosure
+/// is per row.
+///
+/// Stacking alone trades one problem for another: a four-column table becomes
+/// four lines per row, so a mesh of ten destinations is forty lines to scroll
+/// past. So the columns that identify a row stay, and the rest fold away behind
+/// a control on the row itself.
+///
+/// It is a checkbox and a `<label>`, not a signal: the open/closed state of a
+/// row is DOM state, so there is nothing for the server and the browser to
+/// disagree about, nothing to reset on a route change, and the rows still open
+/// on the page whose hydration failed.
+#[test]
+fn a_table_row_folds_its_secondary_columns_behind_a_disclosure() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Routing /> });
+
+    assert!(
+        html.contains("wf-cell-detail"),
+        "the secondary columns are marked: {html}"
+    );
+    assert!(
+        html.contains("wf-row-more-input"),
+        "and a control opens them: {html}"
+    );
+
+    // One disclosure per body row, not one per table: the point is to open the
+    // row you are looking at, and a single control at the top would open all of
+    // them together.
+    let rows = html.matches("class=\"wf-row\"").count();
+    let toggles = html.matches("wf-row-more-input").count();
+    assert_eq!(rows, toggles, "one disclosure per row: {html}");
+}

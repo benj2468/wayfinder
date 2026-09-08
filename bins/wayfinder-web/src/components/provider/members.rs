@@ -31,6 +31,8 @@ use crate::components::provider::report_failure;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Panel;
 use crate::components::widgets::Pending;
+use crate::components::widgets::RowMore;
+use crate::components::widgets::RowMoreHeader;
 use crate::format;
 
 /// Render the Members tab.
@@ -80,6 +82,7 @@ pub fn Members() -> impl IntoView {
                                         <th>
                                             <span class="wf-sr-only">"Actions"</span>
                                         </th>
+                                        <RowMoreHeader />
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -104,10 +107,24 @@ pub fn Members() -> impl IntoView {
                                             let revoke_mac = n.node_id.clone();
                                             view! {
                                                 <tr>
-                                                    <td class="wf-mono">{format::id(&n.node_id)}</td>
-                                                    <td class=class>{state}</td>
-                                                    <td class="wf-mono">{expiry}</td>
-                                                    <td class="wf-num">
+                                                    <td class="wf-mono" data-label="Node">
+                                                        {format::id(&n.node_id)}
+                                                    </td>
+                                                    <td class=class data-label="Identity">
+                                                        {state}
+                                                    </td>
+                                                    // Folded away behind the
+                                                    // verdict beside it, as on
+                                                    // the Security tab: it says
+                                                    // when the row will change,
+                                                    // not what it says now.
+                                                    <td
+                                                        class="wf-mono wf-cell-detail"
+                                                        data-label="Certificate expires"
+                                                    >
+                                                        {expiry}
+                                                    </td>
+                                                    <td class="wf-num wf-row-actions">
                                                         {(!n.revoked)
                                                             .then(|| {
                                                                 view! {
@@ -135,6 +152,7 @@ pub fn Members() -> impl IntoView {
                                                                 }
                                                             })}
                                                     </td>
+                                                    <RowMore />
                                                 </tr>
                                             }
                                         })

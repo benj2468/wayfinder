@@ -68,6 +68,8 @@ use crate::components::widgets::Empty;
 use crate::components::widgets::Hint;
 use crate::components::widgets::Panel;
 use crate::components::widgets::Pending;
+use crate::components::widgets::RowMore;
+use crate::components::widgets::RowMoreHeader;
 use crate::format;
 use crate::invite::InviteMinted;
 use crate::invite::InviteRow;
@@ -451,6 +453,7 @@ pub fn UserTable(
                                 </p>
                             </Hint>
                         </th>
+                        <RowMoreHeader />
                     </tr>
                 </thead>
                 <tbody>
@@ -470,15 +473,30 @@ pub fn UserTable(
                             let username = u.username.clone();
                             view! {
                                 <tr>
-                                    <td class="wf-mono">{u.username}</td>
-                                    <td>{if u.admin { "Administrator" } else { "Read-only" }}</td>
-                                    <td>{format::duration_secs(u.session_ttl_secs)}</td>
-                                    <td class=if u.totp_enrolled {
-                                        "wf-status-on"
-                                    } else {
-                                        "wf-status-mixed"
-                                    }>{if u.totp_enrolled { "Enrolled" } else { "None" }}</td>
-                                    <td class=class>{status}</td>
+                                    <td class="wf-mono" data-label="Account">{u.username}</td>
+                                    <td data-label="Access">
+                                        {if u.admin { "Administrator" } else { "Read-only" }}
+                                    </td>
+                                    // How long a session lasts and whether a
+                                    // second factor is enrolled are settings,
+                                    // read when an account is being changed.
+                                    // Who it is, what it may do and whether it
+                                    // can sign in at all are what the roster is
+                                    // scanned for.
+                                    <td class="wf-cell-detail" data-label="Session length">
+                                        {format::duration_secs(u.session_ttl_secs)}
+                                    </td>
+                                    <td
+                                        class=if u.totp_enrolled {
+                                            "wf-status-on wf-cell-detail"
+                                        } else {
+                                            "wf-status-mixed wf-cell-detail"
+                                        }
+                                        data-label="Second factor"
+                                    >
+                                        {if u.totp_enrolled { "Enrolled" } else { "None" }}
+                                    </td>
+                                    <td class=class data-label="Status">{status}</td>
                                     <td class="wf-row-actions">
                                         <button
                                             class="wf-button"
@@ -498,6 +516,7 @@ pub fn UserTable(
                                             "Remove"
                                         </button>
                                     </td>
+                                    <RowMore />
                                 </tr>
                             }
                         })
@@ -734,6 +753,7 @@ fn InviteTable(
                         <th>
                             <span class="wf-sr-only">"Actions"</span>
                         </th>
+                        <RowMoreHeader />
                     </tr>
                 </thead>
                 <tbody>
@@ -744,12 +764,19 @@ fn InviteTable(
                             let started = invite.started_unix.is_some();
                             view! {
                                 <tr>
-                                    <td class="wf-mono">{invite.username.clone()}</td>
-                                    <td>
+                                    <td class="wf-mono" data-label="Account">
+                                        {invite.username.clone()}
+                                    </td>
+                                    <td data-label="Access">
                                         {if invite.admin { "Administrator" } else { "Read-only" }}
                                     </td>
-                                    <td>{format::timestamp(invite.expires_unix)}</td>
-                                    <td>
+                                    // When it lapses folds away: an invitation
+                                    // is scanned for who it is for and whether
+                                    // anybody has taken it up yet.
+                                    <td class="wf-cell-detail" data-label="Expires">
+                                        {format::timestamp(invite.expires_unix)}
+                                    </td>
+                                    <td data-label="Started">
                                         {
                                             // Spelled out, not shown as a
                                             // timestamp. This is the row an
@@ -764,7 +791,7 @@ fn InviteTable(
                                             }
                                         }
                                     </td>
-                                    <td>
+                                    <td class="wf-row-actions">
                                         <button
                                             class="wf-button wf-button-danger"
                                             on:click=move |_| on_revoke.run(username.clone())
@@ -772,6 +799,7 @@ fn InviteTable(
                                             "Revoke"
                                         </button>
                                     </td>
+                                    <RowMore />
                                 </tr>
                             }
                         })

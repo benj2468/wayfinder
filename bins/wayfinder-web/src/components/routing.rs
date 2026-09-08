@@ -12,6 +12,8 @@ use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Panel;
 use crate::components::widgets::QualityBar;
+use crate::components::widgets::RowMore;
+use crate::components::widgets::RowMoreHeader;
 use crate::format;
 
 /// Render the Routing tab.
@@ -59,6 +61,7 @@ pub fn Routing() -> impl IntoView {
                                         <th>"Via"</th>
                                         <th>"Quality"</th>
                                         <th class="wf-num">"Paths"</th>
+                                        <RowMoreHeader />
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -76,17 +79,37 @@ pub fn Routing() -> impl IntoView {
                                                     class:wf-row-selected=is_selected
                                                     on:click=move |_| set_selected.set(Some(dest.clone()))
                                                 >
-                                                    <td class="wf-mono">
+                                                    <td class="wf-mono" data-label="Destination">
                                                         {format::id(&entry.destination)}
                                                     </td>
-                                                    <td class="wf-mono">{format::id(&entry.next_hop)}</td>
-                                                    <td>
+                                                    // Folded away on a phone:
+                                                    // which neighbour carries
+                                                    // the route, and how many
+                                                    // alternatives there are,
+                                                    // are what you open a row
+                                                    // to ask. Whether the
+                                                    // destination is reachable
+                                                    // and how well is what you
+                                                    // scan the column for.
+                                                    <td
+                                                        class="wf-mono wf-cell-detail"
+                                                        data-label="Via"
+                                                    >
+                                                        {format::id(&entry.next_hop)}
+                                                    </td>
+                                                    <td data-label="Quality">
                                                         <QualityBar
                                                             percent=format::tq_percent(entry.tq)
                                                             title=format!("TQ {}", entry.tq)
                                                         />
                                                     </td>
-                                                    <td class="wf-num">{entry.paths.len()}</td>
+                                                    <td
+                                                        class="wf-num wf-cell-detail"
+                                                        data-label="Paths"
+                                                    >
+                                                        {entry.paths.len()}
+                                                    </td>
+                                                    <RowMore />
                                                 </tr>
                                             }
                                         })
@@ -148,6 +171,7 @@ fn PathDetail(
                                 <th>"Neighbour"</th>
                                 <th>"Quality"</th>
                                 <th class="wf-num">"Last seq"</th>
+                                <RowMoreHeader />
                             </tr>
                         </thead>
                         <tbody>
@@ -157,18 +181,24 @@ fn PathDetail(
                                     let chosen = path.neighbor_id == next_hop;
                                     view! {
                                         <tr class:wf-row-chosen=chosen>
-                                            <td class="wf-mono">
+                                            <td class="wf-mono" data-label="Neighbour">
                                                 {format::id(&path.neighbor_id)}
                                                 {chosen
                                                     .then(|| view! { <span class="wf-tag">"in use"</span> })}
                                             </td>
-                                            <td>
+                                            <td data-label="Quality">
                                                 <QualityBar
                                                     percent=format::tq_percent(path.tq)
                                                     title=format!("TQ {}", path.tq)
                                                 />
                                             </td>
-                                            <td class="wf-num wf-mono">{path.last_seqno}</td>
+                                            <td
+                                                class="wf-num wf-mono wf-cell-detail"
+                                                data-label="Last seq"
+                                            >
+                                                {path.last_seqno}
+                                            </td>
+                                            <RowMore />
                                         </tr>
                                     }
                                 })

@@ -14,6 +14,8 @@ use crate::components::widgets::Empty;
 use crate::components::widgets::Panel;
 use crate::components::widgets::QualityBar;
 use crate::components::widgets::QualityUnmeasured;
+use crate::components::widgets::RowMore;
+use crate::components::widgets::RowMoreHeader;
 use crate::format;
 
 /// Render the Link Quality tab.
@@ -56,6 +58,7 @@ pub fn LinkQuality() -> impl IntoView {
                                         <th>"Interface"</th>
                                         <th>"Quality"</th>
                                         <th class="wf-num">"Samples"</th>
+                                        <RowMoreHeader />
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -64,9 +67,19 @@ pub fn LinkQuality() -> impl IntoView {
                                         .map(|e| {
                                             view! {
                                                 <tr>
-                                                    <td class="wf-mono">{format::id(&e.neighbor_id)}</td>
-                                                    <td>{format::iface_label(&e.iface_name, e.iface_idx)}</td>
-                                                    <td>
+                                                    <td class="wf-mono" data-label="Neighbour">
+                                                        {format::id(&e.neighbor_id)}
+                                                    </td>
+                                                    // Which interface heard it,
+                                                    // and how much evidence the
+                                                    // average rests on, fold
+                                                    // away: the reading itself
+                                                    // is what the column is
+                                                    // scanned for.
+                                                    <td class="wf-cell-detail" data-label="Interface">
+                                                        {format::iface_label(&e.iface_name, e.iface_idx)}
+                                                    </td>
+                                                    <td data-label="Quality">
                                                         {match e.ewma_quality {
                                                             Some(q) => {
                                                                 view! {
@@ -80,7 +93,13 @@ pub fn LinkQuality() -> impl IntoView {
                                                             None => view! { <QualityUnmeasured /> }.into_any(),
                                                         }}
                                                     </td>
-                                                    <td class="wf-num">{e.sample_count}</td>
+                                                    <td
+                                                        class="wf-num wf-cell-detail"
+                                                        data-label="Samples"
+                                                    >
+                                                        {e.sample_count}
+                                                    </td>
+                                                    <RowMore />
                                                 </tr>
                                             }
                                         })
@@ -115,6 +134,7 @@ pub fn LinkQuality() -> impl IntoView {
                                         <th>"Status"</th>
                                         <th class="wf-num">"Last heard"</th>
                                         <th class="wf-num">"Every"</th>
+                                        <RowMoreHeader />
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -136,12 +156,31 @@ pub fn LinkQuality() -> impl IntoView {
                                             };
                                             view! {
                                                 <tr>
-                                                    <td class="wf-mono">{format::id(&e.neighbor_id)}</td>
-                                                    <td class=class>{status}</td>
-                                                    <td class="wf-num">
+                                                    <td class="wf-mono" data-label="Neighbour">
+                                                        {format::id(&e.neighbor_id)}
+                                                    </td>
+                                                    <td class=class data-label="Status">{status}</td>
+                                                    // Two durations that look
+                                                    // alike and mean opposite
+                                                    // things — how long since
+                                                    // the last beat, and how
+                                                    // far apart they come. On a
+                                                    // phone they fold away
+                                                    // together, behind the
+                                                    // verdict they add up to.
+                                                    <td
+                                                        class="wf-num wf-cell-detail"
+                                                        data-label="Last heard"
+                                                    >
                                                         {format::interval(e.ms_since_last_heard as u32)}
                                                     </td>
-                                                    <td class="wf-num">{cadence}</td>
+                                                    <td
+                                                        class="wf-num wf-cell-detail"
+                                                        data-label="Every"
+                                                    >
+                                                        {cadence}
+                                                    </td>
+                                                    <RowMore />
                                                 </tr>
                                             }
                                         })

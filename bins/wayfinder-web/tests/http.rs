@@ -775,3 +775,105 @@ async fn server_fns_are_not_reachable_by_get() {
         "the GET arm is gone, and the page routes do not swallow /api"
     );
 }
+
+/// On a narrow screen the tab bar is a menu, not a strip that scrolls sideways.
+///
+/// The seven router tabs need ~630px of row; a phone has 390. The old bar met
+/// that with `overflow-x: auto`, which does not fail loudly — it renders four
+/// tabs and puts the other three behind a sideways scroll nothing on screen
+/// says is there. A tab an operator cannot find is a tab they do not have.
+///
+/// So the bar carries a toggle that *names the tab it is on* and a list that
+/// collapses behind it. Both are rendered on every viewport and the stylesheet
+/// decides which is drawn, because the server has no way to know how wide the
+/// screen is — and a layout that waits for wasm to find out would flash the
+/// wrong one on the slowest devices, which are exactly the narrow ones.
+#[tokio::test]
+async fn the_tab_bar_collapses_behind_a_toggle_naming_the_current_tab() {
+    for (path, title) in [
+        ("/", "Overview"),
+        ("/routing", "Routing"),
+        ("/link-quality", "Link Quality"),
+    ] {
+        let conn = common::serve_mock_node().await;
+        let app = wayfinder_web::server::build_router(
+            common::test_leptos_options(),
+            common::static_access(conn),
+            common::test_hosts(),
+        );
+
+        let response = app
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+
+        assert!(
+            html.contains("wf-tabs-toggle"),
+            "{path} renders the menu toggle: {html:.600}"
+        );
+        assert!(
+            html.contains("wf-tab-list"),
+            "{path} wraps the tabs in the collapsible list: {html:.600}"
+        );
+        // Closed on arrival, on the server and in the browser alike: the two
+        // have to agree or hydration mismatches, which in this crate is a wasm
+        // panic rather than a cosmetic reflow.
+        assert!(
+            html.contains(r#"aria-expanded="false""#),
+            "{path} renders the menu closed: {html:.600}"
+        );
+        assert_eq!(
+            current_tab_name(&html),
+            Some(title.to_string()),
+            "{path}'s toggle names the tab it is on: {html:.600}"
+        );
+    }
+}
+
+/// The toggle names the *scope's* tab, not a router tab, inside the provider
+/// scope — the same one bar draws both, so a name derived from the wrong table
+/// would read "Overview" on a page of the certificate authority.
+#[tokio::test]
+async fn the_tab_menu_names_a_provider_tab_inside_the_provider_scope() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        common::static_access(conn),
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/provider/members")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&body);
+
+    assert_eq!(
+        current_tab_name(&html),
+        Some("Members".to_string()),
+        "the provider tab, not a router one: {html:.600}"
+    );
+}
+
+/// The text the menu toggle carries, with leptos' hydration markers stripped.
+///
+/// A dynamic text node is written as `<!>text<!>` by the SSR renderer so the
+/// browser can find it again on hydration; the marker is an implementation
+/// detail of that handshake, and asserting on the raw span would be asserting
+/// on it.
+fn current_tab_name(html: &str) -> Option<String> {
+    let (_, rest) = html.split_once(r#"class="wf-tabs-current">"#)?;
+    let (inner, _) = rest.split_once("</span>")?;
+    let stripped = inner
+        .split("<!")
+        .map(|part| part.split_once('>').map_or(part, |(_, after)| after))
+        .collect::<String>();
+    Some(stripped.trim().to_string())
+}

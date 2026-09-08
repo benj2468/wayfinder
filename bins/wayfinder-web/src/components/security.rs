@@ -64,6 +64,8 @@ use crate::components::widgets::Empty;
 use crate::components::widgets::Field;
 use crate::components::widgets::Panel;
 use crate::components::widgets::Pending;
+use crate::components::widgets::RowMore;
+use crate::components::widgets::RowMoreHeader;
 use crate::enroll::EnrollmentOutcome;
 use crate::enroll::ProviderTarget;
 use crate::format;
@@ -432,6 +434,7 @@ pub fn Security() -> impl IntoView {
                                         <th>"Node"</th>
                                         <th>"Identity"</th>
                                         <th>"Certificate expires"</th>
+                                        <RowMoreHeader />
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -457,9 +460,24 @@ pub fn Security() -> impl IntoView {
                                             };
                                             view! {
                                                 <tr>
-                                                    <td class="wf-mono">{format::id(&n.node_id)}</td>
-                                                    <td class=class>{state}</td>
-                                                    <td class="wf-mono">{expiry}</td>
+                                                    <td class="wf-mono" data-label="Node">
+                                                        {format::id(&n.node_id)}
+                                                    </td>
+                                                    <td class=class data-label="Identity">
+                                                        {state}
+                                                    </td>
+                                                    // The expiry folds away
+                                                    // behind the verdict: it is
+                                                    // the reason the row will
+                                                    // eventually change, not
+                                                    // what it says today.
+                                                    <td
+                                                        class="wf-mono wf-cell-detail"
+                                                        data-label="Certificate expires"
+                                                    >
+                                                        {expiry}
+                                                    </td>
+                                                    <RowMore />
                                                 </tr>
                                             }
                                         })
