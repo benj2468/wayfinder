@@ -353,7 +353,8 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
 
 **Radio drivers (`no_std`)** — each → has a driver-authoring guide:
 - **libs/rylr998** — REYAX RYLR998/498 LoRa AT-command driver + `LinkT`.
-- **libs/ieee802154** — hardware-agnostic 802.15.4 framing (`encode`/`decode`).
+- **libs/ieee802154** → hardware-agnostic 802.15.4 framing plus fragmentation,
+  keyed on the MAC header's short source address.
 - **libs/at86rf233** — SPI driver for the AT86RF233 transceiver.
 - **libs/nrf-ieee802154** — `LinkT` adapter for the nRF52840 built-in radio.
 - **libs/blue** → `LinkT` adapters for connectionless BLE advertising
@@ -363,7 +364,7 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   host via BlueZ/`bluer`, used by `bins/wayfinder-tap`).
 - **libs/wayfinder-link-utils** — shared small-MTU fragmentation/reassembly
   for `LinkT` drivers whose medium caps payload well below
-  `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`).
+  `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`, `ieee802154`).
 
 **Identity & management API**
 - **libs/wayfinder-auth** → crypto identity/membership. A mesh is optionally

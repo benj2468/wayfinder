@@ -13,7 +13,7 @@ A board binary owns only what is genuinely board-specific:
 | `memory.x` and the two constants tracking it (`DURABLE_STORE_BASE`, `RAM_ORIGIN`) | `fault` — panic/HardFault handling, the retained fault record |
 | LED and UART pins | `stack` — high-water painting and reporting |
 | `bind_interrupts!` | `identity` — FICR-derived MAC + flash persistence |
-| `.cargo/config.toml` runner | `link` — the `MeshLink` LoRa/BLE/USB/absent enum |
+| `.cargo/config.toml` runner | `link` — the `MeshLink` LoRa/802.15.4/USB/absent enum |
 | | `usb_mgmt` — the USB device: CDC-ACM management port + the shared `Builder` |
 | | `usb_link` — the CDC-NCM mesh interface |
 | | `node::run` — the whole bring-up sequence |
@@ -28,7 +28,11 @@ binary is a behaviour the other silently lacks.
 1. Copy `bins/wayfinder-nrf52840-dongle` — it is the smaller of the two.
 2. Write `memory.x`, then set `DURABLE_STORE_BASE` and `RAM_ORIGIN` to match it.
    Both are checked only by the comments next to them; getting `RAM_ORIGIN`
-   wrong silently disables stack measurement rather than failing.
+   wrong silently disables stack measurement rather than failing. **`RAM_ORIGIN`
+   is not automatically `0x20000000`** — a board that boots through Nordic's
+   MBR must leave its first 8 bytes alone (see "Board differences"). **`RAM_ORIGIN`
+   is not automatically `0x20000000`** — a board that boots through Nordic's
+   MBR must leave its first 8 bytes alone (see "Board differences").
 3. Fix the LED pin, the two UART pins and the `.cargo/config.toml` runner.
 4. Add the build and clippy lines to `.gitlab-ci.yml`'s `build:embedded`.
 
@@ -41,14 +45,39 @@ reaching for should move into this crate first.
 | --- | --- | --- |
 | Liveness LED | `P0_13`, active-low | `P0_06`, active-low (`P0_13` is not routed) |
 | RYLR998 UART | `P0_02` RX / `P0_26` TX | `P0_31` RX / `P0_29` TX (castellated edge) |
-| App flash | `0x27000..0xFE000` (860K) | `0x27000..0xDE000` (732K) |
+| App flash | `0x0..0xFE000` (1016K) | `0x1000..0xDE000` (884K) |
 | Identity store | `0xFE000` | `0xDE000` |
+| Low flash | free (app starts at 0) | MBR, `0x0..0x1000`, required by the bootloader |
+| RAM origin | `0x20000000` | `0x20000008` — the MBR's IRQ-forward address sits below it |
+| RAM origin | `0x20000000` | `0x20000008` — the MBR's IRQ-forward address sits below it |
 | High flash | free | Open Bootloader + MBR params/settings, `0xE0000..0x100000` reserved |
 | Debug probe | onboard | SWD pads only |
 | Logs | RTT or USB | **USB only** |
 
-Both run S140 7.3.0 with the same `nrf_softdevice::Config::default()`, so the
-RAM reservation (13112 bytes) is identical. If one moves, both move.
+Neither runs a SoftDevice, so nothing reserves 13112 bytes below the
+application any more — that was the S140's measured `wanted_app_ram_base`.
+
+**The RAM origins still differ between the boards, and not by much: 8 bytes.**
+The dongle boots via the MBR, which keeps its interrupt-forwarding address in
+the first 8 bytes of RAM; that address is how an application above the MBR
+receives interrupts at all with no SoftDevice present. `flip-link` puts the
+*stack* at the bottom of RAM, so a dongle built at `0x20000000` has
+`stack::paint` overwrite it during boot and the board HardFaults on its first
+interrupt, reboots, and halts with LD1 dark and no USB. The DK has no MBR —
+its application is at `0x0` — so it is genuinely `0x20000000`.
+
+This is not hypothetical: it is what the dongle did, and it is invisible to
+every host test, to clippy, to the cross-compile and to `just stack-budget`
+(which checks that the stack *fits*, not what lives underneath it). See
+design 19 §12.1.
+
+**Flash origins now differ between the boards**, which they did not before.
+The DK links from 0 because `probe-rs` writes wherever the image says. The
+dongle links from 0x1000 because the Open Bootloader depends on the MBR in the
+bottom 4 KiB and, finding no SoftDevice, places an application directly above
+it (`nrf_dfu_bank0_start_addr()` in the nRF5 SDK returns `MBR_SIZE`).
+`runner.sh`'s `--sd-req 0x00` is the other half of that pairing — see
+"Flashing".
 
 The dongle's flash reservation is deliberately conservative — the Open
 Bootloader is smaller than 128K, but its exact extent depends on the build the
@@ -57,21 +86,29 @@ to reflash a dongle without a probe. Flashing over SWD and dropping the
 bootloader frees the whole top 128K, in which case the dongle can use the DK's
 layout.
 
-The dongle has no 32.768 kHz crystal. This costs nothing today because
-`nrf_softdevice::Config::default()` passes a null `p_clock_lf_cfg`, which the
-SoftDevice documents as "RC source with `rc_ctiv = 16`, `rc_temp_ctiv = 2`".
-**Setting an explicit LFXO clock config would break the dongle** while leaving
-the DK working.
+The dongle has no 32.768 kHz crystal. `init_platform` therefore leaves
+`lfclk_source` at `embassy-nrf`'s `InternalRC` default. **Setting
+`LfclkSource::ExternalXtal` would hang the dongle at boot** waiting for a
+crystal that is not fitted, while leaving the DK working — the classic
+one-board-only failure here.
+
+HFCLK is the opposite: `init_platform` explicitly selects `ExternalXtal`,
+which `embassy-nrf` does *not* default to. Both boards have the 32 MHz
+crystal, and both the `RADIO` peripheral and USBD require it — the radio is
+only specified running from the HFXO. The SoftDevice used to start it on
+demand; nothing does now unless `init_platform` says so.
 
 ## Flashing
 
-The DK, over its onboard debugger — the SoftDevice first, once per board:
+The DK, over its onboard debugger — one command, nothing to stage first:
 
 ```bash
-probe-rs download --chip nRF52840_xxAA --binary-format hex \
-  bins/wayfinder-nrf52840/s140_nrf52_7.3.0_softdevice.hex
 cd bins/wayfinder-nrf52840 && cargo run --release
 ```
+
+There used to be a `probe-rs download` of `s140_nrf52_7.3.0_softdevice.hex`
+before this, once per board. It is not needed and not wanted: the image links
+from 0 and simply overwrites any S140 left there.
 
 The dongle has no onboard debugger. With an SWD probe on the pads the flow is
 identical. Without one, it is DFU over the Open Bootloader: hold the reset
@@ -85,22 +122,31 @@ default *dev* profile and objcopies that instead, silently ignoring the actual
 release binary it was handed — this was the first thing that made every early
 flash unbootable, well before the addressing bug below); `nrfutil
 nrf5sdk-tools pkg generate` to build a signed-less DFU `.zip` with
-`--sd-req 0x123` (S140 7.3.0's documented firmware ID, from `nrfutil
-nrf5sdk-tools pkg generate --help`'s well-known-values table); then `nrfutil
+`--sd-req 0x00` ("no SoftDevice"; it was `0x123`, S140 7.3.0's documented
+firmware ID from `nrfutil nrf5sdk-tools pkg generate --help`'s
+well-known-values table, while the app linked above an S140); then `nrfutil
 device program --firmware *.zip --traits nordicDfu` to flash it. A raw `.hex`
 can't go straight to `nrfutil device program` for a USB/`nordicDfu` device —
 that path only accepts `.hex` over `jlink`/`mcuBoot` traits, neither of which
 this board has; it needs the `.zip`.
 
-**`--sd-req` is not optional.** Omitting it (as `nrfdfu-rs` does — tried and
-abandoned, see below) makes the Nordic bootloader conclude the app doesn't
-depend on a SoftDevice and **erase it** before placing the app at `0x1000`
-instead of `0x27000` — corrupting the SoftDevice and misplacing the app (which
-is linked, per `memory.x`, to run from `0x27000`) in one step. The bootloader
-computes the app's actual placement itself at flash time
-(`nrf_dfu_bank0_start_addr()` in `nRF5_SDK`), from whatever SoftDevice it
-currently finds valid — `sd_req` only has to name it correctly, not declare an
-address.
+**`--sd-req` must agree with `memory.x`, and the pairing inverted.** The
+bootloader computes the app's placement itself at flash time
+(`nrf_dfu_bank0_start_addr()` in `nRF5_SDK`) from whatever SoftDevice it
+currently finds valid; `sd_req` only names the requirement, it does not
+declare an address. So:
+
+- **Now**: `--sd-req 0x00` + `FLASH : ORIGIN = 0x00001000`. The bootloader
+  erases any S140 it still finds and places the app just above the MBR.
+- **Before**: `--sd-req 0x123` + `ORIGIN = 0x00027000`, placing the app above
+  a SoftDevice it was told to keep.
+
+Mixing the halves is the failure this note exists for. `0x123` with the
+current `memory.x` places a 0x1000-linked image at 0x27000; `0x00` with the
+old one wipes the SoftDevice the image expected to sit above. Both brick the
+board until the next DFU. Omitting `--sd-req` entirely (as `nrfdfu-rs` does —
+tried and abandoned, see below) behaves like `0x00` on the builds tested, but
+is left explicit rather than relied on.
 
 `nrfutil-nrf5sdk-tools` (the package-generation extension) isn't published by
 Nordic for `aarch64-linux` — check `pkgs/by-name/nr/nrfutil/source.nix` in
@@ -199,39 +245,46 @@ Two consequences when debugging:
   fault — the message was printed once and already drained. Reset it rather
   than attaching to a corpse.
 - `mark_boot_healthy` is called once the run loop is reached, so everything that
-  fails deterministically during bring-up (SoftDevice RAM sizing, identity load,
-  USB) still latches the counter and eventually halts.
+  fails deterministically during bring-up (identity load, radio bring-up, USB)
+  still latches the counter and eventually halts.
 
-## Detaching a debug probe crashes the board, and that is expected
+## Detaching a debug probe used to crash the board
 
-**Disconnecting `probe-rs` while the SoftDevice's radio is live reliably trips a
-SoftDevice timing assert.** It surfaces as `NRF_FAULT_ID_SD_ASSERT` through
+**This was a SoftDevice property and should be gone with it. It is recorded
+because the symptom is distinctive, and because "it stopped happening" is
+worth being able to attribute.**
+
+Disconnecting `probe-rs` while the SoftDevice's radio was live reliably tripped
+a SoftDevice timing assert: `NRF_FAULT_ID_SD_ASSERT` through
 `nrf-softdevice`'s `fault_handler` — the "Softdevice assertion failed … Most
 common cause is disabling interrupts for too long" panic — with the faulting PC
 inside the SoftDevice image (below `0x27000`), not in any code in this repo.
 Tearing the debug session down clears `C_DEBUGEN`/`DEMCR`, drops the chip out of
-Debug Interface Mode, and the SoftDevice notices it missed a radio deadline.
+Debug Interface Mode, and the SoftDevice noticed it had missed a radio deadline.
 
-This is a property of the SoftDevice, not a bug here. What was measured on a DK,
-to save the next person the evening:
+What was measured on a DK at the time, to save the next person the evening:
 
-- Reset and left alone with no probe at all — runs indefinitely.
-- Probe attached continuously — runs indefinitely; attaching is harmless.
-- `probe-rs attach` then Ctrl+C — asserts every time, identical faulting PC.
+- Reset and left alone with no probe at all — ran indefinitely.
+- Probe attached continuously — ran indefinitely; attaching was harmless.
+- `probe-rs attach` then Ctrl+C — asserted every time, identical faulting PC.
 - `--no-catch-reset --no-catch-hardfault` — no difference; probe-rs's default
-  vector catch is not the cause.
-- `probe-rs reset` then detach — survives, because the SoftDevice is not enabled
-  until ~4s into boot and there is no live radio to disturb yet.
+  vector catch was not the cause.
+- `probe-rs reset` then detach — survived, because the SoftDevice was not
+  enabled until ~4s into boot and there was no live radio to disturb yet.
 
-**The way to avoid the whole interaction is not to attach a probe.** Read the
-log ring over the USB management port instead:
+There is no SoftDevice and no `NRF_FAULT_ID_SD_ASSERT` now, so **a crash on
+probe detach today is a new bug, not this one** — `embassy-nrf`'s radio driver
+has no deadline to miss in the same way. Unverified on hardware.
+
+**Reading logs over the USB management port is still the better habit**, and on
+a dongle it is the only option:
 
 ```bash
 wayfinderctl --serial /dev/ttyACMX logs --follow
 ```
 
-That works while detached, and it works *after* a fault, which the probe does
-not. On a dongle it is the only option.
+That works while detached, and it works *after* a fault, which a probe does
+not.
 
 ## Things that fail silently
 
@@ -246,14 +299,17 @@ Five coupled facts, each of which breaks something without a compile error:
   `MEMORY` block, so by the final link `ORIGIN(RAM)` equals `_stack_start`. A
   symbol defined from it collapses the measured region to nothing and painting
   silently stops. It has to be a constant next to `memory.x`.
-- **Never enable `critical-section-single-core`.** Its `acquire` is a bare
-  `cpsid i`, masking the SoftDevice's reserved RADIO/RTC0/TIMER0 interrupts.
-  This firmware takes a critical section on every log record and every heap
-  allocation, so the radio starves and the SoftDevice trips its assert
-  intermittently once the run loop starts logging. The compatible impl is
-  `nrf-softdevice/critical-section-impl`. Both call `critical_section::set_impl!`,
-  so enabling the wrong one fails to link — that is the only reason this is
-  recoverable.
+- **`critical-section-single-core` is now the right impl, and used to be
+  forbidden.** Its `acquire` is a bare `cpsid i`, masking everything. While the
+  SoftDevice owned RADIO/RTC0/TIMER0 at priority 0/1 that starved the radio —
+  this firmware takes a critical section on every log record and every heap
+  allocation — and the SoftDevice tripped its assert intermittently once the
+  run loop started logging. The compatible impl then came from
+  `nrf-softdevice/critical-section-impl`, which masked only non-reserved IRQs.
+  With no SoftDevice there are no reserved interrupts to starve, so the plain
+  single-core impl is both correct and the only one left. If a second impl ever
+  enters the graph, both call `critical_section::set_impl!` and the link fails
+  rather than silently picking one.
 - **A board spawns `node::run` itself; never a local `#[task]` that awaits
   it.** `.await`ing a foreign `async fn` makes its future a field of the outer
   coroutine, and rustc builds it in a stack temporary and `memcpy`s it in — a
@@ -262,10 +318,15 @@ Five coupled facts, each of which breaks something without a compile error:
   is only what `memory.x` leaves after the statics (112,600 bytes on the DK).
   That copy plus `run`'s own frame (~28 KB) plus `Driver::with_capacities`'
   (~26 KB) came to 117,376 and ran off the bottom of RAM into the SoftDevice's
-  reserved region, which traps as `NRF_FAULT_ID_APP_MEMACC`. What that looks
-  like is a node that logs a clean bring-up through "BLE link brought up" and
-  then stops, with the panic only readable on the *next* boot out of
-  `fault::report_retained`. `run` is therefore the `#[embassy_executor::task]`,
+  then-reserved region, which trapped as `NRF_FAULT_ID_APP_MEMACC`. What that
+  looked like was a node logging a clean bring-up through the radio's
+  "link brought up" line and then stopping, with the panic only readable on the
+  *next* boot out of `fault::report_retained`. The 13112 bytes are back, so the
+  stack region is now ~124 KB rather than 112,600 and that exact sum no longer
+  overflows. Read the current figure off `just stack-budget` rather than
+  trusting one written down here — it moves whenever a static does — but the
+  mechanism is unchanged and `just stack-budget` is what actually holds the
+  line. `run` is therefore the `#[embassy_executor::task]`,
   and since a task cannot be generic the board's `USBD` binding reaches it as
   the `fn` pointer `usb_mgmt::UsbDriverFactory`. Two rules follow: keep
   `bind_interrupts!` in the board binary (a `Binding` impl is not a symbol, so
@@ -278,14 +339,24 @@ Five coupled facts, each of which breaks something without a compile error:
 
 ## Peripheral ownership
 
-The SoftDevice claims RADIO, RTC0, TIMER0, POWER, CLOCK, RNG, ECB, CCM_AAR,
-TEMP and SWI5_EGU5. Consequences already encoded in the code:
+Nothing is reserved. The SoftDevice used to claim RADIO, RTC0, TIMER0, POWER,
+CLOCK, RNG, ECB, CCM_AAR, TEMP and SWI5_EGU5, and most of the awkwardness in
+this crate descended from that list. What is left of it:
 
-- `BufferedUarte` uses **TIMER1**, not TIMER0, for its RX idle-gap detection.
-- USB VBUS state and the HF crystal are reached through SoftDevice syscalls
-  rather than the `POWER`/`CLOCK` registers — see `usb_mgmt`.
-- `init_platform` drops GPIOTE, RTC1, UARTE0 and USBD to priority `P2`. The
-  SoftDevice reserves levels 0 and 1 and rejects `sd_softdevice_enable()`
-  outright if anything is already enabled there.
-- `blue`'s BLE link and `nrf-ieee802154` both want RADIO and are mutually
-  exclusive. These boards wire BLE.
+- `BufferedUarte` still uses **TIMER1**, not TIMER0, for its RX idle-gap
+  detection. TIMER0 was the SoftDevice's; it is free now, and the choice is
+  kept only because changing it buys nothing and would invalidate a measured
+  stack budget.
+- USB VBUS state is read straight off `POWER` by `HardwareVbusDetect`, and the
+  HF crystal is started once by `init_platform`. Both used to be SoftDevice
+  syscalls — see `usb_mgmt`.
+- `init_platform` leaves interrupt priorities at `embassy-nrf`'s defaults. It
+  used to force GPIOTE, RTC1, UARTE0 and USBD to `P2`, because the SoftDevice
+  reserved levels 0 and 1 and refused to enable if anything was already there.
+- **`blue`'s BLE link and `nrf-ieee802154` both want RADIO and remain mutually
+  exclusive.** These boards wire 802.15.4. `NrfBleLink` is not linked by any
+  board any more; `just build-loose-drivers` cross-compiles it so it does not
+  rot. The host (BlueZ) half of `blue` is unaffected and still carries
+  `bins/wayfinder-tap`'s BLE links.
+
+See `docs/design/19-ieee802154-nrf-link.md` for why the boards moved.

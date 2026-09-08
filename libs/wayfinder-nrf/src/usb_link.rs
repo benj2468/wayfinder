@@ -134,28 +134,21 @@ struct RxFrame {
 
 /// Bridges the USB receive task to `recv`'s async consumer.
 ///
-/// A `CriticalSectionRawMutex` rather than `blue`'s `NoopRawMutex`-plus-`unsafe
-/// impl Sync`: the critical section is taken once per whole frame, not per byte,
-/// and `nrf-softdevice`'s `critical-section-impl` masks only non-reserved IRQs,
-/// so it cannot starve the radio the way `critical-section-single-core` would.
-/// Cheap enough here to be worth not hand-writing another `Sync`.
+/// A `CriticalSectionRawMutex` rather than a `NoopRawMutex` plus a
+/// hand-written `unsafe impl Sync`: the critical section is taken once per
+/// whole frame, not per byte, which is cheap enough to be worth not writing
+/// another `Sync` by hand. Under `critical-section-single-core` that section
+/// masks every interrupt, which was untenable while the SoftDevice reserved
+/// the radio's; with the SoftDevice gone, a per-frame `cpsid i` is
+/// unremarkable.
 static RX_QUEUE: Channel<CriticalSectionRawMutex, RxFrame, RX_QUEUE_DEPTH> = Channel::new();
 
 /// Everything that can go wrong bringing the USB device up.
 #[derive(Debug)]
 pub enum UsbInitError {
-    /// A SoftDevice syscall failed — see [`crate::usb_mgmt::init`] for which
-    /// power and clock state USB needs and why it is reachable only that way.
-    Softdevice(nrf_softdevice::RawError),
     /// The CDC-NCM receive task could not be spawned, so the mesh link would
     /// have no producer. See [`usb_ncm_rx_task`].
     Spawn(SpawnError),
-}
-
-impl From<nrf_softdevice::RawError> for UsbInitError {
-    fn from(e: nrf_softdevice::RawError) -> Self {
-        Self::Softdevice(e)
-    }
 }
 
 impl From<SpawnError> for UsbInitError {

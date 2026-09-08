@@ -193,10 +193,12 @@ build:embedded:
     # The STM32F411RE (512 KB flash) needs an optimized build to fit the crypto
     # stack, so it's built --release rather than debug like the 1 MB nRF.
     - (cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings)
-    # No board wires 802.15.4 today (it and BLE contend for the same RADIO), so
-    # nothing above cross-compiles it. Built explicitly rather than being linked
-    # into a firmware it doesn't serve.
-    - cargo clippy --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET" -- -D warnings
+    # Both boards now wire 802.15.4, so the clippy runs above cover
+    # `nrf-ieee802154`. What nothing links any more is `blue`'s SoftDevice
+    # backend — 802.15.4 and BLE contend for the same RADIO, and the boards
+    # took the radio. Cross-compiled explicitly so it cannot rot unnoticed.
+    # Keep in step with `clippy-loose-drivers` in the justfile.
+    - cargo clippy --locked -p blue --no-default-features --features hardware,softdevice-log --target "$BARE_METAL_TARGET" -- -D warnings
     - sccache --show-stats
 # The static stack-budget gate for the board images.
 #

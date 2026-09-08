@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# Excluded from the root workspace (see its `exclude`) because `nrf-softdevice`
-# only builds for a real embedded target. Consumed by path from the
-# `bins/wayfinder-nrf52840*` firmware crates; profiles and the target triple
-# come from whichever of those is building.
+# Excluded from the root workspace (see its `exclude`) because `cortex-m-rt`'s
+# entry point and `critical-section-single-core` only make sense for a real
+# embedded target. Consumed by path from the `bins/wayfinder-nrf52840*`
+# firmware crates; profiles and the target triple come from whichever of those
+# is building.
 [lints.rust]
 missing_docs = "deny"
 
@@ -34,10 +35,10 @@ wayfinder-storage = { path = "../wayfinder-storage", default-features = false, f
 ] }
 wayfinder-log = { path = "../wayfinder-log" }
 rylr998 = { path = "../rylr998", features = ["link"] }
-blue = { path = "../blue", default-features = false, features = [
-    "hardware",
-    "softdevice-log",
-] }
+nrf-ieee802154 = { path = "../nrf-ieee802154" }
+# Only `short_address_of`, so a board's LoRa `AT+ADDRESS` and its 802.15.4
+# source address are the same derivation from the same `Mac`.
+ieee802154 = { path = "../ieee802154" }
 
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
@@ -48,11 +49,11 @@ embassy-nrf = { version = "0.10.0", features = [
     "unstable-pac",
     "log",
 ] }
-# 0.10 to match `blue`'s SoftDevice background tasks. Deliberately *not*
-# `executor-interrupt`: `blue`'s `SdHandle`/`ReportQueue` carry hand-written
-# `unsafe impl Send`/`Sync` that are sound only under one non-preempting
-# executor. Enabling the feature is the tripwire — `ReportQueue` would have to
-# move to `CriticalSectionRawMutex` first.
+# 0.10, matching `nrf-ieee802154`'s. Deliberately still *not*
+# `executor-interrupt`: nothing here needs a preempting executor, and the two
+# background tasks a board spawns (the 802.15.4 radio and the CDC-NCM receive
+# loop) both reach `LinkT` through `CriticalSectionRawMutex` channels sized
+# for one. Turning it on is a deliberate act, not a default.
 embassy-executor = { version = "0.10", features = [
     "platform-cortex-m",
     "executor-thread",
@@ -69,15 +70,16 @@ tracing = { version = "0.1.44", default-features = false }
 # of its own.
 zerocopy = { version = "0.8.48", default-features = false }
 
-# **Deliberately without `critical-section-single-core`.** Its `acquire` is a
-# bare `cpsid i`, masking the SoftDevice's priority-0/1 RADIO/RTC0/TIMER0 along
-# with everything else. This firmware takes a critical section on paths that run
-# constantly (every log record, every heap allocation), so that impl starves the
-# radio until the SoftDevice trips `NRF_FAULT_ID_SD_ASSERT`. The compatible impl
-# comes from `nrf-softdevice/critical-section-impl` below, which masks only
-# non-reserved IRQs. Both call `critical_section::set_impl!`, so re-enabling
-# this feature fails to link rather than silently regressing.
-cortex-m = "0.7"
+# `critical-section-single-core` **is** the right impl now, and used to be
+# actively wrong. Its `acquire` is a bare `cpsid i`, masking everything; while
+# the SoftDevice owned priority-0/1 RADIO/RTC0/TIMER0, that starved the radio
+# on paths this firmware runs constantly (every log record, every heap
+# allocation) until the SoftDevice tripped `NRF_FAULT_ID_SD_ASSERT`. The impl
+# then came from `nrf-softdevice/critical-section-impl`, which masked only
+# non-reserved IRQs. With the SoftDevice gone there are no reserved IRQs to
+# starve and no second `critical_section::set_impl!` to collide with, so the
+# plain single-core impl is both correct and the only one left.
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 # `tracing-core` does an unconditional `extern crate alloc;`, so anything in
 # this dependency graph needs a real allocator.
@@ -86,13 +88,4 @@ embedded-alloc = "0.6"
 # handler writes to that crate's initialized print channel rather than opening a
 # second RTT control block, so the versions must match.
 rtt-target = "0.5"
-# The SoftDevice syscalls the USB path needs and the BLE link does not:
-# `sd_power_usb*` (VBUS state, since `POWER` is reserved once the SoftDevice is
-# enabled) and `sd_clock_hfclk_request` (USBD needs the crystal). Cargo unifies
-# this with `blue`'s copy of the same git dependency.
-nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", features = [
-    "nrf52840",
-    "s140",
-    "critical-section-impl",
-] }
 static_cell = "2"

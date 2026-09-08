@@ -12,26 +12,28 @@
 //! — [`crate::usb_link`] owns the mesh side, and a host that never opens the
 //! management port does not affect it, or vice versa.
 //!
-//! The SoftDevice owns `POWER` and `CLOCK`, both of which USBD depends on, so
-//! [`init`] has to ask it for what a bare-metal USB stack would do itself:
+//! USBD depends on `POWER` and `CLOCK`, and this firmware owns both outright,
+//! so both of its needs are met without ceremony:
 //!
-//! - **VBUS state** arrives only as SoC events, hence [`SoftwareVbusDetect`] fed
-//!   by [`on_soc_event`] rather than the register-polling `HardwareVbusDetect`.
-//!   No event is generated for a cable that was *already* plugged in — the
-//!   normal case for a bus-powered dongle — so the initial state is seeded by
-//!   reading `USBREGSTATUS` through the SoftDevice.
-//! - **The high-frequency crystal** must run for USBD to clock the bus at all,
-//!   and the SoftDevice otherwise starts and stops it around radio activity.
+//! - **VBUS state** is read straight off `USBREGSTATUS` by
+//!   [`HardwareVbusDetect`], which also covers the case a software detector
+//!   had to special-case — a cable already plugged in at boot, the normal
+//!   situation for a bus-powered dongle — because a register read has no
+//!   notion of a missed event.
+//! - **The high-frequency crystal** is started once by
+//!   [`crate::init_platform`], for the radio's sake as much as USB's, and
+//!   never stopped.
 //!
-//! [`on_soc_event`] must be handed to the SoftDevice's single event pump, the
-//! only place SoC events are delivered — see [`crate::node`].
+//! Both used to be reached through SoftDevice syscalls, which reserved
+//! `POWER` and started/stopped the crystal around radio activity. That is
+//! also why VBUS arrived as SoC events and needed an event pump to deliver
+//! them; nothing here needs one now.
 
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::Peri;
 use embassy_nrf::peripherals::USBD;
-use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
-use embassy_sync::once_lock::OnceLock;
+use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_time::Duration;
 use embassy_time::Timer;
 use embassy_usb::Builder;
@@ -45,9 +47,6 @@ use embassy_usb::class::cdc_acm::State;
 use embedded_io_async::ErrorType;
 use embedded_io_async::Read;
 use embedded_io_async::Write;
-use nrf_softdevice::RawError;
-use nrf_softdevice::SocEvent;
-use nrf_softdevice::raw;
 use static_cell::StaticCell;
 use tracing::debug;
 use tracing::trace;
@@ -61,14 +60,17 @@ use crate::usb_link::UsbInitError;
 use crate::usb_link::UsbNcmLink;
 
 /// The USB driver this board instantiates: the nRF USBD peripheral, with VBUS
-/// state supplied by software rather than read off the SoftDevice-reserved
-/// `POWER` peripheral.
-pub type UsbDriver = embassy_nrf::usb::Driver<'static, &'static SoftwareVbusDetect>;
+/// state read directly off `POWER`.
+pub type UsbDriver = embassy_nrf::usb::Driver<'static, HardwareVbusDetect>;
 
-/// How a board hands this crate its `USBD` interrupt binding: a constructor
-/// for [`UsbDriver`], called by [`init`] once the SoftDevice is up and VBUS
-/// detection exists. A board supplies
-/// `|usbd, vbus| embassy_nrf::usb::Driver::new(usbd, Irqs, vbus)`.
+/// How a board hands this crate its `USBD` and `POWER_CLOCK` interrupt
+/// bindings: a constructor for [`UsbDriver`], called by [`init`]. A board
+/// supplies
+/// `|usbd| embassy_nrf::usb::Driver::new(usbd, Irqs, HardwareVbusDetect::new(Irqs))`.
+///
+/// [`HardwareVbusDetect`] is built inside the closure rather than passed in
+/// because it needs the board's `CLOCK_POWER` binding, which is subject to
+/// the same linkage argument as `USBD` below.
 ///
 /// A plain `fn` pointer rather than the `impl Binding<USBD, _>` parameter this
 /// replaces, for two reasons that both live outside this module:
@@ -83,7 +85,7 @@ pub type UsbDriver = embassy_nrf::usb::Driver<'static, &'static SoftwareVbusDete
 ///   defined in a library rlib is only linked if something in its object is
 ///   referenced, and a `Binding` impl is not a symbol — so moving the binding
 ///   here to erase the generic would risk a device that enumerates nothing.
-pub type UsbDriverFactory = fn(Peri<'static, USBD>, &'static SoftwareVbusDetect) -> UsbDriver;
+pub type UsbDriverFactory = fn(Peri<'static, USBD>) -> UsbDriver;
 
 /// USB vendor id. `1209:0001` is pid.codes' *unallocated* test pair, never
 /// assigned to a shipping product — right for research firmware, but it must be
@@ -102,119 +104,6 @@ const MAX_PACKET_SIZE: u16 = 64;
 /// bus-powered dongle running the radio; a DK is externally powered and draws
 /// none of it.
 const MAX_POWER_MA: u16 = 100;
-
-/// How long [`init`] waits for the crystal before carrying on regardless. Its
-/// datasheet startup time is well under a millisecond, so reaching this bound
-/// means the clock request is wrong rather than slow.
-const HFCLK_START_TIMEOUT_MS: u64 = 100;
-
-/// Interval between [`hfclk_running`] polls while waiting for the crystal.
-const HFCLK_POLL_INTERVAL_MS: u64 = 1;
-
-/// `USBREGSTATUS.VBUSDETECT` — VBUS is present on the connector. Spelled out
-/// because `sd_power_usbregstatus_get` returns the raw register and the
-/// SoftDevice headers carry no field masks; bit positions from the nRF52840
-/// product specification's `POWER` table.
-const USBREGSTATUS_VBUSDETECT: u32 = 1 << 0;
-
-/// `USBREGSTATUS.OUTPUTRDY` — the USB 3.3V regulator has settled, which is the
-/// condition USBD's pull-up may be enabled under.
-const USBREGSTATUS_OUTPUTRDY: u32 = 1 << 1;
-
-/// The board's VBUS state. A `static` because the halves live apart:
-/// [`on_soc_event`] runs on the SoftDevice event pump with no way to carry board
-/// state, and the USB driver holds a `&'static` borrow for the device's
-/// lifetime. Initialised exactly once, by [`init`].
-static VBUS: OnceLock<SoftwareVbusDetect> = OnceLock::new();
-
-/// Feed one SoftDevice SoC event to the USB stack's VBUS state. Pass to the
-/// SoftDevice's event pump; non-power events are ignored.
-///
-/// Events arriving before [`init`] are dropped rather than initialising [`VBUS`]
-/// with a guess: the SoftDevice generates no power events until `init` enables
-/// them, so this cannot lose a transition, and `init`'s `USBREGSTATUS` read is
-/// authoritative for everything beforehand.
-pub fn on_soc_event(event: SocEvent) {
-    let Some(vbus) = VBUS.try_get() else {
-        trace!(?event, "drop: soc event before usb init");
-        return;
-    };
-    match event {
-        SocEvent::PowerUsbDetected => {
-            debug!("usb power detected");
-            vbus.detected(true);
-        }
-        SocEvent::PowerUsbRemoved => {
-            debug!("usb power removed");
-            vbus.detected(false);
-        }
-        SocEvent::PowerUsbPowerReady => {
-            debug!("usb power ready");
-            vbus.ready();
-        }
-        other => trace!(event = ?other, "ignoring non-power soc event"),
-    }
-}
-
-/// Ask the SoftDevice to deliver USB power events, then seed [`VBUS`] with the
-/// current state.
-///
-/// Enabling comes first so a transition between the two steps is reported
-/// rather than lost; a redundant report is harmless. Neither step awaits, so
-/// the event pump cannot observe a half-initialised state in between.
-fn init_vbus() -> Result<&'static SoftwareVbusDetect, RawError> {
-    // SAFETY: plain SoftDevice syscalls, valid once it is enabled (which
-    // `init`'s contract requires) and borrowing no state.
-    unsafe {
-        RawError::convert(raw::sd_power_usbdetected_enable(1))?;
-        RawError::convert(raw::sd_power_usbremoved_enable(1))?;
-        RawError::convert(raw::sd_power_usbpwrrdy_enable(1))?;
-    }
-
-    let mut status = 0u32;
-    // SAFETY: as above; `status` is a live, aligned, exclusively-borrowed u32.
-    unsafe { RawError::convert(raw::sd_power_usbregstatus_get(&mut status))? };
-    let detected = status & USBREGSTATUS_VBUSDETECT != 0;
-    let ready = status & USBREGSTATUS_OUTPUTRDY != 0;
-    debug!(detected, ready, "seeding usb vbus state");
-
-    Ok(VBUS.get_or_init(|| SoftwareVbusDetect::new(detected, ready)))
-}
-
-/// Whether the SoftDevice reports the high-frequency crystal as running.
-fn hfclk_running() -> Result<bool, RawError> {
-    let mut running = 0u32;
-    // SAFETY: a SoftDevice syscall over a live, exclusively-borrowed u32.
-    unsafe { RawError::convert(raw::sd_clock_hfclk_is_running(&mut running))? };
-    Ok(running != 0)
-}
-
-/// Take a standing request on the high-frequency crystal and wait briefly for it
-/// to start. Without it the USB device would enumerate or not depending on what
-/// BLE happened to be doing.
-///
-/// The request is never released, costing the crystal's run current for the
-/// node's whole lifetime rather than only while a host is attached — the right
-/// trade for the mains-fed boards this targets, and the first thing to revisit
-/// if it ever runs on a battery.
-async fn request_hfclk() -> Result<(), RawError> {
-    // SAFETY: a SoftDevice syscall taking no arguments, valid once enabled.
-    unsafe { RawError::convert(raw::sd_clock_hfclk_request())? };
-
-    for _ in 0..(HFCLK_START_TIMEOUT_MS / HFCLK_POLL_INTERVAL_MS) {
-        if hfclk_running()? {
-            trace!("hfxo running");
-            return Ok(());
-        }
-        Timer::after(Duration::from_millis(HFCLK_POLL_INTERVAL_MS)).await;
-    }
-
-    // Not fatal: the request stands, so the crystal may yet start and the port
-    // come up late. Loud because a USB device that never enumerates is otherwise
-    // indistinguishable from a bad cable.
-    warn!("hfxo did not start within the timeout; usb may not enumerate");
-    Ok(())
-}
 
 /// Render `mac` as the 12 uppercase hex digits of a USB serial-number string, so
 /// the host's `/dev/serial/by-id/…` symlink names the node by its mesh MAC.
@@ -313,12 +202,11 @@ pub struct UsbMgmt {
 /// Bring up the USB device stack, its CDC-ACM management port and its CDC-NCM
 /// mesh interface.
 ///
-/// **Must be called after `Softdevice::enable`**, since the power and clock
-/// state it needs is reachable only through SoftDevice syscalls, which return
-/// [`RawError::SoftdeviceNotEnabled`] otherwise. `node_mac` becomes the device's
-/// USB serial number and seeds the mesh interface's host-side address, and
-/// `make_driver` builds the driver from the board's `bind_interrupts!` struct
-/// — see [`UsbDriverFactory`].
+/// **Must be called after [`crate::init_platform`]**, which starts the
+/// high-frequency crystal USBD needs to clock the bus. `node_mac` becomes the
+/// device's USB serial number and seeds the mesh interface's host-side
+/// address, and `make_driver` builds the driver from the board's
+/// `bind_interrupts!` struct — see [`UsbDriverFactory`].
 ///
 /// Neither returned half does anything until it is polled: the [`UsbMgmt`] via
 /// [`run`](UsbMgmt::run) — which is also what drives the shared device stack,
@@ -330,10 +218,7 @@ pub async fn init(
     node_mac: Mac,
     spawner: Spawner,
 ) -> Result<(UsbMgmt, UsbNcmLink), UsbInitError> {
-    let vbus = init_vbus()?;
-    request_hfclk().await?;
-
-    let driver = make_driver(usbd, vbus);
+    let driver = make_driver(usbd);
 
     let mut config = Config::new(USB_VID, USB_PID);
     config.manufacturer = Some("Wayfinder");

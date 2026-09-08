@@ -13,17 +13,24 @@
 //!
 //! The driver runs the chip in its "basic" operating mode (`RX_ON`/`PLL_ON`,
 //! no hardware auto-ACK or CSMA-CA retries), matching the broadcast,
-//! no-acknowledgement frames produced by [`ieee802154::encode`]. On-air
-//! framing is handled by the [`ieee802154`] crate; this driver speaks only the
-//! chip's SPI register and frame-buffer protocol.
+//! no-acknowledgement frames [`ieee802154::build_fragment`] produces. On-air
+//! framing and fragmentation are handled by the [`ieee802154`] crate; this
+//! driver speaks only the chip's SPI register and frame-buffer protocol.
 
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::spi::Operation;
 use embedded_hal_async::spi::SpiDevice;
+use ieee802154::FragmentSpec;
+use ieee802154::Ieee802154Reassembler;
 use ieee802154::MAX_FRAME_LEN;
-use ieee802154::decode;
-use ieee802154::encode;
+use ieee802154::MAX_REASSEMBLED_LEN;
+use ieee802154::accept_fragment;
+use ieee802154::assemble_frame;
+use ieee802154::build_fragment;
+use ieee802154::decode_frame;
+use ieee802154::fragment_count;
+use ieee802154::short_address_of;
 use interfaces::frame::LinkFrameData;
 use interfaces::frame::Mac;
 use interfaces::link::LinkError;
@@ -128,13 +135,24 @@ pub struct At86Rf233<SPI, IRQ, RST> {
     spi: SPI,
     irq: IRQ,
     reset: RST,
-    /// IEEE 802.15.4 sequence number for the next frame [`LinkT::send`]
-    /// transmits, incremented (with wraparound) after each send.
+    /// IEEE 802.15.4 sequence number for the next fragment [`LinkT::send`]
+    /// transmits, incremented (with wraparound) after each one.
     seq: u8,
-    /// Scratch buffer for the most recently received frame. [`LinkT::recv`]
-    /// decodes into this buffer and borrows from it for its returned
-    /// [`Received`].
+    /// Fragment-reassembly message id for the next *frame* [`LinkT::send`]
+    /// transmits, incremented (with wraparound) after each one. Distinct from
+    /// [`Self::seq`]: every fragment of one frame shares a `msg_id`, while
+    /// each gets its own MAC sequence number.
+    msg_id: u8,
+    /// Assembled frame bytes being fragmented by the current [`LinkT::send`].
+    tx_frame: [u8; MAX_REASSEMBLED_LEN],
+    /// Scratch buffer for the most recently received fragment, filled by
+    /// [`Self::read_frame_buffer`].
     rx_buf: [u8; MAX_FRAME_LEN],
+    /// In-flight fragment reassemblies, keyed on peers' short addresses.
+    reassembler: Ieee802154Reassembler,
+    /// Landing buffer for a completed reassembly; [`LinkT::recv`] borrows its
+    /// returned [`Received`] from this.
+    rx_frame: [u8; MAX_REASSEMBLED_LEN],
 }
 
 impl<SPI, IRQ, RST> At86Rf233<SPI, IRQ, RST>
@@ -160,7 +178,11 @@ where
             irq,
             reset,
             seq: 0,
+            msg_id: 0,
+            tx_frame: [0u8; MAX_REASSEMBLED_LEN],
             rx_buf: [0u8; MAX_FRAME_LEN],
+            reassembler: Ieee802154Reassembler::new(),
+            rx_frame: [0u8; MAX_REASSEMBLED_LEN],
         };
 
         radio.reset_chip().await?;
@@ -278,36 +300,78 @@ where
     IRQ: Wait + Send,
     RST: OutputPin + Send,
 {
+    /// Fragment `data` and transmit every fragment, returning the total
+    /// on-air bytes.
+    ///
+    /// A fragment that fails to transmit abandons the whole frame rather than
+    /// sending the rest: the receiver cannot complete a reassembly missing a
+    /// fragment, so the remaining airtime would be spent for nothing.
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
-        let mut tx_buf = [0u8; MAX_FRAME_LEN];
-        let n = encode(self.seq, origin, data, &mut tx_buf)?;
-        self.seq = self.seq.wrapping_add(1);
+        let frame_len = assemble_frame(origin, data, &mut self.tx_frame)?;
+        let count = fragment_count(frame_len)?;
+        let src_addr = short_address_of(origin);
+        let msg_id = self.msg_id;
+        self.msg_id = self.msg_id.wrapping_add(1);
 
-        self.set_state(STATE_PLL_ON).await?;
-        self.write_frame_buffer((n + FCS_LEN) as u8, &tx_buf[..n])
-            .await?;
-        self.read_register(REG_IRQ_STATUS).await?; // clear any pending IRQ
-        self.write_register(REG_TRX_STATE, CMD_TX_START).await?;
-        self.irq.wait_for_high().await.map_err(|_| LinkError::Io)?;
-        self.read_register(REG_IRQ_STATUS).await?; // ack TRX_END
-        self.set_state(STATE_RX_ON).await?;
+        let mut sent = 0;
+        for index in 0..count {
+            let mut tx_buf = [0u8; MAX_FRAME_LEN];
+            let n = build_fragment(
+                &self.tx_frame[..frame_len],
+                FragmentSpec {
+                    seq: self.seq,
+                    src_addr,
+                    msg_id,
+                    index,
+                    count,
+                },
+                &mut tx_buf,
+            )?;
+            self.seq = self.seq.wrapping_add(1);
 
-        Ok(n)
+            self.set_state(STATE_PLL_ON).await?;
+            self.write_frame_buffer((n + FCS_LEN) as u8, &tx_buf[..n])
+                .await?;
+            self.read_register(REG_IRQ_STATUS).await?; // clear any pending IRQ
+            self.write_register(REG_TRX_STATE, CMD_TX_START).await?;
+            self.irq.wait_for_high().await.map_err(|_| LinkError::Io)?;
+            self.read_register(REG_IRQ_STATUS).await?; // ack TRX_END
+            self.set_state(STATE_RX_ON).await?;
+            sent += n;
+        }
+
+        Ok(sent)
     }
 
+    /// Receive fragments until one completes a frame.
+    ///
+    /// A fragment that does not complete a message is not an event the driver
+    /// has anything to do with, so this loops rather than returning — the
+    /// driver's `recv` arm expects a whole frame or nothing.
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError> {
-        self.irq.wait_for_high().await.map_err(|_| LinkError::Io)?;
-        self.read_register(REG_IRQ_STATUS).await?; // ack TRX_END
-        let (n, lqi) = self.read_frame_buffer().await?;
+        let (len, metrics) = loop {
+            self.irq.wait_for_high().await.map_err(|_| LinkError::Io)?;
+            self.read_register(REG_IRQ_STATUS).await?; // ack TRX_END
+            let (n, lqi) = self.read_frame_buffer().await?;
 
-        let frame = decode(&self.rx_buf[..n])?;
-        Ok(Received {
-            frame,
-            metrics: LinkMetrics {
+            let metrics = LinkMetrics {
                 rssi_dbm: None,
                 snr_db: None,
                 quality: Some(lqi),
-            },
+            };
+            if let Some(complete) = accept_fragment(
+                &mut self.reassembler,
+                &self.rx_buf[..n],
+                metrics,
+                &mut self.rx_frame,
+            ) {
+                break complete;
+            }
+        };
+
+        Ok(Received {
+            frame: decode_frame(&self.rx_frame[..len])?,
+            metrics,
         })
     }
 }
@@ -315,6 +379,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -328,11 +393,17 @@ mod tests {
     /// modeling the chip's state machine without real timing.
     struct FakeChip {
         registers: [u8; 0x40],
-        /// `[phr, ...frame buffer write data]` from the most recent
-        /// frame-buffer write.
-        tx_frame: Vec<u8>,
-        /// `[phr, ...psdu (incl. FCS), lqi]` returned by a frame-buffer read.
-        rx_frame: Vec<u8>,
+        /// One `[phr, ...frame buffer write data]` entry per frame-buffer
+        /// write, in transmission order. A `Vec` of them rather than only the
+        /// most recent because one `send` now writes one entry *per
+        /// fragment*, and the per-fragment sequencing is what needs asserting.
+        tx_frames: Vec<Vec<u8>>,
+        /// `[phr, ...psdu (incl. FCS), lqi]` entries returned by successive
+        /// frame-buffer reads, oldest first. A queue rather than one buffer
+        /// because `recv` now loops until a fragment *completes* a frame, and
+        /// a single-valued field could never drive that loop past its first
+        /// iteration.
+        rx_frames: VecDeque<Vec<u8>>,
     }
 
     impl FakeChip {
@@ -341,8 +412,8 @@ mod tests {
             registers[REG_TRX_STATUS as usize] = STATE_TRX_OFF;
             Self {
                 registers,
-                tx_frame: Vec::new(),
-                rx_frame: Vec::new(),
+                tx_frames: Vec::new(),
+                rx_frames: VecDeque::new(),
             }
         }
     }
@@ -371,8 +442,15 @@ mod tests {
             let mut chip = self.0.lock().unwrap();
             match operations {
                 [Operation::TransferInPlace(buf)] if buf[0] == CMD_FRAME_READ => {
+                    // Peek: one `recv` iteration reads the PHR and then the
+                    // body in two transactions, so the entry is only consumed
+                    // once the body has been handed over.
+                    let frame = chip.rx_frames.front().cloned().unwrap_or_default();
                     for i in 1..buf.len() {
-                        buf[i] = chip.rx_frame.get(i - 1).copied().unwrap_or(0);
+                        buf[i] = frame.get(i - 1).copied().unwrap_or(0);
+                    }
+                    if buf.len() > 2 {
+                        chip.rx_frames.pop_front();
                     }
                 }
                 [Operation::TransferInPlace(buf)] if buf[0] & 0xc0 == CMD_REG_READ => {
@@ -393,7 +471,7 @@ mod tests {
                     let mut frame = Vec::with_capacity(1 + data.len());
                     frame.push(hdr[1]);
                     frame.extend_from_slice(data);
-                    chip.tx_frame = frame;
+                    chip.tx_frames.push(frame);
                 }
                 _ => panic!("unexpected SPI transaction shape"),
             }
@@ -479,10 +557,10 @@ mod tests {
         ));
     }
 
-    /// `send` encodes the frame via [`ieee802154::encode`], writes
-    /// `[phr][encoded frame]` to the frame buffer, triggers
-    /// [`CMD_TX_START`], and leaves the chip back in [`STATE_RX_ON`].
-    /// Successive sends increment the IEEE 802.15.4 sequence number.
+    /// `send` fragments the frame, writes `[phr][fragment]` to the frame
+    /// buffer, triggers [`CMD_TX_START`], and leaves the chip back in
+    /// [`STATE_RX_ON`]. Successive sends increment the IEEE 802.15.4 sequence
+    /// number.
     #[tokio::test]
     async fn send_writes_encoded_frame_and_returns_to_rx_on() {
         let chip = Arc::new(Mutex::new(FakeChip::new()));
@@ -505,8 +583,20 @@ mod tests {
 
         {
             let chip = chip.lock().unwrap();
-            assert_eq!(chip.tx_frame[0], (n + FCS_LEN) as u8);
-            let frame = decode(&chip.tx_frame[1..]).unwrap();
+            assert_eq!(chip.tx_frames.len(), 1, "a small frame is one fragment");
+            let sent = &chip.tx_frames[0];
+            assert_eq!(sent[0], (n + FCS_LEN) as u8);
+
+            let mut reassembler = Ieee802154Reassembler::new();
+            let mut out = [0u8; MAX_REASSEMBLED_LEN];
+            let (len, _) = accept_fragment(
+                &mut reassembler,
+                &sent[1..],
+                LinkMetrics::default(),
+                &mut out,
+            )
+            .expect("a single-fragment frame completes on its own fragment");
+            let frame = decode_frame(&out[..len]).unwrap();
             assert_eq!(frame.src, mac(1));
             assert_eq!(frame.dst, mac(2));
             assert_eq!(&frame.payload, &payload);
@@ -529,12 +619,54 @@ mod tests {
             .unwrap();
 
         // seq is the third byte of the encoded ieee802154 header.
-        assert_eq!(chip.lock().unwrap().tx_frame[1 + 2], 1);
+        assert_eq!(chip.lock().unwrap().tx_frames[1][1 + 2], 1);
+    }
+
+    /// A frame too large for one 127-byte PHY frame is transmitted as several
+    /// fragments: one frame-buffer write and one `TX_START` each, the MAC
+    /// sequence number advancing per *fragment*, and the chip left in
+    /// [`STATE_RX_ON`] at the end. `send` reports the total on-air bytes.
+    #[tokio::test]
+    async fn send_transmits_every_fragment_of_an_oversized_frame() {
+        let chip = Arc::new(Mutex::new(FakeChip::new()));
+        let mut radio = At86Rf233::new(FakeSpi(chip.clone()), FakeIrq, FakeReset, 11)
+            .await
+            .unwrap();
+
+        // Three fragments' worth, matching design 19 §2.1's full-cert OGM.
+        let payload = [0x5a; 250];
+        let n = radio
+            .send(
+                mac(1),
+                &LinkFrameData {
+                    dst: mac(2),
+                    protocol: 0x4305,
+                    payload: &payload,
+                },
+            )
+            .await
+            .unwrap();
+
+        let chip = chip.lock().unwrap();
+        assert_eq!(chip.tx_frames.len(), 3);
+        assert_eq!(
+            n,
+            chip.tx_frames.iter().map(|f| f.len() - 1).sum::<usize>(),
+            "reported bytes are the sum of the fragments actually written"
+        );
+        // Each fragment carries its own MAC sequence number, ascending.
+        for (i, sent) in chip.tx_frames.iter().enumerate() {
+            assert_eq!(sent[1 + 2], i as u8);
+        }
+        assert_eq!(
+            chip.registers[REG_TRX_STATUS as usize] & TRX_STATUS_MASK,
+            STATE_RX_ON
+        );
     }
 
     /// `recv` waits for the IRQ line, reads `[phr][psdu incl. FCS][lqi]` from
-    /// the frame buffer, strips the FCS, decodes the embedded `LinkFrame`,
-    /// and reports the chip's LQI as [`LinkMetrics::quality`].
+    /// the frame buffer, strips the FCS, reassembles the embedded
+    /// `LinkFrame`, and reports the chip's LQI as [`LinkMetrics::quality`].
     #[tokio::test]
     async fn recv_reads_frame_buffer_and_reports_lqi() {
         let chip = Arc::new(Mutex::new(FakeChip::new()));
@@ -543,14 +675,26 @@ mod tests {
             .unwrap();
 
         let payload = [0xca, 0xfe];
-        let mut encoded = [0u8; MAX_FRAME_LEN];
-        let n = encode(
-            5,
+        let mut frame = [0u8; MAX_REASSEMBLED_LEN];
+        let frame_len = assemble_frame(
             mac(3),
             &LinkFrameData {
                 dst: mac(4),
                 protocol: 0x4305,
                 payload: &payload,
+            },
+            &mut frame,
+        )
+        .unwrap();
+        let mut encoded = [0u8; MAX_FRAME_LEN];
+        let n = build_fragment(
+            &frame[..frame_len],
+            FragmentSpec {
+                seq: 5,
+                src_addr: short_address_of(mac(3)),
+                msg_id: 0,
+                index: 0,
+                count: 1,
             },
             &mut encoded,
         )
@@ -561,9 +705,9 @@ mod tests {
             let mut rx = Vec::new();
             rx.push((n + FCS_LEN) as u8);
             rx.extend_from_slice(&encoded[..n]);
-            rx.extend_from_slice(&[0, 0]); // FCS bytes; not validated by decode
+            rx.extend_from_slice(&[0, 0]); // FCS bytes; not validated here
             rx.push(200); // LQI
-            chip.rx_frame = rx;
+            chip.rx_frames.push_back(rx);
         }
 
         let received = radio.recv().await.unwrap();
@@ -576,6 +720,70 @@ mod tests {
         assert_eq!(received.metrics.snr_db, None);
     }
 
+    /// The fragments one `send` puts on the wire reassemble, through a second
+    /// radio's `recv`, into exactly the frame that went in.
+    ///
+    /// This is the test that pins the send/recv pair *semantically* rather
+    /// than structurally, and it is the one that catches the mistake the
+    /// structural assertions cannot: moving `msg_id.wrapping_add(1)` inside
+    /// the fragment loop still yields three fragments with ascending MAC
+    /// sequence numbers and the right byte count, but gives each a distinct
+    /// `FragKey`, so no receiver could ever complete a multi-fragment
+    /// reassembly. The link would silently degrade to carrying only frames
+    /// under 114 bytes — excluding the full-cert OGM this radio exists for.
+    ///
+    /// It also drives `recv`'s loop past its first iteration, which a
+    /// single-fragment test cannot.
+    #[tokio::test]
+    async fn fragments_from_send_reassemble_through_recv() {
+        let tx_chip = Arc::new(Mutex::new(FakeChip::new()));
+        let mut tx = At86Rf233::new(FakeSpi(tx_chip.clone()), FakeIrq, FakeReset, 11)
+            .await
+            .unwrap();
+
+        let payload = [0x5a; 250];
+        tx.send(
+            mac(1),
+            &LinkFrameData {
+                dst: mac(2),
+                protocol: 0x4305,
+                payload: &payload,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Replay what the transmitter actually wrote into a receiver's frame
+        // buffer, in order, shaped as the chip returns them:
+        // `[phr][psdu incl. FCS][lqi]`.
+        let rx_chip = Arc::new(Mutex::new(FakeChip::new()));
+        {
+            let sent = tx_chip.lock().unwrap();
+            assert_eq!(sent.tx_frames.len(), 3, "250 bytes is three fragments");
+            let mut rx = rx_chip.lock().unwrap();
+            for fragment in &sent.tx_frames {
+                let psdu = &fragment[1..];
+                let mut entry = vec![(psdu.len() + FCS_LEN) as u8];
+                entry.extend_from_slice(psdu);
+                entry.extend_from_slice(&[0, 0]); // FCS, not validated here
+                entry.push(200); // LQI
+                rx.rx_frames.push_back(entry);
+            }
+        }
+
+        let mut receiver = At86Rf233::new(FakeSpi(rx_chip), FakeIrq, FakeReset, 11)
+            .await
+            .unwrap();
+        let received = receiver.recv().await.unwrap();
+
+        assert_eq!(received.frame.src, mac(1));
+        assert_eq!(received.frame.dst, mac(2));
+        assert_eq!(received.frame.protocol.get(), 0x4305);
+        assert_eq!(&received.frame.payload, &payload[..]);
+        // The metrics belong to the fragment that *completed* the frame.
+        assert_eq!(received.metrics.quality, Some(200));
+    }
+
     /// A frame buffer read whose reported PHY header length is shorter than
     /// the FCS is rejected rather than underflowing the PSDU length
     /// computation.
@@ -586,7 +794,7 @@ mod tests {
             .await
             .unwrap();
 
-        chip.lock().unwrap().rx_frame = vec![1]; // phr = 1 < FCS_LEN
+        chip.lock().unwrap().rx_frames.push_back(vec![1]); // phr = 1 < FCS_LEN
 
         assert!(matches!(radio.recv().await, Err(LinkError::InvalidPacket)));
     }

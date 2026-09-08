@@ -1,9 +1,10 @@
 //! The bring-up sequence every nRF52840 board runs, once its pins are resolved.
 //!
-//! Ordering here is load-bearing and mostly dictated by the SoftDevice: the
-//! radios come up before USB, and `Softdevice::enable` must happen after the
-//! interrupt priorities [`crate::init_platform`] sets and before any syscall
-//! USB makes.
+//! Ordering is no longer dictated by anything but taste — the radios come up
+//! before USB because a radio failure is fatal and a USB failure is not, so
+//! the fatal check runs first. It used to be forced: the SoftDevice had to be
+//! enabled after [`crate::init_platform`] set interrupt priorities and before
+//! any syscall the USB path made.
 
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
@@ -11,11 +12,9 @@ use embassy_nrf::Peri;
 use embassy_nrf::buffered_uarte::BufferedUarte;
 use embassy_nrf::gpio::Output;
 use embassy_nrf::peripherals::USBD;
+use embassy_nrf::radio::ieee802154::Radio;
 use embassy_time::Duration;
-use embassy_time::Timer;
 use embassy_time::with_timeout;
-use nrf_softdevice::SocEvent;
-use nrf_softdevice::Softdevice;
 use rylr998::Bandwidth;
 use rylr998::CodingRate;
 use rylr998::LoraError;
@@ -34,6 +33,7 @@ use wayfinder_embedded_driver::TrickleParams;
 use wayfinder_server::EmbeddedQueryChannel;
 
 use crate::clock::EmbassyClock;
+use crate::link::Ieee802154Link;
 use crate::link::MeshLink;
 use crate::stack;
 use crate::usb_mgmt;
@@ -41,9 +41,9 @@ use crate::usb_mgmt;
 /// The serial transport a board's RYLR998 link speaks over.
 type Serial = BufferedUarte<'static>;
 
-/// This board's link array: LoRa first, BLE second, USB third. The order is
-/// positional and matched by [`TRICKLE`] and [`features`] — see
-/// [`LORA`]/[`BLE`]/[`USB`].
+/// This board's link array: LoRa first, the built-in radio second, USB third.
+/// The order is positional and matched by [`TRICKLE`] and [`features`] — see
+/// [`LORA`]/[`DOT15D4`]/[`USB`].
 type Links = [MeshLink<Serial>; 3];
 
 /// Index of the LoRa link within [`Links`], [`TRICKLE`], and [`features`]'s
@@ -52,9 +52,9 @@ type Links = [MeshLink<Serial>; 3];
 /// which link is at which index becomes one edit instead of three that all
 /// have to agree.
 const LORA: usize = 0;
-/// Index of the BLE link within [`Links`], [`TRICKLE`], and [`features`]'s
-/// output. See [`LORA`].
-const BLE: usize = 1;
+/// Index of the IEEE 802.15.4 link within [`Links`], [`TRICKLE`], and
+/// [`features`]'s output. See [`LORA`].
+const DOT15D4: usize = 1;
 /// Index of the CDC-NCM USB link within [`Links`], [`TRICKLE`], and
 /// [`features`]'s output. See [`LORA`].
 const USB: usize = 2;
@@ -62,17 +62,32 @@ const USB: usize = 2;
 /// LoRa network id shared by every node in this mesh (RYLR `AT+NETWORKID`).
 const LORA_NETWORK_ID: u8 = 18;
 
+/// IEEE 802.15.4 channel every node in this mesh uses. Deployment policy, like
+/// [`LORA_NETWORK_ID`] — nodes on different channels never hear each other.
+///
+/// 15 sits between the common 2.4 GHz Wi-Fi centres (channels 1, 6 and 11), so
+/// it is the least likely of the sixteen to sit under an access point. Change
+/// it if a site's spectrum says otherwise; valid values are 11..=26 and
+/// `Ieee802154Link::new` rejects anything else rather than panicking.
+const DOT15D4_CHANNEL: u8 = 15;
+
 /// How many `AT` pings (1s timeout each) before concluding no RYLR998 is wired
-/// to this UART and continuing BLE-only, rather than blocking boot forever on a
-/// reply that will never come. ~3s covers the module's own boot delay without
-/// noticeably stalling a BLE-only board.
+/// to this UART and continuing without it, rather than blocking boot forever
+/// on a reply that will never come. ~3s covers the module's own boot delay
+/// without noticeably stalling a board that has no LoRa module.
 const RYLR_PING_ATTEMPTS: u32 = 3;
 
 /// Per-link Trickle schedules, positionally matched to [`Links`] via
-/// [`LORA`]/[`BLE`]. LoRa gets a relaxed cadence suited to its airtime budget;
-/// BLE's tighter bounds reflect its much higher duty-cycle budget, and its
-/// `i_max` is mirrored by `ogm.i_max_ms` on the `Ble` link in
-/// `var/conf/install.yml` so a host node and a board agree on the schedule.
+/// [`LORA`]/[`DOT15D4`]/[`USB`]. LoRa gets a relaxed cadence suited to its
+/// airtime budget; the 802.15.4 radio's tighter bounds reflect its much
+/// higher duty-cycle budget.
+///
+/// The 802.15.4 slot deliberately keeps the numbers the BLE link used, even
+/// though `docs/design/19-ieee802154-nrf-link.md` §2.1 measures roughly two
+/// orders of magnitude more airtime headroom (~13 ms per full-cert OGM
+/// against BLE extended's ~300 ms). Changing the radio and the convergence
+/// schedule at once would make a regression in either indistinguishable from
+/// the other. Retune once there is hardware evidence — design 19 §9.3.
 const TRICKLE: [TrickleParams; 3] = {
     // Every slot gets overwritten below by name; this only satisfies the
     // repeat-array initializer.
@@ -84,7 +99,7 @@ const TRICKLE: [TrickleParams; 3] = {
         i_min: core::time::Duration::from_secs(5),
         i_max: core::time::Duration::from_secs(128),
     };
-    t[BLE] = TrickleParams {
+    t[DOT15D4] = TrickleParams {
         i_min: core::time::Duration::from_secs(1),
         i_max: core::time::Duration::from_secs(20),
     };
@@ -100,23 +115,27 @@ const TRICKLE: [TrickleParams; 3] = {
 };
 
 /// Per-link display names, positionally matched to [`Links`] via
-/// [`LORA`]/[`BLE`]/[`USB`]. Without these the management API reports a board's
-/// three interfaces as `0`/`1`/`2`, which tells an operator staring at the TUI
-/// nothing about which radio a row describes.
+/// [`LORA`]/[`DOT15D4`]/[`USB`]. Without these the management API reports a
+/// board's three interfaces as `0`/`1`/`2`, which tells an operator staring at
+/// the TUI nothing about which radio a row describes.
 const NAMES: [&str; 3] = {
     let mut n = [""; 3];
     n[LORA] = "lora";
-    n[BLE] = "ble";
+    n[DOT15D4] = "dot15d4";
     n[USB] = "usb";
     n
 };
 
 /// Per-link feature matrix, positionally matched to [`Links`] via
-/// [`LORA`]/[`BLE`]/[`USB`]. A function rather than a `const` because
+/// [`LORA`]/[`DOT15D4`]/[`USB`]. A function rather than a `const` because
 /// [`LinkFeatures`]'s defaults are not const.
+///
+/// The radio slot keeps a transmit keepalive for the same reason the BLE link
+/// had one: link quality is sampled from received frames, so a neighbour that
+/// has nothing to say still has to say something.
 fn features() -> [LinkFeatures; 3] {
     let mut f = [LinkFeatures::default(); 3];
-    f[BLE] = LinkFeatures {
+    f[DOT15D4] = LinkFeatures {
         tx_keepalive: Some(KeepAliveConfig { interval_ms: 5000 }),
         ..Default::default()
     };
@@ -131,25 +150,18 @@ fn halt() -> ! {
     }
 }
 
-/// The SoftDevice's single event pump, forwarding SoC events to the USB power
-/// handler. BLE events are consumed internally by `nrf-softdevice`.
-#[embassy_executor::task]
-async fn softdevice_task(sd: &'static Softdevice, on_soc_event: fn(SocEvent)) -> ! {
-    sd.run_with_callback(on_soc_event).await
-}
-
 /// Bring up a RYLR998 on `uarte`, if one is actually wired to it.
 ///
-/// Unlike BLE, this is an external module a board may or may not have attached,
-/// so a radio that never answers `ping` is a normal shape (a BLE-only
-/// deployment) and degrades to [`MeshLink::Absent`]. A module that *does* answer
+/// Unlike the built-in 802.15.4 radio, this is an external module a board may
+/// or may not have attached, so a radio that never answers `ping` is a normal
+/// shape (an 802.15.4-only deployment) and degrades to [`MeshLink::Absent`]. A module that *does* answer
 /// but then rejects configuration is a different problem — present and
 /// malfunctioning — and halts rather than relaying on the wrong address or
 /// network, where it would be silently deaf or cross-contaminating another
 /// node's fragment reassembly.
 async fn bring_up_rylr(uarte: Serial, lora_address: u16) -> MeshLink<Serial> {
     let Ok(mut client) = RylrClient::new(uarte) else {
-        warn!("RYLR998 serial init failed; continuing BLE-only");
+        warn!("RYLR998 serial init failed; continuing without LoRa");
         return MeshLink::Absent;
     };
 
@@ -165,7 +177,7 @@ async fn bring_up_rylr(uarte: Serial, lora_address: u16) -> MeshLink<Serial> {
         trace!("waiting for radio to boot");
     }
     if !detected {
-        warn!("RYLR998 not detected; continuing BLE-only");
+        warn!("RYLR998 not detected; continuing without LoRa");
         return MeshLink::Absent;
     }
 
@@ -216,10 +228,15 @@ async fn bring_up_rylr(uarte: Serial, lora_address: u16) -> MeshLink<Serial> {
 /// stack is only what `memory.x` leaves over after the statics — 112,600 bytes
 /// on the DK. That copy, plus this function's own frame (~28 KB) and
 /// `Driver::with_capacities`' (~26 KB), came to 117,376 and ran off the bottom
-/// of RAM into the SoftDevice's reserved region. The SoftDevice traps that as
-/// `NRF_FAULT_ID_APP_MEMACC` and `nrf-softdevice`'s fault handler panics, which
-/// presented as a silent stop right after "BLE link brought up" — the bring-up
-/// log of a node that had, in fact, already died.
+/// of RAM into the SoftDevice's then-reserved region, which it trapped as
+/// `NRF_FAULT_ID_APP_MEMACC` — a silent stop right after the radio's
+/// bring-up log line, from a node that had already died.
+///
+/// The SoftDevice is gone and its 13,112 bytes are back, so that exact
+/// overflow no longer fits; the reasoning is kept because the mechanism has
+/// not changed, and `flip-link` now puts a stack overflow into a fault rather
+/// than into the statics. `just stack-budget` is what actually holds the
+/// line.
 ///
 /// Spawning this directly removes the wrapper coroutine and so the copy: the
 /// future is written into the task pool from the caller's (shallow) frame at
@@ -231,54 +248,30 @@ async fn bring_up_rylr(uarte: Serial, lora_address: u16) -> MeshLink<Serial> {
 pub async fn run(
     node_mac: Mac,
     uarte: Serial,
+    radio: Radio<'static>,
     usbd: Peri<'static, USBD>,
     make_usb_driver: usb_mgmt::UsbDriverFactory,
     spawner: Spawner,
     mut led: Output<'static>,
 ) -> ! {
-    let lora_address = u16::from_be_bytes([node_mac.0[4], node_mac.0[5]]);
+    // The same short address the 802.15.4 link derives, from the same `Mac`,
+    // so a node's two radios agree on its short identity.
+    let lora_address = ieee802154::short_address_of(node_mac);
     let rylr_link = bring_up_rylr(uarte, lora_address).await;
 
-    // TODO: unconfirmed workaround, added during hardware bring-up with no
-    // recorded root cause. Suspected to paper over a SoftDevice-enable race
-    // against the RYLR998 UART bring-up above, but unverified against real
-    // hardware. Don't remove without confirming BLE bring-up stays reliable.
-    debug!("waiting 1s before starting BLE");
-    Timer::after_secs(1).await;
-
-    // The event pump is the only place SoC events are delivered, so USB power
-    // detection rides along with it — see `usb_mgmt`.
-    let sd = Softdevice::enable(&Default::default());
-    match softdevice_task(sd, usb_mgmt::on_soc_event) {
-        Ok(task) => spawner.spawn(task),
-        Err(e) => {
-            error!(?e, "softdevice event-pump task spawn failed; halting");
-            halt();
-        }
-    }
-
-    // `Both` rather than `Extended`, deliberately, because no part of the
-    // extended path has run on this silicon yet (design 07 §7.2). Under
-    // `Extended` alone the failure mode is total silence, which is
-    // indistinguishable from BLE being broken for any of the other reasons
-    // this crate has already had — and every one of those presented as a link
-    // that looked alive and moved no traffic. `Both` keeps the legacy copy as
-    // the control: if a peer hears the legacy fragments and not the extended
-    // ones, the extended path is what is broken, and if it hears neither the
-    // fault is somewhere else entirely. `blue`'s `"rx frame"` trace carries
-    // the format, which is where that comparison is read off.
-    //
-    // The airtime cost is real (roughly the sum of both formats per frame) and
-    // is the price of a diagnosable bring-up. Move to `Extended` once a real
-    // peer is confirmed reassembling the extended copies.
-    let ble_link = match crate::link::NrfBleLink::new(spawner, sd, blue::BleSendMode::Both) {
+    // The 1s sleep that used to sit here is gone with the SoftDevice it was
+    // guarding: it was an unconfirmed workaround suspected of papering over a
+    // `Softdevice::enable` race against the RYLR998 UART bring-up above. There
+    // is no longer an enable to race. If bring-up turns out to be flaky
+    // without it, that is a real bug to find rather than a delay to restore.
+    let dot15d4_link = match Ieee802154Link::new(spawner, radio, DOT15D4_CHANNEL) {
         Ok(link) => link,
         Err(e) => {
-            error!(?e, "BLE bring-up failed; halting");
+            error!(?e, "802.15.4 bring-up failed; halting");
             halt();
         }
     };
-    debug!("BLE link brought up");
+    debug!(channel = DOT15D4_CHANNEL, "802.15.4 link brought up");
 
     // Both USB functions come from one device, so this either yields the
     // management port *and* the mesh link or neither.
@@ -290,13 +283,18 @@ pub async fn run(
         }
     };
 
-    // Assigned by the same LORA/BLE/USB indices TRICKLE and features() are
+    // Assigned by the same LORA/DOT15D4/USB indices TRICKLE and features() are
     // built from, rather than a positional literal, so the three can't drift
     // apart.
     let mut links: Links = [MeshLink::Absent, MeshLink::Absent, MeshLink::Absent];
     links[LORA] = rylr_link;
-    links[BLE] = MeshLink::Ble(ble_link);
+    links[DOT15D4] = MeshLink::Dot15d4(dot15d4_link);
     links[USB] = usb_link;
+
+    // Sampled before `links` moves into the driver.
+    let lora_up = !matches!(links[LORA], MeshLink::Absent);
+    let usb_up = !matches!(links[USB], MeshLink::Absent);
+
     // Built at this board's capacities rather than the host defaults; the link
     // and clock types are inferred, only the profile is pinned.
     let mut driver: wayfinder_embedded_driver::driver_for!(_, _, 3, crate::nrf52840) =
@@ -306,7 +304,16 @@ pub async fn run(
     // Every deterministic bring-up failure is behind us; from here a fault is a
     // runtime problem the node should reboot out of rather than latch on.
     crate::fault::mark_boot_healthy();
-    info!("wayfinder started");
+    // Which links came up, not just that the node did: a board running on
+    // one of three configured interfaces is otherwise indistinguishable from
+    // a healthy one, and the `warn!`s that said so are long gone from the
+    // bounded ring by the time anyone connects.
+    info!(
+        lora = lora_up,
+        dot15d4 = true,
+        usb = usb_up,
+        "wayfinder started"
+    );
 
     // Best-effort: a board that cannot spawn the watcher is still a working
     // node, and losing a diagnostic is not worth refusing to run over.

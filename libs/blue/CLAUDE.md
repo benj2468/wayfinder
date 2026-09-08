@@ -27,7 +27,7 @@ diagnostics (logging, RSSI association) but is no longer load-bearing.
 |---|---|---|
 | target | nRF52840, `no_std` | Linux host, tokio |
 | stack | `nrf-softdevice` | BlueZ over D-Bus (`bluer`) |
-| consumer | both nRF boards, via `wayfinder_nrf::node::run` | `bins/wayfinder-tap` |
+| consumer | **none** — see below | `bins/wayfinder-tap` |
 | AD framing | built here (`ad.rs`) | built by BlueZ |
 
 They interoperate on-air, which is the point: a `wayfinder-tap` host can
@@ -172,10 +172,15 @@ spawning needs).
 
 `nrf-softdevice` claims the `RADIO` peripheral (and its interrupt) directly,
 same as `libs/nrf-ieee802154`'s 802.15.4 mode. **This firmware can never run
-both live at once** — not a blocker today, since `bins/wayfinder-nrf52840`
-only wires up LoRa + BLE (`nrf-ieee802154` is linked purely to keep it
-compiling for the real target, never instantiated) — but don't try to wire
-both into `Driver::new`'s link array.
+both live at once** — so don't try to wire both into `Driver::new`'s link
+array.
+
+**Both nRF boards now wire 802.15.4, and nothing links `NrfBleLink`.** That is
+the reverse of how it used to be, and it means this backend has no consumer to
+keep it honest — `just build-loose-drivers` / `clippy-loose-drivers`
+cross-compile it for exactly that reason, and CI runs them. `StdBleLink` is
+unaffected and still carries `bins/wayfinder-tap`'s BLE links. See
+`docs/design/implemented/19-ieee802154-nrf-link.md`.
 
 ## On-air format (`src/ad.rs`, `src/mode.rs`)
 

@@ -14,3 +14,11 @@ ieee802154 = { path = "../ieee802154" }
 # keeps the `LinkT` trait available without pulling `alloc`/`std`.
 wayfinder = { path = "../wayfinder", default-features = false }
 embassy-nrf = { version = "0.10.0", features = ["nrf52840"] }
+
+# The never-cancelled radio task and the queues bridging it to `LinkT` — see
+# design 19 §3.3. Versions match `libs/wayfinder-nrf`'s so a board links one
+# copy of each.
+embassy-executor = { version = "0.10" }
+embassy-sync = { version = "0.8.0" }
+embassy-futures = { version = "0.1" }
+tracing = { version = "0.1.44", default-features = false }
