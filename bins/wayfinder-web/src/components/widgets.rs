@@ -137,6 +137,66 @@ pub fn QualityUnmeasured() -> impl IntoView {
     }
 }
 
+/// The trailing header cell for the column [`RowMore`] sits in.
+///
+/// Blank on screen and named to a screen reader, like the actions column beside
+/// it: the column has no heading because on the only viewport where it is drawn
+/// there is no header row to put one in.
+#[component]
+pub fn RowMoreHeader() -> impl IntoView {
+    view! {
+        <th class="wf-cell-more">
+            <span class="wf-sr-only">"Row detail"</span>
+        </th>
+    }
+}
+
+/// The control that opens a row's secondary columns, on the viewport where they
+/// are folded away.
+///
+/// # Why a row folds at all
+///
+/// A table cannot stay a table on a phone: four columns of MACs and intervals
+/// want about twice the width there is. The old answer was `overflow-x: auto`
+/// on the panel, which cut the last columns off behind a sideways scroll inside
+/// a card — present in the DOM, unreachable in practice.
+///
+/// So a narrow viewport stacks each row into `label: value` lines instead. That
+/// alone trades one problem for another — four lines per row is forty lines for
+/// ten destinations — so the columns that *identify* the row stay visible and
+/// the rest fold behind this.
+///
+/// # Why it is a checkbox
+///
+/// Which row is open is state about the document, not about the node, and a
+/// checkbox is where the browser already keeps that kind. Nothing here reaches
+/// a signal, so there is no open/closed state for the server and the browser to
+/// disagree about on hydration — which in this crate is a wasm panic rather
+/// than a cosmetic reflow — nothing to reset on a route change, and the rows
+/// still open on the page whose hydration failed. The stylesheet does the rest
+/// with `:has()`.
+///
+/// The click is stopped from bubbling because two tables select a row when it
+/// is clicked: opening a row to read it should not also change what the detail
+/// panel beside it is showing.
+#[component]
+pub fn RowMore() -> impl IntoView {
+    view! {
+        <td class="wf-cell-more">
+            <label
+                class="wf-row-more"
+                on:click=|ev: leptos::ev::MouseEvent| ev.stop_propagation()
+            >
+                <input type="checkbox" class="wf-row-more-input" />
+                // Both words are rendered and the stylesheet shows one, so the
+                // label tracks the checkbox with no script behind it.
+                <span class="wf-row-more-open">"More"</span>
+                <span class="wf-row-more-close">"Less"</span>
+            </label>
+        </td>
+    }
+}
+
 /// Placeholder shown where a table would be, when there is nothing in it.
 ///
 /// Always says *why* it is empty rather than just showing blank space —

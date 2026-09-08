@@ -64,7 +64,16 @@ pub fn AlarmStrip(
                 <span class="wf-alarm-mark" aria-hidden="true">
                     {move || if summary.with(|s| s.all_clear()) { "●" } else { "▲" }}
                 </span>
-                {move || board.with(|b| format::board_headline(format::summarize_board(b)))}
+                // In a span of its own so a narrow header can truncate the
+                // headline rather than let it push the rest of the header off
+                // the page — which is what it did, because the trigger's text
+                // does not wrap and a flex item does not shrink below its
+                // content. The mark beside it keeps its full meaning at any
+                // width, so what a phone loses is the wording and not the
+                // signal.
+                <span class="wf-alarm-headline">
+                    {move || board.with(|b| format::board_headline(format::summarize_board(b)))}
+                </span>
                 // The quiet count rides on the trigger rather than only in the
                 // card: "nothing is wrong now, but something was" is a
                 // different state from "nothing has been wrong", and the

@@ -13,6 +13,8 @@ use crate::components::chart::ThroughputChart;
 use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Panel;
+use crate::components::widgets::RowMore;
+use crate::components::widgets::RowMoreHeader;
 use crate::components::widgets::Stat;
 use crate::format;
 
@@ -91,6 +93,7 @@ pub fn Metrics() -> impl IntoView {
                                             <th class="wf-num">"Sent"</th>
                                             <th class="wf-num">"Frames in"</th>
                                             <th class="wf-num">"Frames out"</th>
+                                            <RowMoreHeader />
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -99,13 +102,37 @@ pub fn Metrics() -> impl IntoView {
                                             .map(|t| {
                                                 view! {
                                                     <tr>
-                                                        <td>
+                                                        <td data-label="Interface">
                                                             {format::iface_label(&t.iface_name, t.iface_idx)}
                                                         </td>
-                                                        <td class="wf-num">{format::rate(t.rx_bps)}</td>
-                                                        <td class="wf-num">{format::rate(t.tx_bps)}</td>
-                                                        <td class="wf-num">{format::fps(t.rx_fps)}</td>
-                                                        <td class="wf-num">{format::fps(t.tx_fps)}</td>
+                                                        <td class="wf-num" data-label="Received">
+                                                            {format::rate(t.rx_bps)}
+                                                        </td>
+                                                        <td class="wf-num" data-label="Sent">
+                                                            {format::rate(t.tx_bps)}
+                                                        </td>
+                                                        // Frame counts fold
+                                                        // away behind the byte
+                                                        // rates above them:
+                                                        // they are the same
+                                                        // traffic counted the
+                                                        // other way, and it is
+                                                        // the rate that says
+                                                        // whether a link is
+                                                        // busy.
+                                                        <td
+                                                            class="wf-num wf-cell-detail"
+                                                            data-label="Frames in"
+                                                        >
+                                                            {format::fps(t.rx_fps)}
+                                                        </td>
+                                                        <td
+                                                            class="wf-num wf-cell-detail"
+                                                            data-label="Frames out"
+                                                        >
+                                                            {format::fps(t.tx_fps)}
+                                                        </td>
+                                                        <RowMore />
                                                     </tr>
                                                 }
                                             })

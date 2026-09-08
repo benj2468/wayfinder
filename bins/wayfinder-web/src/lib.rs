@@ -208,6 +208,21 @@ impl Scope {
             _ => Scope::Router,
         }
     }
+
+    /// Which of this scope's tabs `pathname` is, if it is one of them.
+    ///
+    /// Answers the collapsed tab menu's only question: what to write on the
+    /// control that stands in for the whole bar. `None` on a route with no tab
+    /// — the 404 view, and `/register`, which renders no bar at all.
+    ///
+    /// Matched against this scope's table rather than both, so the one bar that
+    /// draws either does not name a router tab on a page of the certificate
+    /// authority.
+    #[must_use]
+    pub fn tab_at(self, pathname: &str) -> Option<&'static TabDef> {
+        let path = pathname.trim_matches('/');
+        self.tabs().iter().find(|tab| tab.path == path)
+    }
 }
 
 /// One entry in a scope's tab bar: its route path, its label, and the scope it
@@ -479,30 +494,44 @@ fn Header(
     /// Shared dashboard state.
     dash: Dashboard,
 ) -> impl IntoView {
+    // Named once and used twice — as the word beside the dot and as the dot's
+    // own tooltip — so the two cannot say different things when a narrow
+    // viewport drops the word.
+    let liveness = move || {
+        if dash.connected.get() {
+            "Live".to_string()
+        } else if dash.has_data() {
+            "Reconnecting".to_string()
+        } else {
+            "Connecting".to_string()
+        }
+    };
+
     view! {
         <header class="wf-header">
             <span class="wf-brand">
                 <Logo />
-                "Wayfinder"
+                // The wordmark is a span of its own so a phone can keep the
+                // mark and drop the name: the header has to hold the scope
+                // switch, the alarm strip, who is signed in and the liveness
+                // dot in 390px, and of those the product's own name is the one
+                // nobody is there to read.
+                <span class="wf-brand-name">"Wayfinder"</span>
             </span>
             <ScopeSwitch dash=dash />
             <AlarmStrip dash=dash />
             <ViewerStrip />
-            <span class="wf-header-status">
+            <span class="wf-header-status" title=liveness>
                 <span
                     class="wf-dot"
                     class:wf-dot-live=move || dash.connected.get()
                     class:wf-dot-stale=move || !dash.connected.get()
                 />
-                {move || {
-                    if dash.connected.get() {
-                        "Live".to_string()
-                    } else if dash.has_data() {
-                        "Reconnecting".to_string()
-                    } else {
-                        "Connecting".to_string()
-                    }
-                }}
+                // The word is in a span of its own so a phone can drop it and
+                // keep the dot, which is the part that is read at a glance
+                // anyway. The `title` above is what it leaves behind, so the
+                // state is still reachable when the word is not drawn.
+                <span class="wf-status-text">{liveness}</span>
             </span>
         </header>
     }
@@ -760,10 +789,50 @@ fn StatusStrip(
 ///
 /// The `<Suspense>` is not decoration — see [`ScopeSwitch`] for why reading the
 /// viewer resource outside one is a wasm panic in this crate.
+///
+/// # Why there is a menu underneath it
+///
+/// Seven tabs need about 630px of row and a phone has 390. The bar used to meet
+/// that with `overflow-x: auto`, which is the failure mode worth naming: it does
+/// not look broken. It renders four tabs and puts the other three behind a
+/// sideways scroll that nothing on the screen announces — so on a phone the
+/// dashboard silently loses Metrics, Security and Logs.
+///
+/// So the same tabs are also a menu: a toggle that names the tab you are on,
+/// and the list collapsed behind it. Both are rendered on every viewport and the
+/// stylesheet picks, because the server cannot know how wide the screen is and a
+/// layout that waited for wasm to find out would flash the wrong one on exactly
+/// the slow devices that are narrow.
+///
+/// The open/closed state is a plain local signal, seeded `false`, so the server
+/// and the browser agree on the first paint — which in this crate is the
+/// difference between a menu and a wasm panic.
 #[component]
 fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
     let location = use_location();
     let scope = Memo::new(move |_| Scope::of_path(&location.pathname.get()));
+    let (menu_open, set_menu_open) = signal(false);
+
+    // What the collapsed bar says it is showing. "Menu" only on a route with no
+    // tab — the 404 view — where naming a tab would be a lie about where you
+    // are.
+    let current = Memo::new(move |_| {
+        scope
+            .get()
+            .tab_at(&location.pathname.get())
+            .map_or("Menu", |tab| tab.title)
+    });
+
+    // Shut the menu on every navigation, not only on the tab that was tapped:
+    // the back button and the scope switch both move the page without any tab
+    // being clicked, and a menu still hanging open over the view it just
+    // changed to is the one state this control can get into that is worse than
+    // the scroll it replaced. Effects do not run on the server, so this costs
+    // the first paint nothing.
+    Effect::new(move |_| {
+        location.pathname.track();
+        set_menu_open.set(false);
+    });
 
     // Absent on a provider that coordinates no tunnel, which is every
     // deployment reaching the mesh over radio alone. `vpn_peers` is `None` for
@@ -775,42 +844,71 @@ fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
     });
 
     view! {
-        <nav class="wf-tabs">
-            <Suspense>
-                {move || {
-                    let current_viewer = viewer.get();
-                    let has_tunnel = has_tunnel.get();
+        <nav class="wf-tabs" class:wf-tabs-open=move || menu_open.get()>
+            // Drawn only on a narrow viewport, and always rendered: which one
+            // the reader gets is the stylesheet's call, not this component's.
+            <button
+                type="button"
+                class="wf-tabs-toggle"
+                aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                aria-controls=TAB_LIST_ID
+                on:click=move |_| set_menu_open.update(|open| *open = !*open)
+            >
+                <span class="wf-tabs-current">{move || current.get()}</span>
+                <span class="wf-tabs-caret" aria-hidden="true">
+                    "▾"
+                </span>
+            </button>
+            <div class="wf-tab-list" id=TAB_LIST_ID>
+                <Suspense>
+                    {move || {
+                        let current_viewer = viewer.get();
+                        let has_tunnel = has_tunnel.get();
 
-                    scope
-                        .get()
-                        .tabs()
-                        .iter()
-                        .filter(|tab| tab.path != VPN_TAB_PATH || has_tunnel)
-                        .filter(|tab| {
-                            current_viewer
-                                .as_ref()
-                                .and_then(|res| res.as_ref().ok())
-                                .map(|v| v.can_view(tab))
-                                .unwrap_or_default()
-                        })
-                        .map(|tab| {
-                            view! {
-                                // `exact`, because the provider scope has a
-                                // two-segment route under a one-segment one:
-                                // without it `/provider` reads as current on
-                                // every tab beneath it and two tabs light up
-                                // at once.
-                                <A href=format!("/{}", tab.path) attr:class="wf-tab" exact=true>
-                                    {tab.title}
-                                </A>
-                            }
-                        })
-                        .collect_view()
-                }}
-            </Suspense>
+                        scope
+                            .get()
+                            .tabs()
+                            .iter()
+                            .filter(|tab| tab.path != VPN_TAB_PATH || has_tunnel)
+                            .filter(|tab| {
+                                current_viewer
+                                    .as_ref()
+                                    .and_then(|res| res.as_ref().ok())
+                                    .map(|v| v.can_view(tab))
+                                    .unwrap_or_default()
+                            })
+                            .map(|tab| {
+                                view! {
+                                    // `exact`, because the provider scope has a
+                                    // two-segment route under a one-segment one:
+                                    // without it `/provider` reads as current on
+                                    // every tab beneath it and two tabs light up
+                                    // at once.
+                                    // The click closes the menu as well as
+                                    // navigating: tapping the tab you are
+                                    // already on moves nothing, so the effect
+                                    // above never fires for it.
+                                    <A
+                                        href=format!("/{}", tab.path)
+                                        attr:class="wf-tab"
+                                        exact=true
+                                        on:click=move |_| set_menu_open.set(false)
+                                    >
+                                        {tab.title}
+                                    </A>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </Suspense>
+            </div>
         </nav>
     }
 }
+
+/// DOM id of the collapsible tab list, so the toggle can point `aria-controls`
+/// at the thing it opens. There is one tab bar on the page, so one id suffices.
+const TAB_LIST_ID: &str = "wf-tab-list";
 
 /// Stand-in for a tab that has not been built yet.
 #[component]
@@ -903,6 +1001,55 @@ fn report_panic() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The collapsed tab menu names the tab the URL is on, in the scope the URL
+    /// is in.
+    ///
+    /// The one bar draws either scope, so a lookup against both tables would
+    /// name a router tab on a page of the certificate authority — the two share
+    /// no path, but a future one that did would resolve to whichever table was
+    /// searched first.
+    #[test]
+    fn a_route_resolves_to_the_tab_it_belongs_to() {
+        for tab in ROUTER_TABS.iter().chain(PROVIDER_TABS.iter()) {
+            let path = format!("/{}", tab.path);
+            let scope = Scope::of_path(&path);
+            assert_eq!(
+                scope.tab_at(&path).map(|found| found.title),
+                Some(tab.title),
+                "{path} names its own tab",
+            );
+        }
+    }
+
+    /// A trailing slash is the same route, so it names the same tab. The
+    /// router treats `/routing/` as `/routing`, and a menu that answered
+    /// "Menu" there would say the page has no tab while standing on one.
+    #[test]
+    fn a_trailing_slash_names_the_same_tab() {
+        assert_eq!(
+            Scope::Router.tab_at("/routing/").map(|tab| tab.title),
+            Some("Routing"),
+        );
+        // The index, whose path is the empty string, in both spellings.
+        assert_eq!(
+            Scope::Router.tab_at("/").map(|tab| tab.title),
+            Some("Overview")
+        );
+        assert_eq!(
+            Scope::Router.tab_at("").map(|tab| tab.title),
+            Some("Overview")
+        );
+    }
+
+    /// A route with no tab says so rather than borrowing one. The 404 view is
+    /// in the router scope by `of_path`'s deliberate default, and naming it
+    /// "Overview" would be a menu claiming a page the reader is not on.
+    #[test]
+    fn a_route_with_no_tab_names_none() {
+        assert!(Scope::Router.tab_at("/nonesuch").is_none());
+        assert!(Scope::Router.tab_at("/register").is_none());
+    }
 
     /// Every tab knows which scope it is in, and the two tables agree with it.
     ///

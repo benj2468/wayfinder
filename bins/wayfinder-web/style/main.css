@@ -192,11 +192,72 @@ body {
 
 .wf-tabs {
   display: flex;
-  gap: var(--wf-space-1);
   padding: 0 var(--wf-space-5);
   border-bottom: 1px solid var(--wf-border);
   background: var(--wf-surface);
+}
+
+/* The tabs themselves. A wrapper rather than the tabs sitting directly in
+   `.wf-tabs`, because on a narrow viewport the bar has a second child — the
+   toggle that stands in for it — and the two need opposite layouts: the toggle
+   is a full-width row, the tabs are the thing that collapses under it. */
+.wf-tab-list {
+  display: flex;
+  gap: var(--wf-space-1);
+  min-width: 0;
+  /* The last resort on a window too narrow for the tabs and too wide for the
+     menu below. It is not the mobile answer — a scroll nothing announces is
+     how three of the seven tabs became unreachable on a phone — but between
+     the breakpoint and the widest tab set there is a band where something has
+     to give, and losing the tail of a row the reader can see is better than
+     clipping it. */
   overflow-x: auto;
+}
+
+/* The collapsed bar. Hidden here and drawn only at the narrow breakpoint: both
+   halves are rendered on every viewport because the server cannot know how wide
+   the screen is, and a bar that waited for wasm to tell it would flash the wrong
+   one on exactly the slow devices that are narrow. */
+.wf-tabs-toggle {
+  display: none;
+  align-items: center;
+  gap: var(--wf-space-2);
+  width: 100%;
+  padding: var(--wf-space-3) var(--wf-space-4);
+  border: none;
+  background: none;
+  color: var(--wf-text);
+  font-family: inherit;
+  font-size: var(--wf-text-sm);
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.wf-tabs-toggle:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: -2px;
+}
+
+/* The tab you are on, which is what the control has to say before it says
+   anything about being a menu: a reader who taps nothing should still know
+   where they are. */
+.wf-tabs-current {
+  color: var(--wf-accent);
+}
+
+/* Pushed to the far end and rotated when the menu is open, so the control says
+   which way it will move without a second label. */
+.wf-tabs-caret {
+  margin-left: auto;
+  color: var(--wf-text-muted);
+  font-size: 1em;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+.wf-tabs-open .wf-tabs-caret {
+  transform: rotate(180deg);
 }
 
 .wf-tab {
@@ -209,8 +270,23 @@ body {
   white-space: nowrap;
 }
 
-.wf-tab:hover {
-  color: var(--wf-text);
+/* Every `:hover` in this sheet is guarded on a real pointer existing, and this
+ * is the note the rest of them point back at.
+ *
+ * A touch screen has no hover: browsers fire it on tap and then leave it
+ * applied to whatever was tapped last. So an unguarded hover does not fail on a
+ * phone, it lies — a tab that keeps the full-strength ink of the current tab
+ * after you have navigated away from it, a gate that stays lit after you
+ * flipped it, a row that stays highlighted because you once touched it. The
+ * guard is what makes "you are pointing at this" mean only that.
+ *
+ * The two exceptions are deliberate and are marked where they are: the alarm
+ * and viewer cards *open* on hover, and their touch path is `:focus-within`
+ * rather than a media query. */
+@media (hover: hover) {
+  .wf-tab:hover {
+    color: var(--wf-text);
+  }
 }
 
 /* `leptos_router`'s `<A>` sets aria-current on the matching route, so the
@@ -251,8 +327,10 @@ body {
   white-space: nowrap;
 }
 
-.wf-scope-item:hover {
-  color: var(--wf-text);
+@media (hover: hover) {
+  .wf-scope-item:hover {
+    color: var(--wf-text);
+  }
 }
 
 /* The raised surface is what says "selected" — the accent is spent on the
@@ -341,10 +419,18 @@ body {
   cursor: pointer;
 }
 
-.wf-alarm-trigger:hover,
+/* Focus stays out of the guard: it is how this is reached by keyboard and by
+ * touch, which is exactly what the media query excludes. */
 .wf-header-alarms:focus-within .wf-alarm-trigger {
   border-color: var(--wf-border);
   background: var(--wf-surface-raised);
+}
+
+@media (hover: hover) {
+  .wf-alarm-trigger:hover {
+    border-color: var(--wf-border);
+    background: var(--wf-surface-raised);
+  }
 }
 
 .wf-alarm-trigger:focus-visible {
@@ -753,14 +839,35 @@ body {
   cursor: pointer;
 }
 
-.wf-row:hover {
-  background: var(--wf-surface-raised);
+/* Hover is a fill; being *chosen* is a rule down the leading edge. The split is
+ * the point: one is a transient answer to "where is my pointer", which wants to
+ * follow the eye across the whole row, and the other is durable state the panel
+ * beside it is showing. Neutral grey, so it cannot be mistaken for the accent
+ * the state below wears.
+ *
+ * Guarded on a real pointer existing, because `:hover` on a touch screen sticks
+ * to whatever was tapped last — a highlight meaning "you are pointing at this"
+ * quietly becomes one meaning "you touched this once". */
+@media (hover: hover) {
+  .wf-row:hover {
+    background: var(--wf-surface-raised);
+  }
 }
 
-.wf-row-selected {
-  background: var(--wf-accent-dim);
-}
-
+/* One idiom for "this row", at every width.
+ *
+ * Selection used to be an accent wash across the row and the chosen path a rule
+ * down its side — two ways of saying the same thing, on two panels sitting side
+ * by side on the Routing tab. The rule is the one that survived, for the reason
+ * the alarm list is built the same way: a filled block reads as a *state* — an
+ * error, a warning — rather than as a mark on the row you picked, and it says
+ * it louder the taller the row gets. That is what made the wash unbearable once
+ * a narrow viewport turned a row into a four-line card, and it was never right
+ * on a wide one either.
+ *
+ * On the leading cell rather than the `<tr>`, because the table collapses its
+ * borders and a row border is not reliably painted through that. */
+.wf-row-selected td:first-child,
 .wf-row-chosen td:first-child {
   box-shadow: inset 2px 0 0 var(--wf-accent);
 }
@@ -860,9 +967,11 @@ body {
   cursor: pointer;
 }
 
-.wf-button:hover {
-  border-color: var(--wf-accent);
-  color: var(--wf-accent);
+@media (hover: hover) {
+  .wf-button:hover {
+    border-color: var(--wf-accent);
+    color: var(--wf-accent);
+  }
 }
 
 .wf-button:focus-visible {
@@ -923,9 +1032,11 @@ body {
   cursor: pointer;
 }
 
-.wf-hint-toggle:hover {
-  border-color: var(--wf-accent);
-  color: var(--wf-accent);
+@media (hover: hover) {
+  .wf-hint-toggle:hover {
+    border-color: var(--wf-accent);
+    color: var(--wf-accent);
+  }
 }
 
 /* Lit while its panel is open. The fill is half of the tether: the tail says
@@ -1105,8 +1216,10 @@ body {
   cursor: pointer;
 }
 
-.wf-gate:hover {
-  background: var(--wf-surface-raised);
+@media (hover: hover) {
+  .wf-gate:hover {
+    background: var(--wf-surface-raised);
+  }
 }
 
 .wf-gate:focus-visible {
@@ -1294,11 +1407,13 @@ body {
   font-weight: 500;
 }
 
-.wf-button-primary:hover {
-  border-color: transparent;
-  background: var(--wf-primary);
-  color: var(--wf-primary-ink);
-  filter: brightness(1.1);
+@media (hover: hover) {
+  .wf-button-primary:hover {
+    border-color: transparent;
+    background: var(--wf-primary);
+    color: var(--wf-primary-ink);
+    filter: brightness(1.1);
+  }
 }
 
 /* Outlined rather than filled: loud enough to read as dangerous, not so loud
@@ -1308,10 +1423,12 @@ body {
   color: var(--wf-error);
 }
 
-.wf-button-danger:hover {
-  border-color: var(--wf-error);
-  background: color-mix(in srgb, var(--wf-error) 12%, transparent);
-  color: var(--wf-error);
+@media (hover: hover) {
+  .wf-button-danger:hover {
+    border-color: var(--wf-error);
+    background: color-mix(in srgb, var(--wf-error) 12%, transparent);
+    color: var(--wf-error);
+  }
 }
 
 .wf-note {
@@ -1528,8 +1645,17 @@ body {
   padding: 1px var(--wf-space-1);
 }
 
-.wf-log-row:hover {
-  background: var(--wf-surface-raised);
+/* The one row highlight in the dashboard on something that is not clickable,
+ * and it stays. A table row highlights because clicking it does something —
+ * `.wf-row` is the only table row that does — but a log line is read across
+ * four columns of monospace, and the tint is what keeps the eye on one record's
+ * time, level and message. It is the neutral grey and never the accent, so it
+ * cannot be read as the "this row is chosen" mark that is a rule down the
+ * leading edge everywhere else. */
+@media (hover: hover) {
+  .wf-log-row:hover {
+    background: var(--wf-surface-raised);
+  }
 }
 
 .wf-log-time {
@@ -1749,10 +1875,17 @@ body {
   cursor: pointer;
 }
 
-.wf-user-trigger:hover,
+/* Focus stays out of the guard, as on the alarm trigger above. */
 .wf-header-user:focus-within .wf-user-trigger {
   border-color: var(--wf-border);
   background: var(--wf-surface-raised);
+}
+
+@media (hover: hover) {
+  .wf-user-trigger:hover {
+    border-color: var(--wf-border);
+    background: var(--wf-surface-raised);
+  }
 }
 
 .wf-user-trigger:focus-visible {
@@ -1937,4 +2070,441 @@ body {
   background: var(--wf-surface-2);
   border: 1px solid var(--wf-border);
   border-radius: var(--wf-radius);
+}
+
+/* ------------------------------------------------------- row disclosure -- */
+
+/* The column [`RowMore`] sits in, and the header cell above it. Absent at every
+ * width but the narrow one, where the row it belongs to is no longer a row. */
+.wf-cell-more {
+  display: none;
+}
+
+/* A `<label>` wrapping a checkbox, so the open/closed state of a row is the
+ * browser's rather than the app's — see `RowMore` in `widgets.rs` for why that
+ * matters in a crate where a hydration mismatch is a wasm panic. */
+.wf-row-more {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: var(--wf-space-1) var(--wf-space-2);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius-sm);
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+  cursor: pointer;
+}
+
+/* Unguarded, this was the worst of them: the narrow layout draws this control
+ * borderless, so a tap on a phone made a border appear and stay. */
+@media (hover: hover) {
+  .wf-row-more:hover {
+    border-color: var(--wf-accent);
+    color: var(--wf-accent);
+  }
+}
+
+/* Transparent rather than `display: none`: the control has to stay in the tab
+ * order and in the accessibility tree — hiding it outright would leave a row
+ * that only opens to a pointer. The label carries the focus ring for it. */
+.wf-row-more-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+}
+
+.wf-row-more:has(.wf-row-more-input:focus-visible) {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 2px;
+}
+
+/* Both words are rendered and one is drawn, so the label follows the checkbox
+ * with nothing scripted behind it. */
+.wf-row-more-close {
+  display: none;
+}
+
+.wf-row-more:has(.wf-row-more-input:checked) .wf-row-more-open {
+  display: none;
+}
+
+.wf-row-more:has(.wf-row-more-input:checked) .wf-row-more-close {
+  display: inline;
+}
+
+/* The Members table's action column is numeric-aligned as well as a set of
+ * controls, and `.wf-row-actions` alone would move its button to the left edge
+ * of the last column. */
+.wf-num.wf-row-actions {
+  justify-content: flex-end;
+}
+
+/* ------------------------------------------------- narrow: chrome -- */
+
+/* The page's furniture gives out before its contents do, so it has a
+ * breakpoint of its own. 720px is where the tab bar stops fitting — seven
+ * router tabs need about 630px of row — and where the header stops fitting once
+ * it carries the scope switch and a signed-in name. The tables hold on much
+ * longer, and collapse in the second block below.
+ *
+ * Two problems, in the order a reader meets them: a header that overflowed the
+ * page, and a tab bar that hid half its tabs. */
+@media (width <= 720px) {
+  /* --- the header ------------------------------------------------------ */
+
+  /* The header was a single nowrap row of five things — mark, scope switch,
+   * alarm strip, who is signed in, liveness. At 390px that row is 540px wide,
+   * and because a flex item does not shrink below its content the surplus went
+   * *outside* the header: its background and its bottom rule stopped at the
+   * viewport while its contents carried on past them, and the whole document
+   * gained a sideways scroll.
+   *
+   * It wraps at a place this block chooses rather than wherever the content
+   * happens to run out, and that is the point of the `order`s below. Left to
+   * wrap naturally the break moves with the text: at 390px the alarm strip fell
+   * to the second row, and at 500px it just fitted on the first — which left
+   * the second row holding nothing but a name and a dot, pushed to the far
+   * right by their own auto margin, over a hand's width of empty header. It
+   * read as a layout bug because it looked like one.
+   *
+   * So: who the node is on top, how it is and who is looking underneath, at
+   * every width below the breakpoint. */
+  .wf-header {
+    flex-wrap: wrap;
+    gap: var(--wf-space-2) var(--wf-space-3);
+    padding: var(--wf-space-3) var(--wf-space-4);
+  }
+
+  .wf-brand {
+    order: 1;
+  }
+
+  .wf-scope {
+    order: 2;
+  }
+
+  /* A zero-height item that fills the line, which is the only way to force a
+   * flex container to break where you want rather than where the text does. */
+  .wf-header::after {
+    content: "";
+    order: 3;
+    flex-basis: 100%;
+    height: 0;
+  }
+
+  .wf-header-alarms {
+    order: 4;
+  }
+
+  .wf-header-user {
+    order: 5;
+  }
+
+  .wf-header-status {
+    order: 6;
+  }
+
+  /* The alarm headline is one unbreakable run of text, so on a bad day it is
+   * still wider than the page. These let it shrink, and the ellipsis is what it
+   * shrinks to — the severity mark beside it keeps its full meaning at any
+   * width, so what is lost is the wording rather than the signal. */
+  .wf-header-alarms,
+  .wf-alarm-trigger {
+    min-width: 0;
+  }
+
+  .wf-alarm-headline {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* The dot alone. It is what the word was decoration for, and the word is
+   * kept as the strip's `title` so the state is still reachable. */
+  .wf-status-text {
+    display: none;
+  }
+
+  /* Both header cards hang off a trigger that is now on the second row, and an
+   * absolutely positioned box has nothing to clamp it to the page — so one was
+   * squeezed to a 150px column and the other hung off the left edge with its
+   * labels cut in half.
+   *
+   * Re-anchoring is what fixes it rather than a width: taking the triggers out
+   * of the positioning chain makes the *header* each card's containing block,
+   * so `top: 100%` means below the header rather than below whichever row the
+   * trigger landed on, and `left`/`right` span the page. A full-width sheet
+   * under the header, which is what a dropdown is on a phone anyway. */
+  .wf-header {
+    position: relative;
+  }
+
+  .wf-header-alarms,
+  .wf-header-user {
+    position: static;
+  }
+
+  .wf-alarm-card,
+  .wf-user-card {
+    top: 100%;
+    left: 0;
+    right: 0;
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    border-right: none;
+    border-left: none;
+    border-radius: 0;
+  }
+
+  /* --- the tab bar ----------------------------------------------------- */
+
+  /* A menu, not a strip that scrolls. The toggle names the tab you are on, so
+   * a reader who never opens it still knows where they are. */
+  .wf-tabs {
+    flex-direction: column;
+    padding: 0;
+  }
+
+  .wf-tabs-toggle {
+    display: flex;
+  }
+
+  .wf-tab-list {
+    display: none;
+    flex-direction: column;
+    gap: 0;
+    padding-bottom: var(--wf-space-2);
+    overflow: visible;
+  }
+
+  .wf-tabs-open .wf-tab-list {
+    display: flex;
+  }
+
+  .wf-tabs-open .wf-tabs-toggle {
+    border-bottom: 1px solid var(--wf-border);
+  }
+
+  /* A rule down the side of the tab it opens onto, since in a column there is
+   * no bottom edge to underline and the underline would read as a divider
+   * between two tabs rather than as a mark on one. */
+  .wf-tab {
+    padding: var(--wf-space-3) var(--wf-space-4);
+    border-bottom-width: 0;
+    border-left: 2px solid transparent;
+  }
+
+  .wf-tab[aria-current="page"] {
+    border-left-color: var(--wf-accent);
+  }
+
+  /* --- the page ---------------------------------------------------------- */
+
+  .wf-main {
+    padding: var(--wf-space-3);
+  }
+
+  .wf-panel {
+    padding: var(--wf-space-3);
+  }
+
+  .wf-banner {
+    padding: var(--wf-space-3) var(--wf-space-4);
+  }
+
+  /* A dialog is centred in a flex container with padding, which does not stop a
+   * wider item overflowing it — and 30rem is wider than a phone. */
+  .wf-modal {
+    max-width: 100%;
+  }
+
+  /* Identifiers and URIs have nowhere to break, so a field of them overflows
+   * its panel rather than wrapping in it. */
+  .wf-field-value {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* ------------------------------------------------- narrow: tables -- */
+
+/* Tables give out later than the chrome does, and collapsing them with it was
+ * wrong in both directions: a 700px window got a column of `label ... value`
+ * lines with a hand's width of gap down the middle, for a table that fitted
+ * perfectly well as a table.
+ *
+ * 600px is where a four-column row of MACs and intervals genuinely stops
+ * fitting — about 520px of content plus the panel's and the page's padding.
+ * Between here and the chrome's breakpoint `.wf-table-scroll` keeps its
+ * sideways scroll, which is the right answer on a screen wide enough to show
+ * that there is more. */
+@media (width <= 600px) {
+  /* The header row is dropped and every cell becomes a `label: value` line
+   * carrying its column name from `data-label`. Nothing is hidden by the change
+   * itself — what is hidden is what the row marks as secondary, behind the
+   * disclosure on it. */
+  .wf-table-scroll {
+    overflow-x: visible;
+  }
+
+  .wf-table thead {
+    display: none;
+  }
+
+  .wf-table,
+  .wf-table tbody,
+  .wf-table tr {
+    display: block;
+  }
+
+  /* The horizontal padding is not decoration. A `display: block` row paints its
+   * background across the panel's whole content box, so without it every value
+   * sits flush against the edge of its own highlight and the disclosure button
+   * is clipped by it. */
+  .wf-table tr {
+    padding: var(--wf-space-2) var(--wf-space-2) var(--wf-space-2)
+      var(--wf-space-3);
+    border-bottom: 1px solid var(--wf-border);
+    border-left: 2px solid transparent;
+  }
+
+  .wf-table tr:last-child {
+    border-bottom: none;
+  }
+
+  /* Selection and hover become a rule down the side, never a fill.
+   *
+   * As table rows these were a tint across one line, which is a highlight. As
+   * cards they are a tint across a block four lines tall, which is a *state* —
+   * the accent wash read as an error and the chosen-path marker as an alert
+   * bar, on a table where nothing was wrong. It is the same reasoning the alarm
+   * list is built on a few hundred lines up: a stack of tinted blocks reads as
+   * a stack of warnings.
+   *
+   * Every one of these is qualified with `.wf-table tr`, because that selector
+   * is a class and an element and would otherwise outrank the bare classes the
+   * wide layout uses — the fill would stay and the rule would never appear. */
+  .wf-table tr.wf-row:hover {
+    background: none;
+  }
+
+  .wf-table tr.wf-row-selected,
+  .wf-table tr.wf-row-chosen {
+    border-left-color: var(--wf-accent);
+  }
+
+  /* The marker moves off the first cell, where as a stacked row it was a rule
+   * beside one line of several, and onto the card it belongs to. */
+  .wf-table tr.wf-row-selected td:first-child,
+  .wf-table tr.wf-row-chosen td:first-child {
+    box-shadow: none;
+  }
+
+  /* Hover only where there is a pointer to hover with. On a touch screen
+   * `:hover` sticks to whatever was tapped last, so a highlight meaning "you
+   * are pointing at this" becomes one meaning "you touched this once". */
+  @media (hover: hover) {
+    .wf-table tr.wf-row:hover {
+      border-left-color: var(--wf-border);
+    }
+  }
+
+  .wf-table td {
+    display: flex;
+    gap: var(--wf-space-3);
+    align-items: baseline;
+    padding: var(--wf-space-1) 0;
+    border-bottom: none;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  /* The column header, moved onto the cell. Without it a stacked row is a
+   * column of bare values — a MAC with nothing saying it is the neighbour, and
+   * two durations that look alike and mean opposite things.
+   *
+   * `margin-right: auto` rather than `justify-content: space-between` on the
+   * row, because a cell can hold more than one thing: space-between spread the
+   * Routing tab's "in use" tag to the far edge, a hand's width from the address
+   * it is a tag on. An auto margin on the label alone pins it left and leaves
+   * everything after it packed together on the right. */
+  .wf-table td::before {
+    content: attr(data-label);
+    flex: none;
+    margin-right: auto;
+    color: var(--wf-text-muted);
+    font-size: var(--wf-text-sm);
+  }
+
+  /* `.wf-num` right-aligns a column that no longer exists; the label's auto
+   * margin is what puts the value opposite it now. */
+  .wf-num {
+    text-align: left;
+  }
+
+  /* The bar takes the slack rather than sitting at its 120px minimum against
+   * the label. */
+  .wf-table td .wf-bar-wrap {
+    flex: 1;
+  }
+
+  /* What the row folds away, and the control that unfolds it.
+   *
+   * Qualified with the cell, not left as a bare class: `.wf-table td` above is
+   * one class and one element, which outranks a lone `.wf-cell-detail` — so the
+   * bare selector loses to the `display: flex` that turns a cell into a line,
+   * and every row renders permanently open. */
+  .wf-table td.wf-cell-detail {
+    display: none;
+  }
+
+  .wf-table tr:has(.wf-row-more-input:checked) td.wf-cell-detail {
+    display: flex;
+  }
+
+  .wf-table td.wf-cell-more {
+    display: flex;
+    justify-content: flex-end;
+    padding-top: 0;
+  }
+
+  /* Neither is a value, so neither takes a label — and the actions keep their
+   * own left-to-right layout rather than being pushed opposite a blank one. */
+  .wf-table td.wf-cell-more::before,
+  .wf-table td.wf-row-actions::before {
+    content: none;
+  }
+
+  .wf-table td.wf-row-actions {
+    justify-content: flex-start;
+    padding-top: var(--wf-space-2);
+  }
+
+  /* Drawn as text rather than as a button. It is the quietest thing on the
+   * card — a way to see the rest of a row, next to controls that revoke
+   * certificates — and a second bordered box beside Revoke and Remove competed
+   * with them for the eye. The padding stays, so the tap target does not
+   * shrink with the ink. */
+  .wf-row-more {
+    padding: var(--wf-space-2);
+    border-color: transparent;
+    font-size: 0.75rem;
+  }
+
+  /* --- logs -------------------------------------------------------------- */
+
+  /* Four columns of monospace do not fit, and the message is the one that has
+   * to be readable. Time, level and target keep a line; the message takes the
+   * next one whole. */
+  .wf-log-row {
+    grid-template-columns: max-content max-content minmax(0, 1fr);
+    gap: var(--wf-space-2);
+  }
+
+  .wf-log-message {
+    grid-column: 1 / -1;
+  }
 }
