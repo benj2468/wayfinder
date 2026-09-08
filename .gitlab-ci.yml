@@ -277,6 +277,14 @@ test:run:rust:
     # formats from that same collected profile data, instead of running the
     # entire nextest suite a second time just to get a differently-shaped report.
     - cargo llvm-cov nextest --profile ci --workspace --no-report
+    # `wayfinder-server`'s `embedded` feature is off by default (it is the
+    # `no_std` + `alloc` management transport a board links, and a host build
+    # must not pull `embedded-io-async`/`embassy-sync`), so a plain `--workspace`
+    # run compiles neither the module nor its tests — thirteen of them, covering
+    # the framing and serve loop a node with no debug probe is reached through.
+    # Added to the same profile data rather than as a separate job so its
+    # coverage counts too. See GitLab #22.
+    - cargo llvm-cov nextest --profile ci -p wayfinder-server --features embedded --no-report
     # Cobertura file for the MR diff coverage annotations.
     - cargo llvm-cov report --cobertura --output-path coverage.xml
     # Text summary to stdout so the `coverage:` regex above can extract the badge number.

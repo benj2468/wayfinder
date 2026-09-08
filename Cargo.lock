@@ -5295,10 +5295,18 @@ dependencies = [
  "tokio-serial",
  "tokio-util",
  "wayfinder-auth",
+ "wayfinder-clock-trust",
  "wayfinder-log",
  "wayfinder-protos",
  "wayfinder-server",
  "wayfinder-tls-mgmt",
+]
+
+[[package]]
+name = "wayfinder-clock-trust"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -5447,6 +5455,7 @@ dependencies = [
  "wayfinder",
  "wayfinder-alarm",
  "wayfinder-auth",
+ "wayfinder-clock-trust",
  "wayfinder-log",
  "wayfinder-protos",
  "wayfinder-storage",

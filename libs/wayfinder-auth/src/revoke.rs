@@ -10,6 +10,7 @@ use zerocopy::Unaligned;
 use zerocopy::byteorder::network_endian::U32;
 use zerocopy::byteorder::network_endian::U64;
 
+use crate::clock::Clocked;
 use crate::error::AuthError;
 use crate::key::verify_signature;
 
@@ -138,10 +139,68 @@ impl RevocationRecord {
         cert_not_before: u64,
         now_unix: u64,
     ) -> bool {
-        &self.node_mac == node_mac
-            && cert_not_before <= self.not_before.get()
+        self.names_cert(node_mac, cert_not_before)
             && self.not_before.get() <= now_unix
             && now_unix < self.not_after.get()
+    }
+
+    /// The **clock-free** half of [`cancels`](Self::cancels): does this record
+    /// name this certificate at all — same MAC, and issued at or before the
+    /// revocation instant?
+    ///
+    /// Split out because it is the half that answers "is this credential the
+    /// one being cancelled", and it compares two CA-signed instants with no
+    /// wall clock involved. The other half — whether the record is *in force
+    /// right now* — is the only part that needs a clock, and is what
+    /// [`cancels_under`](Self::cancels_under) varies by posture.
+    ///
+    /// This is what keeps "a node with no clock enforces its records" from
+    /// meaning "this address is banned forever": a certificate issued after
+    /// the revocation instant is a deliberate re-admission and is not named
+    /// here, whatever the reader's clock says.
+    #[must_use]
+    pub fn names_cert(&self, node_mac: &[u8; 6], cert_not_before: u64) -> bool {
+        &self.node_mac == node_mac && cert_not_before <= self.not_before.get()
+    }
+
+    /// Whether this record cancels `cert` under the reader's clock posture.
+    ///
+    /// [`cancels`](Self::cancels) asks the same question of a node that knows
+    /// the time. This one is what a node that does not must ask, and the
+    /// difference is confined to the enforcement window:
+    ///
+    /// | posture | enforcement window |
+    /// |---|---|
+    /// | [`Clocked::At`] | `not_before <= now < not_after`, as before |
+    /// | [`Clocked::AtLeast`] / [`Clocked::Unknown`] | in force unless *provably* expired |
+    ///
+    /// **A held record is treated as in force when the window cannot be
+    /// judged**, and that direction is deliberate. The alternative is what the
+    /// bare `now_unix` produced: no real record has `not_before <= 0`, so a
+    /// node with no clock silently enforced *nothing* — it would ingest a
+    /// revocation, evict the named neighbour once (which looks like it
+    /// worked), and re-admit them on their very next OGM. Design 20 §5.1 rests
+    /// on the opposite: "an all-board segment keeps active revocation and
+    /// loses passive."
+    ///
+    /// Erring toward enforcement is also the safe direction here in a way it
+    /// is not for a certificate window. Refusing a peer costs one route;
+    /// honouring a revoked one is the harm revocation exists to prevent. And
+    /// the cost is bounded by [`names_cert`](Self::names_cert): the only node
+    /// an over-long enforcement window can refuse is one still presenting the
+    /// certificate the record was aimed at.
+    #[must_use]
+    pub fn cancels_under(&self, cert: &crate::cert::VerifiedCert, now: Clocked) -> bool {
+        if !self.names_cert(&cert.mac.0, cert.not_before) {
+            return false;
+        }
+        match now {
+            Clocked::At(t) => self.not_before.get() <= t && t < self.not_after.get(),
+            // Cannot place the window. Enforce unless the posture can *prove*
+            // the record is spent — which a floor can, whenever it has already
+            // reached `not_after`.
+            Clocked::AtLeast(_) | Clocked::Unknown => !now.proves_reached(self.not_after.get()),
+        }
     }
 }
 

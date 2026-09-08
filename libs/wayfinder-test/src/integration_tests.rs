@@ -491,6 +491,38 @@ fn enable_auth(node: &mut TestRouter, authority: &wayfinder_auth::Authority, ind
     node.set_epoch_unix(1_000);
 }
 
+/// [`enable_auth`], but with a certificate shaped the way a real authority
+/// issues one and **no epoch pinned** — so the node reports
+/// `Clocked::Unknown` and judges no validity window, which is what a
+/// bare-metal node with no anchor actually is.
+///
+/// A separate helper rather than a flag on `enable_auth`: leaving the epoch
+/// unset with `enable_auth`'s `not_before` of 0 would be an unclocked node
+/// holding a *fixture-shaped* credential, which is the combination that hid
+/// this gap in the first place (design 20 §2.2). The certificate here starts at
+/// a real Unix instant, so the window genuinely cannot be judged.
+fn enable_auth_unanchored(
+    node: &mut TestRouter,
+    authority: &wayfinder_auth::Authority,
+    index: usize,
+) {
+    const ISSUED_AT: u64 = 1_700_000_000;
+    let kp = machine_keypair(index);
+    let cert = authority.issue_cert(
+        kp.derived_mac(),
+        kp.ed_pubkey(),
+        kp.x_pubkey(),
+        ISSUED_AT,
+        ISSUED_AT + 365 * 24 * 60 * 60,
+    );
+    node.router_mut().set_auth(wayfinder::auth::OgmAuth::new(
+        kp,
+        cert,
+        authority.trust_anchor(),
+    ));
+    // Deliberately no `set_epoch_unix`: zero is the "no wall clock" state.
+}
+
 /// With auth enabled on both nodes, OGMs converge (signed) and a unicast is
 /// delivered with its pairwise tag verified and stripped — the host gets the
 /// clean payload, proving the directed data-plane tag wiring end to end.
@@ -528,6 +560,66 @@ fn test_authenticated_unicast_delivers_and_strips_tag() {
         harness.get_machine("machine2").local_deliveries(),
         vec![host_frame(m2, m1, b"secret payload")]
     );
+}
+
+/// **A board whose anchor is lost keeps routing** — design 20 §10's test 13,
+/// "the regression test for the whole objection".
+///
+/// Two authenticated nodes with real-shaped certificates and no clock at all.
+/// Everything that must still work does: signed OGMs converge, the next-hop
+/// proof round trip completes, and a directed frame is tagged, verified and
+/// stripped. Before design 20 this partitioned completely — an unclocked node
+/// refused every certificate a real authority issues, so it learned no peer,
+/// held no pairwise key, and could neither tag a frame nor verify one.
+///
+/// Deliberately end-to-end rather than a unit test on `OgmAuth`: the unit tests
+/// prove `verify_cert` and `verify_ogm` admit the peer, and this proves the
+/// things that *hang off* that admission — route selection, `retain_proven`,
+/// and the directed data plane — still work when nobody can date anything.
+#[test]
+fn an_unanchored_mesh_still_routes_and_tags() {
+    setup();
+    let mut harness = simple_pair();
+
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
+
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    enable_auth_unanchored(harness.get_machine_mut("machine1"), &authority, 0);
+    enable_auth_unanchored(harness.get_machine_mut("machine2"), &authority, 1);
+
+    harness.converge(Duration::from_secs(1));
+    for router in harness.machines.values() {
+        assert_eq!(
+            router.router().originator_table().count(),
+            1,
+            "an unanchored node must still learn its peer"
+        );
+    }
+
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m2, b"secret payload");
+    harness.tick();
+    harness.tick();
+
+    assert_eq!(
+        harness.get_machine("machine2").local_deliveries(),
+        vec![host_frame(m2, m1, b"secret payload")],
+        "the pairwise data plane works without either node knowing the date"
+    );
+
+    // ...and both nodes say so, rather than reporting a healthy clock.
+    for router in harness.machines.values() {
+        assert_eq!(
+            router.router().auth_wall(),
+            Some(wayfinder_auth::Clocked::Unknown)
+        );
+        assert!(
+            router.router().unjudged_cert_admissions() > 0,
+            "and count what they admitted without dating it"
+        );
+    }
 }
 
 /// An emergency revocation injected at one node floods across the mesh on
@@ -2616,7 +2708,10 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     debug_assert_eq!(a_kp.derived_mac(), m1);
     let a_cert = authority.issue_cert(m1, a_kp.ed_pubkey(), a_kp.x_pubkey(), 0, 1_000_000);
     let mut a_auth = wayfinder::auth::OgmAuth::new(a_kp, a_cert, authority.trust_anchor());
-    a_auth.set_time(1_000);
+    a_auth.set_time(
+        core::time::Duration::from_secs(1_000),
+        wayfinder_auth::Clocked::At(1_000),
+    );
 
     // B is a real authenticated node: this is what actually runs the
     // requester logic under test. `set_auth` resets machine3's own learned

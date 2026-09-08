@@ -38,6 +38,7 @@ use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::auth::OgmAuth;
 use wayfinder::auth::OgmVerdict;
 use wayfinder_auth::Authority;
+use wayfinder_auth::Clocked;
 use wayfinder_auth::Keypair;
 use wayfinder_bench::PAYLOAD_SIZES;
 use wayfinder_bench::ogm_payload;
@@ -63,7 +64,7 @@ fn pair() -> Pair {
         let kp = Keypair::from_seed(&[seed; 32]);
         let cert = authority.issue_cert(mac(id), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
         let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(1_000);
+        auth.set_time(core::time::Duration::from_secs(1_000), Clocked::At(1_000));
         auth
     };
     let mut a = member(2, 1);

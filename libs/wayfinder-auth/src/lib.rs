@@ -27,6 +27,7 @@
 //! segregation only; confidentiality is left to L3.
 
 mod cert;
+mod clock;
 mod error;
 mod key;
 mod mac;
@@ -44,6 +45,9 @@ pub use cert::CERT_VERSION;
 pub use cert::MembershipCert;
 pub use cert::TrustAnchor;
 pub use cert::VerifiedCert;
+pub use clock::Clocked;
+pub use clock::MIN_PLAUSIBLE_UNIX;
+pub use clock::WallClock;
 pub use error::AuthError;
 pub use key::Keypair;
 pub use key::verify_signature;

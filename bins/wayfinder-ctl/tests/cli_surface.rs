@@ -117,6 +117,7 @@ fn auth_set_takes_named_paths() {
         cert,
         trust_anchor,
         renewal,
+        clock: _,
     }) = parse(&[
         "auth",
         "set",

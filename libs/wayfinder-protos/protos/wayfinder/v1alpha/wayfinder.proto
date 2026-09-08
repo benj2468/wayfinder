@@ -875,6 +875,53 @@ message SetAuthRequest {
   // that names no provider therefore turns automatic renewal off, and says so
   // rather than renewing somewhere stale.
   RenewalProvider provider = 4;
+
+  // The wall clock of the machine performing this install, in unix seconds.
+  //
+  // Stamped by the *installer*, NOT by the signer: in the out-of-band
+  // enrolment flow the certificate may have been minted weeks earlier and
+  // hand-carried on a USB stick, so the issuer's clock says nothing about now.
+  // The name is load-bearing — `issuer_unix` would invite a future change to
+  // read it off the CSR bundle, which is a silent fail-open proportional to how
+  // long that bundle sat in a drawer.
+  //
+  // This is the only way an absolute time enters a node with no clock of its
+  // own.  The receiver takes it as `max(current_estimate, installer_unix,
+  // verified_cert.not_before)`, applied *after* the certificate verifies, so an
+  // unverified field can never move the clock, and refuses anything below the
+  // 2025 plausibility floor.
+  //
+  // Absent on the wire it decodes as 0, which is that floor's fail-closed
+  // value; a client whose own clock is not disciplined sends 0 deliberately,
+  // for the same reason.  Note what zero does *not* mean: because the anchor is
+  // a max over three values, a zero stamp contributes nothing of its own and
+  // leaves the certificate's CA-signed not_before to carry the anchor.  It is
+  // the installer's claim that is dropped, not the anchoring.
+  uint64 installer_unix = 5;
+}
+
+// Anchor a node's wall clock, without re-issuing its certificate.
+//
+// A bare-metal node has no RTC and no NTP: what it has is a counter driven by
+// an internal RC oscillator, roughly 20 seconds of drift a day, counting from
+// reset with no notion of a date.  So the estimate it free-runs from an anchor
+// needs correcting, and a node that lost its persisted checkpoint needs
+// re-anchoring — both purely local maintenance, which install-only anchoring
+// would make the certificate authority a participant in.
+//
+// The node treats this exactly as SetAuth's `installer_unix`: refused below the
+// 2025 plausibility floor, taken as `max` against the current estimate so it can
+// never roll the node backwards, and floored against the currently-held
+// certificate's `not_before` — the node holds a valid credential, so "now is at
+// least when that credential began" holds here as it does at install.
+//
+// Carries the same access as SetAuth, and for a reason rather than by analogy:
+// anyone who can lie about the time can already install an arbitrary
+// credential, which is strictly more powerful.
+message SetTimeRequest {
+  // The installing machine's wall clock, in unix seconds.  Same rules and same
+  // fail-closed zero as SetAuthRequest.installer_unix.
+  uint64 installer_unix = 1;
 }
 
 // Where a node renews the membership certificate it holds, as installed
@@ -1439,6 +1486,9 @@ message WayfinderRequest {
 
     // Stop the running ping session.
     CancelPingRequest cancel_ping = 44;
+
+    // Anchor the node's wall clock without re-issuing its certificate.
+    SetTimeRequest set_time = 45;
   }
 }
 
@@ -1483,6 +1533,43 @@ message NodeInfo {
   // clock so it can still judge peer certificate windows.  That is why this
   // needs reporting at all -- the node looks, and is, healthy as a router.
   bool clock_trusted = 5;
+
+  // What this node knows about the wall clock, and therefore which of a
+  // certificate's guarantees it can check.
+  //
+  // A different question from clock_trusted above, which is "may the node make
+  // a credential decision".  This one is "which validity windows does the
+  // router judge", and the two genuinely come apart: a host can hold an
+  // authoritative reading while refusing credential decisions on an
+  // undisciplined NTP verdict, and a bare-metal node has no NTP concept at all
+  // while still holding a usable floor.  Three states, so a bool cannot carry
+  // it without rounding one of them away.
+  ClockPosture clock_posture = 6;
+}
+
+// What a node knows about the wall clock.  Only the validity-window check
+// varies by posture; the signature, mesh id and key-to-MAC binding a
+// certificate is admitted on are checked identically under all three.
+enum ClockPosture {
+  // Unset -- a node too old to report this field.  Not a fourth state: read it
+  // as "this node does not say".
+  CLOCK_POSTURE_UNSPECIFIED = 0;
+
+  // No usable clock.  The node routes and verifies every signature, and judges
+  // no certificate validity window at all.  A supported running state on a
+  // bare-metal node, not a failure -- but one an operator wants told about,
+  // because passive revocation-by-expiry is not being enforced here.
+  CLOCK_POSTURE_UNKNOWN = 1;
+
+  // A lower bound: the node can prove the time is at least some instant, but
+  // not that it is no later.  What a board free-running from an anchor on an
+  // internal RC oscillator actually knows.  Expiry is enforced wherever the
+  // floor establishes it; not-yet-validity is never judged, which is what makes
+  // such a node unable to partition itself by drifting fast.
+  CLOCK_POSTURE_AT_LEAST = 2;
+
+  // An authoritative reading.  Both ends of every validity window are enforced.
+  CLOCK_POSTURE_AT = 3;
 }
 
 // Per-neighbor path metrics for a single path to an originator.
@@ -1902,6 +1989,22 @@ message NodeMetrics {
   // are lapsing without renewal, or the key cache is churning under pressure.
   // Zero when auth is disabled, which has no proofs to sweep.
   uint32 proofs_swept = 22;
+
+  // Count of certificates this node admitted while judging no validity window
+  // at all -- the direct measure of how much passive revocation-by-expiry is
+  // not being enforced here.
+  //
+  // Nonzero means the node has been routing on credentials it could not date,
+  // which is a supported state on a bare-metal node with no anchor and the
+  // whole reason this needs surfacing: nothing else makes it visible, because
+  // the node looks, and is, healthy as a router.  The companion to
+  // ALARM_KIND_CLOCK_UNSYNCHRONIZED, which says the condition holds *now*
+  // where this says how much of it has already happened.
+  //
+  // Counts admissions, not distinct certificates: a re-verified peer counts
+  // again, because each admission is an occasion on which a window went
+  // unchecked.  Zero when authentication is off.
+  uint32 unjudged_cert_admissions = 23;
 }
 
 // Marker payload indicating the router would flood a packet out of every

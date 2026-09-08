@@ -1,16 +1,22 @@
 //! Whether the host's system clock is disciplined enough to make credential
 //! decisions with.
 //!
+//! Its own crate rather than a module of `wayfinder-server`, for the reason
+//! `wayfinder-tls-mgmt` is: both `wayfinder-server` and `wayfinder-client` need
+//! this verdict and neither may depend on the other (design 20 §4.6). The same
+//! verdict has to gate a certificate authority *issuing* a credential and a
+//! client *stamping the time that installs it*, and a rule with two
+//! implementations is two rules.
+//!
 //! Time is a trust input for this node: it decides a certificate's validity
 //! window, when an invitation stops being redeemable, when a lockout lifts, how
 //! long a revocation is enforced, and which TOTP step a code belongs to. A
 //! wrong clock is not a cosmetic fault — it is an expired bearer token that
 //! still works, or a valid membership rejected mesh-wide.
 //!
-//! [`Clock::System`](crate::Clock)'s existing `MIN_PLAUSIBLE_UNIX` floor
-//! catches a clock that was *never set* (a board with no RTC reading 1970). It
-//! cannot catch the case this module exists for: a clock that is plausible and
-//! wrong — off by hours because the node booted before NTP reached it, which is
+//! `wayfinder-auth`'s `MIN_PLAUSIBLE_UNIX` floor catches a clock that was
+//! *never set* (a board with no RTC reading 1970). It cannot catch the case
+//! this crate exists for: a clock that is plausible and wrong — off by hours because the node booted before NTP reached it, which is
 //! the ordinary condition of a field-deployed mesh with no upstream.
 //!
 //! **`chronyd` is the source of truth**; this module reads the verdict chronyd
@@ -52,7 +58,7 @@
 /// credential requirement.
 pub const DEFAULT_MAX_CLOCK_ERROR_US: u64 = 5_000_000;
 
-/// How a [`Clock::System`](crate::Clock) decides whether to trust its reading.
+/// How a caller reading the system clock decides whether to trust it.
 ///
 /// An enum rather than a bare bool because the production variant has to be
 /// re-read at every use (a clock becomes trusted partway through a node's life,
@@ -64,7 +70,7 @@ pub enum ClockTrust {
     /// while it is disciplined and its estimated error is within `max_error_us`.
     ///
     /// What a real node runs on. On a platform with no `ntp_adjtime`, this
-    /// degrades to [`ClockSync::Unsupported`] — see [`clock_sync`](crate::clock_sync) for why that is
+    /// degrades to [`ClockSync::Unsupported`] — see [`read`] for why that is
     /// treated as trusted rather than fail-closed.
     Ntp {
         /// Bound on the kernel's `maxerror`, in microseconds. See
@@ -80,9 +86,8 @@ pub enum ClockTrust {
     /// Never trust the host clock.
     ///
     /// Exists so the gate itself is testable: it pins the untrusted branch on a
-    /// machine whose clock is perfectly fine, the same way
-    /// [`Clock::Fixed`](crate::Clock) pins a time on a machine whose clock is
-    /// moving.
+    /// machine whose clock is perfectly fine, the same way a pinned clock
+    /// reading is a time chosen on a machine whose own clock is moving.
     Never,
 }
 
@@ -165,7 +170,7 @@ impl ClockSync {
     /// Whether a clock in this state may be used for a credential decision.
     ///
     /// [`Unsupported`](Self::Unsupported) counts as trusted — see
-    /// [`clock_sync`](crate::clock_sync).
+    /// [`read`].
     #[must_use]
     pub const fn is_trusted(self) -> bool {
         matches!(self, Self::Synchronized { .. } | Self::Unsupported)
@@ -189,8 +194,8 @@ impl ClockSync {
 ///
 /// A pure function over the three values the syscall reports, so every boundary
 /// below is testable without a machine whose clock is actually wrong — the same
-/// reason `plausible_or_zero` is split out from
-/// [`Clock::System`](crate::Clock).
+/// reason `wayfinder-server`'s `plausible_or_zero` is split out from the
+/// host-clock read it floors.
 ///
 /// `ret` is the syscall's return value, `status` the returned `timex.status`
 /// word, `maxerror_us` its estimated error bound in microseconds, and

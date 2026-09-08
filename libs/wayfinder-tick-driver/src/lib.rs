@@ -165,10 +165,10 @@ pub struct Driver {
     ///
     /// Certificate validity is judged against unix time, but a tick-driven
     /// caller supplies a monotonic `now` starting at zero — so each [`tick`]
-    /// sets the auth clock to `epoch_unix + now`. Left at 0 the auth clock
-    /// never advances, which [`OgmAuth`](wayfinder::auth::OgmAuth) reads as
-    /// "clock never set". Set it with
-    /// [`set_epoch_unix`](Self::set_epoch_unix).
+    /// sets the auth clock to `epoch_unix + now`. Left at 0 the driver reports
+    /// [`Clocked::Unknown`](wayfinder_auth::Clocked) — a node with no usable
+    /// wall clock, which routes but judges no certificate validity window. Set
+    /// it with [`set_epoch_unix`](Self::set_epoch_unix).
     ///
     /// [`tick`]: Self::tick
     epoch_unix: u64,
@@ -275,10 +275,26 @@ impl Driver {
     ///
     /// Each [`tick`](Self::tick) then advances the auth clock to
     /// `epoch_unix + now`. Set this whenever OGM authentication is enabled;
-    /// without it the auth clock stays at 0, which
-    /// [`OgmAuth`](wayfinder::auth::OgmAuth) treats as never having been set.
+    /// without it the node reports [`Clocked::Unknown`](wayfinder_auth::Clocked)
+    /// and judges no validity window.
     pub fn set_epoch_unix(&mut self, epoch_unix: u64) {
         self.epoch_unix = epoch_unix;
+    }
+
+    /// This driver's wall-clock posture at `now`.
+    ///
+    /// A pinned epoch is a value its caller chose, so it is reported as
+    /// [`Clocked::At`](wayfinder_auth::Clocked::At) verbatim rather than
+    /// floored by `MIN_PLAUSIBLE_UNIX` — flooring it would make a simulation
+    /// asking about second 1000 silently ask about something else. The floor
+    /// exists for the reading nobody chose; zero is the "no epoch pinned"
+    /// state and is the one value that means there is no clock here.
+    fn wall(&self, now: Duration) -> wayfinder_auth::Clocked {
+        if self.epoch_unix == 0 {
+            wayfinder_auth::Clocked::Unknown
+        } else {
+            wayfinder_auth::Clocked::At(self.epoch_unix.saturating_add(now.as_secs()))
+        }
     }
 
     /// Enqueue a frame received on interface `idx` (with its carrier's
@@ -336,8 +352,7 @@ impl Driver {
         // the clock can evict a lapsed peer's key, and the engine's next-hop
         // proofs must be reconciled with that in the same call (design 09
         // §8.10).
-        self.router
-            .set_auth_time(now, self.epoch_unix.saturating_add(now.as_secs()));
+        self.router.set_auth_time(now, self.wall(now));
 
         let mut stage = StageSink::default();
 

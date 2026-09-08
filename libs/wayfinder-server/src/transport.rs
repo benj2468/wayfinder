@@ -1524,7 +1524,21 @@ fn authorize(peer_key: &[u8; 32], cert: Option<&MembershipCert>, ctx: &AuthConte
         cert,
         ctx.anchor.as_ref(),
         ctx.own_key.as_ref(),
-        ctx.now_unix,
+        // `At`, deliberately: the management gate keeps full window enforcement
+        // regardless of what the *router's* posture is. The accept loop reads
+        // the host system clock and errors rather than defaulting when it
+        // cannot (see `now_unix`), so a connection is either judged against a
+        // real reading or refused outright — opening the router's posture
+        // (design 20 §4.2) does not open this door.
+        //
+        // Not floored by `MIN_PLAUSIBLE_UNIX`, unlike the other two host-clock
+        // readers in this workspace, and that is a real edge: a host whose RTC
+        // died to 1970 would refuse every client certificate as `NotYetValid`
+        // rather than admitting them undated. Fail-closed is the right
+        // direction for a management gate — a node that refuses every
+        // administrator is recoverable, one that admits every stranger is
+        // not — so it is left as it is rather than quietly widened here.
+        wayfinder::wayfinder_auth::Clocked::At(ctx.now_unix),
         |cert| ctx.revoked.iter().any(|r| r.cancels(cert, ctx.now_unix)),
     )
 }
@@ -1923,6 +1937,7 @@ mod tests {
             auth_locked: false,
             runtime_config_active: false,
             clock_trusted: true,
+            clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
         })
     }
 
@@ -3364,6 +3379,7 @@ mod tests {
             auth_locked: false,
             runtime_config_active: false,
             clock_trusted: true,
+            clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
         });
         let (mut client, server) = spawn_authenticated_server_answering(key, ctx, big);
 

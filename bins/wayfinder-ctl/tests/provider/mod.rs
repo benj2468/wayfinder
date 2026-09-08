@@ -158,6 +158,7 @@ impl RouterReads for ProviderMock {
             seqno_resyncs: 0,
             ogm_refloods_suppressed: 0,
             proofs_swept: 0,
+            unjudged_cert_admissions: 0,
         }
     }
 
@@ -174,6 +175,12 @@ impl RouterReads for ProviderMock {
 
     fn runtime_config_active(&self) -> bool {
         false
+    }
+
+    fn clock_posture(&self) -> wayfinder_protos::service::ClockPostureData {
+        // A mock with no clock policy to report: `At` matches the `true` it
+        // reports for `clock_trusted`, so the two do not contradict.
+        wayfinder_protos::service::ClockPostureData::At
     }
 
     fn clock_trusted(&self) -> bool {
@@ -202,7 +209,12 @@ impl RouterWrites for ProviderMock {
         _cert: &[u8],
         _trust_anchor: &[u8],
         _provider: Option<wayfinder_protos::service::RenewalProviderData>,
+        _installer_unix: u64,
     ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_time(&mut self, _installer_unix: u64) -> Result<(), String> {
         Ok(())
     }
 

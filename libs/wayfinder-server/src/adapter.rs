@@ -17,14 +17,18 @@ use wayfinder::EgressInterface;
 use wayfinder::auth::OgmAuth;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::ping::ProbeState;
+use wayfinder::wayfinder_auth::Clocked;
 use wayfinder::wayfinder_auth::Keypair;
+use wayfinder::wayfinder_auth::MIN_PLAUSIBLE_UNIX;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
+use wayfinder::wayfinder_auth::WallClock;
 use wayfinder_protos::service::AlarmData;
 use wayfinder_protos::service::AlarmKindData;
 use wayfinder_protos::service::AlarmSeverityData;
 use wayfinder_protos::service::AlarmSubjectData;
 use wayfinder_protos::service::AlarmsData;
+use wayfinder_protos::service::ClockPostureData;
 use wayfinder_protos::service::EgressDecisionData;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::InterfaceThroughputData;
@@ -122,6 +126,15 @@ pub struct RouterAdapter<
     /// restart.  Absent on a node with no runtime state configured (and on
     /// every embedded node), where a change applies in memory only.
     settings: Option<&'a mut dyn SettingsStore>,
+    /// The node's own [`WallClock`] — its monotone floor on absolute time —
+    /// when it has no other source of one.
+    ///
+    /// Present on a bare-metal node, whose only route to an absolute time is
+    /// an installer stamping one (design 20 §4.4). Absent on a host, which
+    /// reads its own clock and supplies it through
+    /// [`with_epoch_unix`](Self::with_epoch_unix) instead; `SetTime` against
+    /// such a node is refused rather than silently doing nothing.
+    wall_clock: Option<&'a mut WallClock>,
     /// This node's own identity seed — the one its management TLS terminates
     /// on, which is also its mesh identity once it holds a certificate.
     ///
@@ -217,6 +230,7 @@ impl<
             enrollment: None,
             epoch_unix: Duration::default(),
             clock_trusted: true,
+            wall_clock: None,
             settings: None,
             identity_seed: None,
             renewal_provider: None,
@@ -226,17 +240,21 @@ impl<
     /// Update the unix offset for this adapter, used to convert between unix
     /// timestamps and [`Duration`] values.
     ///
-    /// This is what [`unix_now`](Self::unix_now) feeds `set_auth`'s
-    /// certificate-validity check: an adapter built without this defaults
-    /// `epoch_unix` to zero, so `unix_now()` collapses to just `now` — a small
-    /// monotonic duration, nowhere near a real certificate's validity window —
-    /// and every `SetAuth` will then fail as "not yet valid" no matter how
-    /// valid the certificate actually is. Every host caller must supply the
-    /// same `epoch_unix` it advances the router's auth clock with elsewhere
-    /// (see `refresh_auth_clock` in `wayfinder-driver`); an embedded node has
-    /// no wall clock to supply here at all yet, which is why `SetAuth` over
-    /// its management port is not wired up (see
-    /// `wayfinder-embedded-driver`'s `run_once_with_mgmt`).
+    /// This is what [`wall`](Self::wall) reports as the posture `set_auth`
+    /// verifies a certificate under. Every host caller must supply the same
+    /// `epoch_unix` it advances the router's auth clock with elsewhere (see
+    /// `refresh_auth_clock` in `wayfinder-driver`), so the adapter and the
+    /// router agree about what time it is.
+    ///
+    /// Leaving it unset is a supported state, not a broken one: an adapter with
+    /// no epoch reports [`Clocked::Unknown`] and verifies a certificate on its
+    /// signature, mesh id and key↔MAC binding without judging a window it has
+    /// no grounds to judge (design 20 §4.2). That is what a bare-metal node
+    /// does — it supplies [`with_wall_clock`](Self::with_wall_clock) instead —
+    /// and it is why `SetAuth` over a board's management port works at all.
+    /// Before design 20 an absent epoch made `unix_now()` collapse to the
+    /// loop's monotonic `now`, a few seconds past 1970, and every `SetAuth`
+    /// failed as "not yet valid" however valid the certificate was.
     pub fn with_epoch_unix(mut self, offset: Duration) -> Self {
         self.epoch_unix = offset;
         self
@@ -252,6 +270,24 @@ impl<
     /// be worse than reporting nothing.
     pub fn with_clock_trusted(mut self, trusted: bool) -> Self {
         self.clock_trusted = trusted;
+        self
+    }
+
+    /// Hand the adapter the node's own [`WallClock`], so a credential install
+    /// or a `SetTime` can anchor it.
+    ///
+    /// A bare-metal node's only route to an absolute time (design 20 §4.4). A
+    /// host has its own clock and supplies it through
+    /// [`with_epoch_unix`](Self::with_epoch_unix) instead, so it leaves this
+    /// unset — and `SetTime` against it is then refused with a reason rather
+    /// than silently accepted and dropped.
+    ///
+    /// A mutable reference for the same reason
+    /// [`with_identity`](Self::with_identity) is: the anchor has to be visible
+    /// to the driver loop that reads it on its next pass, not only after a
+    /// restart.
+    pub fn with_wall_clock(mut self, clock: &'a mut WallClock) -> Self {
+        self.wall_clock = Some(clock);
         self
     }
 
@@ -341,6 +377,67 @@ impl<
     /// Calculate the now time with the epoch unix offset.
     fn unix_now(&self) -> Duration {
         self.epoch_unix + self.now
+    }
+
+    /// What this adapter knows about the wall clock — the posture every
+    /// certificate it verifies is judged under.
+    ///
+    /// [`Clocked::Unknown`] in the two cases where there is no time worth
+    /// judging against, and they are different cases:
+    ///
+    /// * **No epoch supplied** (`epoch_unix` zero), the permanent condition of
+    ///   a bare-metal node, which has no wall clock to supply. Previously
+    ///   `unix_now()` collapsed to a small monotonic duration — a few seconds
+    ///   past 1970 — so every `SetAuth` failed as `NotYetValid` no matter how
+    ///   valid the certificate was, which is why credential installation over a
+    ///   board's management port was not wired up at all.
+    /// * **The host's clock is not trusted**, the verdict
+    ///   [`with_clock_trusted`](Self::with_clock_trusted) carries. A reading
+    ///   nothing vouches for is worth exactly as much as no reading, and saying
+    ///   so is more honest than the previous mechanism — an epoch offset of
+    ///   zero, chosen because it happened to land below every real
+    ///   `not_before`.
+    ///
+    /// Under either, the certificate is still fully verified: signature, mesh
+    /// id, key↔MAC binding, reserved-address refusal. Only the validity window
+    /// — the one guarantee this node has no grounds to judge — is skipped
+    /// (design 20 §4.2). What replaces it as the guard on a wrong install is
+    /// the client side: `wayfinderctl` refuses to stamp a time it cannot vouch
+    /// for (§4.6).
+    ///
+    /// A supplied non-zero epoch is a value its caller chose, so it is reported
+    /// verbatim rather than floored by `MIN_PLAUSIBLE_UNIX` — the floor exists
+    /// for the reading nobody chose. Zero is the exception, and is the "no
+    /// epoch" case above rather than a chosen instant.
+    ///
+    /// An attached [`WallClock`] wins over both: a node holding one has no host
+    /// clock behind it, and that floor is the whole of what it knows.
+    fn wall(&self) -> Clocked {
+        // A node holding its own `WallClock` has no host clock behind it; that
+        // floor is the whole of what it knows.
+        if let Some(clock) = self.wall_clock.as_deref() {
+            return clock.posture(self.now);
+        }
+        if self.epoch_unix.is_zero() || !self.clock_trusted {
+            Clocked::Unknown
+        } else {
+            Clocked::At(self.unix_now().as_secs())
+        }
+    }
+}
+
+/// Project the auth crate's [`Clocked`] onto the service layer's posture.
+///
+/// Two enums rather than a re-export, on the same rule the severity projection
+/// below follows: `wayfinder-protos` names the wire's vocabulary and
+/// `wayfinder-auth` names the verifier's, and neither may depend on the other.
+/// The payload is dropped on the way across — an operator needs to know *which*
+/// posture the node is in, not the floor it derived.
+fn posture_data(wall: Clocked) -> ClockPostureData {
+    match wall {
+        Clocked::At(_) => ClockPostureData::At,
+        Clocked::AtLeast(_) => ClockPostureData::AtLeast,
+        Clocked::Unknown => ClockPostureData::Unknown,
     }
 }
 
@@ -942,6 +1039,7 @@ impl<
             seqno_resyncs: self.router.seqno_resyncs(),
             ogm_refloods_suppressed: self.router.ogm_refloods_suppressed(),
             proofs_swept: self.router.proofs_swept(),
+            unjudged_cert_admissions: self.router.unjudged_cert_admissions(),
         }
     }
 
@@ -984,6 +1082,19 @@ impl<
 
     fn clock_trusted(&self) -> bool {
         self.clock_trusted
+    }
+
+    fn clock_posture(&self) -> ClockPostureData {
+        // Read from the router's own auth state, not from whatever supplied
+        // the clock, so the operator-facing report and the check it describes
+        // cannot disagree — this is the value `verify_cert` is handed.
+        //
+        // Authentication off answers `Unknown`, and that is exactly true
+        // rather than a fallback: a node judging no certificates judges no
+        // validity windows.
+        self.router
+            .auth_wall()
+            .map_or(ClockPostureData::Unknown, posture_data)
     }
 
     /// Read from the process-wide log ring.
@@ -1200,6 +1311,10 @@ impl<
         self.view().clock_trusted()
     }
 
+    fn clock_posture(&self) -> ClockPostureData {
+        self.view().clock_posture()
+    }
+
     fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
         self.view().logs(since_seq, max_records)
     }
@@ -1301,6 +1416,7 @@ impl<
         cert: &[u8],
         trust_anchor: &[u8],
         provider: Option<RenewalProviderData>,
+        installer_unix: u64,
     ) -> Result<(), String> {
         // Checked before anything is installed, so an address that can never be
         // dialled is an error the operator sees while they are standing at the
@@ -1335,8 +1451,8 @@ impl<
             .ok_or_else(|| "unable to parse trust anchor".to_string())?;
 
         // Validate the certificate before we persist it.
-        anchor
-            .verify_cert(&parsed_cert, self.unix_now().as_secs())
+        let verified = anchor
+            .verify_cert(&parsed_cert, self.wall())
             .map_err(|e| e.to_string())?;
         // The certificate must actually name the key being installed — a
         // provider bug or an operator approving the wrong pending row must
@@ -1427,7 +1543,80 @@ impl<
         if let Some(slot) = self.renewal_provider.as_deref_mut() {
             *slot = provider;
         }
+        // Anchored last, and only on a node that has no clock of its own.
+        //
+        // *After* the certificate verified, deliberately: `not_before` is the
+        // CA-signed half of this floor, and reading it from a certificate that
+        // had not verified would let anyone who can reach this port set the
+        // node's clock to any instant they liked (design 20 §4.4). Failing to
+        // anchor is not an error — the credential is installed either way, and
+        // a node that ends up `Unknown` still routes and still verifies its
+        // peers; it simply judges no expiry, and says so through the alarm.
+        if let Some(clock) = self.wall_clock.as_deref_mut() {
+            clock.install_anchor(installer_unix, &verified, self.now);
+        }
         Ok(())
+    }
+
+    fn set_time(&mut self, installer_unix: u64) -> Result<(), String> {
+        if installer_unix < MIN_PLAUSIBLE_UNIX {
+            // Zero is what a client sends when it could not vouch for its own
+            // clock, and anything else below the floor is a clock that was
+            // never set. Either way there is nothing here to anchor with, and a
+            // request whose entire content is a time deserves to be told so
+            // rather than silently doing nothing.
+            return Err(format!(
+                "refusing an implausible time: {installer_unix} is before 2025, so either \
+                 the installing host could not vouch for its clock or that clock was \
+                 never set"
+            ));
+        }
+        // Floored against the certificate this node already runs under, on the
+        // same reasoning as an install: the node holds a valid credential, so
+        // "now is at least when that credential began" holds here too, and it
+        // is CA-signed where the installer's stamp is merely trusted.
+        //
+        // Read straight off the held certificate rather than through
+        // `install_anchor`'s `&VerifiedCert`, because there is no verification
+        // happening here to produce one — this is the certificate the node is
+        // *already running under*, which verified when it was installed. The
+        // `max` is spelled out for that reason.
+        let not_before = self
+            .router
+            .auth()
+            .map(|auth| auth.own_cert().not_before.get())
+            .unwrap_or(0);
+        let floored = installer_unix.max(not_before);
+        let now = self.now;
+        let Some(clock) = self.wall_clock.as_deref_mut() else {
+            return Err(
+                "this node reads its own wall clock and has no anchor to set; SetTime is \
+                 for a node with no clock of its own"
+                    .to_string(),
+            );
+        };
+        if clock.anchor(floored, now) {
+            return Ok(());
+        }
+        // **Reported, not swallowed.** `max` refusing a lower anchor is the
+        // monotonicity invariant working, and nothing was mutated — but the
+        // operator asked this node to take a time and it did not. The response
+        // carries no payload, so an error is the only channel there is, and
+        // saying nothing would have `wayfinderctl time set` print "clock
+        // anchored" for a request that changed nothing.
+        //
+        // This is the reachable case, not a corner: a board free-running on an
+        // internal RC oscillator drifts about twenty seconds a day, and half of
+        // that drift is *fast*. Correcting a fast board is what `SetTime` is
+        // for, and it is precisely what the estimate-never-decreases invariant
+        // forbids — so the operator has to be told that their correction was
+        // refused and why, rather than left believing it landed.
+        Err(format!(
+            "no change: this node's estimate is already at or past {installer_unix}. Its \
+             clock only ever moves forward, so a correction behind the current estimate \
+             cannot be applied; re-issuing the node's certificate is what re-anchors a \
+             node that has run ahead"
+        ))
     }
 
     fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
@@ -1778,7 +1967,10 @@ mod tests {
 
         let mut router = CentralRouter::new(me);
         router.set_auth(OgmAuth::new(kp, cert, anchor));
-        router.auth_mut().unwrap().set_time(100);
+        router
+            .auth_mut()
+            .unwrap()
+            .set_time(core::time::Duration::from_secs(100), Clocked::At(100));
 
         assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
 
@@ -2204,13 +2396,16 @@ mod tests {
         let cert1 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp1)).unwrap();
         let mut router = CentralRouter::new(me);
         router.set_auth(OgmAuth::new(kp1, cert1, anchor));
-        router.auth_mut().unwrap().set_time(100);
+        router
+            .auth_mut()
+            .unwrap()
+            .set_time(core::time::Duration::from_secs(100), Clocked::At(100));
 
         let kp2 = Keypair::from_seed(&[3; 32]);
         let peer = kp2.derived_mac();
         let cert2 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp2)).unwrap();
         let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
-        peer_auth.set_time(100);
+        peer_auth.set_time(core::time::Duration::from_secs(100), Clocked::At(100));
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
             version: BATMAN_VERSION,
@@ -2404,7 +2599,10 @@ mod tests {
         router.set_auth(OgmAuth::new(kp, cert, anchor));
 
         let due_at = |router: &mut CentralRouter, now: u64| {
-            router.auth_mut().unwrap().set_time(now);
+            router
+                .auth_mut()
+                .unwrap()
+                .set_time(core::time::Duration::from_secs(now), Clocked::At(now));
             RouterAdapter::new(router, Duration::ZERO).security_status()
         };
 
@@ -2460,7 +2658,10 @@ mod tests {
         let cert1 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp1)).unwrap();
         let mut router = CentralRouter::new(me);
         router.set_auth(OgmAuth::new(kp1, cert1, anchor));
-        router.auth_mut().unwrap().set_time(100);
+        router
+            .auth_mut()
+            .unwrap()
+            .set_time(core::time::Duration::from_secs(100), Clocked::At(100));
 
         // Peer mac(2) emits a signed OGM; feed it so the router verifies + caches
         // it as an originator carrying its cert expiry.
@@ -2468,7 +2669,7 @@ mod tests {
         let peer = kp2.derived_mac();
         let cert2 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp2)).unwrap();
         let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
-        peer_auth.set_time(100);
+        peer_auth.set_time(core::time::Duration::from_secs(100), Clocked::At(100));
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
             version: BATMAN_VERSION,
@@ -2726,7 +2927,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor, None)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
             .unwrap();
 
         let identity = store
@@ -2779,7 +2980,13 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .with_renewal_provider(&mut live)
-            .set_auth(&[3; 32], &cert, &anchor, Some(provider("ca.example:7700")))
+            .set_auth(
+                &[3; 32],
+                &cert,
+                &anchor,
+                Some(provider("ca.example:7700")),
+                0,
+            )
             .unwrap();
 
         assert_eq!(
@@ -2827,7 +3034,7 @@ mod tests {
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_settings(&mut store)
                 .with_renewal_provider(&mut live)
-                .set_auth(&[3; 32], &cert, &anchor, Some(provider(address)))
+                .set_auth(&[3; 32], &cert, &anchor, Some(provider(address)), 0)
                 .unwrap();
         }
 
@@ -2871,7 +3078,7 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .with_renewal_provider(&mut live)
-            .set_auth(&[3; 32], &cert, &anchor, None)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
             .unwrap();
 
         assert_eq!(live, None, "the live slot is cleared, not merged");
@@ -2910,7 +3117,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor, Some(provider("ca.example")))
+            .set_auth(&[3; 32], &cert, &anchor, Some(provider("ca.example")), 0)
             .unwrap_err();
 
         assert!(
@@ -2965,7 +3172,10 @@ mod tests {
             old_cert,
             authority.trust_anchor(),
         ));
-        router.auth_mut().unwrap().set_time(2_000);
+        router
+            .auth_mut()
+            .unwrap()
+            .set_time(core::time::Duration::from_secs(2_000), Clocked::At(2_000));
         router.ingest_revocation(&authority.revoke(node, 1_000, 100_000), Duration::ZERO);
         assert!(router.self_revoked());
 
@@ -2978,7 +3188,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], stale.as_bytes(), &anchor_bytes, None)
+            .set_auth(&[3; 32], stale.as_bytes(), &anchor_bytes, None, 0)
             .expect_err("a cancelled certificate is refused");
         assert!(err.contains("revoked"), "the reason names the cause: {err}");
         assert!(router.auth_locked(), "and the node stays inert");
@@ -2989,7 +3199,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], fresh.as_bytes(), &anchor_bytes, None)
+            .set_auth(&[3; 32], fresh.as_bytes(), &anchor_bytes, None, 0)
             .expect("a certificate issued after the revocation re-admits the node");
         assert!(!router.self_revoked());
         assert!(!router.auth_locked());
@@ -3044,7 +3254,7 @@ mod tests {
         let mut adapter = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store);
-        adapter.set_auth(&[3; 32], &cert, &anchor, None).unwrap();
+        adapter.set_auth(&[3; 32], &cert, &anchor, None, 0).unwrap();
 
         let pair = adapter.own_cert().expect("the node is certified");
 
@@ -3108,7 +3318,7 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
-            .set_auth(&[], &cert, &anchor, None)
+            .set_auth(&[], &cert, &anchor, None, 0)
             .unwrap();
 
         assert!(router.auth().is_some(), "the node is now authenticated");
@@ -3163,7 +3373,7 @@ mod tests {
             RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
-                .set_auth(&new_seed, &cert, &anchor, None)
+                .set_auth(&new_seed, &cert, &anchor, None, 0)
                 .unwrap();
 
             assert_eq!(
@@ -3192,7 +3402,7 @@ mod tests {
             RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
-                .set_auth(&[], &cert, &anchor, None)
+                .set_auth(&[], &cert, &anchor, None, 0)
                 .unwrap();
 
             assert_eq!(identity_seed, Some(old_seed));
@@ -3212,7 +3422,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
-            .set_auth(&[], &cert, &anchor, None)
+            .set_auth(&[], &cert, &anchor, None, 0)
             .expect_err("no identity to certify");
 
         assert!(err.contains("identity"), "got: {err}");
@@ -3229,7 +3439,7 @@ mod tests {
 
         let result = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
-            .set_auth(&[3; 32], b"not a cert", b"not an anchor", None);
+            .set_auth(&[3; 32], b"not a cert", b"not an anchor", None, 0);
 
         assert!(result.is_err());
         assert!(store.writes.is_empty());
@@ -3256,7 +3466,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &foreign_anchor, None)
+            .set_auth(&[3; 32], &cert, &foreign_anchor, None, 0)
             .expect_err("cert does not chain to this anchor");
 
         assert!(err.contains("signature"), "got: {err}");
@@ -3285,7 +3495,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &wrong_mesh_anchor, None)
+            .set_auth(&[3; 32], &cert, &wrong_mesh_anchor, None, 0)
             .expect_err("cert is for a different mesh");
 
         assert!(err.contains("mesh"), "got: {err}");
@@ -3311,7 +3521,7 @@ mod tests {
             // Well past not_after.
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor, None)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
             .expect_err("cert has expired");
 
         assert!(err.contains("expired"), "got: {err}");
@@ -3319,9 +3529,9 @@ mod tests {
         assert!(store.writes.is_empty(), "never persisted");
     }
 
-    /// A cert whose `not_before` is still in the future must be refused —
-    /// installing it now would let the node authenticate before the CA meant
-    /// it to.
+    /// A cert whose `not_before` is still in the future must be refused **by a
+    /// node that knows the time** — installing it now would let the node
+    /// authenticate before the CA meant it to.
     #[test]
     fn set_auth_rejects_a_not_yet_valid_cert() {
         let mut router = CentralRouter::new(mac(1));
@@ -3334,14 +3544,257 @@ mod tests {
         let mut store = RecordingStore::default();
 
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
-            // Adapter clock defaults to unix time 0, well before not_before.
+            // An epoch the caller supplied, before not_before: `Clocked::At`,
+            // which judges both ends of the window.
+            .with_epoch_unix(Duration::from_secs(500))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor, None)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
             .expect_err("cert is not yet valid");
 
         assert!(err.contains("not yet valid"), "got: {err}");
         assert!(router.auth().is_none(), "never installed");
         assert!(store.writes.is_empty(), "never persisted");
+    }
+
+    /// **An install anchors the node's clock, floored at the certificate's own
+    /// start.**
+    ///
+    /// Design 20 §4.4. The installer's stamp and the certificate's `not_before`
+    /// come from *different machines at different times* — a certificate minted
+    /// weeks earlier and hand-carried is the intended out-of-band flow — and
+    /// `not_before` is the CA-signed one, so a stale installer clock cannot drag
+    /// the node back past the instant its own credential began.
+    #[test]
+    fn set_auth_anchors_the_wall_clock_floored_at_the_certificate() {
+        const NOT_BEFORE: u64 = 1_800_000_000;
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 100_000, None, true);
+        ca.set_now_unix(NOT_BEFORE);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue_for(&mut ca, &kp);
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut wall = WallClock::new();
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_settings(&mut store)
+            .with_wall_clock(&mut wall)
+            // An installer whose clock is behind the certificate's start.
+            .set_auth(&[3; 32], &cert, &anchor, None, MIN_PLAUSIBLE_UNIX)
+            .expect("installs");
+
+        assert_eq!(
+            wall.posture(Duration::ZERO),
+            Clocked::AtLeast(NOT_BEFORE),
+            "the certificate's own start is the floor"
+        );
+    }
+
+    /// A refused install anchors nothing: the floor is taken from a certificate
+    /// that verified, so a certificate that did not cannot move the clock.
+    #[test]
+    fn a_refused_install_leaves_the_wall_clock_alone() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 100_000, None, true);
+        ca.set_now_unix(1_800_000_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let mut cert = ca_issue_for(&mut ca, &kp);
+        cert[core::mem::size_of::<wayfinder::wayfinder_auth::MembershipCert>() - 1] ^= 1;
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut wall = WallClock::new();
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_settings(&mut store)
+            .with_wall_clock(&mut wall)
+            .set_auth(&[3; 32], &cert, &anchor, None, 1_900_000_000)
+            .expect_err("a forgery is refused");
+
+        assert_eq!(
+            wall.posture(Duration::ZERO),
+            Clocked::Unknown,
+            "an unverified certificate must never move the clock"
+        );
+    }
+
+    /// `SetTime` anchors a node that has a clock to anchor, refuses an
+    /// implausible time, and cannot roll the node backwards.
+    #[test]
+    fn set_time_anchors_forward_only() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut wall = WallClock::new();
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_wall_clock(&mut wall)
+            .set_time(MIN_PLAUSIBLE_UNIX)
+            .expect("a plausible time anchors");
+        assert_eq!(
+            wall.posture(Duration::ZERO),
+            Clocked::AtLeast(MIN_PLAUSIBLE_UNIX)
+        );
+
+        // Zero is what a client sends when it could not vouch for its clock.
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_wall_clock(&mut wall)
+            .set_time(0)
+            .expect_err("a request whose whole content is a time must say so");
+        assert!(err.contains("before 2025"), "got: {err}");
+
+        // A later time still anchors.
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_wall_clock(&mut wall)
+            .set_time(MIN_PLAUSIBLE_UNIX + 1)
+            .expect("later still anchors");
+        assert_eq!(
+            wall.posture(Duration::ZERO),
+            Clocked::AtLeast(MIN_PLAUSIBLE_UNIX + 1)
+        );
+
+        // **An earlier one is refused, and says so.** Nothing was mutated —
+        // the `max` is the monotonicity invariant working — but the operator
+        // asked for a correction and did not get one, and this is the
+        // reachable case: correcting a board that has run *fast* is what
+        // `SetTime` exists for, and is exactly what monotonicity forbids.
+        // Reporting `Ok` here would have `wayfinderctl time set` print "clock
+        // anchored" for a request that changed nothing.
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_wall_clock(&mut wall)
+            .set_time(MIN_PLAUSIBLE_UNIX)
+            .expect_err("a correction behind the estimate must be reported");
+        assert!(err.contains("already at or past"), "got: {err}");
+        assert_eq!(
+            wall.posture(Duration::ZERO),
+            Clocked::AtLeast(MIN_PLAUSIBLE_UNIX + 1),
+            "and the estimate is unmoved"
+        );
+    }
+
+    /// `SetTime` is floored against the certificate the node already runs
+    /// under, not just the installer's stamp — the branch
+    /// `set_time_anchors_forward_only` cannot reach, because it runs against a
+    /// router with no auth so the floor is always zero.
+    #[test]
+    fn set_time_is_floored_at_the_certificate_the_node_runs_under() {
+        const NOT_BEFORE: u64 = 1_800_000_000;
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 100_000, None, true);
+        ca.set_now_unix(NOT_BEFORE);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue_for(&mut ca, &kp);
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut wall = WallClock::new();
+
+        // Installed with a zero stamp, so the anchor comes from the
+        // certificate alone.
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_settings(&mut store)
+            .with_wall_clock(&mut wall)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
+            .expect("installs");
+
+        // A plausible-but-stale `SetTime`, behind the certificate's start: the
+        // certificate floor is what answers, so nothing moves and the refusal
+        // is reported.
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_wall_clock(&mut wall)
+            .set_time(MIN_PLAUSIBLE_UNIX)
+            .expect_err("behind the certificate's own start");
+        assert!(err.contains("already at or past"), "got: {err}");
+        assert_eq!(wall.posture(Duration::ZERO), Clocked::AtLeast(NOT_BEFORE));
+    }
+
+    /// A node that reads its own wall clock has no anchor to set, and says so
+    /// rather than accepting the request and dropping it.
+    #[test]
+    fn set_time_on_a_node_with_its_own_clock_is_refused() {
+        let mut router = CentralRouter::new(mac(1));
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_800_000_000))
+            .set_time(MIN_PLAUSIBLE_UNIX)
+            .expect_err("nothing to anchor");
+        assert!(err.contains("no anchor to set"), "got: {err}");
+    }
+
+    /// `GetNodeInfo` reports the posture the router is *actually* judging
+    /// under, read from the auth state rather than from whatever supplied the
+    /// clock — so the operator-facing report and the check it describes cannot
+    /// disagree. Authentication off judges no windows, and says `Unknown`.
+    #[test]
+    fn node_info_reports_the_clock_posture_the_router_judges_under() {
+        let mut router = CentralRouter::new(mac(1));
+        assert_eq!(
+            RouterAdapter::new(&mut router, Duration::ZERO).clock_posture(),
+            ClockPostureData::Unknown,
+            "a node judging no certificates judges no windows"
+        );
+
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 100_000, None, true);
+        ca.set_now_unix(1_800_000_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue_for(&mut ca, &kp);
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut wall = WallClock::new();
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_settings(&mut store)
+            .with_wall_clock(&mut wall)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
+            .expect("installs");
+
+        // Installed, but the router's own clock has not been advanced yet.
+        assert_eq!(
+            RouterAdapter::new(&mut router, Duration::ZERO).clock_posture(),
+            ClockPostureData::Unknown
+        );
+        router.set_auth_time(Duration::ZERO, wall.posture(Duration::ZERO));
+        assert_eq!(
+            RouterAdapter::new(&mut router, Duration::ZERO).clock_posture(),
+            ClockPostureData::AtLeast,
+            "an anchored board judges expiry from a floor"
+        );
+        router.set_auth_time(Duration::ZERO, Clocked::At(1_800_000_001));
+        assert_eq!(
+            RouterAdapter::new(&mut router, Duration::ZERO).clock_posture(),
+            ClockPostureData::At
+        );
+    }
+
+    /// **A node with no wall clock installs a credential it cannot date.**
+    ///
+    /// The bootstrap this unblocks (design 20 §4.2/§4.7). A bare-metal node
+    /// supplies no epoch, so the adapter previously judged every certificate
+    /// against `epoch + now` — a few seconds past 1970 — and refused every
+    /// `SetAuth` as `NotYetValid` no matter how valid the certificate was.
+    /// The certificate is still fully verified; only the validity window, the
+    /// one guarantee the node has no grounds to judge, is skipped.
+    #[test]
+    fn set_auth_installs_a_credential_on_a_node_with_no_wall_clock() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_700_000_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue_for(&mut ca, &kp);
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            // No epoch supplied at all: `Clocked::Unknown`.
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
+            .expect("an unclocked node installs a credential it cannot date");
+        assert!(router.auth().is_some(), "installed");
+
+        // ...and still refuses one it can reject without a clock.
+        let mut forged = cert;
+        forged[core::mem::size_of::<wayfinder::wayfinder_auth::MembershipCert>() - 1] ^= 1;
+        let mut router = CentralRouter::new(mac(1));
+        let mut store = RecordingStore::default();
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &forged, &anchor, None, 0)
+            .expect_err("a forgery is refused with or without a clock");
+        assert!(err.contains("signature"), "got: {err}");
     }
 
     /// A certificate that verifies against the anchor but names a *different*
@@ -3370,7 +3823,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor, None)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
             .expect_err("cert names a different key than the seed being installed");
 
         assert!(
@@ -3417,7 +3870,7 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
-            .set_auth(&[], &cert, &anchor, None)
+            .set_auth(&[], &cert, &anchor, None, 0)
             .expect_err("cert is bound to a MAC other than the one this router runs under");
 
         assert!(
@@ -3450,7 +3903,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor, None)
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
             .unwrap();
 
         assert!(router.auth().is_some());

@@ -200,9 +200,46 @@ mod ssr {
                     node_key: node_key.to_vec(),
                     enrollment_token: provider.token.clone(),
                 };
+                // The wall clock this server can vouch for, carried to a node
+                // that may have none of its own (design 20 §4.6). Unlike
+                // `wayfinderctl`, this does not *refuse* on an undisciplined
+                // clock: there is no flag to offer an operator mid-enrolment,
+                // and the fail-closed zero is not the disaster it would be in
+                // the out-of-band flow — the certificate was minted seconds
+                // ago by the provider this page just spoke to, so its
+                // CA-signed `not_before` carries the anchor on its own and the
+                // node comes up dated anyway.
+                let (installer_unix, verdict) =
+                    wayfinder_client::stamp_unix(wayfinder_client::ClockTrust::default());
+                if installer_unix == 0 {
+                    // Two different causes, and an operator told the wrong one
+                    // fixes the wrong thing — the same split `wayfinderctl`'s
+                    // `refusal` makes. A trusted verdict with a zero stamp
+                    // means the reading itself was before 2025 (`date -s`); an
+                    // untrusted one means nothing is disciplining the clock
+                    // (NTP, or chrony's `rtcsync`).
+                    if verdict.is_trusted() {
+                        tracing::warn!(
+                            verdict = verdict.name(),
+                            "enrolling without stamping a time: this host's clock reads before \
+                             2025, so there is no time to send"
+                        );
+                    } else {
+                        tracing::warn!(
+                            verdict = verdict.name(),
+                            "enrolling without stamping a time: nothing vouches for this host's \
+                             clock"
+                        );
+                    }
+                }
                 conn.run(async |client| {
                     client
-                        .install_cert(&issued.cert, &issued.trust_anchor, Some(renewal.clone()))
+                        .install_cert(
+                            &issued.cert,
+                            &issued.trust_anchor,
+                            Some(renewal.clone()),
+                            installer_unix,
+                        )
                         .await
                 })
                 .await

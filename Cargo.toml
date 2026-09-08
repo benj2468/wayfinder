@@ -15,6 +15,7 @@ members = [
     "libs/wayfinder-protos",
     "libs/wayfinder-server",
     "libs/wayfinder-tls-mgmt",
+    "libs/wayfinder-clock-trust",
     "libs/wayfinder-storage",
     "libs/wayfinder-driver-core",
     "libs/wayfinder-driver",
@@ -89,6 +90,7 @@ wayfinder = { path = "./libs/wayfinder" }
 wayfinder-protos = { path = "./libs/wayfinder-protos" }
 wayfinder-server = { path = "./libs/wayfinder-server" }
 wayfinder-tls-mgmt = { path = "./libs/wayfinder-tls-mgmt" }
+wayfinder-clock-trust = { path = "./libs/wayfinder-clock-trust" }
 wayfinder-storage = { path = "./libs/wayfinder-storage", default-features = false }
 wayfinder-driver-core = { path = "./libs/wayfinder-driver-core" }
 wayfinder-driver = { path = "./libs/wayfinder-driver" }

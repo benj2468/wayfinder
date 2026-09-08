@@ -31,6 +31,7 @@ use wayfinderctl::run_query;
 use provider::spawn_approval_gated_provider;
 use provider::spawn_provider;
 use provider::spawn_provider_full;
+use wayfinder_auth::Clocked;
 
 /// The case online enrollment actually has to serve: the provider is itself an
 /// enrolled member of the mesh it certifies, and the node asking to join holds
@@ -92,7 +93,9 @@ async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
 
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
-    anchor.verify_cert(&cert, 500).expect("cert verifies");
+    anchor
+        .verify_cert(&cert, Clocked::At(500))
+        .expect("cert verifies");
 }
 
 /// The other half of the enrollment grant: it enrolls and nothing more. The
@@ -161,7 +164,9 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
     assert_eq!(std::fs::metadata(&seed).unwrap().len(), 32);
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert).unwrap()).unwrap();
-    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    let verified = anchor
+        .verify_cert(&cert, Clocked::At(500))
+        .expect("cert verifies");
     assert_eq!(verified.mac, seed_derived_mac(&seed));
 }
 
@@ -198,7 +203,9 @@ async fn enroll_without_mac_derives_it_from_the_keypair() {
 
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert).unwrap()).unwrap();
-    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    let verified = anchor
+        .verify_cert(&cert, Clocked::At(500))
+        .expect("cert verifies");
     assert_eq!(verified.mac, expected_mac);
 }
 
@@ -449,7 +456,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
     assert_eq!(
-        anchor.verify_cert(&cert, 500).unwrap().mac,
+        anchor.verify_cert(&cert, Clocked::At(500)).unwrap().mac,
         seed_derived_mac(&dir.path().join("seed"))
     );
 }
@@ -556,7 +563,9 @@ async fn csr_submit_writes_the_certificate_the_provider_issues() {
 
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&out_anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&out_cert).unwrap()).unwrap();
-    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    let verified = anchor
+        .verify_cert(&cert, Clocked::At(500))
+        .expect("cert verifies");
     assert_eq!(
         verified.ed_pubkey,
         node.ed_pubkey(),
@@ -637,7 +646,9 @@ async fn csr_submit_collects_the_certificate_after_an_operator_approves() {
 
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&out_anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&out_cert).unwrap()).unwrap();
-    anchor.verify_cert(&cert, 500).expect("cert verifies");
+    anchor
+        .verify_cert(&cert, Clocked::At(500))
+        .expect("cert verifies");
 }
 
 /// The lifetime the operator typed at approval is the one the certificate
@@ -695,7 +706,9 @@ async fn an_approval_can_name_how_long_the_certificate_lasts() {
 
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&out_anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&out_cert).unwrap()).unwrap();
-    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    let verified = anchor
+        .verify_cert(&cert, Clocked::At(500))
+        .expect("cert verifies");
     assert_eq!(
         verified.not_after - verified.not_before,
         2 * 365 * 86_400,

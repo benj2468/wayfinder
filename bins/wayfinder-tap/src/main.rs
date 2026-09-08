@@ -1321,7 +1321,7 @@ mod tests {
 
         assert_eq!(cert.node_mac, node.derived_mac().0);
         let verified = anchor
-            .verify_cert(&cert, now + 1)
+            .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(now + 1))
             .expect("a certificate signed by the anchor's own root");
         assert!(
             verified.admin,
@@ -1343,9 +1343,15 @@ mod tests {
 
         assert_eq!(cert.not_before.get(), now);
         assert_eq!(cert.not_after.get(), now + ttl);
-        assert!(anchor.verify_cert(&cert, now + ttl - 1).is_ok());
         assert!(
-            anchor.verify_cert(&cert, now + ttl + 1).is_err(),
+            anchor
+                .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(now + ttl - 1))
+                .is_ok()
+        );
+        assert!(
+            anchor
+                .verify_cert(&cert, wayfinder::wayfinder_auth::Clocked::At(now + ttl + 1))
+                .is_err(),
             "the certificate must age out at its stated expiry"
         );
     }

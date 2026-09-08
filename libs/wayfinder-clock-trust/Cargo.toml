@@ -1,0 +1,17 @@
+[package]
+name = "wayfinder-clock-trust"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# Its own crate rather than a module of `wayfinder-server` for the same reason
+# `wayfinder-tls-mgmt` is: both `wayfinder-server` and `wayfinder-client` need
+# this verdict and neither may depend on the other (design 20 §4.6). The *same*
+# verdict must gate a certificate authority issuing a credential and a client
+# stamping the time that installs it, and a rule with two implementations is
+# two rules.
+
+[dependencies]
+libc.workspace = true

@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use interfaces::frame::Mac;
+use wayfinder_auth::Clocked;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
@@ -69,7 +70,7 @@ fn issued_cert_verifies_against_written_anchor() {
     let cert = MembershipCert::from_bytes(&cert_bytes).expect("cert reloads");
 
     let verified = anchor
-        .verify_cert(&cert, 500)
+        .verify_cert(&cert, Clocked::At(500))
         .expect("issued cert verifies within its window against its own anchor");
     assert_eq!(verified.mac, node_mac);
 }
@@ -116,7 +117,9 @@ fn issue_without_mac_derives_it_from_the_node_seed() {
 
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert).unwrap()).unwrap();
-    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    let verified = anchor
+        .verify_cert(&cert, Clocked::At(500))
+        .expect("cert verifies");
     assert_eq!(verified.mac, expected_mac);
 }
 
@@ -129,7 +132,7 @@ fn cert_is_rejected_by_a_foreign_mesh_anchor() {
     let anchor_a = TrustAnchor::from_bytes(&anchor_a).unwrap();
     let cert_b = MembershipCert::from_bytes(&cert_b).unwrap();
     assert!(
-        anchor_a.verify_cert(&cert_b, 500).is_err(),
+        anchor_a.verify_cert(&cert_b, Clocked::At(500)).is_err(),
         "a cert from mesh 0x2222 must not verify under mesh 0x1111's anchor"
     );
 }
@@ -141,7 +144,7 @@ fn tampered_cert_fails_verification() {
     // Flip a byte in the signed body (the node MAC).
     cert_bytes[6] ^= 0xff;
     let cert = MembershipCert::from_bytes(&cert_bytes).unwrap();
-    assert!(anchor.verify_cert(&cert, 500).is_err());
+    assert!(anchor.verify_cert(&cert, Clocked::At(500)).is_err());
 }
 
 /// A cert issued without `--admin` carries no management-administration
@@ -155,7 +158,7 @@ fn an_ordinary_issued_cert_is_not_an_admin() {
     let cert = MembershipCert::from_bytes(&cert_bytes).expect("cert reloads");
 
     assert!(
-        !anchor.verify_cert(&cert, 100).unwrap().admin,
+        !anchor.verify_cert(&cert, Clocked::At(100)).unwrap().admin,
         "a plain membership cert must not carry the admin capability"
     );
 }
@@ -200,7 +203,7 @@ fn an_admin_issued_cert_verifies_as_admin() {
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
 
     assert!(
-        anchor.verify_cert(&cert, 100).unwrap().admin,
+        anchor.verify_cert(&cert, Clocked::At(100)).unwrap().admin,
         "--admin must set the capability the management API authorizes on"
     );
 }
@@ -247,7 +250,7 @@ fn a_viewer_issued_cert_verifies_as_viewer_and_not_admin() {
 
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
-    let verified = anchor.verify_cert(&cert, 100).unwrap();
+    let verified = anchor.verify_cert(&cert, Clocked::At(100)).unwrap();
 
     assert!(
         verified.viewer,

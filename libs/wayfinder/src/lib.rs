@@ -847,6 +847,29 @@ impl<
         self.batman.relay_oversize_drops()
     }
 
+    /// How many certificates this node has admitted while judging no validity
+    /// window at all — the direct measure of how much passive
+    /// revocation-by-expiry is not being enforced here (design 20 §7).
+    ///
+    /// Counts *admissions*, not distinct certificates: every verified OGM
+    /// re-caches its originator, so under a sustained unclocked posture this
+    /// tracks receptions rather than peers. Read it as "has this happened, and
+    /// roughly how much", not as a population count.
+    ///
+    /// Nonzero means this node has been routing on credentials it could not
+    /// date. That is a supported state on a board with no anchor, and the whole
+    /// point of surfacing it is that the node otherwise looks, and is, healthy:
+    /// `AlarmKind::ClockUnsynchronized` says the condition holds *now*, and this
+    /// says how much of it has already happened.
+    ///
+    /// Zero when authentication is off, which is exactly true — a node
+    /// admitting no certificates admits none unjudged.
+    pub fn unjudged_cert_admissions(&self) -> u32 {
+        self.auth
+            .as_ref()
+            .map_or(0, |auth| auth.unjudged_admissions())
+    }
+
     /// How many sequence-number high-waters this node has resynchronised —
     /// concluded its own recorded state, rather than the frame in front of it,
     /// was what was wrong. Covers both the broadcast and OGM spaces.
@@ -2254,11 +2277,10 @@ impl<
     }
 
     /// Build a keep-alive heartbeat to emit into `tx_buf`, or `None` if
-    /// suppressed. No `now` needed to build the base heartbeat — a keep-alive
-    /// carries no sequence number on the wire — but when auth is enabled the
-    /// signed trailer's time bucket is drawn from the auth clock
-    /// ([`OgmAuth::set_time`](auth::OgmAuth::set_time)), refreshed
-    /// separately. Like [`poll`](Self::poll), a keep-alive is signed
+    /// suppressed. No `now` needed — a keep-alive carries no sequence number on
+    /// the wire, and when auth is enabled its signed trailer draws a replay
+    /// counter from the node's single outgoing sequence rather than from any
+    /// clock (design 20 §4.3). Like [`poll`](Self::poll), a keep-alive is signed
     /// ([`OgmAuth::augment_keepalive`](auth::OgmAuth::augment_keepalive))
     /// when auth is on, verified by peers against the sender's cert cached
     /// from a prior OGM rather than a cert/fingerprint resent on every
@@ -2970,8 +2992,14 @@ impl<
         self.batman.self_ident
     }
 
-    /// Advance the certificate-validity clock, and keep the routing engine's
-    /// next-hop proofs in step with the key material that backs them.
+    /// Advance both of the router's clocks — the monotonic `now` every duration
+    /// is measured on, and the `wall` posture every certificate validity window
+    /// is judged under — and keep the routing engine's next-hop proofs in step
+    /// with the key material that backs them.
+    ///
+    /// `wall` is a *posture*, not a reading: a shell that cannot vouch for an
+    /// absolute time passes [`Clocked::Unknown`](wayfinder_auth::Clocked) and
+    /// the node keeps routing, judging no validity window (design 20 §4.2).
     ///
     /// **The only correct way for a driver to set the auth clock.** Advancing
     /// it can evict a lapsed member's pairwise key, and a proof answered with
@@ -2999,11 +3027,42 @@ impl<
     /// [`OgmAuth::key_generation`](auth::OgmAuth::key_generation) changing.
     /// Without that it would scan the proof table, with a neighbor-cache lookup
     /// per entry, on a hot path, to discover that nothing had been evicted.
-    pub fn set_auth_time(&mut self, now: core::time::Duration, now_unix: u64) {
+    pub fn set_auth_time(&mut self, now: core::time::Duration, wall: wayfinder_auth::Clocked) {
         let Some(auth) = self.auth.as_mut() else {
             return;
         };
-        auth.set_time(now_unix);
+        auth.set_time(now, wall);
+        if !wall.judges_windows() {
+            // A credentialed node judging no validity window is a *supported*
+            // running state under design 20 §4.2 — it routes, and its clocked
+            // peers enforce expiry on its behalf (§5.1). It is also invisible:
+            // the node looks, and is, healthy as a router while passive
+            // revocation-by-expiry is switched off on it. This is how a board
+            // with no debug probe attached says so.
+            //
+            // Raised on every pass rather than on a transition. The board
+            // coalesces on `(kind, subject)`, so a repeat advances the row's
+            // window and count instead of adding one, and only a `New` or
+            // `Escalated` transition mirrors a log line — so a per-pass raise
+            // does not flood the ring.
+            //
+            // **Nothing clears this, deliberately.** The board latches
+            // (`AlarmBoard::clear`'s doc: a stale row stays, and that is the
+            // point), and a snapshot is stamped with the reader's `now_ms`, so
+            // a row whose `last` has stopped advancing is already
+            // distinguishable from a live one. Clearing from here would also be
+            // wrong rather than merely unnecessary: `wayfinder-driver` raises
+            // this same `(kind, Subject::None)` for an entirely different
+            // condition — a host whose NTP is undisciplined — and this call
+            // runs on every frame of that driver's loop, so a clear here would
+            // silently retire the host's alarm as fast as it could raise it.
+            wayfinder_alarm::alarm!(
+                wayfinder_alarm::Severity::Warning,
+                wayfinder_alarm::AlarmKind::ClockUnsynchronized,
+                wayfinder_alarm::Subject::None,
+                "state=unanchored; certificate validity windows are not being judged"
+            );
+        }
         // Re-borrowed immutably: the sweep reads the key cache while writing
         // the engine, and they are disjoint fields.
         let auth = &*auth;
@@ -3013,6 +3072,16 @@ impl<
         }
         self.batman.retain_proven(now, |mac| auth.has_live_key(mac));
         self.swept_key_generation = generation;
+    }
+
+    /// The clock posture this router is currently judging certificate validity
+    /// windows under, or `None` when authentication is off and it judges none.
+    ///
+    /// Read from the auth state rather than from whatever supplied the clock,
+    /// so an operator-facing report and the check it describes cannot disagree:
+    /// this is the very value `verify_cert` is handed.
+    pub fn auth_wall(&self) -> Option<wayfinder_auth::Clocked> {
+        self.auth.as_ref().map(|auth| auth.wall())
     }
 
     /// Whether `neighbor` currently holds a valid next-hop proof as of `now`.
@@ -3640,7 +3709,10 @@ mod cert_responder {
             responder_cert,
             authority.trust_anchor(),
         ));
-        router.auth_mut().unwrap().set_time(100);
+        router.auth_mut().unwrap().set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
 
         let requester_kp = wayfinder_auth::Keypair::from_seed(&[3; 32]);
         let requester_cert = authority.issue_cert(
@@ -3652,7 +3724,10 @@ mod cert_responder {
         );
         let mut requester_auth =
             auth::OgmAuth::new(requester_kp, requester_cert, authority.trust_anchor());
-        requester_auth.set_time(100);
+        requester_auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
 
         // Prime a direct route + cert cache from the requester (mac(3)).
         let ogm_bytes = signed_ogm(&mut requester_auth, mac(3), 1, 50);
@@ -3717,7 +3792,10 @@ mod cert_responder {
             responder_cert,
             authority.trust_anchor(),
         ));
-        router.auth_mut().unwrap().set_time(100);
+        router.auth_mut().unwrap().set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
 
         let requester_kp = wayfinder_auth::Keypair::from_seed(&[3; 32]);
         let requester_cert = authority.issue_cert(
@@ -3729,7 +3807,10 @@ mod cert_responder {
         );
         let mut requester_auth =
             auth::OgmAuth::new(requester_kp, requester_cert, authority.trust_anchor());
-        requester_auth.set_time(100);
+        requester_auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
 
         // No prior OGM from the requester: no route yet.
         let mut req_buf = [0u8; 512];
@@ -3819,7 +3900,10 @@ mod cert_responder {
             receiver_cert,
             authority.trust_anchor(),
         ));
-        router.auth_mut().unwrap().set_time(100);
+        router.auth_mut().unwrap().set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         assert_eq!(
             router.cert_req_tx_rate(core::time::Duration::from_secs(1)),
             0.0
@@ -3829,7 +3913,10 @@ mod cert_responder {
         let sender_cert =
             authority.issue_cert(mac(2), sender_kp.ed_pubkey(), sender_kp.x_pubkey(), 0, 1000);
         let mut sender_auth = auth::OgmAuth::new(sender_kp, sender_cert, authority.trust_anchor());
-        sender_auth.set_time(100);
+        sender_auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
 
         let ogm_bytes = lazy_signed_ogm(&mut sender_auth, mac(2), 1, 50);
         let ogm_frame_bytes = link_frame_bytes(2, 0xff, &ogm_bytes);
@@ -3867,7 +3954,10 @@ mod cert_responder {
             responder_cert,
             authority.trust_anchor(),
         ));
-        router.auth_mut().unwrap().set_time(100);
+        router.auth_mut().unwrap().set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         assert_eq!(
             router.cert_reply_tx_rate(core::time::Duration::from_secs(1)),
             0.0
@@ -3883,7 +3973,10 @@ mod cert_responder {
         );
         let mut requester_auth =
             auth::OgmAuth::new(requester_kp, requester_cert, authority.trust_anchor());
-        requester_auth.set_time(100);
+        requester_auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
 
         // Prime a direct route back to the requester (mac(3)).
         let ogm_bytes = signed_ogm(&mut requester_auth, mac(3), 1, 50);
@@ -4817,7 +4910,10 @@ mod ogm_auth_integration {
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut r = CentralRouter::new(m);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         r.set_auth(auth);
         r
     }
@@ -4971,7 +5067,10 @@ mod ogm_auth_integration {
         let kp = Keypair::from_seed(&[3; 32]);
         let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         node.set_auth(auth);
         assert_eq!(
             node.originator_count(),
@@ -5000,7 +5099,10 @@ mod ogm_auth_integration {
         let first = Keypair::from_seed(&[4; 32]);
         let first_cert = authority.issue_cert(mac(2), first.ed_pubkey(), first.x_pubkey(), 0, 1000);
         let mut first_auth = crate::auth::OgmAuth::new(first, first_cert, authority.trust_anchor());
-        first_auth.set_time(100);
+        first_auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         node.set_auth(first_auth);
 
         node.batman.note_proven(Duration::ZERO, mac(5), 0);
@@ -5013,7 +5115,10 @@ mod ogm_auth_integration {
         let kp = Keypair::from_seed(&[3; 32]);
         let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         node.set_auth(auth);
 
         assert!(
@@ -5051,7 +5156,10 @@ mod ogm_auth_integration {
         let bob_cert = authority.issue_cert(mac(2), bob_kp.ed_pubkey(), bob_kp.x_pubkey(), 0, 200);
         let mut bob = CentralRouter::new(mac(2));
         let mut bob_auth = crate::auth::OgmAuth::new(bob_kp, bob_cert, authority.trust_anchor());
-        bob_auth.set_time(100);
+        bob_auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         bob.set_auth(bob_auth);
 
         // Prove bob first, so his OGM installs him as the selected next hop
@@ -5084,7 +5192,7 @@ mod ogm_auth_integration {
 
         // Walk the certificate-validity clock past bob's expiry, the way a
         // driver does on every pass of its loop.
-        victim.set_auth_time(Duration::ZERO, 300);
+        victim.set_auth_time(Duration::ZERO, wayfinder_auth::Clocked::At(300));
 
         assert!(
             victim
@@ -5162,7 +5270,7 @@ mod ogm_auth_integration {
 
         // The same clock value as the router was built with: this reconciliation
         // is not driven by time passing.
-        victim.set_auth_time(Duration::ZERO, 100);
+        victim.set_auth_time(Duration::ZERO, wayfinder_auth::Clocked::At(100));
 
         assert!(
             !victim.proof_current(Duration::ZERO, mac(2)),
@@ -5277,7 +5385,10 @@ mod ogm_auth_integration {
         let kp = Keypair::from_seed(&[3; 32]);
         let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         node.set_auth(auth);
         assert!(!node.auth_locked(), "a valid cert unlocks the router");
 
@@ -5327,7 +5438,10 @@ mod ogm_auth_integration {
         let kp = Keypair::from_seed(&[3; 32]);
         let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         node.set_auth(auth);
         assert!(!node.auth_locked());
         assert!(
@@ -5362,7 +5476,10 @@ mod ogm_auth_integration {
         let kp = Keypair::from_seed(&[3; 32]);
         let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         node.set_auth(auth);
         assert!(!node.auth_locked());
         assert!(
@@ -5712,7 +5829,10 @@ mod ogm_auth_integration {
         let cert = authority.issue_cert(readmitted, kp.ed_pubkey(), kp.x_pubkey(), 60, 1000);
         let mut peer = CentralRouter::new(readmitted);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         peer.set_auth(auth);
 
         let ogm = poll_ogm_bytes(&mut peer);
@@ -5824,7 +5944,10 @@ mod lazy_cert_distribution_switchover {
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut r = CentralRouter::new(m);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
-        auth.set_time(100);
+        auth.set_time(
+            core::time::Duration::from_secs(100),
+            wayfinder_auth::Clocked::At(100),
+        );
         r.set_auth(auth);
         r
     }
@@ -6373,7 +6496,10 @@ mod self_revocation {
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), issued_at, 100_000);
         let mut router: CentralRouter = CentralRouter::new(m);
         router.set_auth(auth::OgmAuth::new(kp, cert, authority.trust_anchor()));
-        router.auth_mut().unwrap().set_time(now);
+        router.auth_mut().unwrap().set_time(
+            core::time::Duration::from_secs(now),
+            wayfinder_auth::Clocked::At(now),
+        );
         router
     }
 
@@ -6505,7 +6631,10 @@ mod self_revocation {
         let peer_cert =
             authority.issue_cert(mac(3), peer_kp.ed_pubkey(), peer_kp.x_pubkey(), 0, 100_000);
         let mut peer = auth::OgmAuth::new(peer_kp, peer_cert, authority.trust_anchor());
-        peer.set_time(700);
+        peer.set_time(
+            core::time::Duration::from_secs(700),
+            wayfinder_auth::Clocked::At(700),
+        );
         assert!(peer.ingest_revocation(&authority.revoke(mac(2), 500, 100_000)));
 
         // The peer's next OGM carries it.

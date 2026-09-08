@@ -19,7 +19,12 @@ wayfinder-protos.workspace = true
 wayfinder-tls-mgmt.workspace = true
 # The identity crate: `Keypair` (to derive the pinned node key from a seed) and
 # the seed/cert types the client authenticates with.
-wayfinder-auth.workspace = true
+wayfinder-auth = { workspace = true, features = ["std"] }
+# Whether this host's own clock is disciplined enough to stamp onto a node.
+# Shared with `wayfinder-server` so the *same* verdict gates a CA issuing a
+# credential and a client stamping the time that installs it (design 20 §4.6);
+# neither of those crates depends on the other, which is why it is its own.
+wayfinder-clock-trust.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true
 tokio-rustls.workspace = true

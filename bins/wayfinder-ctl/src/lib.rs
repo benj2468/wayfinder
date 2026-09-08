@@ -20,6 +20,7 @@
 
 pub mod auth;
 pub mod cert;
+pub mod clock;
 pub mod csr;
 pub mod link;
 pub mod output;
@@ -168,6 +169,9 @@ pub enum Command {
     /// and how it is advertised.
     #[command(subcommand)]
     Auth(auth::AuthCommand),
+    /// The node's wall clock — the anchor a node with no RTC free-runs from.
+    #[command(subcommand)]
+    Time(clock::TimeCommand),
     /// Enroll a node that cannot reach the provider, by carrying its request
     /// there as a file.
     ///
@@ -708,6 +712,7 @@ async fn dispatch_query(
         }
         Command::Link(cmd) => link::run(cmd, client, output).await?,
         Command::Auth(cmd) => auth::run(cmd, client, output, endpoint).await?,
+        Command::Time(cmd) => clock::run(cmd, client).await?,
         Command::Csr(cmd) => csr::run(cmd, client).await?,
         Command::Provider(cmd) => provider::run(cmd, client, output).await?,
         // Every command that needs no node connection is dispatched by `run`

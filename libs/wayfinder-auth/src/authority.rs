@@ -180,6 +180,7 @@ impl Authority {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Clocked;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -207,6 +208,10 @@ mod tests {
         // And a's cert does not verify under b's anchor.
         let node = Keypair::from_seed(&[3u8; 32]);
         let cert = a.issue_cert(mac(1), node.ed_pubkey(), node.x_pubkey(), 0, 100);
-        assert!(b.trust_anchor().verify_cert(&cert, 50).is_err());
+        assert!(
+            b.trust_anchor()
+                .verify_cert(&cert, Clocked::At(50))
+                .is_err()
+        );
     }
 }

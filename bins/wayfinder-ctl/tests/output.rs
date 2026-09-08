@@ -21,6 +21,7 @@ fn node_info_human_renders_mac_and_count() {
         auth_locked: true,
         runtime_config_active: true,
         clock_trusted: false,
+        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
     };
     let human = output::node_info(&v, OutputFormat::Human).unwrap();
     assert!(human.contains("aa:bb:cc:dd:ee:01"), "got: {human}");
@@ -44,6 +45,7 @@ fn node_info_json_is_valid_and_complete() {
         auth_locked: true,
         runtime_config_active: true,
         clock_trusted: true,
+        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
     };
     let json = output::node_info(&v, OutputFormat::Json).unwrap();
     // Parse it back to confirm it is well-formed JSON with the expected fields.

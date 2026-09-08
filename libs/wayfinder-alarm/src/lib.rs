@@ -173,14 +173,23 @@ pub enum AlarmKind {
     /// A bounded table is at capacity and evicting, so the node is now
     /// forgetting state it would otherwise have kept.
     TableSaturation,
-    /// The host's system clock is not disciplined, so this node refuses every
-    /// credential decision that depends on knowing the time.
+    /// This node cannot vouch for the time, in one of two ways.
     ///
-    /// Latched rather than momentary: it stays wrong until someone fixes NTP,
-    /// and an operator who sees only the downstream refusals — a certificate
-    /// that will not issue, a login that will not complete — debugs the wrong
-    /// thing. The node keeps routing, which is exactly why this needs saying
-    /// out loud: it looks healthy.
+    /// On a **host**: the system clock is not disciplined, so the node refuses
+    /// every credential decision that depends on knowing the time.
+    ///
+    /// On a **credentialed node with no anchor**: the node judges no
+    /// certificate validity window at all, so passive revocation-by-expiry is
+    /// not being enforced here (design 20 §4.2, §7). That is a *supported*
+    /// running state rather than a failure — the node routes, verifies every
+    /// signature, and its clocked peers enforce expiry on its behalf — which is
+    /// precisely why it needs an alarm: nothing else makes it visible.
+    ///
+    /// Latched rather than momentary in both cases: it stays wrong until
+    /// someone fixes NTP or anchors the node, and an operator who sees only the
+    /// downstream effects — a certificate that will not issue, a lapsed peer
+    /// still being routed to — debugs the wrong thing. The node keeps routing,
+    /// which is exactly why this needs saying out loud: it looks healthy.
     ClockUnsynchronized,
     /// This node's own mesh membership has been revoked: it holds a
     /// root-signed record naming itself, has dropped its certificate and trust

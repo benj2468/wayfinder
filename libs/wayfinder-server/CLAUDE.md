@@ -28,7 +28,7 @@ The rule here used to be *nothing outside the driver loop touches
 > **Nothing outside the driver loop may hold a `&mut CentralRouter`.** A shared
 > `&` is fine, and is how every management *read* is served.
 
-Sixteen of the nineteen router-facing answers take `&self`. Serving those on the
+Most router-facing answers take `&self` — the reads. Serving those on the
 loop meant a dashboard polling seven tables a second built seven response `Vec`s
 between mesh frames, one at a time, behind a depth-16 channel. `RouterHandle`
 (`router_handle.rs`) gives them a read lock instead, so they run on the
@@ -36,8 +36,8 @@ connection's own task and concurrently with each other. Its module doc has the
 honest accounting — including the part that has *not* changed, which is that a
 large read still contends with the loop for the lock.
 
-The three mutations (`SetAuth`, `SetConfig`, `SetLogLevel`) still travel
-`QueryTx`/`QueryRx` to the loop, and should. They are operator actions rather
+The mutations (`SetAuth`, `SetTime`, `SetConfig`, `SetLogLevel`, `Ping`,
+`CancelPing`) still travel `QueryTx`/`QueryRx` to the loop, and should. They are operator actions rather
 than polls, so there is nothing to win; and `set_auth` writes back through the
 identity-seed slot that lives beside the router under the same lock, which only
 the loop's write guard reaches.
