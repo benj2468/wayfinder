@@ -1,0 +1,58 @@
+[package]
+name = "wayfinder-hil"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+# A root-workspace member on purpose, with every hardware test `#[ignore]`d
+# (design 21 §4.4). `cargo build --workspace` and `cargo nextest run
+# --workspace` therefore compile this crate and its tests on every machine and
+# in CI, while running none of them.
+#
+# The alternative — keeping the harness out of the workspace, behind a feature
+# nothing turns on or in a directory nothing walks — compiles only on the rig,
+# so it breaks silently on the first refactor of `wayfinder-client` and is
+# discovered weeks later by whoever next has boards on the desk. Compiling it
+# everywhere turns that into a build error on the MR that caused it.
+
+[dependencies]
+# The management-API client. Every test drives a board through this and not
+# through a bespoke transport, so authenticating the board's port later
+# (GitLab #57) is a harness change rather than a rewrite of the tests.
+wayfinder-client.workspace = true
+wayfinder-protos.workspace = true
+wayfinder-auth = { workspace = true, features = ["std"] }
+tokio = { workspace = true }
+# Ephemeral key material for the throwaway mesh a hardware test installs. Never
+# written to disk and unrelated to any real trust anchor.
+rand.workspace = true
+# `MembershipCert` is a wire struct; `as_bytes` is zerocopy's.
+zerocopy.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+# The board inventory (`hil.toml`). TOML rather than the YAML a *node* config
+# uses: this is developer tooling config, and it sits beside `.config/nextest.toml`.
+# Parse only: the harness reads an inventory and never writes one, and
+# dropping the serializer keeps `toml_writer` out of the tree.
+#
+# Pinned exactly: 1.1.4 requires `toml_writer >=1.1.2`, which this environment's
+# registry does not carry, and the resolver wants a version for it even with
+# `display` off. Relax the pin whenever the index catches up.
+toml = { version = "=1.1.1", default-features = false, features = [
+    "parse",
+    "serde",
+    "std",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# A one-shot listing of what `usb::enumerate` sees on this machine, so a rig
+# can be diagnosed without running a test.
+[[bin]]
+name = "hil-devices"
+path = "src/bin/hil-devices.rs"

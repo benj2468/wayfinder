@@ -96,9 +96,11 @@ invocation from its own directory:
   firmware binaries with `test = false`; a host test harness can't link against
   them at all. Their logic is exercised indirectly through the `libs/*` crates
   they wire together (tested in the root workspace) plus CI's `build:embedded`
-  job (cross-compile + clippy for the real target). Behaviour still needs
-  real/simulated hardware-in-the-loop (e.g. `defmt-test` + `probe-rs`), which is
-  not set up in this repo — but not every board-only property does. Anything
+  job (cross-compile + clippy for the real target). Behaviour beyond that needs
+  hardware-in-the-loop: `libs/wayfinder-hil` (`just hil`) drives a real board
+  over its management API, `#[ignore]`d so it compiles everywhere and runs only
+  where boards are attached — see `docs/design/21-hardware-in-the-loop-tests.md`.
+  But not every board-only property needs a board. Anything
   decidable from the linked image is gatable without a board, and
   `build:stack-budget` (`just stack-budget`) is the one that exists: it reads
   each board's ELF and fails if a task's poll frame reserves more of the stack

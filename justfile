@@ -92,6 +92,41 @@ test-workspace:
     cargo nextest run --workspace {{ host_workspace_excludes }} --release
 
 # ---------------------------------------------------------------------------
+# Hardware-in-the-loop (libs/wayfinder-hil)
+# ---------------------------------------------------------------------------
+#
+# Tests that drive a real board over its management API (design 21). They are
+# `#[ignore]`d, so `test-workspace` compiles them and runs none — the crate is a
+# workspace member precisely so it keeps compiling on machines with no boards,
+# which is what stops it rotting between bench sessions.
+#
+# Never a CI gate on the shared runner: it has no boards, by the same argument
+# that keeps the wall-clock benchmarks manual. A self-hosted runner with parts
+# attached would take these as a `tags: [hardware]`, `when: manual` job.
+#
+# With no `hil.toml` every test skips with a reason and this exits clean, so
+# running it on a machine with nothing plugged in is a no-op rather than a
+# failure. Copy `example.hil.toml` to get started.
+#
+# To flash a board, run `cargo run --release` in its own directory
+# (`bins/wayfinder-nrf52840`): the configured runner flashes it and attaches RTT.
+
+[doc("Run the hardware tests against the boards in hil.toml.")]
+hil *ARGS:
+    cargo nextest run -p wayfinder-hil --run-ignored all {{ ARGS }}
+
+[doc("Show the attached probes and how hil.toml resolves against them.")]
+hil-list:
+    @echo "=== probes ==="
+    -probe-rs list
+    @echo ""
+    @echo "=== serial devices, as the harness sees them ==="
+    cargo run -q -p wayfinder-hil --bin hil-devices
+    @echo ""
+    @echo "=== inventory ==="
+    cargo nextest run -p wayfinder-hil --run-ignored all -E 'test(every_inventoried_board_answers)' --no-capture
+
+# ---------------------------------------------------------------------------
 # Benchmarks (libs/wayfinder-bench)
 # ---------------------------------------------------------------------------
 #

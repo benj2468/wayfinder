@@ -7,3 +7,40 @@ fail-fast = false
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# Boards are a singleton resource and nextest runs tests in parallel, so two
+# hardware tests flashing or resetting the same part would look like flaky
+# hardware — the worst thing a rig can look like, because it is unfalsifiable
+# and teaches people to re-run (design 21 §4.4, §6.4). One group for every
+# board is the honest starting point; per-board groups are worth it only once
+# tests outnumber boards.
+[test-groups]
+hil = { max-threads = 1 }
+
+# `success-output` is the load-bearing half. A hardware test that finds no board
+# for its role prints `SKIP: <reason>` and returns `Ok(())`, so nextest reports
+# it as a pass -- and nextest's default `success-output = "never"` throws a
+# passing test's output away. Without this, a rig where someone renamed a role
+# in `hil.toml` tests nothing and prints output byte-identical to a real green
+# run, which is exactly the unfalsifiable failure design 21 §6.4 is written
+# against. The skip reason is the only thing distinguishing the two, so it must
+# survive.
+#
+# `terminate-after` bounds the other end: a board that stops answering without
+# dropping its USB endpoint leaves a read pending forever, and because this
+# group is `max-threads = 1` one hung test blocks every other hardware test.
+# That is not hypothetical -- it is the shape of the HardFault this suite
+# reproduces.
+[[profile.default.overrides]]
+filter = "package(wayfinder-hil)"
+test-group = "hil"
+success-output = "immediate"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The same settings under `--profile ci`, which does not inherit
+# `profile.default`'s overrides.
+[[profile.ci.overrides]]
+filter = "package(wayfinder-hil)"
+test-group = "hil"
+success-output = "immediate"
+slow-timeout = { period = "60s", terminate-after = 5 }
