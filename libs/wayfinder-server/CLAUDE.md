@@ -372,9 +372,23 @@ connection boundary to hang it off.
 What follows is a requirement on whoever wires the port up: **bring it up only
 when a board is configured to, never unconditionally.** Enabling it is an act
 that means "this node's identity and configuration are available over
-`/dev/ttyACM*`", and it should read that way at the call site. Nothing enables
-it today — the nRF boards' management wiring was removed during BLE bring-up
-and has not returned.
+`/dev/ttyACM*`", and it should read that way at the call site.
+
+**That requirement is currently unmet, and this paragraph used to say the
+opposite.** `libs/wayfinder-nrf/src/node.rs`'s `usb_mgmt::init` brings a
+CDC-ACM management port up unconditionally on both nRF boards whenever USB
+init succeeds — no feature flag, no config gate. The text here previously read
+"nothing enables it today", which is what let the requirement read as
+hypothetical while the wiring came back during the USB/802.15.4 work. Design
+20 then made `SetAuth` over that port *work* where it had been inert, so the
+gap went from theoretical to reachable. Tracked as **GitLab #57**, which
+carries the three options (gate it, authenticate it, or accept it and say so).
+
+`libs/wayfinder-hil`'s hardware tests reach a board through this port and so
+depend on it being open. They drive it through `wayfinder_client::Client`
+rather than a bespoke transport, so authenticating it is a change in that
+harness and not a rewrite of its tests — the rig must not become the reason
+the port stays unauthenticated.
 
 ## The user store (`users.rs`)
 

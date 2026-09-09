@@ -210,6 +210,15 @@ trust boundary as a JTAG header.
 > whoever re-wires it, and is recorded in `libs/wayfinder-server/CLAUDE.md`
 > beside the transport it governs.
 
+**Correction (2026-09-07): the wiring returned and the requirement was not
+met.** Both nRF boards bring a CDC-ACM management port up unconditionally
+(`libs/wayfinder-nrf/src/node.rs`), and the embedded serve path dispatches
+straight to `handle_router` with no tier check — so `SetAuth` and `SetTime` are
+available to anything that can open `/dev/ttyACM*`. Design 20 made that path
+functional where it had previously rejected every certificate as not-yet-valid,
+which is what turned a dormant gap into a live one. Tracked as **GitLab #57**;
+F7's requirement above is the thing that issue re-opens.
+
 ### F8 — Medium. The enrollment token is a bearer secret on a one-second poll.
 
 Already the first item of `05-...`'s untouched §4, restated because F1 and F2

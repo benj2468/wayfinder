@@ -26,6 +26,7 @@ members = [
     "libs/wayfinder-test",
     "libs/wayfinder-bench",
     "libs/wayfinder-client",
+    "libs/wayfinder-hil",
     "bins/wayfinder-tap",
     "bins/wayfinder-tui",
     "bins/wayfinder-ctl",

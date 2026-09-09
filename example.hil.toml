@@ -1,0 +1,40 @@
+# Board inventory for the hardware-in-the-loop tests (`just hil`).
+#
+# Copy to `hil.toml` (gitignored) and fill in your own serial numbers. Without
+# it every hardware test skips with a reason, which is the intended state of a
+# machine with no boards attached — `just hil` is a clean no-op there.
+#
+# Point at a different file with WAYFINDER_HIL_CONFIG=/path/to/inventory.toml.
+#
+# Find the values:
+#   probe-rs list                       # probe serial, for a DK
+#   just hil-list                       # probes plus how this file resolves
+#   udevadm info -q property -n /dev/ttyACM0 | grep ID_SERIAL_SHORT
+#
+# Roles, not device paths, are what tests ask for: which physical part plays a
+# role lives only here, which is what lets the same tests run on a desk and on a
+# self-hosted runner. `/dev/ttyACM*` numbering reorders between plugs and across
+# a reset, so nothing addresses a board by it.
+
+# The probed board most tests use. `kind = "nrf52840-dk"` requires a `probe`.
+[[board]]
+role  = "alpha"
+kind  = "nrf52840-dk"
+probe = "001050288335"
+usb   = "F4CE3684A1B2"
+
+# The dongle. No probe, so it cannot be flashed or reset from the host — but it
+# is the part the full-ring GetLogs reset was reported on, so it earns a slot.
+[[board]]
+role = "dongle"
+kind = "nrf52840-dongle"
+usb  = "CD1F4A0099EE"
+
+# A second probed board, for the tests that need two parts (the OGM/keep-alive
+# interop and the fragmentation table). Tests asking for it skip while it is
+# absent.
+# [[board]]
+# role  = "beta"
+# kind  = "nrf52840-dk"
+# probe = "001050288336"
+# usb   = "F4CE3684A1B3"

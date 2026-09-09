@@ -73,3 +73,7 @@ dist/
 
 # Cloudflare
 .wrangler
+
+# The HIL board inventory: probe and USB serial numbers are specific to one
+# bench, so each machine keeps its own. `example.hil.toml` is the template.
+hil.toml
