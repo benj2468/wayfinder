@@ -232,6 +232,29 @@ pub enum AlarmKind {
     /// deadline with time still on it, and it is latched so that a node nobody
     /// watched for a week still says why it is about to go quiet.
     CertExpiring,
+    /// This node holds a membership certificate naming a MAC other than the
+    /// address it routes under, so its own OGMs carry an originator its
+    /// credential does not name.
+    ///
+    /// The ordinary way to reach this is a wholesale identity install: since
+    /// design 09 §5 a certificate's MAC *is* the address its key derives, and
+    /// a node adopts a newly installed seed's address on its next boot rather
+    /// than mid-flight — `self_ident` is fixed at construction because
+    /// changing it while running is a topology event every peer would have to
+    /// be told about. So this is a transient, expected state that **clears
+    /// itself on the next restart**, and saying so is the whole point: without
+    /// it the condition is visible only to somebody who thinks to compare
+    /// `GetNodeInfo`'s `node_id` against `GetSecurityStatus`'s `node_mac`,
+    /// which is how it went unnoticed until a hardware rig found it
+    /// (GitLab #58).
+    ///
+    /// Distinct from [`IdentityConflict`](Self::IdentityConflict), which is
+    /// two keys claiming one address and is about *somebody else*: that one is
+    /// a dispute needing the authority that issued twice, this one is settled
+    /// by a reboot. A node still holding this after a restart is the genuinely
+    /// bad case — a credential it cannot use — and means its address is not
+    /// derived from its seed.
+    CertifiedAddressMismatch,
 }
 
 impl AlarmKind {
@@ -251,6 +274,7 @@ impl AlarmKind {
             Self::SelfRevoked => 9,
             Self::IdentityConflict => 10,
             Self::CertExpiring => 11,
+            Self::CertifiedAddressMismatch => 12,
         }
     }
 
@@ -270,6 +294,7 @@ impl AlarmKind {
             Self::SelfRevoked => "self_revoked",
             Self::IdentityConflict => "identity_conflict",
             Self::CertExpiring => "cert_expiring",
+            Self::CertifiedAddressMismatch => "certified_address_mismatch",
         }
     }
 }
@@ -397,6 +422,7 @@ mod tests {
         AlarmKind::SelfRevoked,
         AlarmKind::IdentityConflict,
         AlarmKind::CertExpiring,
+        AlarmKind::CertifiedAddressMismatch,
     ];
 
     /// Codes and names are a wire contract: a client renders a row by them, so
@@ -423,5 +449,25 @@ mod tests {
         assert_eq!(AlarmKind::CertExpiring.code(), 11);
         assert_eq!(AlarmKind::CertExpiring.as_str(), "cert_expiring");
         assert_ne!(AlarmKind::CertExpiring, AlarmKind::SelfRevoked);
+    }
+
+    /// The node routing under one address while certified for another, which
+    /// is a *this node* condition and not the two-keys-one-address dispute
+    /// [`AlarmKind::IdentityConflict`] reports about somebody else.
+    ///
+    /// Pinned separately because the remedies could not be less alike: this
+    /// one clears itself on the next restart, where an identity conflict needs
+    /// the authority that issued twice.
+    #[test]
+    fn a_certified_address_mismatch_is_not_an_identity_conflict() {
+        assert_eq!(AlarmKind::CertifiedAddressMismatch.code(), 12);
+        assert_eq!(
+            AlarmKind::CertifiedAddressMismatch.as_str(),
+            "certified_address_mismatch"
+        );
+        assert_ne!(
+            AlarmKind::CertifiedAddressMismatch,
+            AlarmKind::IdentityConflict
+        );
     }
 }

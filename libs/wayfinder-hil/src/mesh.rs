@@ -15,46 +15,58 @@
 //! # The board takes an identity from the rig
 //!
 //! [`TestMesh::install`] uses `SetAuth`, which replaces the node's seed — so
-//! the board stops using its FICR-derived MAC and adopts the one this mesh
-//! issued. That is the right trade on a bench: a certificate binds a key to a
-//! MAC, and the alternative (`InstallCert`, keeping the board's own key) needs
-//! a certificate issued for a public key the board has never disclosed, which
-//! is the enrollment flow rather than a test fixture.
+//! the board stops using the identity it minted for itself and adopts the one
+//! this mesh issued. That is the right trade on a bench: a certificate binds a
+//! key to a MAC, and the alternative (keeping the board's own key) needs a
+//! certificate issued for a public key the board has never disclosed, which is
+//! the enrollment flow rather than a test fixture.
 //!
-//! A board is returned to its own identity by reflashing it.
+//! **Since design 22 that seed is durable**, so an installed identity outlives
+//! the run that installed it — and outlives a reflash, because the store sits
+//! in two pages the linker keeps clear of the image. A DK that has run this
+//! suite therefore keeps a rig-minted mesh identity until it is taken back by
+//! erasing the whole chip and reflashing — `just hil-fresh`, which exists
+//! because `tests/fresh_board.rs` needs exactly that.
 //!
-//! # The board does not adopt the MAC, and that is a known gap
+//! That is a property of the bench, not a leak: the anchor is a fresh random
+//! root per call and never leaves the process that minted it, so a board
+//! holding a stale rig credential is a member of a mesh that no longer exists
+//! anywhere.
 //!
-//! Installing this credential leaves the node **routing under one MAC and
-//! certified under another**. `GetNodeInfo`'s `node_id` is the router's own
-//! address — FICR-derived on an nRF board — and nothing in `SetAuth` updates
-//! it, while `GetSecurityStatus`'s `node_mac` is the certificate's. The node
-//! accepts the install without complaint.
+//! # The board adopts the MAC on its next boot, not at install time
 //!
-//! That is fine for the clock tests, which are about a posture read from the
-//! auth state and never touch the key↔MAC binding. It would not be fine for a
-//! test involving a peer, because a certificate binds a key to a MAC and this
-//! node's OGMs carry an originator its credential does not name.
+//! Between the install and the next reset the node **routes under one MAC and
+//! is certified under another**: `GetNodeInfo`'s `node_id` is the router's own
+//! address and `GetSecurityStatus`'s `node_mac` is the certificate's.
+//! `CentralRouter::self_ident` is fixed at construction and has no setter,
+//! deliberately — a mid-flight address change is a topology event, and every
+//! peer holds the old originator — so the address follows the seed on the next
+//! boot, which is also exactly what `wayfinder-tap` does.
 //!
-//! **Tracked as GitLab #58, and the fix is not in this file.** The rule already
-//! exists: since design 09 §5 a certificate's MAC *is* the address its identity
-//! key derives, and a node comes up under it on the next boot from the *seed*,
-//! never by copying the certificate. `wayfinder-tap` complies. The nRF board is
-//! the only identity in the workspace that is not seed-derived — it derives a
-//! MAC from FICR and persists a MAC, with no seed anywhere — and that single
-//! fact is the whole of this gap. It is resolved as part of GitLab #52, which
-//! is what gives the board a persisted seed in the first place.
+//! Two things follow for a test written here:
 //!
-//! Two consequences for whoever comes back to this once #52 lands:
+//! - **The window is expected, and the node says so.** It raises
+//!   `AlarmKind::CertifiedAddressMismatch` while it holds it, which is what
+//!   `an_installed_credential_is_adopted_across_a_reset` asserts on both sides
+//!   of the reset. A test that needs the board answering under its certified
+//!   address must reset it after installing.
+//! - **A test involving a peer must reset first.** A certificate binds a key
+//!   to a MAC, so before the reset this node's OGMs carry an originator its
+//!   credential does not name and a clocked peer should refuse them.
 //!
-//! - **Switch to certifying the identity the board already holds** — `SetAuth`
-//!   with an *empty* seed. That branch checks the certificate's MAC against the
-//!   node's and would refuse a mismatch, where the wholesale-install path used
-//!   here is deliberately exempt. It needs the board's public key, so the rig
-//!   grows a CSR step rather than minting a seed locally.
-//! - **Do not try to fix it here by grinding a keypair** to match the board's
-//!   FICR address. The MAC is a hash of the public key; that is not a fixture
-//!   problem.
+//! This used to be GitLab #58 — a board whose address was FICR-derived and
+//! could therefore *never* match its certificate, on any boot. Design 22 made
+//! the board seed-derived, so the two agree by construction and the divergence
+//! is bounded by one restart. Two notes kept from that entry:
+//!
+//! - **Certifying the identity the board already holds** — `SetAuth` with an
+//!   *empty* seed — is the other shape, and it checks the certificate's MAC
+//!   against the node's rather than being exempt as the wholesale install is.
+//!   It needs the board's public key, so it wants a CSR step here rather than
+//!   a locally minted seed. That is the enrolment path, GitLab #53.
+//! - **Do not try to avoid the window by grinding a keypair** to match some
+//!   address the board already has. The MAC is a hash of the public key; that
+//!   was never a fixture problem.
 
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -185,6 +197,74 @@ impl TestMesh {
             installer_unix,
         )
         .await
+    }
+
+    /// Admit the identity `node` **already holds** to this mesh, and return the
+    /// address it will keep.
+    ///
+    /// The other half of [`install`](Self::install), and the one a test with
+    /// two boards needs. `install` replaces the node's seed, so the node adopts
+    /// its certified address only on its next boot — fine for a DK, and
+    /// impossible for a dongle, which has no debugger and cannot be reset from
+    /// the host. This certifies the key the node is already running under, so
+    /// **no reboot is involved**: the address does not change, and the
+    /// credential is usable the moment it lands.
+    ///
+    /// It is also the shape real enrolment takes (GitLab #53). The node's
+    /// public keys come off `GetSecurityStatus` — an un-enrolled node reports
+    /// them, which is exactly what makes this possible — and the subject is
+    /// *derived* from the Ed25519 key rather than taken from the node's word
+    /// for it, so a node whose address does not match its own key is refused
+    /// here rather than handed a certificate it could not use.
+    ///
+    /// Every node certified against one `TestMesh` shares its trust anchor,
+    /// which is what puts two boards on one mesh.
+    pub async fn certify(&self, node: &mut Node, installer_unix: u64) -> anyhow::Result<[u8; 6]> {
+        let role = node.role().to_string();
+        let status = node.security_status().await?;
+        // Named, because with two boards in play "no usable key" says nothing
+        // about which one to reflash — and an empty key here has exactly one
+        // cause: firmware that predates the driver passing its seed to the
+        // adapter, so `GetSecurityStatus` has no identity to report.
+        let ed: [u8; 32] = status.own_ed_pubkey.clone().try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "board {role:?} reports no Ed25519 identity key, so there is nothing to \
+                 certify. Its firmware predates the board passing its seed to the \
+                 management adapter; reflash it."
+            )
+        })?;
+        let x: [u8; 32] = status.own_x_pubkey.clone().try_into().map_err(|_| {
+            anyhow::anyhow!("board {role:?} reports no usable X25519 agreement key")
+        })?;
+
+        // Derived, never taken from `node_id`: a certificate's MAC *is* the
+        // address its key derives (design 09 §5), so deriving it here is what
+        // makes the certificate usable. A node whose reported address differs
+        // is one this path cannot serve — `SetAuth` would refuse the result —
+        // so say which two values disagreed rather than letting the node's own
+        // refusal be the first anyone hears of it.
+        let mac = wayfinder_auth::derive_mac(&ed);
+        let node_id = node.node_info().await?.node_id;
+        anyhow::ensure!(
+            node_id == mac.0,
+            "board {role:?} routes as {node_id:x?} but its identity key derives {:x?}; its \
+             address is not derived from its seed, so no certificate can name both",
+            mac.0,
+        );
+
+        let cert = self
+            .authority
+            .issue_cert(mac, ed, x, self.not_before, self.not_after);
+        // An **empty** seed: certify what the node has, do not replace it.
+        node.set_auth(
+            &[],
+            cert.as_bytes(),
+            &self.authority.trust_anchor().to_bytes(),
+            None,
+            installer_unix,
+        )
+        .await?;
+        Ok(mac.0)
     }
 }
 

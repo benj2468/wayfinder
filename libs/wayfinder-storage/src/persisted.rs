@@ -157,6 +157,54 @@ impl<T: Clone, S: DurableStore, C: Codec<T>> Persisted<T, S, C> {
         }
         (result, persisted)
     }
+
+    /// [`mutate`](Self::mutate), for a change that replaces a **secret**: the
+    /// successful persist is followed by a [`DurableStore::scrub`], so the
+    /// value this one supersedes does not linger in whatever spare copy the
+    /// medium keeps to provide atomicity.
+    ///
+    /// The order — persist, then scrub — is the safety argument. After `save`
+    /// returns there is a valid copy of the new value, so erasing the old one
+    /// can only remove a copy nothing needs; the reverse order has a window
+    /// with nothing durable at all. Design 22 §4.4.
+    ///
+    /// Use it only for a mutation that *does* replace a secret. On a
+    /// two-page flash store a scrub costs an extra erase, and the frequent
+    /// writer through this type is a clock checkpoint whose wear budget is
+    /// sized on one erase per write.
+    ///
+    /// # A failed scrub is not a failed persist
+    ///
+    /// The returned outcome describes the *persist*. If the save succeeded and
+    /// only the scrub failed, this returns `Ok` and does not roll back: the new
+    /// value is durable, and discarding a change that survived — to punish a
+    /// failure to tidy up — would be the worse outcome. What is lost is that
+    /// the previous copy stays readable on the medium, which is logged at
+    /// `warn!` because it is worth an operator's attention.
+    pub fn mutate_sealed<R>(
+        &mut self,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> (R, PersistOutcome<S::Error, C::Error>)
+    where
+        // Only this method needs it, and only to name the cause in the warning
+        // below — the sealed path is the one whose failure an operator has to
+        // be able to diagnose later.
+        S::Error: core::fmt::Debug,
+    {
+        let (result, persisted) = self.mutate(f);
+        if persisted.is_ok()
+            && let Err(e) = self.store.scrub()
+        {
+            // The cause, in a field: this is the one record an operator has
+            // that a superseded key is still readable, and "it failed" without
+            // saying how supports no diagnosis later.
+            tracing::warn!(
+                error = ?e,
+                "superseded copy of a durable secret not erased; the new value is stored"
+            );
+        }
+        (result, persisted)
+    }
 }
 
 /// Makes persistence itself optional: `None` is an always-empty store whose
@@ -176,6 +224,22 @@ impl<S: DurableStore> DurableStore for Option<S> {
     fn save(&mut self, data: &[u8]) -> Result<(), Self::Error> {
         match self {
             Some(store) => store.save(data),
+            None => Ok(()),
+        }
+    }
+
+    fn scrub(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Some(store) => store.scrub(),
+            None => Ok(()),
+        }
+    }
+
+    /// `None` erases successfully because it holds nothing: an absent store
+    /// never had the secret this is disposing of.
+    fn erase(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Some(store) => store.erase(),
             None => Ok(()),
         }
     }
@@ -202,10 +266,58 @@ mod tests {
     #[derive(Default, Clone)]
     struct MemStore {
         blob: Rc<RefCell<Option<heapless::Vec<u8, 256>>>>,
+        /// Every store call, in order — some properties below are about
+        /// *sequence* rather than final state.
+        calls: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl MemStore {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
     }
 
     impl DurableStore for MemStore {
         type Error = Infallible;
+
+        fn load(&mut self, out: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+            self.calls.borrow_mut().push("load");
+            Ok(self.blob.borrow().as_ref().map(|b| {
+                out[..b.len()].copy_from_slice(b);
+                b.len()
+            }))
+        }
+
+        fn save(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push("save");
+            let mut v = heapless::Vec::new();
+            v.extend_from_slice(data).unwrap();
+            *self.blob.borrow_mut() = Some(v);
+            Ok(())
+        }
+
+        fn scrub(&mut self) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push("scrub");
+            Ok(())
+        }
+
+        fn erase(&mut self) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push("erase");
+            *self.blob.borrow_mut() = None;
+            Ok(())
+        }
+    }
+
+    /// A store whose `save` succeeds and whose `scrub` always fails, for the
+    /// one asymmetry that matters: the new blob is durable either way, so a
+    /// failed scrub must not roll the value back.
+    #[derive(Default, Clone)]
+    struct UnscrubbableStore {
+        blob: Rc<RefCell<Option<heapless::Vec<u8, 256>>>>,
+    }
+
+    impl DurableStore for UnscrubbableStore {
+        type Error = &'static str;
 
         fn load(&mut self, out: &mut [u8]) -> Result<Option<usize>, Self::Error> {
             Ok(self.blob.borrow().as_ref().map(|b| {
@@ -220,12 +332,29 @@ mod tests {
             *self.blob.borrow_mut() = Some(v);
             Ok(())
         }
+
+        fn scrub(&mut self) -> Result<(), Self::Error> {
+            Err("the stale page would not erase")
+        }
+
+        fn erase(&mut self) -> Result<(), Self::Error> {
+            Err("the stale page would not erase")
+        }
     }
 
     /// A store whose `save` always fails, to exercise the
-    /// rollback-on-persist-failure guarantee.
-    #[derive(Default)]
-    struct FailingStore;
+    /// rollback-on-persist-failure guarantee. Records its calls, so a test can
+    /// assert what was *not* attempted as well as what was.
+    #[derive(Default, Clone)]
+    struct FailingStore {
+        calls: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl FailingStore {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
 
     impl DurableStore for FailingStore {
         type Error = &'static str;
@@ -235,6 +364,16 @@ mod tests {
         }
 
         fn save(&mut self, _data: &[u8]) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push("save");
+            Err("disk full")
+        }
+
+        fn scrub(&mut self) -> Result<(), Self::Error> {
+            self.calls.borrow_mut().push("scrub");
+            Ok(())
+        }
+
+        fn erase(&mut self) -> Result<(), Self::Error> {
             Err("disk full")
         }
     }
@@ -329,7 +468,7 @@ mod tests {
     #[test]
     fn failed_persist_rolls_back_the_in_memory_mutation() {
         let mut buf = [0u8; 64];
-        let mut p = Persisted::load(FailingStore, CounterCodec, 0, &mut buf).unwrap();
+        let mut p = Persisted::load(FailingStore::default(), CounterCodec, 0, &mut buf).unwrap();
 
         let (old, persisted) = p.mutate(|v| {
             let old = *v;
@@ -428,5 +567,96 @@ mod tests {
             0,
             "the in-memory value was rolled back since encoding it for persistence failed"
         );
+    }
+
+    /// `mutate_sealed` persists and *then* scrubs, in that order.
+    ///
+    /// The order is the whole safety argument (design 22 §4.4): after `save`
+    /// returns there is a valid copy of the new value, so erasing the old one
+    /// can only remove a copy nothing needs. The reverse order has a window
+    /// with nothing durable at all.
+    #[test]
+    fn mutate_sealed_persists_and_then_scrubs() {
+        let store = MemStore::default();
+        let mut buf = [0u8; 64];
+        let mut p = Persisted::load(store.clone(), CounterCodec, 0u32, &mut buf).unwrap();
+        let after_load = store.calls().len();
+
+        let (_, outcome) = p.mutate_sealed(|v| *v = 7);
+
+        assert!(outcome.is_ok());
+        assert_eq!(*p.get(), 7);
+        assert_eq!(
+            &store.calls()[after_load..],
+            &["save", "scrub"],
+            "the previous copy is erased only once the new one is durable"
+        );
+    }
+
+    /// Plain `mutate` does **not** scrub.
+    ///
+    /// Not an oversight: on a two-page flash store a scrub costs an extra
+    /// erase, and the frequent writer through this type is the clock
+    /// checkpoint, whose wear budget design 22 §4.5 sizes on one erase per
+    /// write. Only a mutation that replaces a *secret* pays for the scrub.
+    #[test]
+    fn plain_mutate_does_not_scrub() {
+        let store = MemStore::default();
+        let mut buf = [0u8; 64];
+        let mut p = Persisted::load(store.clone(), CounterCodec, 0u32, &mut buf).unwrap();
+        let after_load = store.calls().len();
+
+        let (_, outcome) = p.mutate(|v| *v = 7);
+
+        assert!(outcome.is_ok());
+        assert_eq!(&store.calls()[after_load..], &["save"]);
+    }
+
+    /// A failed persist rolls the value back and scrubs nothing: there is no
+    /// new copy to protect, and the stored blob is still the one the
+    /// rolled-back value describes.
+    #[test]
+    fn mutate_sealed_does_not_scrub_when_the_persist_failed() {
+        let store = FailingStore::default();
+        let mut buf = [0u8; 64];
+        let mut p = Persisted::load(store.clone(), CounterCodec, 0u32, &mut buf).unwrap();
+
+        let (_, outcome) = p.mutate_sealed(|v| *v = 7);
+
+        assert!(matches!(outcome, Err(PersistError::Store("disk full"))));
+        assert_eq!(*p.get(), 0, "a failed persist rolls the value back");
+        assert_eq!(
+            store.calls(),
+            vec!["save"],
+            "nothing landed, so there is no superseded copy to erase -- and scrubbing \
+             would target the blob the rolled-back value still describes"
+        );
+    }
+
+    /// **A failed scrub does not roll the value back.**
+    ///
+    /// The asymmetry is deliberate. When `save` fails, nothing landed and the
+    /// caller must treat the change as not having taken effect. When only the
+    /// scrub fails, the new value *is* durable — rolling it back would discard
+    /// a change that survived, to punish a failure to tidy up. What is lost is
+    /// that the previous copy stays readable, which is worth an operator's
+    /// attention and not worth undoing a successful write over.
+    #[test]
+    fn a_failed_scrub_does_not_roll_back_a_value_that_did_persist() {
+        let store = UnscrubbableStore::default();
+        let mut buf = [0u8; 64];
+        let mut p = Persisted::load(store.clone(), CounterCodec, 0u32, &mut buf).unwrap();
+
+        let (_, outcome) = p.mutate_sealed(|v| *v = 7);
+
+        assert!(
+            outcome.is_ok(),
+            "the value is durable; a failed scrub is not a failed persist"
+        );
+        assert_eq!(*p.get(), 7);
+
+        let mut reload_buf = [0u8; 64];
+        let reloaded = Persisted::load(store, CounterCodec, 0u32, &mut reload_buf).unwrap();
+        assert_eq!(*reloaded.get(), 7, "and it really did reach the medium");
     }
 }

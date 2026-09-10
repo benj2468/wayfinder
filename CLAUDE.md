@@ -453,9 +453,10 @@ loop. **A behavior change almost always belongs in the core, not a shell.**
   plain `async fn` loop the board's executor drives, racing each link's `recv`
   against the OGM timer with `embassy_futures::select`, staging into a fixed
   `heapless` buffer. No vendor HAL and no concrete time driver — a board
-  supplies the `LinkT`s and a `Clock`. Optional `mgmt` feature adds the
-  management-API arm (`run_with_mgmt`). Also owns node-identity persistence
-  (`identity.rs`) over `wayfinder-storage`.
+  supplies the `LinkT`s and a `Clock`. `run_with_mgmt` adds the management-API
+  arm; it is unconditional, since every board wants it and every board already
+  links an allocator for `tracing-core` regardless. Also owns node-identity
+  persistence (`identity.rs`) over `wayfinder-storage`.
 - **libs/wayfinder-tick-driver** — a synchronous, non-blocking shell for a
   caller that drives its own clock: no `LinkT` at all, interfaces are plain
   queues (`push_rx` → `tick` → `poll_egress`/`poll_local`). For tick-based

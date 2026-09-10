@@ -30,8 +30,8 @@ pub const REVOKE_VERSION: u8 = 2;
 /// Nodes store the record and drop frames from any certificate for `node_mac`
 /// issued at or before its [`not_before`](Self::not_before); one issued after is
 /// a re-admission and survives.  It is deliberately **not** keyed on the MAC
-/// alone — a node whose MAC it cannot change (an nRF derives it from factory
-/// FICR) would otherwise be excluded until `not_after` with no recovery.
+/// alone — a node whose MAC it cannot readily change would otherwise be
+/// excluded until `not_after` with no recovery.
 /// Passive cert expiry then makes the removal permanent without further
 /// traffic.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
@@ -54,9 +54,15 @@ pub struct RevocationRecord {
     /// by definition the authority signed knowing it had revoked — is
     /// unaffected, and a re-approved node rejoins under its own MAC instead of
     /// waiting out [`not_after`](Self::not_after).  That matters most where a
-    /// MAC cannot be changed at all: an nRF board derives its MAC from the
-    /// chip's factory FICR, so without this, revoking one would exclude it
-    /// with no way back.
+    /// node's MAC is not the operator's to pick: it is the address its identity
+    /// key derives (design 09 §5), so re-admitting a node under a *different*
+    /// address means rotating its identity, and without this a revoked node
+    /// would have no way back short of that.
+    ///
+    /// (This used to say an nRF board's MAC was FICR-derived and could not
+    /// change at all. Design 22 made a board seed-derived like every other
+    /// node, so the example is gone; the argument is unchanged and now applies
+    /// uniformly.)
     ///
     /// The tie (a certificate issued in the same second) resolves toward
     /// *revoked*: this is a security control, and an authority re-admitting a
@@ -81,6 +87,12 @@ pub struct RevocationRecord {
 }
 
 impl RevocationRecord {
+    /// On-wire / on-disk size of a revocation record. Like
+    /// [`MembershipCert::SERIALIZED_LEN`](crate::MembershipCert::SERIALIZED_LEN)
+    /// this is `size_of::<Self>()`, named so callers that persist one do not
+    /// recompute it.
+    pub const SERIALIZED_LEN: usize = core::mem::size_of::<Self>();
+
     /// Parse an owned record from its raw
     /// [`as_bytes`](zerocopy::IntoBytes::as_bytes) form — a blob read back
     /// from a settings store, say — ignoring any trailing bytes.  `None` if
@@ -101,7 +113,7 @@ impl RevocationRecord {
     /// The byte range the signature covers: every field except the trailing
     /// signature.
     pub fn signed_body(&self) -> &[u8] {
-        let body_len = core::mem::size_of::<RevocationRecord>() - 64;
+        let body_len = Self::SERIALIZED_LEN - 64;
         &self.as_bytes()[..body_len]
     }
 

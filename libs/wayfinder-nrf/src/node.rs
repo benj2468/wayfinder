@@ -27,12 +27,14 @@ use tracing::trace;
 use tracing::warn;
 use wayfinder::config::KeepAliveConfig;
 use wayfinder::config::LinkFeatures;
-use wayfinder::interfaces::frame::Mac;
 use wayfinder_embedded_driver::Driver;
+use wayfinder_embedded_driver::RefusalReason;
+use wayfinder_embedded_driver::Restored;
 use wayfinder_embedded_driver::TrickleParams;
 use wayfinder_server::EmbeddedQueryChannel;
 
 use crate::clock::EmbassyClock;
+use crate::identity::Identity;
 use crate::link::Ieee802154Link;
 use crate::link::MeshLink;
 use crate::stack;
@@ -246,7 +248,7 @@ async fn bring_up_rylr(uarte: Serial, lora_address: u16) -> MeshLink<Serial> {
 /// binding arrives as a `fn` pointer instead of an `impl Binding<..>`.
 #[embassy_executor::task]
 pub async fn run(
-    node_mac: Mac,
+    mut identity: Identity,
     uarte: Serial,
     radio: Radio<'static>,
     usbd: Peri<'static, USBD>,
@@ -254,6 +256,7 @@ pub async fn run(
     spawner: Spawner,
     mut led: Output<'static>,
 ) -> ! {
+    let node_mac = identity.mac();
     // The same short address the 802.15.4 link derives, from the same `Mac`,
     // so a node's two radios agree on its short identity.
     let lora_address = ieee802154::short_address_of(node_mac);
@@ -300,6 +303,50 @@ pub async fn run(
     let mut driver: wayfinder_embedded_driver::driver_for!(_, _, 3, crate::nrf52840) =
         Driver::with_capacities(node_mac, links, EmbassyClock, &TRICKLE, &features(), &NAMES);
 
+    // Come back from what the last run wrote down: the clock checkpoint, then
+    // the credential. Before the LED and before anything is emitted, so this
+    // node's first OGM already carries its authentication rather than going
+    // out unsigned and being re-flooded that way.
+    //
+    // A board with no durable store has no record and skips this — it has
+    // nothing to come back from, which is the same state as a board that has
+    // never been enrolled.
+    if let Some(record) = identity.record() {
+        match driver.restore(record) {
+            Restored::Authenticated => info!("restored membership credential from flash"),
+            Restored::Unauthenticated => {
+                debug!("no stored credential; routing unauthenticated")
+            }
+            // `error!`, not `warn!`: node-local, not reachable by any peer, not
+            // retryable this boot, and the node is running in a posture an
+            // operator did not choose. Every reason is stated rather than
+            // summarised, because they call for different remedies.
+            Restored::Refused(why) => {
+                // One of these is a *latched condition*, not just a line.
+                // `SetAuth` raises this alarm for the window between installing
+                // a credential and the reboot that adopts its address — a
+                // window that clears itself. Reaching here means the reboot has
+                // happened and the two still disagree, which is the case the
+                // alarm's own doc calls the genuinely bad one, and it was the
+                // only one going unreported: the board is in RAM, so the
+                // install-time raise did not survive the reset.
+                if why == RefusalReason::CertifiedAddressMismatch {
+                    wayfinder_alarm::alarm!(
+                        wayfinder_alarm::Severity::Critical,
+                        wayfinder_alarm::AlarmKind::CertifiedAddressMismatch,
+                        wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&node_mac.0)),
+                        "a stored credential names another address; this node cannot use it, \
+                         and a restart will not clear it"
+                    );
+                }
+                error!(
+                    why = why.as_str(),
+                    "the stored credential could not be used; routing without it"
+                )
+            }
+        }
+    }
+
     led.set_low();
     // Every deterministic bring-up failure is behind us; from here a fault is a
     // runtime problem the node should reboot out of rather than latch on.
@@ -329,9 +376,12 @@ pub async fn run(
 
     match usb {
         Some(usb) => {
-            join(driver.run_with_mgmt(&query_rx), usb.run(&query_tx))
-                .await
-                .0
+            join(
+                driver.run_with_mgmt(&query_rx, identity.store_mut()),
+                usb.run(&query_tx),
+            )
+            .await
+            .0
         }
         // Nothing will ever send on `query_rx`, so racing it would only cost an
         // idle future per loop iteration.

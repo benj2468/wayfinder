@@ -1389,6 +1389,7 @@ dependencies = [
 name = "wayfinder-embedded-driver"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "embassy-futures",
  "embassy-sync",
  "heapless",

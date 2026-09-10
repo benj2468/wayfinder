@@ -472,6 +472,9 @@ fn alarm_kind_data(kind: wayfinder_alarm::AlarmKind) -> AlarmKindData {
         wayfinder_alarm::AlarmKind::SelfRevoked => AlarmKindData::SelfRevoked,
         wayfinder_alarm::AlarmKind::IdentityConflict => AlarmKindData::IdentityConflict,
         wayfinder_alarm::AlarmKind::CertExpiring => AlarmKindData::CertExpiring,
+        wayfinder_alarm::AlarmKind::CertifiedAddressMismatch => {
+            AlarmKindData::CertifiedAddressMismatch
+        }
     }
 }
 
@@ -1522,6 +1525,33 @@ impl<
             self_revocation: Some(Vec::new()),
             ..Default::default()
         })?;
+
+        // A wholesale identity install leaves this node certified for one
+        // address and routing under another until it restarts, because
+        // `self_ident` is fixed at construction — a mid-flight address change
+        // is a topology event every peer would have to be told about. That
+        // window is legitimate and self-clearing, but it must not be *silent*:
+        // it is the state GitLab #58 was filed for, and the fault there was
+        // that the only evidence was `GetNodeInfo`'s `node_id` disagreeing with
+        // `GetSecurityStatus`'s `node_mac` for anyone who thought to look.
+        //
+        // Raised before the install rather than after, so the two reads a
+        // client correlates and this alarm cannot briefly disagree.
+        //
+        // Not raised on the certify-in-place path: that one refused a MAC
+        // mismatch outright above, so reaching here means the two agree.
+        let certified_mac = Mac(parsed_cert.node_mac);
+        if certified_mac != self.router.self_ident() {
+            wayfinder_alarm::alarm!(
+                wayfinder_alarm::Severity::Warning,
+                wayfinder_alarm::AlarmKind::CertifiedAddressMismatch,
+                wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&certified_mac.0)),
+                "certified as {:?} while routing as {:?}; restart to adopt the certified \
+                 address",
+                certified_mac,
+                self.router.self_ident()
+            );
+        }
 
         let auth = OgmAuth::with_capacities(key_pair, parsed_cert, anchor);
         self.router.set_auth(auth);
@@ -2938,6 +2968,96 @@ mod tests {
         assert_eq!(identity.seed, [3u8; 32].to_vec());
         assert_eq!(identity.cert, cert);
         assert_eq!(identity.trust_anchor, anchor);
+    }
+
+    /// **Installing a wholesale new identity leaves the node routing under its
+    /// old address until it restarts, and it must say so.**
+    ///
+    /// `CentralRouter::self_ident` is fixed at construction and has no setter,
+    /// deliberately: a mid-flight address change is a topology event, and every
+    /// peer still holds the old originator. So `SetAuth` with a new seed makes
+    /// this node certified for one MAC and routing under another until the next
+    /// boot derives the address from the seed just installed.
+    ///
+    /// That window is exactly the state GitLab #58 was filed for — observed on
+    /// hardware, `node_id=da18…` against `node_mac=663d…` — and the fault there
+    /// was that nothing reported it. Design 22 takes #58's option 3 (the
+    /// address follows the seed) and keeps option 1's substance here: the node
+    /// latches the condition itself, so an operator reads it over the API
+    /// instead of noticing two fields disagree.
+    #[test]
+    fn installing_a_new_identity_raises_a_certified_address_mismatch() {
+        let board = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            let mut router = CentralRouter::new(mac(1));
+            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+            ca.set_now_unix(1_000);
+            // A keypair whose derived MAC is not `mac(1)`, which is the whole
+            // point: a certificate's MAC is a hash of its public key, so it
+            // cannot be made to match an address chosen independently.
+            let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+            let cert = ca_issue(
+                &mut ca,
+                &kp.derived_mac().0,
+                &kp.ed_pubkey(),
+                &kp.x_pubkey(),
+            );
+            let anchor = ca.trust_anchor_bytes();
+
+            RouterAdapter::new(&mut router, Duration::ZERO)
+                .with_epoch_unix(Duration::from_secs(1_000))
+                .set_auth(&[3; 32], &cert, &anchor, None, 0)
+                .unwrap();
+
+            assert!(
+                board
+                    .snapshot()
+                    .alarms
+                    .iter()
+                    .any(|a| a.kind == wayfinder_alarm::AlarmKind::CertifiedAddressMismatch),
+                "a node certified for an address it does not route under must latch the \
+                 condition, not leave it to whoever compares two API fields",
+            );
+        });
+    }
+
+    /// Certifying the identity the node already holds raises nothing: the
+    /// certificate names the address the node runs under, which is what that
+    /// path checks before it gets here.
+    #[test]
+    fn recertifying_the_running_identity_raises_no_mismatch() {
+        let board = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+            // A router already running under the address the seed derives —
+            // the seed-derived shape design 22 gives a board.
+            let mut router = CentralRouter::new(kp.derived_mac());
+            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+            ca.set_now_unix(1_000);
+            let cert = ca_issue(
+                &mut ca,
+                &kp.derived_mac().0,
+                &kp.ed_pubkey(),
+                &kp.x_pubkey(),
+            );
+            let anchor = ca.trust_anchor_bytes();
+
+            RouterAdapter::new(&mut router, Duration::ZERO)
+                .with_epoch_unix(Duration::from_secs(1_000))
+                .with_identity(&mut Some([3; 32]))
+                .set_auth(&[], &cert, &anchor, None, 0)
+                .unwrap();
+
+            assert!(
+                !board
+                    .snapshot()
+                    .alarms
+                    .iter()
+                    .any(|a| a.kind == wayfinder_alarm::AlarmKind::CertifiedAddressMismatch),
+                "the certificate names the address this node runs under; there is nothing \
+                 to report",
+            );
+        });
     }
 
     /// A helper renewal target, so the tests below read as being about *which*

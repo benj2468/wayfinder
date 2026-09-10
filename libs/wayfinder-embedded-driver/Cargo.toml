@@ -6,15 +6,6 @@ edition = "2024"
 [lints]
 workspace = true
 
-[features]
-default = [ "mgmt" ]
-# Opt-in embedded management API: adds a third event-loop arm that services
-# `WayfinderRequest`s forwarded from a `wayfinder-server` `serve` loop (over an
-# `embassy-sync` channel) against a `RouterAdapter`. Off by default so a pure
-# radio relay stays heap-free — enabling it pulls in `wayfinder-server`'s
-# `alloc`-based adapter and the query channel.
-mgmt = ["dep:wayfinder-server", "dep:wayfinder-protos", "dep:embassy-sync"]
-
 # The `no_std` counterpart to `wayfinder-driver`: it runs the router's event
 # loop on bare metal.  Deliberately **HAL- and executor-agnostic** — it depends
 # on no vendor HAL and on no concrete time driver, so the same driver runs on
@@ -35,23 +26,41 @@ wayfinder-storage = { workspace = true, default-features = false }
 wayfinder = { path = "../wayfinder", default-features = false }
 interfaces.workspace = true
 heapless.workspace = true
+# The record's flags byte, as a type rather than seven loose `1 << n`
+# constants: `RecordFlags` in `identity.rs`. `no_std`, no transitive deps.
+bitflags.workspace = true
 # Pure future combinators (`select_array`) — no time driver, builds for host.
 embassy-futures = "0.1.2"
 # Pinned directly to keep tracing's `std` feature off for the `no_std` build.
 tracing = { version = "0.1.44", default-features = false }
 
-# `mgmt` feature only: the `no_std` management-API adapter + request dispatcher
-# and the query channel that carries a request in / a response out. Pinned
-# directly (not workspace inheritance, which can't override `default-features`)
-# so `wayfinder-server` is taken with only its `embedded` feature and no
-# `std`/tokio leaks in.
+# The `no_std` management-API adapter + request dispatcher and the query channel
+# that carries a request in / a response out. Pinned directly (not workspace
+# inheritance, which can't override `default-features`) so `wayfinder-server` is
+# taken with only its `embedded` feature and no `std`/tokio leaks in.
+#
+# Unconditional, where this used to sit behind an off-by-default `mgmt` feature.
+# The feature bought nothing: it was `default = ["mgmt"]`, so both consumers
+# (`wayfinder-nrf` and `bins/wayfinder-stm32f411`) took it, nothing in CI or the
+# `justfile` ever built `--no-default-features`, and its stated purpose — keeping
+# a pure radio relay heap-free — was already void, since `tracing-core`'s
+# unconditional `extern crate alloc` means every board that logs links an
+# allocator regardless. What it did cost was 24 `#[cfg]` attributes over a
+# configuration nothing compiled.
 wayfinder-server = { path = "../wayfinder-server", default-features = false, features = [
     "embedded",
-], optional = true }
-wayfinder-protos = { workspace = true, optional = true }
-embassy-sync = { workspace = true, optional = true }
+] }
+wayfinder-protos.workspace = true
+embassy-sync.workspace = true
 
 [dev-dependencies]
+# Test-only, and `std` on purpose: `Authority` is the host-side CA, so it is
+# the only way to mint a *signed* certificate — which `SetAuth` verifies. A
+# hand-built unsigned one is enough for `Driver::restore` (which deliberately
+# does not re-verify) and not enough for the mgmt path. A dev-dependency, so
+# the feature does not reach a firmware build: dev-deps are not part of the
+# normal graph, and `cargo build` for a board never resolves them.
+wayfinder-auth = { workspace = true, features = ["std"] }
 # A minimal executor to drive the async loop in host unit tests.
 futures.workspace = true
 # Test-only: build/parse raw link frames (`as_bytes`/`ref_from_bytes`) to feed a

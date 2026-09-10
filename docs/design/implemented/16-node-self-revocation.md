@@ -75,6 +75,15 @@ the reasons an operator revokes are mostly not compromise:
 - **Decommission and later redeploy**, **lease or role expiry** — hardware
   still trusted, key never exposed.
 
+> **Note (design 22).** The premise in the next paragraph — that an nRF board's
+> MAC is FICR-derived and cannot change — stopped being true when a board got a
+> durable identity seed: its address is now `derived_mac()` of that seed, like
+> every other node's, and changes on the next boot after a `SetAuth`. The
+> conclusion is unaffected and if anything broader: a node's MAC is the address
+> its identity key derives (design 09 §5), so "get a new MAC" means rotating its
+> identity everywhere, not just on a board. Left in place rather than rewritten,
+> per this folder's rule about implemented docs.
+
 And the escape hatch of "get a new MAC" does not exist everywhere: on nRF
 boards the MAC is derived from the chip's factory FICR device id
 (`libs/wayfinder-nrf/src/identity.rs:23`) and is re-derived identically if

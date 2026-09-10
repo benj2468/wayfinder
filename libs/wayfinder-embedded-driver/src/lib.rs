@@ -20,15 +20,16 @@
 //! device or IGMP snoop yet.  Authentication *time* is wired — the driver owns
 //! a [`WallClock`] and feeds the router its posture on every pass, so a board
 //! judges certificate windows to whatever extent it can prove them (design 20
-//! §4.4) — but nothing persists that clock's checkpoint across a reset yet, so
-//! an unanchored board comes up
-//! [`Unknown`](wayfinder::wayfinder_auth::Clocked::Unknown) after every power
-//! cycle.  Persisting it belongs with the credential (#52).  A board can enable
-//! auth via [`Driver::router_mut`].  The optional `mgmt`
+//! §4.4) — and since design 22 that clock's checkpoint survives a reset,
+//! alongside the credential and in the same durable record ([`identity`]).
+//! A board calls [`Driver::restore`] once at bring-up to come back from it, and
+//! the loop rewrites the checkpoint every [`CHECKPOINT_INTERVAL`].  A board can
+//! also enable auth directly via [`Driver::router_mut`].  The optional `mgmt`
 //! feature adds a management-API arm to the event loop (`run_with_mgmt`) that
 //! serves read-only/config queries forwarded from a `wayfinder-server` `serve`
 //! loop, so an embedded node is inspectable over a debug transport (e.g. a UART)
-//! exactly like a host node.
+//! exactly like a host node — and, given a [`NodeStore`], a `SetAuth` over that
+//! port is durable rather than lost on the next reset.
 //!
 //! [`wayfinder-driver-core`]: https://docs.rs/wayfinder-driver-core
 #![cfg_attr(not(test), no_std)]
@@ -61,6 +62,165 @@ use wayfinder_driver_core::poll_due_all;
 
 pub mod identity;
 
+// `NodeSettings` is `alloc`-based, and so is the `RouterAdapter` that writes
+// through it. Not a cost this crate is choosing: every board already links an
+// allocator, because `tracing-core` does an unconditional `extern crate
+// alloc` and every board logs.
+extern crate alloc;
+
+pub mod settings;
+
+/// How much wall-clock time a board lets accumulate before rewriting its
+/// durable clock checkpoint.
+///
+/// A **wear** figure, not a correctness one — design 20 settled that a coarser
+/// interval only widens the deficit on restore and can never make the clock
+/// wrong in the other direction, because the posture is a floor. The
+/// arithmetic behind six hours (design 22 §4.5): the nRF52840's two 4 KiB
+/// pages sustain roughly 10 000 erase cycles each and are written
+/// alternately, so the pair is good for ~20 000 checkpoints; at this interval
+/// that is 1 461 a year, or ~13.7 years. An hourly checkpoint would be 2.3
+/// years, which is not a service life; a daily one buys 55 and costs a wider
+/// deficit for nothing.
+pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// What [`Driver::restore`] did with the record it was handed.
+///
+/// Returned rather than logged internally so a board can report it through
+/// whatever it has — an `info!` on a DK with a probe, the bounded log ring on
+/// a dongle with none — and so a test can assert it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restored {
+    /// The record held no credential. The node routes unauthenticated, which
+    /// is every board's state before it is first enrolled.
+    Unauthenticated,
+    /// The credential in the record was installed.
+    Authenticated,
+    /// The record held something credential-shaped that could not be used. The
+    /// node routes unauthenticated.
+    ///
+    /// Distinct from [`Unauthenticated`](Self::Unauthenticated) because the two
+    /// look identical from outside and mean very different things: one is a
+    /// board waiting to be enrolled, the other is a board whose enrolment is
+    /// on the medium and unusable.
+    Refused(RefusalReason),
+}
+
+/// Why [`Driver::restore`] would not arm a credential the record held.
+///
+/// An enum rather than a message, because one of these is a *latchable
+/// condition* and not merely a line to print: a board still reporting a
+/// certified-address mismatch after a restart is design 22 §7's genuinely bad
+/// case — a credential it can never use — and the caller has to be able to pick
+/// it out to raise an alarm for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The record holds a root-signed revocation of this node's own
+    /// membership.
+    SelfRevoked,
+    /// A certificate without its anchor, or an anchor with no certificate.
+    /// Neither half is a credential on its own.
+    IncompleteCredential,
+    /// The stored certificate or trust anchor did not parse.
+    Unparseable,
+    /// The stored certificate names a MAC this node does not run under.
+    ///
+    /// Unreachable through `SetAuth`, which checks the certificate against the
+    /// seed it installs — so a record in this state was written by a build
+    /// predating that rule, and **it does not clear itself**. Every boot will
+    /// refuse the same credential.
+    CertifiedAddressMismatch,
+}
+
+impl RefusalReason {
+    /// A short static phrase for a log line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusalReason::SelfRevoked => "this node holds a revocation of its own membership",
+            RefusalReason::IncompleteCredential => {
+                "the stored credential is missing its certificate or its anchor"
+            }
+            RefusalReason::Unparseable => "the stored certificate or trust anchor does not parse",
+            RefusalReason::CertifiedAddressMismatch => {
+                "the stored certificate names a MAC this node does not run under"
+            }
+        }
+    }
+}
+
+/// The durable state a board hands its driver: the settings the management API
+/// writes through, plus the clock checkpoint that lives beside them.
+///
+/// One trait rather than two parameters because they are one blob — design 20
+/// §4.5 requires the checkpoint be written, loaded and erased with the
+/// credential, and a driver holding two independent handles could not honour
+/// that. `&mut dyn` rather than a type parameter because [`Driver`] is already
+/// const-generic over fourteen parameters and this is a once-per-loop virtual
+/// call on a path that does I/O anyway.
+///
+/// [`settings::RecordSettings`] is the implementation; a board whose durable
+/// medium is unusable supplies [`NullStore`] instead.
+pub trait NodeStore: wayfinder_server::SettingsStore {
+    /// The clock high-water mark currently on the medium, or `None` for a
+    /// store that keeps none at all.
+    ///
+    /// `None` and `Some(0)` are different answers and both occur: a board with
+    /// no usable medium ([`NullStore`]) can never checkpoint, while a board
+    /// with a fresh record has simply not checkpointed *yet* and should do so
+    /// as soon as it is anchored. An earlier version of this returned a plain
+    /// `u64` with `u64::MAX` standing in for the first case, which read as
+    /// "never due" and was not: the due test adds an interval to it, and
+    /// `u64::MAX + 21_600` panics in a dev build and wraps in a release one —
+    /// making a store-less board attempt a checkpoint, which is the opposite
+    /// of what the sentinel was for.
+    fn stored_checkpoint(&self) -> Option<u64>;
+
+    /// Durably record a new high-water mark.
+    fn checkpoint(&mut self, unix: u64) -> Result<(), alloc::string::String>;
+}
+
+/// The store a board falls back to when it has no usable durable medium —
+/// misconfigured flash geometry, or a device that will not write.
+///
+/// Every write is refused with a stated reason rather than silently accepted,
+/// which is the honest answer: such a board has nowhere to keep a credential,
+/// so `SetAuth` against it must fail rather than appear to work until the next
+/// reset. It is also the posture design 22 §4.3 gives a board with no seed at
+/// all — it cannot hold a credential, so refusing to pretend is correct.
+#[derive(Default)]
+pub struct NullStore {
+    empty: wayfinder_server::NodeSettings,
+}
+
+impl wayfinder_server::SettingsStore for NullStore {
+    fn settings(&self) -> &wayfinder_server::NodeSettings {
+        &self.empty
+    }
+
+    fn persist(
+        &mut self,
+        _update: wayfinder_server::NodeSettings,
+    ) -> Result<(), alloc::string::String> {
+        Err(alloc::string::String::from(
+            "this node has no usable durable store, so nothing set over the management API \
+             would survive a reset; it is refused rather than accepted and lost",
+        ))
+    }
+}
+
+impl NodeStore for NullStore {
+    /// `None`: there is no medium, so no checkpoint is ever due.
+    fn stored_checkpoint(&self) -> Option<u64> {
+        None
+    }
+
+    fn checkpoint(&mut self, _unix: u64) -> Result<(), alloc::string::String> {
+        Err(alloc::string::String::from(
+            "this node has no durable store",
+        ))
+    }
+}
+
 /// Build the concrete [`Driver`] type for a capacity profile declared with
 /// [`define_profile!`](wayfinder::define_profile).
 ///
@@ -88,17 +248,11 @@ macro_rules! driver_for {
     };
 }
 
-#[cfg(feature = "mgmt")]
 use embassy_futures::select::Either3;
-#[cfg(feature = "mgmt")]
 use embassy_futures::select::select3;
-#[cfg(feature = "mgmt")]
 use wayfinder_protos::service::audit_request;
-#[cfg(feature = "mgmt")]
 use wayfinder_protos::service::handle_router;
-#[cfg(feature = "mgmt")]
 use wayfinder_server::EmbeddedQueryRx;
-#[cfg(feature = "mgmt")]
 use wayfinder_server::RouterAdapter;
 
 /// A monotonic clock plus an async delay — the one piece of platform the driver
@@ -235,6 +389,28 @@ pub struct Driver<
     /// validity is judged under a posture that says what the node can actually
     /// prove rather than against a counter that reads 1970 (design 20 §4.4).
     wall: WallClock,
+    /// Monotonic instant of the last clock-checkpoint *attempt*, or `None`
+    /// before the first.
+    ///
+    /// Attempts rather than successes: a store that cannot write leaves the
+    /// stored checkpoint where it is, so a success-only guard would have the
+    /// loop ask again on every pass. See
+    /// [`write_checkpoint_if_due`](Driver::write_checkpoint_if_due).
+    checkpoint_attempted: Option<Duration>,
+    /// The identity seed this node runs under, as the adapter's write-back
+    /// slot.
+    ///
+    /// `SetAuth`'s *certify the identity I already have* branch reads it, and
+    /// writes back through it when an install rotates the seed — so the value
+    /// here is the one the record holds, not a stale copy. Without it that
+    /// branch refuses with "this node has no identity to certify" on a board
+    /// that plainly has one, which is the only shape of enrolment a board with
+    /// no debugger can use: the wholesale path needs a reboot to take effect,
+    /// and a dongle cannot be reset from the host.
+    ///
+    /// Set by [`restore`](Driver::restore); `None` on a board whose durable
+    /// store is unusable, which has no seed to certify either.
+    identity_seed: Option<[u8; 32]>,
     /// Each link's declared native fan-out, cached at construction.
     ///
     /// Read here rather than at use: the receive arm holds a borrow of `links`
@@ -334,6 +510,8 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
             clock,
             mac,
             wall: WallClock::new(),
+            checkpoint_attempted: None,
+            identity_seed: None,
             tx_buffer: [0u8; FRAME_LEN],
             stage: StageSink::default(),
             fan_out,
@@ -393,6 +571,7 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
             wall,
             tx_buffer,
             stage,
+            ..
         } = self;
         // Advanced before anything reads it, and through the router rather than
         // straight at the auth state: advancing the clock can evict a lapsed
@@ -431,7 +610,6 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
 /// would create a second near-copy of `WayfinderDataProvider` to keep in step.
 /// No practical loss: `R` is always a `CentralRouter` today. Making
 /// `RouterAdapter` generic over `RouterOps` would retire this block.
-#[cfg(feature = "mgmt")]
 impl<
     L: LinkT,
     C: Clock,
@@ -479,9 +657,157 @@ impl<
     /// loop owns the router, so a query is serviced synchronously here — against
     /// a fresh [`RouterAdapter`] at the current instant — and never shares the
     /// router across tasks. Never returns; the board spawns this on its executor.
-    pub async fn run_with_mgmt(&mut self, mgmt: &EmbeddedQueryRx<'_>) -> ! {
+    pub async fn run_with_mgmt(
+        &mut self,
+        mgmt: &EmbeddedQueryRx<'_>,
+        store: &mut dyn NodeStore,
+    ) -> ! {
         loop {
-            self.run_once_with_mgmt(mgmt).await;
+            self.run_once_with_mgmt(mgmt, store).await;
+        }
+    }
+
+    /// Bring this driver up from the record the board loaded: restore the
+    /// clock checkpoint, then install the credential the record holds.
+    ///
+    /// Call it once, before [`run_with_mgmt`](Self::run_with_mgmt).
+    ///
+    /// # The clock comes from the checkpoint and nothing else
+    ///
+    /// Design 20 §4.4 states this in bold and it is the rule most easily
+    /// broken by being helpful: a restored certificate's `not_before` looks
+    /// like a perfectly good lower bound on the current time, and using it
+    /// resets the expiry clock on **every power cycle**, by an amount that
+    /// grows with the certificate's age, triggerable by anyone who can pull
+    /// the cable. The damage is not mainly to this node's own credential —
+    /// clocked peers reject that anyway — but to its judgement of *everyone
+    /// else's*: a board with a one-year certificate rebooting at month eleven
+    /// would believe it is month zero and honour peer certificates revoked by
+    /// expiry ten months earlier.
+    ///
+    /// The checkpoint is handed to [`WallClock::anchor`], so it goes through
+    /// that method's `max` and its plausibility floor: a stale page cannot
+    /// pull a corrected estimate back, and a checkpoint of zero — a board that
+    /// was never anchored — leaves the node `Unknown`, which is a supported
+    /// state it keeps routing in.
+    ///
+    /// # The credential is not re-verified
+    ///
+    /// Its signature was checked by the `SetAuth` that stored it, and
+    /// `wayfinder-tap`'s boot path makes the same choice for the same reason.
+    /// What *is* checked here is the binding that a stored record could
+    /// violate: the certificate must name the address this node runs under.
+    /// It cannot fail on a record this build wrote — the address is derived
+    /// from the seed the certificate names — but a record from a build
+    /// predating that rule could hold one, and arming from it would have the
+    /// board sign OGMs no peer attributes to it (GitLab #58).
+    pub fn restore(&mut self, record: &crate::identity::NodeRecord) -> Restored {
+        use wayfinder::auth::OgmAuth;
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
+
+        // Handed to the adapter so `SetAuth` can certify this identity in
+        // place rather than only replace it. Set before any early return: a
+        // board whose credential is refused below still has a seed, and
+        // certifying it is exactly how an operator fixes that.
+        self.identity_seed = Some(record.seed);
+
+        let now = self.clock.now();
+        // First, so anything below is judged under the restored posture — and
+        // from the checkpoint alone. See the doc above.
+        if record.checkpoint_unix != 0 && !self.wall.anchor(record.checkpoint_unix, now) {
+            warn!(
+                checkpoint = record.checkpoint_unix,
+                "the stored clock checkpoint was refused as implausible; this node cannot \
+                 judge validity windows"
+            );
+        }
+
+        // Fail closed on a revocation of this node. Nothing on a board writes
+        // one today — the record carries the field so a `SetAuth` that
+        // *clears* it round-trips — so finding one means either a future
+        // build wired the write, or the record is not what this build thinks.
+        // Arming and hoping is the single outcome design 16 exists to
+        // prevent; judging its window properly belongs with whatever wires
+        // self-revocation on embedded.
+        if record.self_revocation.is_some() {
+            return Restored::Refused(RefusalReason::SelfRevoked);
+        }
+
+        let (Some(cert_bytes), Some(anchor_bytes)) = (&record.cert, &record.trust_anchor) else {
+            // A certificate with no anchor to chain to is not a credential,
+            // and neither is an anchor with nothing under it.
+            return if record.cert.is_some() || record.trust_anchor.is_some() {
+                Restored::Refused(RefusalReason::IncompleteCredential)
+            } else {
+                Restored::Unauthenticated
+            };
+        };
+        let Some(cert) = MembershipCert::from_bytes(cert_bytes) else {
+            return Restored::Refused(RefusalReason::Unparseable);
+        };
+        let Some(anchor) = TrustAnchor::from_bytes(anchor_bytes) else {
+            return Restored::Refused(RefusalReason::Unparseable);
+        };
+        if cert.node_mac != record.mac().0 {
+            return Restored::Refused(RefusalReason::CertifiedAddressMismatch);
+        }
+
+        self.router
+            .set_auth(OgmAuth::with_capacities(record.keypair(), cert, anchor));
+        Restored::Authenticated
+    }
+
+    /// Write the clock's current estimate back to `store`, if enough of it has
+    /// accumulated to be worth an erase.
+    ///
+    /// Called at the top of every pass of the loop rather than on a timer of
+    /// its own: a board wakes far more often than [`CHECKPOINT_INTERVAL`] — an
+    /// interface's `i_max` is at most a couple of minutes — so a plain check
+    /// here fires on time without another deadline in the `select`'s `min`.
+    ///
+    /// Three guards, all of them about flash wear ([`CHECKPOINT_INTERVAL`]):
+    ///
+    /// - An **unanchored** board writes nothing. It has nothing to say.
+    /// - The estimate must have run at least an interval past what is stored.
+    ///   This is what makes a plain reboot free — the restored estimate starts
+    ///   *at* the stored value — while still writing promptly after a
+    ///   `SetAuth`, whose anchor lands a whole unix epoch past a fresh board's
+    ///   zero.
+    /// - Attempts, not just successes, are rate-limited on the monotonic
+    ///   clock. A store that cannot write leaves the stored checkpoint where
+    ///   it was, so without this it would be asked again on every pass.
+    fn write_checkpoint_if_due(&mut self, store: &mut dyn NodeStore) {
+        let now = self.clock.now();
+        let Some(estimate) = self.wall.estimate(now) else {
+            return;
+        };
+        // A store that keeps no checkpoint is never due — and says so as an
+        // absence rather than as a large number, so there is nothing here to
+        // overflow.
+        let Some(stored) = store.stored_checkpoint() else {
+            return;
+        };
+        // Saturating, because `stored` is whatever was last checkpointed and
+        // the clock takes any plausible instant an operator hands it: a
+        // `SetTime` far into the future is checkpointed like any other, and
+        // adding an interval to it must not wrap.
+        if estimate < stored.saturating_add(CHECKPOINT_INTERVAL.as_secs()) {
+            return;
+        }
+        if self
+            .checkpoint_attempted
+            .is_some_and(|last| now.saturating_sub(last) < CHECKPOINT_INTERVAL)
+        {
+            return;
+        }
+        self.checkpoint_attempted = Some(now);
+        if let Err(e) = store.checkpoint(estimate) {
+            warn!(
+                error = %e,
+                "could not write the clock checkpoint; this node will come back undated \
+                 after its next reset"
+            );
         }
     }
 
@@ -489,7 +815,12 @@ impl<
     /// `recv`, the periodic OGM/keep-alive timer, and an inbound management
     /// query; plan the winner; then dispatch any staged frames. A served query
     /// stages nothing, so its dispatch is a no-op.
-    async fn run_once_with_mgmt(&mut self, mgmt: &EmbeddedQueryRx<'_>) {
+    async fn run_once_with_mgmt(&mut self, mgmt: &EmbeddedQueryRx<'_>, store: &mut dyn NodeStore) {
+        // Here rather than on a deadline of its own: the interval is hours and
+        // this loop wakes every few seconds, so a check costs nothing and
+        // keeps the `select`'s `min` about the mesh.
+        self.write_checkpoint_if_due(store);
+
         let now = self.clock.now();
         // Same four deadlines as `run_once`, and for the same reasons.
         let due = self
@@ -520,6 +851,8 @@ impl<
             wall,
             tx_buffer,
             stage,
+            identity_seed,
+            ..
         } = self;
         // Same reason as `run_once`: advanced before anything reads it, and
         // through the router so an eviction and the proofs behind it move
@@ -563,7 +896,18 @@ impl<
                 // reports none. Wire one through if an embedded node ever grows
                 // the ability to renew itself.
                 let response = handle_router(
-                    &mut RouterAdapter::new(&mut *router, now).with_wall_clock(wall),
+                    &mut RouterAdapter::new(&mut *router, now)
+                        .with_wall_clock(wall)
+                        // The seed this node runs under, so `SetAuth` can
+                        // certify it in place. Also what earns a client the
+                        // self-key access tier, which a board could not offer
+                        // before it had a durable seed to compare against.
+                        .with_identity(identity_seed)
+                        // The board's durable record. Without it a `SetAuth`
+                        // over this port installed a credential that lived
+                        // until the next reset and no further, which is what
+                        // design 22 exists to fix.
+                        .with_settings(store),
                     request,
                 )
                 // `handle_unowned`, not the not-a-provider message: an
@@ -816,8 +1160,8 @@ mod tests {
     /// A clock whose `sleep` never completes, so a ready `recv` always wins the
     /// `select` — used to drive the received-frame (forwarding) arm of the loop
     /// deterministically, rather than the periodic-OGM timer arm.
-    struct RecvClock {
-        now: Duration,
+    pub(crate) struct RecvClock {
+        pub(crate) now: Duration,
     }
 
     impl Clock for RecvClock {
@@ -893,7 +1237,6 @@ mod tests {
     /// nor a link recv is ready is served against the router: the response is a
     /// `NodeInfo` whose node id is this driver's own MAC — the full embedded
     /// mgmt path: channel → `run_once_with_mgmt` → `RouterAdapter` → reply.
-    #[cfg(feature = "mgmt")]
     #[test]
     fn run_once_with_mgmt_serves_a_node_info_query() {
         use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
@@ -921,7 +1264,7 @@ mod tests {
         };
 
         let (_, response) = futures::executor::block_on(futures::future::join(
-            driver.run_once_with_mgmt(&rx),
+            driver.run_once_with_mgmt(&rx, &mut NullStore::default()),
             client,
         ));
 
@@ -948,7 +1291,6 @@ mod tests {
     /// deliberate, verified property rather than an unverified implementation
     /// detail of `select3`'s poll order; it is not yet mitigated (no fairness /
     /// round-robin between the two).
-    #[cfg(feature = "mgmt")]
     #[test]
     fn run_once_with_mgmt_prefers_ready_link_traffic_over_a_pending_query() {
         use futures::FutureExt;
@@ -991,7 +1333,7 @@ mod tests {
         let trickle = [TrickleParams::default()];
         let mut driver = Driver::new(mac(1), [link0], clock, &trickle, &[], &[]);
 
-        futures::executor::block_on(driver.run_once_with_mgmt(&rx));
+        futures::executor::block_on(driver.run_once_with_mgmt(&rx, &mut NullStore::default()));
 
         // Had the mgmt arm won, `run_once_with_mgmt` would have drained the
         // request via `mgmt.recv()`, leaving the channel empty. It's still
@@ -1087,5 +1429,628 @@ mod capacity_tests {
     // Map a compact `u8` test identifier to a full MAC.
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
+    }
+}
+
+/// What a board does with the record it loaded, and what it writes back.
+///
+/// Design 22 §4.5/§4.6. The load-bearing test here is
+/// [`restore_never_anchors_from_the_certificate`]: that is design 20 §4.4's
+/// bold rule, and getting it wrong resets the expiry clock on every power
+/// cycle for anyone who can pull the cable.
+#[cfg(test)]
+mod restore_tests {
+    extern crate std;
+    use std::rc::Rc;
+    use std::vec::Vec;
+
+    use super::tests::FakeLink;
+    use super::tests::ImmediateClock;
+    use super::*;
+    use core::cell::RefCell;
+    use wayfinder::wayfinder_auth::Clocked;
+    use wayfinder::wayfinder_auth::Keypair;
+    use wayfinder::wayfinder_auth::MIN_PLAUSIBLE_UNIX;
+    use wayfinder::wayfinder_auth::MembershipCert;
+    use wayfinder::wayfinder_auth::RevocationRecord;
+    use wayfinder::wayfinder_auth::TrustAnchor;
+    use wayfinder_storage::DurableStore;
+    use zerocopy::IntoBytes;
+
+    use crate::identity::NodeRecord;
+    use crate::settings::RecordSettings;
+
+    const MESH_ID: u32 = 0x4849_4C00;
+
+    fn seed(n: u8) -> [u8; Keypair::SEED_LEN] {
+        [n; Keypair::SEED_LEN]
+    }
+
+    /// An in-memory store, so a test can see what the driver wrote back.
+    #[derive(Default, Clone)]
+    struct MemStore {
+        blob: Rc<RefCell<Option<Vec<u8>>>>,
+        saves: Rc<RefCell<usize>>,
+    }
+
+    impl DurableStore for MemStore {
+        type Error = core::convert::Infallible;
+
+        fn load(&mut self, out: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+            Ok(self.blob.borrow().as_ref().map(|b| {
+                out[..b.len()].copy_from_slice(b);
+                b.len()
+            }))
+        }
+
+        fn save(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+            *self.saves.borrow_mut() += 1;
+            *self.blob.borrow_mut() = Some(data.to_vec());
+            Ok(())
+        }
+
+        fn erase(&mut self) -> Result<(), Self::Error> {
+            *self.blob.borrow_mut() = None;
+            Ok(())
+        }
+    }
+
+    /// A settings store already holding `record`.
+    fn store_holding(record: NodeRecord) -> (RecordSettings<MemStore>, MemStore) {
+        let medium = MemStore::default();
+        let settings = RecordSettings::new(wayfinder_storage::Persisted::new(
+            record,
+            medium.clone(),
+            crate::identity::RecordCodec,
+        ));
+        (settings, medium)
+    }
+
+    /// A certificate binding `keypair` to the address that keypair derives —
+    /// the shape design 09 §5 requires, built by hand because minting a signed
+    /// one needs the `std` `Authority` this crate does not link.
+    ///
+    /// Unsigned, which is fine here for the same reason it is fine on the
+    /// host's own boot path: restoring a stored credential does not re-verify
+    /// the signature (see [`Driver::restore`]).
+    fn cert_for(keypair: &Keypair, not_before: u64) -> [u8; MembershipCert::SERIALIZED_LEN] {
+        let cert = MembershipCert {
+            version: 1,
+            flags: 0,
+            mesh_id: MESH_ID.into(),
+            node_mac: keypair.derived_mac().0,
+            ed_pubkey: keypair.ed_pubkey(),
+            x_pubkey: keypair.x_pubkey(),
+            not_before: not_before.into(),
+            not_after: (not_before + 365 * 86_400).into(),
+            signature: [0u8; 64],
+        };
+        cert.as_bytes()
+            .try_into()
+            .expect("a certificate is a fixed-size struct")
+    }
+
+    fn anchor_bytes() -> [u8; TrustAnchor::SERIALIZED_LEN] {
+        TrustAnchor {
+            mesh_id: MESH_ID,
+            root_pubkey: [0x0B; 32],
+        }
+        .to_bytes()
+    }
+
+    /// A record holding a credential for its own seed, and `checkpoint`.
+    fn credentialed(seed_byte: u8, checkpoint: u64, cert_not_before: u64) -> NodeRecord {
+        let seed = seed(seed_byte);
+        NodeRecord {
+            checkpoint_unix: checkpoint,
+            cert: Some(cert_for(&Keypair::from_seed(&seed), cert_not_before)),
+            trust_anchor: Some(anchor_bytes()),
+            ..NodeRecord::fresh(seed)
+        }
+    }
+
+    fn driver_at(now: Duration, mac: Mac) -> Driver<FakeLink, ImmediateClock, 1> {
+        Driver::new(
+            mac,
+            [FakeLink::default()],
+            ImmediateClock { now },
+            &[TrickleParams::default()],
+            &[],
+            &[],
+        )
+    }
+
+    /// A board that has never been anchored comes back `Unknown` and
+    /// unauthenticated — the state design 20 says it must keep routing in.
+    #[test]
+    fn restoring_an_empty_record_leaves_the_board_unclocked() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord::fresh(seed(0x01));
+        let mut driver = driver_at(now, record.mac());
+
+        assert_eq!(driver.restore(&record), Restored::Unauthenticated);
+        assert_eq!(driver.wall.posture(now), Clocked::Unknown);
+    }
+
+    /// A stored checkpoint is what the clock comes back from.
+    #[test]
+    fn a_checkpoint_restores_the_clock_as_a_floor() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord {
+            checkpoint_unix: 1_800_000_000,
+            ..NodeRecord::fresh(seed(0x02))
+        };
+        let mut driver = driver_at(now, record.mac());
+
+        driver.restore(&record);
+
+        assert_eq!(
+            driver.wall.posture(now),
+            Clocked::AtLeast(1_800_000_000),
+            "a restored board reports a floor, never a reading: it cannot measure how \
+             long it was powered off"
+        );
+    }
+
+    /// **Design 20 §4.4's bold rule, and the reason this design exists.**
+    ///
+    /// A board restores its clock from the checkpoint and *nothing else*. In
+    /// particular never from its own certificate's `not_before`: that resets
+    /// the expiry clock on every power cycle, by an amount that grows with the
+    /// certificate's age, and anyone who can pull the cable triggers it. The
+    /// damage is not mainly to its own credential — clocked peers reject that
+    /// anyway — but to its judgement of *everyone else's*.
+    #[test]
+    fn restore_never_anchors_from_the_certificate() {
+        let now = Duration::from_secs(30);
+        // A credential whose window opened long ago, and no checkpoint.
+        let record = credentialed(0x03, 0, 1_800_000_000);
+        let mut driver = driver_at(now, record.mac());
+
+        assert_eq!(driver.restore(&record), Restored::Authenticated);
+
+        assert_eq!(
+            driver.wall.posture(now),
+            Clocked::Unknown,
+            "the certificate's not_before must not reach the clock; a board that was \
+             never checkpointed comes back undated even while credentialed"
+        );
+    }
+
+    /// A checkpoint below the plausibility floor is refused by the clock, the
+    /// same as any other implausible anchor — a board that has never been
+    /// powered in 1970.
+    #[test]
+    fn an_implausible_checkpoint_is_refused() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord {
+            checkpoint_unix: MIN_PLAUSIBLE_UNIX - 1,
+            ..NodeRecord::fresh(seed(0x04))
+        };
+        let mut driver = driver_at(now, record.mac());
+
+        driver.restore(&record);
+
+        assert_eq!(driver.wall.posture(now), Clocked::Unknown);
+    }
+
+    /// A stored credential is installed, so the board comes back
+    /// authenticated rather than having to be re-enrolled after every reset.
+    #[test]
+    fn a_stored_credential_is_installed_at_boot() {
+        let now = Duration::from_secs(30);
+        let record = credentialed(0x05, 1_800_000_000, 1_800_000_000);
+        let mut driver = driver_at(now, record.mac());
+
+        assert_eq!(driver.restore(&record), Restored::Authenticated);
+        assert!(driver.router.auth_mut().is_some());
+    }
+
+    /// A certificate naming a MAC the board does not run under is refused.
+    ///
+    /// Unreachable through `SetAuth`, which checks the key against the seed it
+    /// installs — but a record written by a build predating the seed-derived
+    /// address could hold one, and arming from it would have the board sign
+    /// OGMs no peer attributes to it. GitLab #58, refused rather than run.
+    #[test]
+    fn a_credential_for_another_mac_is_refused() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord {
+            // A certificate for a *different* key's address.
+            cert: Some(cert_for(&Keypair::from_seed(&seed(0xFF)), 1_800_000_000)),
+            trust_anchor: Some(anchor_bytes()),
+            ..NodeRecord::fresh(seed(0x06))
+        };
+        let mut driver = driver_at(now, record.mac());
+
+        assert!(matches!(driver.restore(&record), Restored::Refused(_)));
+        assert!(
+            driver.router.auth_mut().is_none(),
+            "a board must not arm under an address its credential does not name"
+        );
+    }
+
+    /// A certificate with no anchor to chain to is not a credential.
+    #[test]
+    fn a_certificate_without_its_anchor_is_refused() {
+        let now = Duration::from_secs(30);
+        let seed = seed(0x07);
+        let record = NodeRecord {
+            cert: Some(cert_for(&Keypair::from_seed(&seed), 1_800_000_000)),
+            trust_anchor: None,
+            ..NodeRecord::fresh(seed)
+        };
+        let mut driver = driver_at(now, record.mac());
+
+        assert!(matches!(driver.restore(&record), Restored::Refused(_)));
+    }
+
+    /// A record holding a revocation of this node does not arm, whatever else
+    /// it holds. Nothing on a board writes one today; refusing is the
+    /// fail-closed reading of finding one, and the alternative — arming and
+    /// hoping — is the one outcome design 16 exists to prevent.
+    #[test]
+    fn a_held_self_revocation_refuses_to_arm() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord {
+            self_revocation: Some([0x9E; RevocationRecord::SERIALIZED_LEN]),
+            ..credentialed(0x08, 1_800_000_000, 1_800_000_000)
+        };
+        let mut driver = driver_at(now, record.mac());
+
+        assert!(matches!(driver.restore(&record), Restored::Refused(_)));
+        assert!(driver.router.auth_mut().is_none());
+    }
+
+    /// An unanchored board writes no checkpoint at all — it has nothing to
+    /// write, and design 22 §4.5's whole budget is spent on writes that say
+    /// something.
+    #[test]
+    fn an_unanchored_board_spends_no_flash_wear() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord::fresh(seed(0x09));
+        let (mut settings, medium) = store_holding(record.clone());
+        let mut driver = driver_at(now, record.mac());
+        driver.restore(&record);
+
+        driver.write_checkpoint_if_due(&mut settings);
+
+        assert_eq!(*medium.saves.borrow(), 0);
+    }
+
+    /// A board anchored well past its stored checkpoint writes one promptly.
+    ///
+    /// This is the `SetAuth` case: a fresh board's stored checkpoint is zero
+    /// and the installer's anchor is a real unix second, so the gap exceeds
+    /// the interval immediately. Without it, a credential installed and then
+    /// reset within six hours would come back `Unknown` — which is exactly the
+    /// hardware test design 21 §5.3 says to flip.
+    #[test]
+    fn a_freshly_anchored_board_checkpoints_at_once() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord::fresh(seed(0x0A));
+        let (mut settings, medium) = store_holding(record.clone());
+        let mut driver = driver_at(now, record.mac());
+        driver.restore(&record);
+        driver.wall.anchor(1_800_000_000, now);
+
+        driver.write_checkpoint_if_due(&mut settings);
+
+        assert_eq!(*medium.saves.borrow(), 1);
+        assert_eq!(settings.record().checkpoint_unix, 1_800_000_000);
+    }
+
+    /// ...and does not write again on the next pass of the loop. A board wakes
+    /// far more often than every six hours, so an unguarded write here would
+    /// burn the two-page erase budget in minutes.
+    #[test]
+    fn a_checkpoint_is_not_rewritten_on_every_pass() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord::fresh(seed(0x0B));
+        let (mut settings, medium) = store_holding(record.clone());
+        let mut driver = driver_at(now, record.mac());
+        driver.restore(&record);
+        driver.wall.anchor(1_800_000_000, now);
+
+        for _ in 0..100 {
+            driver.write_checkpoint_if_due(&mut settings);
+        }
+
+        assert_eq!(*medium.saves.borrow(), 1);
+    }
+
+    /// A board restored from a checkpoint does not immediately rewrite it: the
+    /// restored estimate starts *at* the stored value, so there is nothing to
+    /// advance. Otherwise every boot would cost an erase, and a board that
+    /// reboots often would exhaust the budget long before its service life.
+    #[test]
+    fn a_reboot_alone_costs_no_erase() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord {
+            checkpoint_unix: 1_800_000_000,
+            ..NodeRecord::fresh(seed(0x0C))
+        };
+        let (mut settings, medium) = store_holding(record.clone());
+        let mut driver = driver_at(now, record.mac());
+        driver.restore(&record);
+
+        driver.write_checkpoint_if_due(&mut settings);
+
+        assert_eq!(*medium.saves.borrow(), 0);
+    }
+
+    /// Six hours of free-running later, the checkpoint advances.
+    #[test]
+    fn the_checkpoint_advances_once_the_interval_has_elapsed() {
+        let boot = Duration::from_secs(30);
+        let record = NodeRecord {
+            checkpoint_unix: 1_800_000_000,
+            ..NodeRecord::fresh(seed(0x0D))
+        };
+        let (mut settings, medium) = store_holding(record.clone());
+        let mut driver = driver_at(boot, record.mac());
+        driver.restore(&record);
+        driver.write_checkpoint_if_due(&mut settings);
+        assert_eq!(*medium.saves.borrow(), 0);
+
+        driver.clock.now = boot + CHECKPOINT_INTERVAL;
+        driver.write_checkpoint_if_due(&mut settings);
+
+        assert_eq!(*medium.saves.borrow(), 1);
+        assert_eq!(
+            settings.record().checkpoint_unix,
+            1_800_000_000 + CHECKPOINT_INTERVAL.as_secs()
+        );
+    }
+
+    /// Six hours is the interval design 22 §4.5 settles on, and the number is
+    /// pinned here because it is a **wear** decision with arithmetic behind it:
+    /// two 4 KiB pages at ~10 000 erase cycles, alternating, is ~20 000 writes;
+    /// at this interval that is ~13.7 years. An hour would be 2.3.
+    #[test]
+    fn the_checkpoint_interval_is_six_hours() {
+        assert_eq!(CHECKPOINT_INTERVAL, Duration::from_secs(6 * 60 * 60));
+    }
+
+    /// **An anchored board with no durable medium must not fault.**
+    ///
+    /// A board that fell back to `NullStore` still serves its management port,
+    /// and `SetTime` anchors the wall clock without going near a store — so
+    /// `estimate` becomes `Some` and the due test runs against a store that
+    /// keeps no checkpoint at all. That combination has to be a quiet no-op.
+    #[test]
+    fn an_anchored_board_with_no_store_never_checkpoints() {
+        let now = Duration::from_secs(30);
+        let mut driver = driver_at(now, NodeRecord::fresh(seed(0x0E)).mac());
+        driver.wall.anchor(1_800_000_000, now);
+
+        // Deliberately many passes: the loop calls this every time round.
+        for _ in 0..10 {
+            driver.write_checkpoint_if_due(&mut NullStore::default());
+        }
+    }
+
+    /// **`NullStore` refuses every write, with a reason** — the entire
+    /// justification for the type existing (design 22 §11.2). A board with no
+    /// usable medium must fail a `SetAuth` rather than appear to accept one
+    /// and lose it at the next reset.
+    #[test]
+    fn a_board_with_no_store_refuses_writes_and_says_why() {
+        use wayfinder_server::SettingsStore;
+
+        let mut store = NullStore::default();
+        assert!(store.settings().is_empty());
+
+        let err = store
+            .persist(wayfinder_server::NodeSettings {
+                require_auth: Some(true),
+                ..Default::default()
+            })
+            .expect_err("a store-less board cannot make anything durable");
+        assert!(
+            err.contains("durable"),
+            "the refusal must say what is wrong, not just refuse: {err}"
+        );
+        assert!(
+            store.settings().is_empty(),
+            "and it must not be applied in memory either"
+        );
+    }
+
+    /// A store that keeps a checkpoint but cannot write one, counting the
+    /// attempts. Models flash that has stopped accepting writes.
+    #[derive(Default)]
+    struct FailingCheckpointStore {
+        attempts: Rc<RefCell<usize>>,
+        empty: wayfinder_server::NodeSettings,
+    }
+
+    impl wayfinder_server::SettingsStore for FailingCheckpointStore {
+        fn settings(&self) -> &wayfinder_server::NodeSettings {
+            &self.empty
+        }
+
+        fn persist(
+            &mut self,
+            _update: wayfinder_server::NodeSettings,
+        ) -> Result<(), alloc::string::String> {
+            Err(alloc::string::String::from("flash is not accepting writes"))
+        }
+    }
+
+    impl NodeStore for FailingCheckpointStore {
+        /// A real store holding no checkpoint yet — `Some(0)`, not `None`, so
+        /// the due test is met and the attempt guard is what has to bound it.
+        fn stored_checkpoint(&self) -> Option<u64> {
+            Some(0)
+        }
+
+        fn checkpoint(&mut self, _unix: u64) -> Result<(), alloc::string::String> {
+            *self.attempts.borrow_mut() += 1;
+            Err(alloc::string::String::from("flash is not accepting writes"))
+        }
+    }
+
+    /// **A store that cannot write is asked at most once per interval.**
+    ///
+    /// The advance guard alone cannot bound this: a failed `checkpoint` leaves
+    /// the stored value where it was, so `estimate >= stored + interval` stays
+    /// true and the loop — which runs every few seconds — would retry forever,
+    /// warning each time. That is what `checkpoint_attempted` is for, and
+    /// without this test deleting it left the suite green.
+    #[test]
+    fn a_store_that_cannot_write_is_not_asked_on_every_pass() {
+        let boot = Duration::from_secs(30);
+        let record = NodeRecord::fresh(seed(0x10));
+        let mut settings = FailingCheckpointStore::default();
+        let mut driver = driver_at(boot, record.mac());
+        driver.restore(&record);
+        driver.wall.anchor(1_800_000_000, boot);
+
+        for _ in 0..50 {
+            driver.write_checkpoint_if_due(&mut settings);
+        }
+        assert_eq!(*settings.attempts.borrow(), 1, "one attempt per interval");
+
+        driver.clock.now = boot + CHECKPOINT_INTERVAL;
+        driver.write_checkpoint_if_due(&mut settings);
+        assert_eq!(
+            *settings.attempts.borrow(),
+            2,
+            "and it does try again once the interval has passed"
+        );
+    }
+
+    /// **A board hands the adapter the seed it holds**, so `SetAuth` can
+    /// *certify the identity the node already runs under* — the empty-seed
+    /// branch — rather than only installing a wholesale new one.
+    ///
+    /// This is the difference between a node that can be enrolled and one that
+    /// can only be replaced. The wholesale path gives a node an address it
+    /// adopts on its next boot, which is fine for a board with a debugger and
+    /// impossible for one without: a dongle cannot be reset from the host, so
+    /// a credential it will not use until a reboot is a credential it never
+    /// uses. Certifying in place keeps the address and needs no reboot.
+    ///
+    /// It was unreachable on a board until design 22 gave one a durable seed —
+    /// there was nothing to certify — and then stayed unreachable because the
+    /// driver never passed it. `current_identity_seed` returning `None` makes
+    /// `SetAuth` refuse with "this node has no identity to certify", on a node
+    /// that plainly has one.
+    ///
+    /// Also the end-to-end test of the `mgmt` seam that nothing else covers:
+    /// a real request, through the loop, landing in the durable record.
+    #[test]
+    fn a_set_auth_certifies_the_identity_the_board_already_holds() {
+        use wayfinder_auth::Authority;
+        use wayfinder_protos::wayfinder::v1alpha::SetAuthRequest;
+        use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
+        use wayfinder_server::EmbeddedQueryChannel;
+        use zerocopy::IntoBytes;
+
+        const MESH: u32 = 0x4849_4C00;
+        let record = NodeRecord::fresh(seed(0x21));
+        let keypair = record.keypair();
+
+        // Issued for the key the board already holds, naming the address that
+        // key derives — which is the address the board is already running
+        // under. That equality is the whole point of the path.
+        let ca = Authority::from_seed(&[0x5C; 32], MESH);
+        let cert = ca.issue_cert(
+            keypair.derived_mac(),
+            keypair.ed_pubkey(),
+            keypair.x_pubkey(),
+            MIN_PLAUSIBLE_UNIX,
+            MIN_PLAUSIBLE_UNIX + 365 * 86_400,
+        );
+
+        let (mut settings, medium) = store_holding(record.clone());
+        let channel = EmbeddedQueryChannel::new();
+        let (tx, rx) = channel.split();
+        let mut driver = Driver::new(
+            record.mac(),
+            [FakeLink::default()],
+            crate::tests::RecvClock {
+                now: Duration::from_secs(1),
+            },
+            &[TrickleParams::default()],
+            &[],
+            &[],
+        );
+        driver.restore(&record);
+
+        let client = async {
+            tx.query(WayfinderRequest {
+                request: Some(ReqKind::SetAuth(SetAuthRequest {
+                    // Empty: certify what the node has, do not replace it.
+                    seed: Vec::new(),
+                    cert: cert.as_bytes().to_vec(),
+                    trust_anchor: ca.trust_anchor().to_bytes().to_vec(),
+                    installer_unix: MIN_PLAUSIBLE_UNIX,
+                    ..Default::default()
+                })),
+            })
+            .await
+        };
+
+        let (_, response) = futures::executor::block_on(futures::future::join(
+            driver.run_once_with_mgmt(&rx, &mut settings),
+            client,
+        ));
+
+        // `SetAuth` carries nothing back, so success is `Empty` and failure is
+        // an `Error` whose message is the interesting part of a red run.
+        match response.response {
+            Some(RespKind::Empty(_)) => {}
+            Some(RespKind::Error(e)) => panic!(
+                "certifying the identity the board already holds was refused: {}",
+                e.message
+            ),
+            other => panic!("expected an Empty response, got {other:?}"),
+        }
+
+        assert!(
+            driver.router.auth_mut().is_some(),
+            "the credential should be live on the router"
+        );
+        // And durable: the medium, not just memory. Nothing else tests the
+        // `.with_settings(...)` wiring end to end.
+        let mut buf = [0u8; crate::identity::RECORD_READ_BUF_LEN];
+        let (reloaded, _) = crate::identity::load_or_init_record(
+            medium,
+            || panic!("already provisioned"),
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded.get().seed,
+            seed(0x21),
+            "certifying in place must not change the seed -- that is the whole difference \
+             from a wholesale install"
+        );
+        assert!(reloaded.get().cert.is_some(), "and the cert is durable");
+    }
+
+    /// A checkpoint near the top of the range must not overflow the due test
+    /// either.
+    ///
+    /// Reachable, not theoretical: `WallClock::anchor` accepts any plausible
+    /// instant, so an operator (or anyone with the cable — the port is
+    /// unauthenticated, GitLab #57) can `SetTime` a board to the far future,
+    /// and that estimate is then what gets checkpointed and restored.
+    #[test]
+    fn a_checkpoint_near_the_end_of_time_does_not_overflow() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord {
+            checkpoint_unix: u64::MAX - 1,
+            ..NodeRecord::fresh(seed(0x0F))
+        };
+        let (mut settings, _) = store_holding(record.clone());
+        let mut driver = driver_at(now, record.mac());
+        driver.restore(&record);
+
+        driver.write_checkpoint_if_due(&mut settings);
     }
 }

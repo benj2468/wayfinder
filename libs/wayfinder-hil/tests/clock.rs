@@ -9,6 +9,11 @@
 //! All `#[ignore]`d: `cargo nextest run --workspace` compiles them and runs
 //! none. `just hil` runs them, and each skips cleanly when the inventory names
 //! no board for its role.
+//!
+//! **Every test here installs a credential, and since design 22 that is
+//! durable.** So each one leaves the board anchored for good — the estimate
+//! never decreases — and design 20's `Unknown` claims are not testable from
+//! here at all. They live in `fresh_board.rs`, which says why.
 
 use wayfinder_auth::MIN_PLAUSIBLE_UNIX;
 use wayfinder_hil::Node;
@@ -16,85 +21,6 @@ use wayfinder_hil::Rig;
 use wayfinder_hil::mesh::TestMesh;
 use wayfinder_hil::mesh::host_unix;
 use wayfinder_protos::wayfinder::v1alpha::ClockPosture;
-
-/// **The regression test for design 20's whole objection** (§10's test 13, and
-/// §5's test 1 here): a board that cannot tell the time keeps working.
-///
-/// Under the superseded design an unanchored board rejected every certificate a
-/// real authority issues and went inert. It must now report `Unknown` — judging
-/// no validity window — and still answer as a router.
-///
-/// The half this cannot prove alone is "and has a neighbour": that needs a
-/// second node, which is design 21 §5's test 4. What is checked here is that
-/// the router is *running and answering*, which is what went away in the
-/// failure this guards against.
-#[tokio::test]
-#[ignore = "needs hardware: a board playing the role \"alpha\""]
-async fn an_unanchored_board_reports_unknown_and_keeps_answering() -> anyhow::Result<()> {
-    let rig = Rig::load()?;
-    let Some(board) = rig.board("alpha") else {
-        return Ok(());
-    };
-
-    // Start from a known state: a board that has been given a time earlier in
-    // the run is still holding it, and its clock only moves forward.
-    board.reset()?;
-    let mut node = Node::attach(&board).await?;
-
-    // A credential that cannot date the board, installed with a zero stamp —
-    // the fail-closed value a host sends when it cannot vouch for its own
-    // clock. See `TestMesh::mint_undatable`: this is the only way to reach
-    // credentialed-and-`Unknown`, and it is the state the whole design is
-    // about.
-    let mesh = TestMesh::mint_undatable()?;
-    mesh.install(&mut node, 0).await?;
-
-    node.with_diagnostics(async |node: &mut Node| {
-        let info = node.node_info().await?;
-        anyhow::ensure!(
-            info.clock_posture() != ClockPosture::Unspecified,
-            "the board reports no clock posture at all, which means its firmware predates \
-             design 20 -- reflash it before trusting anything this test says",
-        );
-        // Proven before the assertion that rests on it: a `SetAuth` that
-        // silently did nothing would otherwise be reported as "should judge no
-        // windows", pointing at the clock instead of at the install.
-        //
-        // `auth_locked` is *not* this check: it means "required to
-        // authenticate and holding no certificate yet", i.e. the inert state,
-        // so a successful install makes it false.
-        anyhow::ensure!(
-            node.security_status().await?.auth_enabled,
-            "the credential should be installed, so the node reports authentication on",
-        );
-        anyhow::ensure!(
-            info.clock_posture() == ClockPosture::Unknown,
-            "a credentialed board with nothing to date itself by should judge no windows, \
-             got {:?}",
-            info.clock_posture(),
-        );
-
-        // The router answers, which is the property that disappeared when an
-        // unclocked node refused everything.
-        node.routing_table().await?;
-        node.link_quality_table().await?;
-
-        // Design 21 §5's test 5, which is the same state: this is how a board
-        // with no probe attached says "I am routing, and I am not judging
-        // expiry".
-        let alarms = node.alarms().await?;
-        anyhow::ensure!(
-            alarms.alarms.iter().any(|a| {
-                a.kind() == wayfinder_protos::wayfinder::v1alpha::AlarmKind::ClockUnsynchronized
-            }),
-            "a credentialed board that cannot judge windows should raise \
-             ClockUnsynchronized; alarms were {:?}",
-            alarms.alarms.iter().map(|a| a.kind()).collect::<Vec<_>>(),
-        );
-        Ok(())
-    })
-    .await
-}
 
 /// Design 21 §5's test 2, and design 20 §4.7's three rules for `SetTime`:
 /// a plausible time anchors the floor, an implausible one is refused, and a
@@ -189,22 +115,24 @@ async fn set_time_anchors_forward_and_refuses_to_roll_back() -> anyhow::Result<(
     .await
 }
 
-/// Design 21 §5's test 3. **This test is written to be flipped, and deleting it
-/// is the wrong way to make it pass.**
+/// Design 21 §5's test 3, **flipped**, which is what its previous form said to
+/// do when GitLab #52 landed.
 ///
-/// Today nothing persists a clock checkpoint, so a reset returns a board to
-/// `Unknown`. That is the shipped behaviour and this pins it.
+/// It used to assert that a reset returned the board to `Unknown`, because
+/// nothing persisted a clock checkpoint. Design 22 persists one, in the same
+/// durable record as the credential — design 20 §4.5 requires the two be
+/// written, loaded and erased together — so a reset now comes back anchored.
 ///
-/// It is the executable form of design 20 §4.5's constraint on GitLab #52:
-/// when a credential is persisted, the checkpoint must be persisted with it,
-/// and boot must restore *from the checkpoint and nothing else*. When #52
-/// lands, this test should be changed to assert `AtLeast` after a reset — and
-/// if it starts reporting `AtLeast` while #52 is still open, or reports a floor
-/// derived from the node's own certificate `not_before`, that is the rollback
-/// design 20 §4.4 forbids in bold, not a test that needs updating.
+/// **The `AtLeast` here is not the whole assertion.** A board that restored its
+/// clock from its own certificate's `not_before` would also report `AtLeast`,
+/// and that is the rollback design 20 §4.4 forbids in bold: it resets the
+/// expiry clock on every power cycle, by an amount that grows with the
+/// certificate's age, triggerable by anyone who can pull the cable. What
+/// distinguishes the two is the *value*, so the floor is checked against the
+/// certificate's start rather than merely being present.
 #[tokio::test]
 #[ignore = "needs hardware: a probed board playing the role \"alpha\""]
-async fn a_reset_returns_the_board_to_unknown() -> anyhow::Result<()> {
+async fn a_reset_restores_the_credential_and_the_clock() -> anyhow::Result<()> {
     let rig = Rig::load()?;
     let Some(board) = rig.board("alpha") else {
         return Ok(());
@@ -218,17 +146,29 @@ async fn a_reset_returns_the_board_to_unknown() -> anyhow::Result<()> {
 
     // Anchoring needs a credential: `clock_posture` is read from the router's
     // auth state, so an uncredentialed board reports `Unknown` however the wall
-    // clock stands, and there would be nothing for the reset to visibly clear.
+    // clock stands, and there would be nothing for the reset to preserve.
+    //
+    // Stamped well past the certificate's `not_before`, which is a year back.
+    // That gap is the whole measurement: a board restoring from the checkpoint
+    // comes back near this value, and one restoring from the certificate comes
+    // back near `mesh.not_before()`.
+    let installed_at = host_unix()?;
     let mesh = TestMesh::mint_now()?;
-    mesh.install(&mut node, host_unix()?).await?;
+    mesh.install(&mut node, installed_at).await?;
     anyhow::ensure!(
         node.node_info().await?.clock_posture() == ClockPosture::AtLeast,
-        "the board should be anchored before the reset that is supposed to clear it",
+        "the board should be anchored before the reset that is supposed to preserve it",
     );
+    // A second read, deliberately. The checkpoint is written at the top of a
+    // pass of the driver loop, so the pass that *served* the install had
+    // already made its check with nothing to write. One more request guarantees
+    // another pass, and so a checkpoint on the medium before the reset.
+    node.security_status().await?;
     drop(node);
 
     // A reset, which is not a power cycle -- see `Board::reset`. Under a real
-    // power cut this assertion is strictly stronger, never weaker.
+    // power cut these assertions are strictly stronger, never weaker: the
+    // checkpoint would be the same and the free-run since it would be lost.
     board.reset()?;
 
     let mut node = Node::attach(&board).await?;
@@ -239,19 +179,185 @@ async fn a_reset_returns_the_board_to_unknown() -> anyhow::Result<()> {
         // no board sets `require_auth`, so it reads false both before and after
         // a reset. `auth_enabled` is the fact wanted.
         anyhow::ensure!(
-            !node.security_status().await?.auth_enabled,
-            "nothing persists a credential yet, so a reset must clear it too; the board \
-             came back still authenticated, which means #52 has landed and this test \
-             needs the reading in its doc comment",
+            node.security_status().await?.auth_enabled,
+            "the credential is persisted, so a reset must bring it back; the board came \
+             back unauthenticated",
         );
         anyhow::ensure!(
-            info.clock_posture() == ClockPosture::Unknown,
-            "nothing persists a clock checkpoint yet, so a reset must clear the anchor; \
-             got {:?}. If GitLab #52 has landed, read this test's doc comment \
-             before changing it.",
+            info.clock_posture() == ClockPosture::AtLeast,
+            "the checkpoint is persisted alongside the credential, so a reset must bring \
+             the anchor back too; got {:?}",
             info.clock_posture(),
+        );
+
+        // `SetTime` is the only way to read the floor back: it refuses anything
+        // at or below the current estimate, so a value the board accepts is one
+        // it had not already reached.
+        //
+        // Halfway between the certificate's start and the install stamp. A
+        // board restored from the checkpoint is already past this and refuses;
+        // one restored from `not_before` is behind it and accepts. Accepting is
+        // the failure.
+        let Some(not_before) = mesh.not_before() else {
+            anyhow::bail!("mint_now must produce a datable certificate");
+        };
+        let midpoint = not_before + (installed_at - not_before) / 2;
+        // Specifically the monotonicity refusal, not merely *a* refusal: a
+        // transport hiccup or an unimplemented request would otherwise read as
+        // proof the floor is where it should be, on the one property this
+        // whole design exists for.
+        let Err(err) = node.set_time(midpoint).await else {
+            anyhow::bail!(
+                "the board accepted a time between its certificate's start and the install \
+                 stamp, so its restored floor is behind the checkpoint -- it anchored from \
+                 the certificate's not_before, which design 20 §4.4 forbids"
+            );
+        };
+        anyhow::ensure!(
+            format!("{err:#}").contains("no change"),
+            "the refusal must be the estimate-already-past one; got: {err:#}",
         );
         Ok(())
     })
     .await
+}
+
+/// **GitLab #58, on the hardware that found it.**
+///
+/// A certificate binds a key to a MAC, and since design 09 §5 that MAC *is* the
+/// address the key derives. The nRF board used to derive its address from FICR
+/// instead, so the two could never agree: it accepted a credential naming a MAC
+/// it did not route under, and its OGMs carried an originator its credential
+/// did not name.
+///
+/// Design 22 makes the board seed-derived, which fixes it in the only way that
+/// closes it — by construction rather than by a check. What is left is a
+/// *bounded* divergence: `CentralRouter::self_ident` is fixed at construction,
+/// so the address follows the new seed on the next boot rather than mid-flight.
+/// Both halves are asserted here, because a test that only checked the second
+/// would pass on a build that had quietly stopped installing anything.
+#[tokio::test]
+#[ignore = "needs hardware: a probed board playing the role \"alpha\""]
+async fn an_installed_credential_is_adopted_across_a_reset() -> anyhow::Result<()> {
+    let rig = Rig::load()?;
+    let Some(board) = rig.board("alpha") else {
+        return Ok(());
+    };
+
+    board.reset()?;
+    let mut node = Node::attach(&board).await?;
+
+    let mesh = TestMesh::mint_now()?;
+    let before = node.node_info().await?.node_id.clone();
+    mesh.install(&mut node, host_unix()?).await?;
+
+    node.with_diagnostics(async |node: &mut Node| {
+        // The window, and the node reporting it. Not a bug being tolerated: a
+        // mid-flight address change strands every peer holding the old
+        // originator, so the node holds its address and says the two disagree.
+        anyhow::ensure!(
+            node.node_info().await?.node_id == before,
+            "the router's address must not change under a running node",
+        );
+        anyhow::ensure!(
+            node.security_status().await?.node_mac == mesh.mac(),
+            "the installed certificate's MAC is what GetSecurityStatus reports",
+        );
+        anyhow::ensure!(
+            node.alarms().await?.alarms.iter().any(|a| {
+                a.kind()
+                    == wayfinder_protos::wayfinder::v1alpha::AlarmKind::CertifiedAddressMismatch
+            }),
+            "a node certified for an address it does not route under must say so rather \
+             than leaving an operator to compare two fields",
+        );
+        Ok(())
+    })
+    .await?;
+    drop(node);
+
+    board.reset()?;
+
+    let mut node = Node::attach(&board).await?;
+    node.with_diagnostics(async |node: &mut Node| {
+        let info = node.node_info().await?;
+        anyhow::ensure!(
+            info.node_id == mesh.mac(),
+            "after the reset the board must route under the address its persisted seed \
+             derives, which is the address its certificate names; got {:?}, wanted {:?}",
+            info.node_id,
+            mesh.mac(),
+        );
+        anyhow::ensure!(
+            node.security_status().await?.node_mac == info.node_id,
+            "the certified address and the routed address must now be one value -- that \
+             is the whole of #58",
+        );
+        // Holding it *after* a reboot is the case that does not self-clear, and
+        // the board raises it from its own boot path — so this is a real
+        // assertion rather than one the reset satisfies for free by wiping an
+        // in-memory board.
+        anyhow::ensure!(
+            !node.alarms().await?.alarms.iter().any(|a| {
+                a.kind()
+                    == wayfinder_protos::wayfinder::v1alpha::AlarmKind::CertifiedAddressMismatch
+            }),
+            "the board re-raised a certified-address mismatch at boot, which means its \
+             address did not follow the seed its credential names",
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// The clock floor never goes backwards across a reboot, which is the invariant
+/// the whole checkpoint scheme rests on (design 20 §4.4).
+///
+/// A second reset is where a naive implementation shows itself: one that
+/// restored from a stale flash page, or re-anchored from the certificate, would
+/// come back *behind* where the first restore left it. The board cannot measure
+/// how long it was off, so it may come back behind where it was *running* —
+/// that deficit is expected and safe — but never behind what it wrote down.
+#[tokio::test]
+#[ignore = "needs hardware: a probed board playing the role \"alpha\""]
+async fn a_second_reset_does_not_move_the_floor_backwards() -> anyhow::Result<()> {
+    let rig = Rig::load()?;
+    let Some(board) = rig.board("alpha") else {
+        return Ok(());
+    };
+
+    let mut node = Node::attach(&board).await?;
+    let installed_at = host_unix()?;
+    TestMesh::mint_now()?
+        .install(&mut node, installed_at)
+        .await?;
+    node.security_status().await?;
+    drop(node);
+
+    for pass in 1..=2 {
+        board.reset()?;
+        let mut node = Node::attach(&board).await?;
+        node.with_diagnostics(async |node: &mut Node| {
+            anyhow::ensure!(
+                node.node_info().await?.clock_posture() == ClockPosture::AtLeast,
+                "pass {pass}: the board must come back anchored",
+            );
+            // A day before the install stamp is well behind any floor the board
+            // can legitimately hold, so accepting it means the estimate moved
+            // backwards.
+            let Err(err) = node.set_time(installed_at - 86_400).await else {
+                anyhow::bail!(
+                    "pass {pass}: the board accepted a time a day before its install stamp, \
+                     so its floor went backwards across a reboot"
+                );
+            };
+            anyhow::ensure!(
+                format!("{err:#}").contains("no change"),
+                "pass {pass}: the refusal must be the monotonicity one; got: {err:#}",
+            );
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(())
 }
