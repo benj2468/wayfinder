@@ -30,8 +30,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use wayfinder_protos::service::RenewalProviderData;
-use wayfinder_protos::service::RenewalTargetData;
-use wayfinder_protos::service::SharedSecret;
 
 /// The mesh identity material a node was handed at runtime: the same three
 /// blobs `wayfinder-tap` otherwise loads from the files an `auth:` config block
@@ -156,9 +154,9 @@ mod file {
     use super::NodeIdentity;
     use super::NodeSettings;
     use super::RenewalProviderData;
-    use super::RenewalTargetData;
     use super::SettingsStore;
-    use super::SharedSecret;
+    use wayfinder_protos::service::RenewalTargetData;
+    use wayfinder_protos::service::SharedSecret;
 
     use alloc::format;
     use alloc::string::String;
@@ -485,6 +483,8 @@ mod tests {
     use super::*;
     use alloc::vec;
     use std::path::PathBuf;
+    use wayfinder_protos::service::RenewalTargetData;
+    use wayfinder_protos::service::SharedSecret;
 
     /// A unique per-call settings path, so parallel tests never collide.
     fn unique_path(label: &str) -> PathBuf {

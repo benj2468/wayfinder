@@ -24,9 +24,12 @@ bench = false
 
 [dependencies]
 wayfinder = { path = "../wayfinder", default-features = false }
-wayfinder-embedded-driver = { path = "../wayfinder-embedded-driver", features = [
-    "mgmt",
-] }
+# The node's alarm board, for the one boot-path condition that is latchable
+# rather than merely loggable: a stored credential naming an address this node
+# does not run under, which no restart clears. Already in the graph via
+# `wayfinder`; named here because this crate raises against it directly.
+wayfinder-alarm = { path = "../wayfinder-alarm" }
+wayfinder-embedded-driver = { path = "../wayfinder-embedded-driver" }
 wayfinder-server = { path = "../wayfinder-server", default-features = false, features = [
     "embedded",
 ] }

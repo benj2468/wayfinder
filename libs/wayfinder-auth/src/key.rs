@@ -28,11 +28,20 @@ pub struct Keypair {
 }
 
 impl Keypair {
+    /// Length of a node's identity seed — the 32 bytes an Ed25519 signing key
+    /// is built from, and from which the X25519 secret is derived.
+    ///
+    /// Named here because the seed *is* the identity: anything that persists,
+    /// transports or validates one (an embedded node's durable record, the
+    /// CLI's "is this file a seed or a certificate?" length check) is asking
+    /// about this type, not about a bare 32.
+    pub const SEED_LEN: usize = 32;
+
     /// Derive a keypair deterministically from a 32-byte seed.  The same seed
     /// always yields the same identity, so a node persists its identity by
     /// persisting the seed.  The X25519 secret is derived from a domain-separated
     /// hash of the seed so it is independent of the Ed25519 key.
-    pub fn from_seed(seed: &[u8; 32]) -> Self {
+    pub fn from_seed(seed: &[u8; Self::SEED_LEN]) -> Self {
         let signing = SigningKey::from_bytes(seed);
 
         let mut h = Blake2s256::new();
@@ -62,8 +71,8 @@ impl Keypair {
         clippy::expect_used,
         reason = "host-only keygen with no sane fallback if the OS RNG is broken; the caller (enrollment tooling) has no way to proceed without entropy anyway"
     )]
-    pub fn generate_seed() -> [u8; 32] {
-        let mut seed = [0u8; 32];
+    pub fn generate_seed() -> [u8; Self::SEED_LEN] {
+        let mut seed = [0u8; Self::SEED_LEN];
         getrandom::getrandom(&mut seed).expect("OS RNG unavailable");
         seed
     }

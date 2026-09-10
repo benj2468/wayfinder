@@ -73,8 +73,8 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
     `wayfinder-server`'s `RouterAdapter` already projects those onto
     `WayfinderDataProvider`, and duplicating ~25 of them here would create a
     second near-copy to keep in step. `RouterAdapter` (and the one
-    `#[cfg(feature = "mgmt")]` impl in `wayfinder-embedded-driver` that feeds
-    it) therefore still spell the capacities out.
+    concrete-`CentralRouter` impl in `wayfinder-embedded-driver` that feeds it)
+    therefore still spell the capacities out.
 - `ping.rs` (`PingSession`) — the node's single reachability-probe session, the
   mesh's `ping`. **The node owns the session, not the client**: probes are paced
   on the node's own timer and round trips measured against its own clock, so

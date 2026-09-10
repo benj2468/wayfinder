@@ -691,3 +691,22 @@ fn ensure_selection(app: &mut App) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This binary's arguments are internally consistent — see the twin of this
+    /// test in `wayfinder-ctl`, which exists because `ping --count` took `-c`
+    /// while the shared [`ConnectArgs`] claims it globally for `--connect`, and
+    /// the subcommand panicked before reading argv.
+    ///
+    /// Worth having here rather than only there: this binary flattens the same
+    /// `ConnectArgs`, so it reserves the same letters, and it is the next place
+    /// a locally-obvious short flag would collide with one.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+    }
+}

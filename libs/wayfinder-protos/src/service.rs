@@ -832,6 +832,9 @@ pub enum AlarmKindData {
     /// This node's own membership certificate is inside the last quarter of its
     /// validity window and has not been renewed.
     CertExpiring,
+    /// This node holds a certificate naming a MAC other than the address it
+    /// routes under; it clears itself on the restart that adopts the address.
+    CertifiedAddressMismatch,
 }
 
 /// Who or what an alarm is about.
@@ -1741,6 +1744,7 @@ fn proto_alarm_kind(kind: AlarmKindData) -> AlarmKind {
         AlarmKindData::SelfRevoked => AlarmKind::SelfRevoked,
         AlarmKindData::IdentityConflict => AlarmKind::IdentityConflict,
         AlarmKindData::CertExpiring => AlarmKind::CertExpiring,
+        AlarmKindData::CertifiedAddressMismatch => AlarmKind::CertifiedAddressMismatch,
     }
 }
 

@@ -5385,6 +5385,7 @@ dependencies = [
 name = "wayfinder-embedded-driver"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.13.1",
  "embassy-futures",
  "embassy-sync",
  "futures",
@@ -5392,6 +5393,7 @@ dependencies = [
  "interfaces",
  "tracing",
  "wayfinder",
+ "wayfinder-auth",
  "wayfinder-driver-core",
  "wayfinder-protos",
  "wayfinder-server",

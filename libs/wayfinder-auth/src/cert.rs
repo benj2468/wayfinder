@@ -153,6 +153,12 @@ pub struct MembershipCert {
 }
 
 impl MembershipCert {
+    /// On-wire / on-disk size of a certificate. The layout is a fixed-size
+    /// `zerocopy` struct, so this is exactly `size_of::<Self>()` — named here
+    /// so a caller that stores or length-checks a certificate asks the type
+    /// rather than recomputing it.
+    pub const SERIALIZED_LEN: usize = core::mem::size_of::<Self>();
+
     /// Parse an owned certificate from its raw [`as_bytes`](zerocopy::IntoBytes::as_bytes)
     /// form (e.g. a file the portal issued), ignoring any trailing bytes.
     /// Returns `None` if `bytes` is shorter than the fixed certificate layout.
@@ -164,7 +170,7 @@ impl MembershipCert {
     /// 64-byte signature itself.  Both the issuer (when signing) and the
     /// verifier compute the signature over exactly these bytes.
     pub fn signed_body(&self) -> &[u8] {
-        let body_len = core::mem::size_of::<MembershipCert>() - 64;
+        let body_len = Self::SERIALIZED_LEN - 64;
         &self.as_bytes()[..body_len]
     }
 

@@ -142,7 +142,17 @@ pub enum Command {
         /// Destination identifier: a MAC like `02:00:00:00:00:09`, or raw hex.
         dest: String,
         /// Probes to send. 0 uses the node's default.
-        #[arg(long, short = 'c', default_value_t = 0)]
+        ///
+        /// **Long-only, unlike its siblings.** `-c` is what Unix `ping` uses
+        /// and what this reached for, but `--connect` claims it globally for
+        /// every subcommand — and clap rejects the collision by panicking when
+        /// it *builds* the parser, so `wayfinder-ctl ping` aborted before
+        /// reading its arguments at all. Do not give it a short form back
+        /// without taking `-c` off `--connect` first, and do not give it some
+        /// other letter: `-n` and `-w` both mean something else to `ping`, and
+        /// a short flag that contradicts the tool it imitates is worse than
+        /// none.
+        #[arg(long, default_value_t = 0)]
         count: u32,
         /// Milliseconds between probes. 0 uses the node's default.
         #[arg(long, short = 'i', default_value_t = 0)]
@@ -820,6 +830,32 @@ pub fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every subcommand's arguments are internally consistent.**
+    ///
+    /// `debug_assert` is clap's own validation of the whole command tree —
+    /// duplicate short or long names, an `about` that does not render, a
+    /// default that does not parse — and it runs when the `Command` is *built*,
+    /// which for a binary means on every invocation with no arguments at all.
+    /// So a violation is not a bad-input error: it is `wayfinder-ctl <anything>`
+    /// panicking before it reads argv.
+    ///
+    /// That is exactly how `ping` shipped broken. Its `--count` took `-c`,
+    /// which `ConnectArgs` already claims globally for `--connect`, and the
+    /// whole subcommand panicked with "Short option names must be unique for
+    /// each argument". Nothing caught it because clap's checks are
+    /// `debug_assert`s: a release build silently resolves the ambiguity, and no
+    /// test built the parser.
+    ///
+    /// Written against the tree rather than that one pair on purpose. The
+    /// failure mode is "a global argument and a subcommand's argument reach for
+    /// the same letter", and the next one will be a different letter in a
+    /// different subcommand.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     /// The suffixed forms an operator reaches for, and the bare one the
     /// management API speaks.

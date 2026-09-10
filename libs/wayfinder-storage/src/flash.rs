@@ -262,6 +262,57 @@ impl<F: NorFlash> FlashStore<F> {
             (Some(a), _) => Some((0, a)),
         })
     }
+
+    /// Whether page `idx` is entirely erased.
+    ///
+    /// **Read in full, not just the header.** An earlier version of this
+    /// checked the 16-byte header alone, arguing that [`DurableStore::save`]
+    /// writes the header first so an all-`0xFF` header implies an all-`0xFF`
+    /// payload. That argument covers an interrupted *write* and misses an
+    /// interrupted *erase* — and `save` **begins** with one. A page erase is
+    /// ~85 ms on an nRF52840, cells clear toward `1`, and someone pulling the
+    /// cable is a first-class event here, so a cut mid-erase can leave the
+    /// header reading blank while payload cells still hold the previous
+    /// record. That record is an identity seed in the clear, and skipping the
+    /// page would have [`DurableStore::erase`] report success having left it —
+    /// its contract violated inside the method that exists to keep it.
+    ///
+    /// A full read is the cheap half of this trade: microseconds against the
+    /// ~85 ms erase it may save, on a budget the clock checkpoint is also
+    /// spending (design 22 §4.5).
+    fn page_is_blank(&mut self, idx: u32) -> Result<bool, FlashError<F::Error>> {
+        let base = self.page_base(idx);
+        let mut remaining = F::ERASE_SIZE;
+        let mut offset = base;
+        let mut chunk = [0u8; CRC_CHUNK];
+        while remaining > 0 {
+            let n = remaining.min(CRC_CHUNK);
+            self.flash
+                .read(offset, &mut chunk[..n])
+                .map_err(FlashError::Flash)?;
+            if chunk[..n].iter().any(|&b| b != 0xFF) {
+                return Ok(false);
+            }
+            remaining -= n;
+            offset += n as u32;
+        }
+        Ok(true)
+    }
+
+    /// Erase page `idx`, unless it is already blank.
+    ///
+    /// Skipping the blank case is not an optimisation for its own sake — the
+    /// erase budget these two pages have is what the clock checkpoint spends
+    /// (design 22 §4.5), so an erase issued for nothing is a real cost.
+    fn erase_page_if_written(&mut self, idx: u32) -> Result<(), FlashError<F::Error>> {
+        if self.page_is_blank(idx)? {
+            return Ok(());
+        }
+        let base = self.page_base(idx);
+        self.flash
+            .erase(base, base + F::ERASE_SIZE as u32)
+            .map_err(FlashError::Flash)
+    }
 }
 
 impl<F: NorFlash> DurableStore for FlashStore<F> {
@@ -345,6 +396,31 @@ impl<F: NorFlash> DurableStore for FlashStore<F> {
             self.flash
                 .write(payload_base + aligned as u32, &tail[..w])
                 .map_err(FlashError::Flash)?;
+        }
+        Ok(())
+    }
+
+    /// Erase whichever page is not the newest valid one.
+    ///
+    /// Keyed on *which page is current*, not on whether the other one
+    /// validates: a torn page is precisely the case where readable bytes
+    /// linger somewhere `load` will never look, so skipping it would defeat
+    /// the point. With no valid page at all — a fresh device, or one whose
+    /// pages are both damaged — every written page is stale, so both are
+    /// erased.
+    fn scrub(&mut self) -> Result<(), Self::Error> {
+        let keep = self.newest_valid()?.map(|(idx, _)| idx);
+        for idx in 0..2 {
+            if keep != Some(idx) {
+                self.erase_page_if_written(idx)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn erase(&mut self) -> Result<(), Self::Error> {
+        for idx in 0..2 {
+            self.erase_page_if_written(idx)?;
         }
         Ok(())
     }
@@ -761,7 +837,7 @@ mod tests {
     /// Both pages corrupt simultaneously (e.g. two independent power-loss
     /// events over the device's lifetime, one per page) reads as `None` —
     /// same as a never-written store — rather than returning stale or torn
-    /// data. This is the scenario `load_or_init_identity` treats identically
+    /// data. This is the scenario `load_or_init_record` treats identically
     /// to "never provisioned" (see that module's doc comment on the
     /// tradeoff this implies for a caller built on top of this store).
     #[test]
@@ -784,5 +860,217 @@ mod tests {
             None,
             "both pages corrupt must read as empty, never stale/torn data"
         );
+    }
+
+    /// `scrub` erases the copy the ping-pong keeps behind and leaves the
+    /// current one loadable.
+    ///
+    /// Asserted against the raw sibling page rather than through `load`,
+    /// because `load` already ignores the stale page — reading the bytes is
+    /// the only way to tell "not returned" from "not there".
+    #[test]
+    fn scrub_erases_the_stale_page_and_keeps_the_current_one() {
+        let mut store = FlashStore::new(MemFlash::new(), 0).unwrap();
+        store.save(b"an old secret").unwrap(); // page 0
+        store.save(b"the new secret").unwrap(); // page 1
+
+        store.scrub().unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = store.load(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"the new secret",
+            "scrub must not disturb the current blob"
+        );
+        assert_eq!(
+            &store.flash.mem[0..TEST_PAGE],
+            &[0xFFu8; TEST_PAGE],
+            "the stale page still holds the previous blob in the clear"
+        );
+    }
+
+    /// `scrub` keys on *which page is current*, not on whether the other one
+    /// validates. A torn page is exactly the case where secret bytes linger
+    /// somewhere `load` will never look, so skipping it would defeat the
+    /// point.
+    #[test]
+    fn scrub_erases_a_stale_page_that_load_already_ignores() {
+        let mut store = FlashStore::new(MemFlash::new(), 0).unwrap();
+        store.save(b"an old secret").unwrap(); // page 0
+        store.save(b"the new secret").unwrap(); // page 1
+
+        // Break page 0's CRC, so it no longer validates but its payload is
+        // still sitting there readable.
+        store.flash.mem[12] ^= 0xFF;
+
+        store.scrub().unwrap();
+
+        assert_eq!(
+            &store.flash.mem[0..TEST_PAGE],
+            &[0xFFu8; TEST_PAGE],
+            "a torn stale page must be erased too"
+        );
+    }
+
+    /// **A page whose header is blank but whose payload is not must still be
+    /// erased.**
+    ///
+    /// `save` *begins* by erasing its target page and only then writes the
+    /// header, so a power cut during the erase — ~85 ms on this part, and
+    /// design 21 §6.2 treats someone pulling the cable as a first-class event
+    /// — can leave the 16-byte header reading `0xFF` while payload cells still
+    /// hold the previous record. That record may be an identity seed in the
+    /// clear.
+    ///
+    /// Deciding blankness from the header alone would skip such a page and
+    /// report success, which is `erase`'s contract ("no copy of the blob
+    /// remains") violated inside the one method that exists to keep it.
+    #[test]
+    fn a_partially_erased_page_is_not_mistaken_for_a_blank_one() {
+        let mut store = FlashStore::new(MemFlash::new(), 0).unwrap();
+        store.save(b"an old secret").unwrap(); // page 0
+        store.save(b"the new secret").unwrap(); // page 1
+
+        // Model an erase interrupted after the header cells reached 0xFF and
+        // before the payload's did. Poked directly: a real NOR erase is not
+        // expressible through `NorFlash::write`, which only clears bits.
+        store.flash.mem[..HEADER_LEN].fill(0xFF);
+
+        store.erase().unwrap();
+
+        assert_eq!(
+            &store.flash.mem[0..TEST_PAGE],
+            &[0xFFu8; TEST_PAGE],
+            "the payload of a half-erased page still held the old blob, and erase left it"
+        );
+    }
+
+    /// `scrub` has the same duty on the stale page, for the same reason.
+    #[test]
+    fn scrub_erases_a_partially_erased_stale_page() {
+        let mut store = FlashStore::new(MemFlash::new(), 0).unwrap();
+        store.save(b"an old secret").unwrap(); // page 0
+        store.save(b"the new secret").unwrap(); // page 1
+        store.flash.mem[..HEADER_LEN].fill(0xFF);
+
+        store.scrub().unwrap();
+
+        assert_eq!(&store.flash.mem[0..TEST_PAGE], &[0xFFu8; TEST_PAGE]);
+        let mut buf = [0u8; 64];
+        let n = store.load(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"the new secret",
+            "and the current blob survives"
+        );
+    }
+
+    /// `scrub` on a store with nothing written issues no erase at all.
+    ///
+    /// A checkpoint-sized write budget is what pays for this feature (design
+    /// 22 §4.5), so an erase for nothing is a real cost, not a rounding error.
+    #[test]
+    fn scrub_on_a_fresh_store_issues_no_erase() {
+        let mut store = FlashStore::new(FlakyFlash::new(MemFlash::new()), 0).unwrap();
+
+        store.scrub().unwrap();
+
+        assert_eq!(
+            store.flash.erase_count, 0,
+            "a blank page needs no erase; scrub must not spend flash wear on one"
+        );
+    }
+
+    /// The first save also leaves nothing to scrub — the sibling page has
+    /// never been written.
+    #[test]
+    fn scrub_after_one_save_issues_no_erase() {
+        let mut store = FlashStore::new(FlakyFlash::new(MemFlash::new()), 0).unwrap();
+        store.save(b"only ever one").unwrap();
+        let after_save = store.flash.erase_count;
+
+        store.scrub().unwrap();
+
+        assert_eq!(
+            store.flash.erase_count, after_save,
+            "with only one page ever written there is no stale copy to erase"
+        );
+    }
+
+    /// **The atomicity of the rotation sequence.** `save` then `scrub` is how
+    /// a secret is replaced (design 22 §4.4), and a power cut in the gap
+    /// between them must leave the *new* blob loadable — not the old one, and
+    /// not nothing.
+    ///
+    /// The gap is modelled by simply not calling `scrub` yet: at that instant
+    /// the medium holds both blobs and the generation counter decides.
+    #[test]
+    fn the_new_blob_is_loadable_before_and_after_scrub() {
+        let mut store = FlashStore::new(MemFlash::new(), 0).unwrap();
+        store.save(b"an old secret").unwrap();
+        store.save(b"the new secret").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = store.load(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"the new secret",
+            "a cut after save and before scrub must still find the new blob"
+        );
+
+        store.scrub().unwrap();
+
+        let n = store.load(&mut buf).unwrap().unwrap();
+        assert_eq!(&buf[..n], b"the new secret", "and so must a cut after it");
+    }
+
+    /// `erase` returns the store to never-written: `load` reports `Ok(None)`
+    /// again, and neither page holds the blob.
+    #[test]
+    fn erase_returns_the_store_to_never_written() {
+        let mut store = FlashStore::new(MemFlash::new(), 0).unwrap();
+        store.save(b"an old secret").unwrap();
+        store.save(b"the new secret").unwrap();
+
+        store.erase().unwrap();
+
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            store.load(&mut buf).unwrap(),
+            None,
+            "an erased store is indistinguishable from a fresh one"
+        );
+        assert_eq!(
+            &store.flash.mem[0..TEST_PAGE * 2],
+            &[0xFFu8; TEST_PAGE * 2],
+            "erase must leave no copy of the blob on either page"
+        );
+    }
+
+    /// `erase` on a fresh store is free, for the same reason `scrub` is.
+    #[test]
+    fn erase_on_a_fresh_store_issues_no_erase() {
+        let mut store = FlashStore::new(FlakyFlash::new(MemFlash::new()), 0).unwrap();
+
+        store.erase().unwrap();
+
+        assert_eq!(store.flash.erase_count, 0);
+    }
+
+    /// A store that has been erased can be written again and behaves like a
+    /// fresh one — this is design 22 §4.4's corrupt-record recovery path,
+    /// which erases before re-minting.
+    #[test]
+    fn a_store_can_be_saved_again_after_erase() {
+        let mut store = FlashStore::new(MemFlash::new(), 0).unwrap();
+        store.save(b"the compromised seed").unwrap();
+        store.erase().unwrap();
+
+        store.save(b"a freshly minted seed").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = store.load(&mut buf).unwrap().unwrap();
+        assert_eq!(&buf[..n], b"a freshly minted seed");
     }
 }

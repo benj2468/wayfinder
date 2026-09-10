@@ -142,6 +142,10 @@ embedded-hal-async = "1.0.0"
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
 heapless = "0.9.3"
+# Typed bit flags. `no_std` with no dependencies of its own, so it reaches a
+# board without pulling anything else in, and already in the lockfile
+# transitively.
+bitflags = { version = "2.13", default-features = false }
 embedded-io-adapters = { version = "0.7.0", features = ["tokio-1"] }
 tokio-serial = "5.4"
 async-trait = "0.1.89"

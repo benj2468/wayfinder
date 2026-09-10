@@ -107,6 +107,39 @@ impl DurableStore for FileStore {
         }
         result
     }
+
+    /// Removes a `.tmp` sibling left behind by an interrupted save.
+    ///
+    /// This was originally the trait's default no-op, on the argument that a
+    /// completed `save` renames its temporary away and so leaves no second
+    /// copy. True of a *completed* save — but one interrupted between
+    /// `write_all` and the `rename` leaves `<path>.tmp` holding the blob in
+    /// full, its cleanup is best-effort, and it does not run at all if the
+    /// process was killed or the host lost power. For a blob carrying a node
+    /// identity seed, that stray file is exactly the superseded readable copy
+    /// [`DurableStore::scrub`] exists to remove.
+    fn scrub(&mut self) -> Result<(), Self::Error> {
+        remove_if_present(&self.tmp_path())
+    }
+
+    /// Removes the file, and any `.tmp` sibling with it — see
+    /// [`scrub`](Self::scrub), which is where the second copy comes from.
+    ///
+    /// A missing file is success, not `NotFound`: the store is already in the
+    /// state this asks for.
+    fn erase(&mut self) -> Result<(), Self::Error> {
+        remove_if_present(&self.path)?;
+        remove_if_present(&self.tmp_path())
+    }
+}
+
+/// Remove `path`, treating "it was not there" as success.
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Write `data` to `tmp_path`, flush it, then rename it over `path`.
@@ -283,5 +316,82 @@ mod tests {
 
         let mut buf = [0u8; 64];
         assert_eq!(store.load(&mut buf).unwrap(), None);
+    }
+
+    /// `erase` returns the store to never-written, and takes the file with
+    /// it: a blob holding a secret must not survive as an unreferenced file
+    /// on disk.
+    #[test]
+    fn erase_removes_the_file() {
+        let path = unique_path("erase");
+        let mut store = FileStore::new(&path);
+        store.save(b"a secret").unwrap();
+
+        store.erase().unwrap();
+
+        assert!(!path.exists(), "erase must remove the backing file");
+        let mut buf = [0u8; 64];
+        assert_eq!(store.load(&mut buf).unwrap(), None);
+    }
+
+    /// `erase` on a store that was never written is not an error — the
+    /// desired end state already holds, and a caller erasing before minting
+    /// a fresh identity must not have to special-case a fresh device.
+    #[test]
+    fn erase_on_a_missing_file_is_ok() {
+        let path = unique_path("erase-missing");
+        let mut store = FileStore::new(&path);
+
+        store.erase().unwrap();
+
+        let mut buf = [0u8; 64];
+        assert_eq!(store.load(&mut buf).unwrap(), None);
+    }
+
+    /// **A `.tmp` left by an interrupted save is a complete second copy of the
+    /// blob**, and `scrub`/`erase` must both remove it.
+    ///
+    /// `save` writes the temporary, then renames. Interrupted in between — a
+    /// killed process, a power cut — it leaves the file behind holding
+    /// everything, including a node identity seed, and its best-effort cleanup
+    /// never ran.
+    #[test]
+    fn a_stray_tmp_from_an_interrupted_save_is_removed() {
+        let path = unique_path("stray-tmp");
+        let mut store = FileStore::new(&path);
+        store.save(b"the current secret").unwrap();
+        // What an interrupted save leaves: the temporary, written in full,
+        // never renamed.
+        std::fs::write(store.tmp_path(), b"a superseded secret").unwrap();
+
+        store.scrub().unwrap();
+        assert!(
+            !store.tmp_path().exists(),
+            "scrub must remove a stray temporary; it holds the whole blob"
+        );
+
+        std::fs::write(store.tmp_path(), b"a superseded secret").unwrap();
+        store.erase().unwrap();
+        assert!(!store.tmp_path().exists(), "and so must erase");
+        assert!(!path.exists());
+    }
+
+    /// `scrub` leaves the current blob alone — it removes superseded copies,
+    /// not the value.
+    #[test]
+    fn scrub_keeps_the_current_blob_and_leaves_no_sibling() {
+        let path = unique_path("scrub");
+        let mut store = FileStore::new(&path);
+        store.save(b"an old secret").unwrap();
+        store.save(b"the new secret").unwrap();
+
+        store.scrub().unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = store.load(&mut buf).unwrap().unwrap();
+        assert_eq!(&buf[..n], b"the new secret");
+        assert!(!store.tmp_path().exists());
+
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -12,7 +12,7 @@ A board binary owns only what is genuinely board-specific:
 | --- | --- |
 | `memory.x` and the two constants tracking it (`DURABLE_STORE_BASE`, `RAM_ORIGIN`) | `fault` — panic/HardFault handling, the retained fault record |
 | LED and UART pins | `stack` — high-water painting and reporting |
-| `bind_interrupts!` | `identity` — FICR-derived MAC + flash persistence |
+| `bind_interrupts!` | `identity` — the durable node record: a seed minted from the RNG, the MAC derived from it, and the FICR board id |
 | `.cargo/config.toml` runner | `link` — the `MeshLink` LoRa/802.15.4/USB/absent enum |
 | | `usb_mgmt` — the USB device: CDC-ACM management port + the shared `Builder` |
 | | `usb_link` — the CDC-NCM mesh interface |
@@ -47,6 +47,8 @@ reaching for should move into this crate first.
 | RYLR998 UART | `P0_02` RX / `P0_26` TX | `P0_31` RX / `P0_29` TX (castellated edge) |
 | App flash | `0x0..0xFE000` (1016K) | `0x1000..0xDE000` (884K) |
 | Identity store | `0xFE000` | `0xDE000` |
+| Mesh address | the seed's `derived_mac()`, persisted since design 22 | same |
+| USB serial | the FICR board id — **not** the mesh MAC | same |
 | Low flash | free (app starts at 0) | MBR, `0x0..0x1000`, required by the bootloader |
 | RAM origin | `0x20000000` | `0x20000008` — the MBR's IRQ-forward address sits below it |
 | RAM origin | `0x20000000` | `0x20000008` — the MBR's IRQ-forward address sits below it |

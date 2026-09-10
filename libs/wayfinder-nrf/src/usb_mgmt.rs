@@ -106,9 +106,19 @@ const MAX_PACKET_SIZE: u16 = 64;
 const MAX_POWER_MA: u16 = 100;
 
 /// Render `mac` as the 12 uppercase hex digits of a USB serial-number string, so
-/// the host's `/dev/serial/by-id/…` symlink names the node by its mesh MAC.
-/// Without it several dongles on one host are distinguishable only by
-/// enumeration order.
+/// the host's `/dev/serial/by-id/…` symlink names the board. Without it several
+/// dongles on one host are distinguishable only by enumeration order.
+///
+/// Fed the **board id** ([`crate::identity::from_ficr`]), not the node's mesh
+/// MAC. The two used to be the same value and stopped being so in design 22,
+/// when the mesh address became the one the node's identity seed derives: that
+/// address changes on the next boot after every `SetAuth`, and a USB serial
+/// that moved with it would rename `/dev/serial/by-id/…` under whoever was
+/// holding the port — including the hardware-in-the-loop rig, whose inventory
+/// pins boards by exactly this string. A serial number identifies a physical
+/// part; a mesh MAC identifies a mesh node; they change on entirely different
+/// schedules. Because it stays FICR-derived the value itself is unchanged, so
+/// existing `hil.toml` files and `by-id` paths keep working.
 fn serial_number(mac: Mac) -> &'static str {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     static SERIAL: StaticCell<[u8; 12]> = StaticCell::new();
@@ -203,10 +213,12 @@ pub struct UsbMgmt {
 /// mesh interface.
 ///
 /// **Must be called after [`crate::init_platform`]**, which starts the
-/// high-frequency crystal USBD needs to clock the bus. `node_mac` becomes the
-/// device's USB serial number and seeds the mesh interface's host-side
-/// address, and `make_driver` builds the driver from the board's
-/// `bind_interrupts!` struct — see [`UsbDriverFactory`].
+/// high-frequency crystal USBD needs to clock the bus. `node_mac` seeds the
+/// mesh interface's host-side address — that one really is the node's, since
+/// the NCM interface is a mesh link and not a hardware label — while the USB
+/// serial number comes from the board's FICR id (see [`serial_number`]).
+/// `make_driver` builds the driver from the board's `bind_interrupts!` struct
+/// — see [`UsbDriverFactory`].
 ///
 /// Neither returned half does anything until it is polled: the [`UsbMgmt`] via
 /// [`run`](UsbMgmt::run) — which is also what drives the shared device stack,
@@ -226,7 +238,7 @@ pub async fn init(
     // product string is part of the host's `/dev/serial/by-id/` symlink, so
     // editing it silently breaks every script and doc naming that path.
     config.product = Some("Wayfinder mesh node management");
-    config.serial_number = Some(serial_number(node_mac));
+    config.serial_number = Some(serial_number(crate::identity::from_ficr()));
     config.max_power = MAX_POWER_MA;
     config.self_powered = false;
     // Left at its default `true`, with the matching 0xEF/0x02/0x01 device

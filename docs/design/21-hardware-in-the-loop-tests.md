@@ -246,7 +246,8 @@ and not observable over the management port:
 - `FlashStore`'s A/B ping-pong against real flash: write, read back, write
   again, read; and a reader never sees a torn mix when a page is erased
   mid-sequence.
-- FICR-derived identity is stable across a reset.
+- A node's durable identity record is stable across a reset (design 22; this
+  said "FICR-derived identity" before a board had a seed of its own).
 - The largest response the log ring can produce fits the 32 KiB heap — §2.2's
   second bug, bounded from inside as well as reproduced from outside.
 

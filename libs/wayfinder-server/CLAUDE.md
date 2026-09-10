@@ -381,8 +381,11 @@ init succeeds — no feature flag, no config gate. The text here previously read
 "nothing enables it today", which is what let the requirement read as
 hypothetical while the wiring came back during the USB/802.15.4 work. Design
 20 then made `SetAuth` over that port *work* where it had been inert, so the
-gap went from theoretical to reachable. Tracked as **GitLab #57**, which
-carries the three options (gate it, authenticate it, or accept it and say so).
+gap went from theoretical to reachable. Design 22 then made it **durable**: a
+board supplies a `SettingsStore` now, so whoever holds the cable changes the
+node's identity permanently rather than until the next reset. That raises the
+stakes of the gap without creating it. Tracked as **GitLab #57**, which carries
+the three options (gate it, authenticate it, or accept it and say so).
 
 `libs/wayfinder-hil`'s hardware tests reach a board through this port and so
 depend on it being open. They drive it through `wayfinder_client::Client`
@@ -477,8 +480,16 @@ Two stores, split by *what owns the thing*, not by convenience:
   restart performs, so the live path and the restart path cannot drift apart.
 - **Everything node-wide** (the fail-closed gate, lazy cert distribution, an
   identity installed by `SetAuth`) goes to `settings.rs`, injected into
-  `RouterAdapter` via `.with_settings(...)` by the host driver. The CA, by
-  contrast, is no longer injected here at all — see *Provider mode (the CA)*.
+  `RouterAdapter` via `.with_settings(...)`. The CA, by contrast, is no longer
+  injected here at all — see *Provider mode (the CA)*.
+
+  Two implementations now: the host's `SettingsFile` here, and a board's
+  `wayfinder_embedded_driver::settings::RecordSettings`, which projects the same
+  `NodeSettings` onto the durable node record design 22 gives a bare-metal node.
+  The shapes differ on purpose — a board has an identity *seed* from its first
+  boot and a credential only later, so the record hoists the seed out of the
+  identity a host keeps it inside — and the projection is where to look when a
+  setting persists on one target and not the other.
 
 Both stores hold **overrides**, never values: `None` means "the operator never
 changed this", so the startup config still governs it and deleting the state

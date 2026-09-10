@@ -549,6 +549,14 @@ enum AlarmKind {
   // the enrollment queue and needs an operator.  Distinct from
   // ALARM_KIND_SELF_REVOKED, which is that outcome already arrived at.
   ALARM_KIND_CERT_EXPIRING = 11;
+
+  // This node holds a certificate naming a MAC other than the address it routes
+  // under, so its own OGMs carry an originator its credential does not name.
+  // The ordinary cause is a wholesale identity install: a node adopts a newly
+  // installed seed's address on its next boot, not mid-flight, so this clears
+  // itself on restart.  Distinct from ALARM_KIND_IDENTITY_CONFLICT, which is
+  // two keys claiming one address and is about somebody else.
+  ALARM_KIND_CERTIFIED_ADDRESS_MISMATCH = 12;
 }
 
 // One latched condition the node is holding.

@@ -3460,9 +3460,9 @@ mod tests {
     /// A certificate issued *after* the revocation instant is not cancelled by
     /// it: the authority re-admitted the node, and a revocation only cancels
     /// what existed when it was signed.  This is what lets a re-approved node
-    /// rejoin under its own MAC instead of waiting out `not_after` — which on
-    /// an nRF board, whose MAC is FICR-derived and cannot change, is the only
-    /// way back at all.
+    /// rejoin under its own MAC instead of waiting out `not_after` — which,
+    /// since a node's MAC is the address its identity key derives, is the only
+    /// way back that does not also rotate its identity.
     #[test]
     fn a_certificate_issued_after_the_revocation_is_not_cancelled() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);

@@ -588,6 +588,7 @@ fn alarm_kind_name(kind: i32) -> &'static str {
         Ok(AlarmKind::SelfRevoked) => "self_revoked",
         Ok(AlarmKind::IdentityConflict) => "identity_conflict",
         Ok(AlarmKind::CertExpiring) => "cert_expiring",
+        Ok(AlarmKind::CertifiedAddressMismatch) => "certified_address_mismatch",
         // A node newer than this build, holding a condition it has no name for.
         // Shown as unknown rather than dropped: an alarm this client cannot name
         // is still an alarm.

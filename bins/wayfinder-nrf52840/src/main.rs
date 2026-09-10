@@ -51,7 +51,7 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = wayfinder_nrf::init_platform(RAM_ORIGIN);
-    let node_mac = wayfinder_nrf::identity::resolve(p.NVMC, DURABLE_STORE_BASE);
+    let identity = wayfinder_nrf::identity::resolve(p.NVMC, p.RNG, DURABLE_STORE_BASE);
 
     // LED1 (P0.13, active-low) lit = reached the run loop. Moved into the task
     // that actually lights it: `Output`'s `Drop` disconnects the pin, and `main`
@@ -89,7 +89,7 @@ async fn main(spawner: Spawner) {
     // `UsbDriverFactory`; it exists to keep `Irqs` — and with it the linked
     // `USBD` interrupt handler — in this binary rather than in the library.
     let Ok(task) = wayfinder_nrf::node::run(
-        node_mac,
+        identity,
         uarte,
         Radio::new(p.RADIO, Irqs),
         p.USBD,

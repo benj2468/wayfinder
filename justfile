@@ -126,6 +126,32 @@ hil-list:
     @echo "=== inventory ==="
     cargo nextest run -p wayfinder-hil --run-ignored all -E 'test(every_inventoried_board_answers)' --no-capture
 
+# `tests/fresh_board.rs` is about a board that has **never held a credential**,
+# and since design 22 a credential is durable — so every other hardware test
+# destroys that precondition. Running them all in one invocation means that
+# binary always skips, whatever order nextest happens to pick, which is how
+# design 20's headline regression test spent a bench session reporting green
+# without ever executing. Hence a command that blanks the board and runs it
+# alone.
+#
+# Three steps, and the middle one is the load-bearing one:
+#
+# - `probe-rs erase` wipes the whole chip. A reflash does *not*: `download`
+#   erases only the sectors the image covers, and the node record lives in two
+#   pages the linker keeps clear of it — precisely so a node keeps its identity
+#   across a firmware update.
+# - `probe-rs download` rather than `cargo run`, which is otherwise the better
+#   way to flash this board: its runner is `probe-rs run`, which attaches RTT
+#   and does not return, so it cannot be chained ahead of a test.
+# - Single-board bench, so no `--probe` selector — the same assumption
+#   `hil-list` makes.
+[doc("Erase the DK, reflash it, and run the tests that need a blank board.")]
+hil-fresh:
+    cd bins/wayfinder-nrf52840 && cargo build --release
+    probe-rs erase --chip nRF52840_xxAA
+    probe-rs download --chip nRF52840_xxAA \
+        bins/wayfinder-nrf52840/target/{{ bare_metal_target }}/release/wayfinder-nrf52840
+    cargo nextest run -p wayfinder-hil --run-ignored all -E 'binary(fresh_board)'
 # ---------------------------------------------------------------------------
 # Benchmarks (libs/wayfinder-bench)
 # ---------------------------------------------------------------------------
