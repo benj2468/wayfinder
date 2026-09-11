@@ -14,7 +14,14 @@ Core abstractions shared by every layer. `no_std`.
 - `LinkFrame` / `LinkFrameData` / `LinkFrameDataMut` — zero-copy link-layer frame.
 - `RoutingAction` enum — returned by routing engines: `Consumed`, `ForwardTo`,
   `DeliverLocal`, `DeliverLocalAndForward`.
-- `LinkMetrics` (per-frame RSSI/SNR) and `LinkError`.
+- `LinkMetrics` (per-frame RSSI/SNR) and `LinkError`. Its `quality` field is
+  the one thing here a driver can satisfy *incorrectly*: it is a normalized
+  IEEE 802.15.4 LQI on `0..=255`, consumed verbatim, and it clamps the TQ the
+  node advertises for every path over that link. A driver whose hardware
+  reports something else — a correlator indicator, an ED level — must map it,
+  and pin that mapping to its datasheet with a unit test, because nothing
+  about the value distinguishes a correct LQI from an unscaled one.
+  `nrf-ieee802154`'s `ieee_lqi` is the worked example.
 
 ## Link-layer frame format
 

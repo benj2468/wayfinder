@@ -128,7 +128,14 @@ pub struct PyLinkMetrics {
     /// Signal-to-noise ratio, in dB.
     #[pyo3(get, set)]
     pub snr_db: Option<i8>,
-    /// A carrier-defined link quality figure (e.g. 0-255).
+    /// Normalized link quality on the IEEE 802.15.4 LQI scale, `0..=255`,
+    /// higher is better.
+    ///
+    /// Not carrier-defined: `interfaces::link::LinkMetrics::quality` is
+    /// consumed verbatim and clamps the TQ a node advertises for every path
+    /// over the link, so a value on some other scale suppresses routing
+    /// through it rather than merely looking wrong.  Leave it `None` to have
+    /// the engine score the link from `rssi_dbm`/`snr_db` instead.
     #[pyo3(get, set)]
     pub quality: Option<u8>,
 }

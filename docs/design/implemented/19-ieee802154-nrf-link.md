@@ -896,12 +896,12 @@ Two consequences worth carrying forward:
 - §7.3's A/B comparison — that the §3.3 task *is* what prevents frame loss.
   The task build works; a direct-await build was never flashed to measure
   against. The 5% single-fragment baseline is the number to beat.
-- §7.4 range and LQI behaviour. Link quality reads **49** on `dot15d4` where
-  the BLE link reported 255 on the same desk. `Packet::lqi()` is the
-  hardware's raw LQI and is plainly not on the same scale as the BLE
-  backend's synthetic value, so **TQ is not comparable across radios** on a
-  multi-radio node. Nothing depends on that today; it would matter to path
-  selection on a node carrying both.
+- §7.4 range behaviour. The scale half is closed (§12.7) and has a hardware
+  check — `interop.rs`'s `assert_scaled_lqi` — but **that check has not been
+  run**: it needs two boards and is `#[ignore]`d like the rest of the HIL
+  tier. The TQ numbers in §12.7 remain predicted, not measured, and nothing
+  has been walked out of range to confirm the value falls rather than sitting
+  at 255.
 - The nRF fault reports (mgmt-port HardFault, GetLogs OOM) — not
   re-tested, and §7.5 already said not to assume the SoftDevice's removal
   addresses them.
@@ -928,33 +928,107 @@ each for a stated reason:
   state, would delete the duplication *and* make a transposed index/count
   unrepresentable rather than merely rejected. Worth doing; too large to ride
   along here.
-- **This driver's `LinkMetrics::quality` is probably unscaled**, and it is
-  the only one in the workspace that sets the field at all. `blue` and
-  `rylr998` leave it `None` and pass RSSI/SNR, so `normalize_quality` maps
-  them onto `0..=255`; a `Some` is returned verbatim, because "the driver has
-  already done the mapping". This driver hands over `Packet::lqi()` — the raw
-  hardware correlator byte — and Nordic's own 802.15.4 driver scales that
-  before calling it an LQI.
-
-  §12.3's "link quality reads 49 on `dot15d4` where BLE reported 255" recorded
-  the symptom and guessed at "different scales". The mechanism is narrower
-  than that: BLE's 255 is just where `normalize_quality`'s RSSI curve
-  saturates (-50 dBm), and 802.15.4's number never entered the curve. Because
-  the smoothed quality **clamps an OGM's advertised TQ**, an under-scaled
-  value suppresses TQ on every path through this radio — so it would lose to a
-  saturated BLE or LoRa link on a multi-radio node even when it is the better
-  path.
-
-  Two caveats before someone "fixes" this by multiplying: the correct factor
-  wants confirming against the nRF52840 Product Specification, and the link
-  genuinely is not perfect — §12.4 measures 5% single-fragment loss at desk
-  range, so some of that reading is honest. The cheap discriminator is to move
-  the boards well apart: a value that does not fall is saturated and unscaled.
-  Predates this branch (it is on `main`); what changed is that a board now
-  uses the driver, so it went from dormant to live. Tracked as issue #56.
+- **This driver's `LinkMetrics::quality` was unscaled.** Fixed since — §12.7
+  records the mechanism and the conversion. Was issue #56.
 - **Bring-up degradation is logged, not latched.** A node running on one of
   three interfaces says so once, into a bounded ring that per-frame traffic
   evicts. `wayfinder-alarm` exists for exactly that, and neither
   `wayfinder-nrf` nor `nrf-ieee802154` raises a single alarm. The startup line
   now names which links came up, which is the cheap half; the alarm is the
   right fix.
+
+### 12.7 The LQI scale (issue #56)
+
+`Packet::lqi()` was handed to `LinkMetrics::quality` raw, and it is not an
+LQI. It returns the correlator indicator the hardware appends after the
+payload, whose useful domain is **`0..=63`** — where the field is defined on
+`0..=255`, and `wayfinder::link_quality::normalize_quality` returns a `Some`
+verbatim on the grounds that the driver has already done the mapping.
+
+**It was not cosmetic, because the smoothed quality clamps an OGM's advertised
+TQ** (`batman::engine`: `computed_tq = (ogm.tq - 10).min(local_quality)`). A
+perfect one-hop OGM arriving over `dot15d4` was recorded at `min(245, 49) =
+49` — every path through the radio capped at 19% of the TQ scale. Bring-up read 49 on
+`dot15d4` against BLE's 255 on the same desk and put it down to "different
+scales"; the mechanism is narrower. BLE's 255 is simply where
+`normalize_quality`'s RSSI curve saturates (-50 dBm), and the 802.15.4 number
+never entered that curve at all.
+
+**The factor comes from the Product Specification, not from a guess.** The
+RADIO chapter gives the conversion literally:
+
+```
+LQI_IEEE = (uint8_t)(val > 63 ? 255 : val * ED_RSSISCALE)     // ED_RSSISCALE = 4
+```
+
+Nordic's own driver agrees — `nrf_802154_core.c`'s `lqi_get()` is
+`lqi * LQI_VALUE_FACTOR` clamped to `LQI_MAX 0xff`, with `LQI_VALUE_FACTOR`
+defined as `ED_RSSISCALE`. Its extra temperature correction is nRF53-only; on
+this part `nrf_802154_rssi_lqi_corrected_get` is a pass-through. The constant
+is **4 on the nRF52840** and 5 on the nRF52833/nRF5340. Nothing enforces that
+— `embassy-nrf`'s chip-feature guard fires only when *no* part is selected,
+and Cargo features are additive — so what protects it is that a port means
+editing the `nrf52840` feature in `Cargo.toml`, with
+`ed_rssiscale_is_the_nrf52840_value` to make that edit fail loudly.
+
+Two things that argument settles, which §12.6 had left open:
+
+- **The "is it really saturated?" question needs no range test.** The domain
+  is `0..=63`, and one of the readings was **67** — already past the ceiling,
+  reported as 26% quality. Walking the boards apart is still worth doing as a
+  check on the *scaled* value (§12.5), but it was not needed to decide whether
+  to scale.
+- **Scaling does not erase the honest part of the reading.** §12.4 measures 5%
+  single-fragment loss at desk range, and 49 maps to 196, not 255 — a link
+  that still reads as imperfect. The conversion moves the number onto the axis
+  the router believes it is reading; it does not invent a perfect link.
+
+Expected effect at desk range: `dot15d4` advertises TQ ~196-245 against BLE's
+245, where it advertised 49.
+
+**The fix removes the evidence that would confirm it**, which is the part
+worth carrying forward. The management API's link-quality column *was* the raw
+correlator value, smoothed — that is how bring-up measured 49 and 67 at all.
+After the conversion every hardware reading of 64 or more reads 255, so that
+column can no longer separate "correctly saturated" from "wrong scale factor"
+or "reading a stale byte", and the discriminator §12.5 proposes (walk the
+boards apart, watch the value fall) starts from a number already pinned at its
+ceiling. Worse, the saturation branch moves an out-of-spec reading from
+*conspicuously bad* — 67 shown as 26%, which is what got this investigated —
+to *ideal*. Two things answer it: a per-frame `trace!` in `capture` carries
+**both** numbers, which is now the only place in the receive path the raw
+value survives; and `interop.rs`'s `assert_scaled_lqi` is the on-hardware
+check, asserting the best `dot15d4` row clears 128 — a floor an unscaled build
+is structurally incapable of reaching, since the correlator tops out at 63.
+
+**Other drivers set the field too**, contrary to how #56 was filed. Two, in
+fact: `at86rf233` passes its chip's appended byte, which is correct because
+the AT86RF23x appends a conformant IEEE `0..=255` LQI; and `PyLinkMetrics` in
+`wayfinder-py` exposes it to a Python simulation author as a settable field,
+where it had been documented as "carrier-defined" — the one framing this whole
+entry exists to retire. So the contract had a correct user and an
+undocumented third surface, and was worth sharpening rather than replacing.
+
+**What made it easy to get wrong** is that nothing distinguishes a correct LQI
+from an unscaled one by inspection: 67 is plausible on either scale, so no
+assertion in the router can catch it. A newtype does not help either — the
+upstream method is *named* `lqi()` and its docs assert it is one, so
+`Lqi::from_ieee(packet.lqi())` would have read as correct to author and
+reviewer alike. The false belief was injected between a datasheet and the
+first line of Rust, which is outside what any type can reach.
+
+The mapping therefore stays in the driver — a correlator indicator is neither
+RSSI nor SNR, and centralizing it would put a per-chip hardware constant in
+the `no_std` router — and enforcement is four things instead:
+`LinkMetrics::quality`'s docs state the scale and the datasheet-pinned-test
+obligation, `libs/interfaces/CLAUDE.md` repeats it where a driver author
+actually looks, `ieee_lqi` carries that test, and `capture_reports_a_scaled_lqi`
+pins the *wiring* — because every other test here passes against a `capture`
+that never calls `ieee_lqi` at all, which is one token away from silently
+un-shipping the fix.
+
+One thing that is **not** enforceable and should not be attempted: a lower
+length bound in `capture`. `Packet::lqi` is documented to return garbage below
+3 bytes, and a runt can reach it — but `decode_fragment` rejects anything
+under 11 bytes before `recv` returns, so those metrics never reach the router.
+A bound here would only duplicate that one.

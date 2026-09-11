@@ -109,6 +109,9 @@ const RX_QUEUE_DEPTH: usize = MAX_REASSEMBLED_LEN.div_ceil(ieee802154::FRAG_PAYL
 struct RxFragment {
     bytes: [u8; MAX_FRAME_LEN],
     len: u8,
+    /// IEEE 802.15.4 LQI on the `0..=255` scale, already scaled out of the
+    /// hardware's correlator indicator by [`ieee_lqi`] — the raw value exists
+    /// only at the `packet.lqi()` call site.
     lqi: u8,
 }
 
@@ -186,25 +189,9 @@ async fn radio_task(mut radio: Radio<'static>) -> ! {
 
         match outcome {
             Either::First(Ok(())) => {
-                // `Packet::len` is `buffer[0] - 2` on a byte the radio's DMA
-                // wrote, with no bound of its own: a PHR of 0 or 1 wraps to
-                // 254/255 in a release build, and the copy below would then
-                // index a 125-byte array out of range — a panic inside a
-                // `-> !` task, on the one board whose only diagnostic path is
-                // USB. The sibling `at86rf233` driver validates its
-                // equivalent field; this one must too.
-                let len = usize::from(packet.len());
-                if len > MAX_FRAME_LEN {
-                    trace!(len, "drop: implausible 802.15.4 phy length");
+                let Some(fragment) = capture(&packet) else {
                     continue;
-                }
-
-                let mut fragment = RxFragment {
-                    bytes: [0u8; MAX_FRAME_LEN],
-                    len: len as u8,
-                    lqi: packet.lqi(),
                 };
-                fragment.bytes[..len].copy_from_slice(&packet[..len]);
 
                 // Dropping the newest fragment is correct when the driver is
                 // not draining: the medium is lossy, the reassembler is built
@@ -315,35 +302,116 @@ fn map_err(err: RadioError) -> LinkError {
     }
 }
 
+/// The nRF52840's energy-detection scale factor, from the RADIO chapter of
+/// the Product Specification (`PRF[dBm] = ED_RSSIOFFS + ED_RSSISCALE x
+/// VALHARDWARE`). The same constant converts a correlator indicator into an
+/// IEEE 802.15.4 LQI.
+///
+/// It is **4 on this part** and 5 on the nRF52833/nRF5340. Nothing enforces
+/// that — `embassy-nrf`'s chip-feature guard only fires when *no* part is
+/// selected, and Cargo features are additive — so what keeps the constant
+/// honest is that porting this crate means editing the `nrf52840` feature in
+/// its `Cargo.toml`, and `ed_rssiscale_is_the_nrf52840_value` makes that edit
+/// fail loudly. Note the exhaustive test derives its expectation *from* this
+/// constant, so it moves with it; the pinned table is what catches a change.
+const ED_RSSISCALE: u8 = 4;
+
+/// Top of the correlator indicator's useful domain. The Product
+/// Specification saturates anything above this at [`u8::MAX`] rather than
+/// scaling it, so a reading over 63 carries no information beyond "as good as
+/// the hardware can report".
+const HW_LQI_MAX: u8 = 63;
+
+/// Scale the radio's raw correlator indicator into an IEEE 802.15.4 LQI on
+/// the `0..=255` scale [`LinkMetrics::quality`] is defined on.
+///
+/// [`Packet::lqi`] returns the byte the hardware appends after the payload,
+/// which is *not* an LQI: its useful domain is `0..=63`. The Product
+/// Specification's RADIO chapter states the conversion as
+/// `LQI_IEEE = (uint8_t)(val > 63 ? 255 : val * ED_RSSISCALE)`, and Nordic's
+/// own driver applies the same mapping in `nrf_802154_core.c`'s `lqi_get`.
+///
+/// Handing the raw value over instead was not cosmetic — it suppressed
+/// routing through this radio. Design 19 §12.7 records the incident, the
+/// measured readings and the reasoning.
+fn ieee_lqi(hw: u8) -> u8 {
+    if hw > HW_LQI_MAX {
+        return u8::MAX;
+    }
+    // Saturating, not plain `*`: the product cannot exceed 252 with today's
+    // constants, but a wrapping multiply would turn a strong link into a weak
+    // one if either ever moved, and a panicking one would take down a `-> !`
+    // task on a board.
+    hw.saturating_mul(ED_RSSISCALE)
+}
+
+/// Copy a received [`Packet`] into an [`RxFragment`], scaling its LQI, or
+/// return `None` for a packet whose length makes it unusable.
+///
+/// Split out of [`radio_task`] so the capture step is reachable from a host
+/// test: `Packet` is host-constructible, so a test can plant a chosen
+/// hardware LQI and assert the fragment carries the *scaled* value. Inline,
+/// the only coverage was of `ieee_lqi` itself — and deleting its call here
+/// would have left every test green.
+///
+/// `Packet::len` is `buffer[0] - 2` on a byte the radio's DMA wrote, with no
+/// bound of its own: a PHR of 0 or 1 wraps to 254/255 in a release build, and
+/// `&packet[..len]` below would then slice `Packet`'s own 128-byte internal
+/// buffer out of range — a panic inside a `-> !` task, on the one board whose
+/// only diagnostic path is USB.
+/// The sibling `at86rf233` driver validates its equivalent field; this one
+/// must too. That guard has no test and cannot have one here:
+/// `MAX_FRAME_LEN` and `Packet::CAPACITY` are both 125 and `Packet::set_len`
+/// asserts at 125, so a host test cannot build the oversized packet it
+/// rejects — only the radio's DMA can. A test written against it would assert
+/// nothing.
+///
+/// There is deliberately no *lower* bound, though [`Packet::lqi`] is
+/// documented to return an invalid value for packets under 3 bytes. Such a
+/// fragment cannot carry its LQI to the router: `decode_fragment` rejects
+/// anything below `HEADER_LEN + FRAG_HDR_LEN` (11 bytes) before `recv` breaks
+/// out of its loop, so the metrics are dropped with the fragment. Adding a
+/// bound here would only duplicate that one.
+fn capture(packet: &Packet) -> Option<RxFragment> {
+    let len = usize::from(packet.len());
+    if len > MAX_FRAME_LEN {
+        trace!(len, "drop: implausible 802.15.4 phy length");
+        return None;
+    }
+
+    // Both numbers, because the scaled one alone cannot be verified. Every
+    // hardware reading of 64 or more maps to 255, so the management API's
+    // link-quality column — which is how bring-up measured 49 and 67 in the
+    // first place — can no longer tell a correctly saturated link from a
+    // wrong scale factor or a stale buffer read. This is the only place in the
+    // receive path where the raw value still exists. Per-frame and `trace!` per the logging rules;
+    // metadata only, no payload.
+    let hw_lqi = packet.lqi();
+    let lqi = ieee_lqi(hw_lqi);
+    trace!(hw_lqi, lqi, len, "rx 802.15.4 fragment");
+
+    let mut fragment = RxFragment {
+        bytes: [0u8; MAX_FRAME_LEN],
+        len: len as u8,
+        lqi,
+    };
+    fragment.bytes[..len].copy_from_slice(&packet[..len]);
+    Some(fragment)
+}
+
 /// The nRF52840 radio has no software-controlled retry/ack and no SNR
 /// concept: `send` performs hardware clear-channel assessment before
 /// transmitting each fragment and reports a busy channel as
-/// [`LinkError::TransmitFailed`]; `recv` reports the hardware [`Packet::lqi`]
-/// as [`LinkMetrics::quality`], leaving `rssi_dbm` and `snr_db` as `None`.
+/// [`LinkError::TransmitFailed`]; `recv` reports an IEEE 802.15.4 LQI as
+/// [`LinkMetrics::quality`], leaving `rssi_dbm` and `snr_db` as `None`.
 ///
-/// # Known: that LQI is probably not on the scale the router expects
+/// # The LQI is scaled, and has to be
 ///
-/// This is the **only** driver in the workspace that sets
-/// [`LinkMetrics::quality`] to `Some`. `blue` and `rylr998` both leave it
-/// `None` and pass RSSI/SNR, so `wayfinder::link_quality::normalize_quality`
-/// maps them onto `0..=255` itself — and a `Some` it returns *verbatim*, on
-/// the stated grounds that "the driver has already done the mapping".
-///
-/// This driver has not done that mapping. [`Packet::lqi`] returns the raw
-/// byte the radio's hardware appends — its correlator indicator — and Nordic's
-/// own 802.15.4 driver scales that before presenting it as an 802.15.4 LQI.
-/// Two desk-distance boards read ~67 here where a BLE link on the same desk
-/// read 255, and 255 is simply where `normalize_quality`'s RSSI curve
-/// saturates (at -50 dBm), so the two numbers are not comparable at all.
-///
-/// It is not cosmetic: `CentralRouter` uses the smoothed link quality to
-/// **clamp an OGM's advertised TQ**, so an under-scaled value suppresses TQ on
-/// every path through this radio and would lose to a saturated BLE or LoRa
-/// link on a multi-radio node even when it is the better path.
-///
-/// Not fixed here because the correct factor wants confirming against the
-/// nRF52840 Product Specification rather than guessing. See
-/// `docs/design/implemented/19-ieee802154-nrf-link.md` §12.6.
+/// [`Packet::lqi`] does not return an LQI — it returns the correlator
+/// indicator the hardware appends, whose useful domain is `0..=63`. The
+/// private `ieee_lqi` converts it; see
+/// `wayfinder::link_quality::normalize_quality` for why that mapping stays
+/// here rather than moving into the router.
 impl LinkT for Ieee802154Link {
     /// Fragment `data` and transmit every fragment, returning the total
     /// on-air bytes.
@@ -443,6 +511,95 @@ mod tests {
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// Pins [`ieee_lqi`]'s mapping at the points hardware produced; see that
+    /// function for the Product Specification formula it implements.
+    ///
+    /// 49 and 67 are the readings bring-up actually measured between two
+    /// desk-distance boards (design 19 §12.7).
+    #[test]
+    fn hardware_lqi_is_scaled_into_the_ieee_range() {
+        // (hardware correlator indicator, IEEE 802.15.4 LQI)
+        let cases = [
+            (0u8, 0u8),
+            (1, 4),
+            (49, 196), // measured at desk range
+            (63, 252), // top of the hardware domain
+            (64, 255), // first value the PS saturates
+            (67, 255), // measured at desk range, already over the ceiling
+            // The correlator cannot produce this, but `lqi()` is an unchecked
+            // read of a byte the hardware may never have written (a runt frame
+            // leaves stale buffer contents there), so it must not wrap.
+            (255, 255),
+        ];
+        for (hw, ieee) in cases {
+            assert_eq!(ieee_lqi(hw), ieee, "hardware lqi {hw}");
+        }
+    }
+
+    /// The table above documents the mapping at seven points; this pins it at
+    /// all 256, so no input is left to a reading of the formula.
+    ///
+    /// Worth having as well as the table because a weaker property would not
+    /// catch much: monotonicity alone is satisfied by a function returning a
+    /// constant, and the table alone pins the 64-value linear region at only
+    /// four points.
+    #[test]
+    fn every_hardware_value_maps_per_the_product_specification() {
+        for hw in 0..=HW_LQI_MAX {
+            assert_eq!(
+                u16::from(ieee_lqi(hw)),
+                u16::from(hw) * u16::from(ED_RSSISCALE),
+                "in the scaled domain, hardware lqi {hw}"
+            );
+        }
+        for hw in (HW_LQI_MAX + 1)..=u8::MAX {
+            assert_eq!(ieee_lqi(hw), u8::MAX, "past the ceiling, hardware lqi {hw}");
+        }
+    }
+
+    /// The scale factor is a per-part constant — 4 here, 5 on the
+    /// nRF52833/nRF5340 — and every row of the table above moves with it.
+    /// Pinned as a named fact the way [`CHANNEL_MIN`] is in
+    /// `channel_bounds_match_the_24ghz_band`, so a port to another part fails
+    /// here rather than quietly rescaling every link in the mesh.
+    #[test]
+    fn ed_rssiscale_is_the_nrf52840_value() {
+        assert_eq!(ED_RSSISCALE, 4);
+        assert_eq!(HW_LQI_MAX, 63);
+    }
+
+    /// `capture` must hand on the *scaled* LQI, not the hardware byte.
+    ///
+    /// This is the test the first version of this change was missing: every
+    /// assertion above passes against a `capture` that never calls
+    /// [`ieee_lqi`] at all, so reverting the fix was a one-token edit away
+    /// from going unnoticed. `recv` itself is not reachable from a host test
+    /// — it awaits a process-global `Channel` and this workspace registers no
+    /// host `critical-section` implementation — but `Packet` is
+    /// host-constructible, which puts the capture step within reach.
+    #[test]
+    fn capture_reports_a_scaled_lqi() {
+        let mut packet = Packet::new();
+        let body = [0xaa; 16];
+        packet.copy_from_slice(&body);
+
+        // `lqi()` reads `buffer[1 + len()]`, so plant the byte by briefly
+        // lengthening the packet over it. Upstream documents the aliasing:
+        // `copy_from_slice` and `set_len` + `deref_mut` overwrite the stored
+        // LQI, which is exactly the seam being used here.
+        packet.set_len(body.len() as u8 + 1);
+        packet[body.len()] = 49;
+        packet.set_len(body.len() as u8);
+        assert_eq!(packet.lqi(), 49, "planting the hardware lqi");
+
+        let fragment = capture(&packet).expect("a 16-byte packet is capturable");
+        assert_eq!(fragment.len as usize, body.len());
+        assert_eq!(
+            fragment.lqi, 196,
+            "capture must scale 49 to 196, not pass the hardware byte through"
+        );
     }
 
     /// `map_err` distinguishes the two `RadioError` variants `recv`/`send`
