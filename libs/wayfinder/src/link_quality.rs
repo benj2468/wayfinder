@@ -10,7 +10,8 @@
 //! Quality is normalized at the point of update: drivers that already know
 //! how to produce a 0..=255 quality can set [`LinkMetrics::quality`]
 //! directly, and otherwise [`normalize_quality`] maps RSSI/SNR into the same
-//! space.
+//! space.  A driver that sets the field owns the mapping outright — see that
+//! field's docs for the scale it must land on.
 //!
 //! [`update`]: LinkQualityTable::update
 //! [`best_interface_for`]: LinkQualityTable::best_interface_for
@@ -202,7 +203,11 @@ impl<Ident: MeshIdentifier, const CAP: usize> LinkQualityTable<Ident, CAP> {
 /// when the frame carried no physical-layer measurement at all.
 ///
 /// When `metrics.quality` is `Some`, it is returned verbatim — the driver
-/// has already done the mapping.  Otherwise the function applies a default
+/// has already done the mapping, and [`LinkMetrics::quality`] states the
+/// scale it owes.  The conversion stays in the driver deliberately: a native
+/// reading is not always RSSI or SNR (the nRF52840 reports an 802.15.4
+/// correlator indicator), so mapping it here would mean carrying a per-chip
+/// hardware constant in the router.  Otherwise the function applies a default
 /// curve tuned for LoRa-like radios:
 ///
 /// * RSSI is mapped linearly across `-120..=-50 dBm` into `0..=255`.

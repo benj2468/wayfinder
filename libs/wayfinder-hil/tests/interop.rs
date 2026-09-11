@@ -130,6 +130,64 @@ async fn two_boards_on_one_mesh_route_to_each_other() -> anyhow::Result<()> {
     ping_across(&mut alpha, "alpha", dongle_mac, "dongle").await?;
     ping_across(&mut dongle, "dongle", alpha_mac, "alpha").await?;
 
+    // Both boards have now heard each other over real RF, which is the only
+    // state in which the LQI scale is measurable at all.
+    assert_scaled_lqi(&mut alpha, "alpha").await?;
+    assert_scaled_lqi(&mut dongle, "dongle").await?;
+
+    Ok(())
+}
+
+/// The floor a correctly scaled 802.15.4 LQI must clear on two boards sharing
+/// a desk.
+///
+/// Chosen to sit above what the *unscaled* driver could ever report rather
+/// than at a signal strength worth having: the hardware correlator's domain
+/// tops out at 63, so an unscaled build is structurally incapable of exceeding
+/// it, while a scaled one maps even a mediocre 32 to 128. Anything in between
+/// is the ambiguous band, so the floor goes above it.
+const DESK_RANGE_LQI_FLOOR: u32 = 128;
+
+/// **The scale half of GitLab #56, which no host test can reach.**
+///
+/// `ieee_lqi`'s unit tests pin the mapping against the Product Specification,
+/// and `capture_reports_a_scaled_lqi` pins the wiring — but both are arguments
+/// from the datasheet. Whether the byte `Packet::lqi()` actually returns on
+/// this silicon is the correlator indicator those documents describe is not
+/// decidable off-board, and design 19 §12.5 records the number as predicted
+/// rather than measured.
+///
+/// This is the discriminator, and it is cheap because it needs no new
+/// measurement: bring-up observed 49 and 67 on `dot15d4` at desk range, both
+/// below [`DESK_RANGE_LQI_FLOOR`] and one of them already past the hardware
+/// ceiling. So this fails on the pre-fix firmware and passes on the fixed one,
+/// which is exactly what "verified on hardware" has to mean here.
+///
+/// Skips rather than fails when the node has no measured `dot15d4` row: a
+/// board built without the 802.15.4 link is a legitimate configuration, and
+/// failing it would make this test a claim about the build rather than about
+/// the scale.
+async fn assert_scaled_lqi(node: &mut Node, name: &str) -> anyhow::Result<()> {
+    let table = node.link_quality_table().await?;
+    let measured: Vec<_> = table
+        .entries
+        .iter()
+        .filter(|e| e.iface_name == "dot15d4")
+        .filter_map(|e| e.ewma_quality)
+        .collect();
+
+    if measured.is_empty() {
+        eprintln!("SKIP: {name} reports no measured dot15d4 link-quality row");
+        return Ok(());
+    }
+
+    let best = measured.iter().copied().max().unwrap_or(0);
+    anyhow::ensure!(
+        best >= DESK_RANGE_LQI_FLOOR,
+        "{name}'s best dot15d4 link quality is {best}, under the {DESK_RANGE_LQI_FLOOR} \
+         floor — at desk range that is the signature of an unscaled hardware \
+         correlator indicator (domain 0..=63), not a weak link. All rows: {measured:?}",
+    );
     Ok(())
 }
 

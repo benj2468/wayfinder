@@ -291,7 +291,13 @@ where
 /// [`CMD_TX_START`] → [`STATE_RX_ON`], blocking on the IRQ line for
 /// [`IRQ_TRX_END`] before returning. `recv` blocks on the same IRQ line for an
 /// incoming frame and reports the chip's hardware LQI as
-/// [`LinkMetrics::quality`]; the AT86RF233 has no SNR concept, so
+/// [`LinkMetrics::quality`] **unscaled**, which is correct here and is not an
+/// oversight: the AT86RF23x appends a conformant IEEE 802.15.4 LQI already on
+/// `0..=255`, the scale that field is defined on. The sibling
+/// `nrf-ieee802154` must scale because the nRF52840 appends a correlator
+/// indicator on `0..=63` instead. (Datasheet §14.3.8 "Link Quality
+/// Indication": <https://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-8351-MCU_Wireless-AT86RF233_Datasheet.pdf>.)
+/// The AT86RF233 has no SNR concept, so
 /// [`LinkMetrics::snr_db`] is always `None`, and `rssi_dbm` is left for a
 /// future `PHY_RSSI` read.
 impl<SPI, IRQ, RST> LinkT for At86Rf233<SPI, IRQ, RST>
