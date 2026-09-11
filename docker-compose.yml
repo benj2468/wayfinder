@@ -140,6 +140,7 @@ services:
       dockerfile: containers/Dockerfile
       target: ctl
     image: registry.haganah.net/wayfinder-ctl:nightly
+    pull_policy: always
     # Host networking, like everything else here: the node's management API is
     # on the host's loopback, and an offline `cert` subcommand opens no
     # connection at all (`provider user` is not one of those any more — accounts

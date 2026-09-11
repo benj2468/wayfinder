@@ -136,6 +136,8 @@ impl RouterReads for Mock {
             untaggable_drop_rate: 2.25,
             seqno_resyncs: 7,
             ogm_refloods_suppressed: 11,
+            ogm_echoes_dropped: 13,
+            ogm_tails_malformed: 5,
             proofs_swept: 3,
             unjudged_cert_admissions: 0,
         }
@@ -542,6 +544,8 @@ async fn metrics_query_renders_json_from_server() {
     // rendered like the rates beside them.
     assert_eq!(parsed["seqno_resyncs"], 7);
     assert_eq!(parsed["ogm_refloods_suppressed"], 11);
+    assert_eq!(parsed["ogm_echoes_dropped"], 13);
+    assert_eq!(parsed["ogm_tails_malformed"], 5);
     assert_eq!(parsed["proofs_swept"], 3);
 }
 
@@ -558,6 +562,8 @@ async fn metrics_query_renders_human_from_server() {
     assert!(out.contains("pending_cert_replies: 0/16"), "got: {out}");
     assert!(out.contains("cert_req_rate: 0.50"), "got: {out}");
     assert!(out.contains("cert_reply_rate: 1.50"), "got: {out}");
+    assert!(out.contains("ogm_echoes_dropped: 13"), "got: {out}");
+    assert!(out.contains("ogm_tails_malformed: 5"), "got: {out}");
     assert!(out.contains("untaggable_drop_rate: 2.25"), "got: {out}");
     assert!(out.contains("seqno_resyncs: 7"), "got: {out}");
     assert!(out.contains("ogm_refloods_suppressed: 11"), "got: {out}");

@@ -1041,6 +1041,8 @@ impl<
             // smoothed rate is the wrong instrument for these three.
             seqno_resyncs: self.router.seqno_resyncs(),
             ogm_refloods_suppressed: self.router.ogm_refloods_suppressed(),
+            ogm_echoes_dropped: self.router.ogm_echoes_dropped(),
+            ogm_tails_malformed: self.router.ogm_tails_malformed(),
             proofs_swept: self.router.proofs_swept(),
             unjudged_cert_admissions: self.router.unjudged_cert_admissions(),
         }
@@ -2326,13 +2328,70 @@ mod tests {
     /// Zero on an untroubled node is half the assertion. These name faults, so
     /// one that reads non-zero out of the box would be noise an operator learns
     /// to ignore.
+    /// The echo counter reaches the wire from the engine, not a default.
+    ///
+    /// Worth its own test because this counter is the only way an operator can
+    /// confirm the loop guard is firing at all. The guard is cooperative — it
+    /// depends on neighbours stamping their forwards — so a mesh where it has
+    /// silently stopped working (a peer regression, a fragmentation bug
+    /// truncating tails) looks exactly like a healthy one from every other
+    /// metric.
+    #[test]
+    fn node_metrics_projects_the_ogm_echo_count() {
+        let mut router = CentralRouter::new(mac(1));
+
+        // An OGM from mac(2) relaying mac(3), stamped as heard from us: our
+        // own re-flood coming back.
+        let mut tail = [0u8; 32];
+        let tail_len = wayfinder::batman::wire::stamp_prev_sender(&[], &mut tail, mac(1)).unwrap();
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig: mac(3),
+            reserved: 0,
+            tq: 255,
+            tvlv_len: (tail_len as u16).to_be(),
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(ogm.as_bytes());
+        payload.extend_from_slice(&tail[..tail_len]);
+        let bytes = link_frame_bytes(
+            mac(2),
+            Mac::BROADCAST,
+            wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
+            &payload,
+        );
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
+
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
+        assert_eq!(
+            m.ogm_echoes_dropped, 1,
+            "the engine's echo count has to reach the wire"
+        );
+        assert_eq!(
+            m.ogm_tails_malformed, 0,
+            "a well-formed echo is not a malformed tail"
+        );
+    }
+
     #[test]
     fn node_metrics_projects_each_fault_counter_from_its_own_accessor() {
         let mut router = CentralRouter::new(mac(1));
         let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
         assert_eq!(
-            (m.seqno_resyncs, m.ogm_refloods_suppressed, m.proofs_swept),
-            (0, 0, 0),
+            (
+                m.seqno_resyncs,
+                m.ogm_refloods_suppressed,
+                m.proofs_swept,
+                m.ogm_echoes_dropped,
+                m.ogm_tails_malformed,
+            ),
+            (0, 0, 0, 0, 0),
             "an untroubled node reports no faults"
         );
 

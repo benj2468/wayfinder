@@ -1737,6 +1737,13 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                     "OGM refloods suppressed",
                     &m.ogm_refloods_suppressed.to_string(),
                 ),
+                // The echo count is the cost of flooding out every interface,
+                // so a steady climb is expected and only its size against real
+                // OGM intake is informative. A malformed-tail count is the
+                // opposite: any steady rate means a peer is emitting frames
+                // nothing in the mesh can relay.
+                field("OGM echoes dropped", &m.ogm_echoes_dropped.to_string()),
+                field("OGM tails malformed", &m.ogm_tails_malformed.to_string()),
                 field("Proofs swept", &m.proofs_swept.to_string()),
                 // Nonzero means this node has been routing on credentials it
                 // could not date. It sits beside the counts rather than the
@@ -2336,6 +2343,8 @@ mod tests {
             seqno_resyncs: 0,
             unjudged_cert_admissions: 0,
             ogm_refloods_suppressed: 0,
+            ogm_echoes_dropped: 0,
+            ogm_tails_malformed: 0,
             proofs_swept: 0,
             ..Default::default()
         });

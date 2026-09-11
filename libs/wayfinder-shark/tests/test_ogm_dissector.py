@@ -57,6 +57,7 @@ WF_TVLV_CERT = 0x80
 WF_TVLV_OGM_SIG = 0x81
 WF_TVLV_REVOKE = 0x82
 WF_TVLV_CERTFP = 0x83
+WF_TVLV_PREV_SENDER = 0x84
 
 
 def tvlv(tvlv_type: int, value: bytes, version: int = 1) -> bytes:
@@ -224,6 +225,38 @@ def test_certfp_tvlv_decodes(dissect):
     )
     assert result["wayfinder.tvlv.type"] == "0x83"
     assert result["wayfinder.tvlv.cert_fp"] == fp.hex()
+
+
+def test_prev_sender_tvlv_decodes(dissect):
+    """A WF_TVLV_PREV_SENDER record surfaces the relay's stated upstream as a
+    MAC address.
+
+    This is the one record a *relay* writes about itself rather than carrying
+    on the originator's behalf, so reading it off a capture is how an operator
+    tells a genuine path from a node's own re-flood coming back: the field
+    equal to the receiving node's own address is an echo, which that node drops
+    rather than learning as a path.
+    """
+    addr = bytes([0x02, 0, 0, 0, 0, 0x07])
+    frame = ogm_frame(tvlv=tvlv(WF_TVLV_PREV_SENDER, addr))
+    result = dissect(
+        frame,
+        ["wayfinder.tvlv.type", "wayfinder.tvlv.prev_sender"],
+    )
+    assert result["wayfinder.tvlv.type"] == "0x84"
+    assert result["wayfinder.tvlv.prev_sender"] == "02:00:00:00:00:07"
+
+
+def test_prev_sender_of_wrong_length_falls_back_to_raw_bytes(dissect):
+    """A malformed record is shown as raw bytes rather than silently dropped.
+
+    The dissector guards on a 6-byte value, so a record that is not one MAC
+    must still be visible to whoever is debugging why the loop guard is not
+    firing.
+    """
+    frame = ogm_frame(tvlv=tvlv(WF_TVLV_PREV_SENDER, b"\x01\x02\x03\x04"))
+    result = dissect(frame, ["wayfinder.tvlv.value"])
+    assert result["wayfinder.tvlv.value"] == "01020304"
 
 
 def test_walk_handles_cert_sig_then_revoke(dissect):

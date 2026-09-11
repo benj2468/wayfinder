@@ -77,3 +77,27 @@ dist/
 # The HIL board inventory: probe and USB serial numbers are specific to one
 # bench, so each machine keeps its own. `example.hil.toml` is the template.
 hil.toml
+
+# One bench's own deployment, in three parts. Same reasoning as `hil.toml`
+# above: these name hardware that exists on exactly one machine — an nRF52840
+# dongle, and the USB-path-derived NIC name it presents on the port it happens
+# to occupy — so they belong beside the machine, not in the repo. The committed
+# docker-compose.vpn.yml and containers/node-vpn.yml stay portable, and nothing
+# in git names this host's NIC.
+#
+#   * the launch script, which also performs the one setup step no compose file
+#     can express (moving that NIC into the tailscale container's network
+#     namespace);
+#   * a compose layer stacked on docker-compose.vpn.yml; and
+#   * the node config that layer mounts.
+#
+# `<host>.yml` rather than a fixed name so a second bench can keep its own.
+scripts/local-*.sh
+docker-compose.gantz.yml
+containers/gantz.yml
+
+# Transit files for scripts/local-enroll-dongle.sh: a CSR and the certificate
+# the CA issues against it. Not secret (a CSR carries only public keys, and a
+# membership certificate is presented on every connection), but per-bench and
+# regenerable from the board at any time.
+.local-enroll/

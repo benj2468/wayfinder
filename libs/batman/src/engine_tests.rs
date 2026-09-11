@@ -1152,6 +1152,14 @@ mod ogm_tvlv {
     /// When an intermediate node re-floods an OGM, it must preserve the TVLV
     /// tail verbatim (so membership announcements propagate) while still
     /// decrementing TTL and attenuating TQ.
+    ///
+    /// "Verbatim" means every record the originator sent survives unchanged
+    /// and in order — a relay may not alter what the originator said. The
+    /// relay does append one record of its *own*,
+    /// [`TvlvType::PrevSender`](crate::wire::TvlvType::PrevSender), naming the
+    /// neighbour it heard the OGM from; that is the only permitted difference,
+    /// and it is what lets that neighbour recognise its own re-flood coming
+    /// back rather than learning it as a path that does not exist.
     #[test]
     fn forwarded_ogm_preserves_tvlv_tail() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
@@ -1189,13 +1197,18 @@ mod ogm_tvlv {
         assert_eq!(fwd.ttl, 49); // decremented
         assert_eq!(
             u16::from_be(fwd.tvlv_len) as usize,
-            tvlv.len(),
-            "tvlv_len must survive forwarding"
+            tvlv.len() + crate::wire::PREV_SENDER_RECORD_LEN,
+            "tvlv_len must survive forwarding, grown by the relay's own stamp"
         );
         assert_eq!(
             &tail[..tvlv.len()],
             &tvlv[..],
-            "tvlv tail must be preserved"
+            "the originator's records must be preserved, unchanged and in order"
+        );
+        assert_eq!(
+            crate::wire::prev_sender(&tail[..tvlv.len() + crate::wire::PREV_SENDER_RECORD_LEN]),
+            Some(mac(2)),
+            "and the relay names the neighbour it heard this from"
         );
     }
 }
