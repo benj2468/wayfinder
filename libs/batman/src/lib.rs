@@ -817,6 +817,14 @@ pub struct BatmanEngine<
     /// common case and carries no information — only for a frame refused while
     /// a resync watch is open.
     pub(crate) ogm_refloods_suppressed: u32,
+    /// How many OGMs this node dropped because a neighbour echoed back a
+    /// re-flood this node had itself forwarded — see
+    /// [`BatmanEngine::ogm_echoes_dropped`].
+    pub(crate) ogm_echoes_dropped: u32,
+    /// How many OGMs this node refused to re-flood because the TVLV tail the
+    /// sender supplied could not be parsed — see
+    /// [`BatmanEngine::ogm_tails_malformed`].
+    pub(crate) ogm_tails_malformed: u32,
     /// How many next-hop proofs this node has dropped because the pairwise key
     /// they were answered with is no longer usable.
     ///
@@ -909,6 +917,8 @@ impl<
             proven: FnvIndexMap::new(),
             seqno_resyncs: 0,
             ogm_refloods_suppressed: 0,
+            ogm_echoes_dropped: 0,
+            ogm_tails_malformed: 0,
             proofs_swept: 0,
             challenged: FnvIndexMap::new(),
             require_proof: false,

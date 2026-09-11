@@ -471,6 +471,14 @@ pub struct NodeMetricsData {
     /// under correction — the harm this node does to the nodes behind it while
     /// it keeps routing to that member itself.
     pub ogm_refloods_suppressed: u32,
+    /// Count of OGMs dropped as this node's own re-flood echoed back by a
+    /// neighbour. Steadily non-zero is normal — it is the cost of flooding out
+    /// every interface, not a fault.
+    pub ogm_echoes_dropped: u32,
+    /// Count of OGMs not re-flooded because the sender's TVLV tail could not be
+    /// parsed. Any steady rate is a fault: a peer is emitting frames no node
+    /// can relay.
+    pub ogm_tails_malformed: u32,
     /// Count of next-hop proofs dropped because the pairwise key they were
     /// answered with stopped being usable. Zero when auth is disabled.
     pub proofs_swept: u32,
@@ -2056,6 +2064,8 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 untaggable_drop_rate: m.untaggable_drop_rate,
                 seqno_resyncs: m.seqno_resyncs,
                 ogm_refloods_suppressed: m.ogm_refloods_suppressed,
+                ogm_echoes_dropped: m.ogm_echoes_dropped,
+                ogm_tails_malformed: m.ogm_tails_malformed,
                 proofs_swept: m.proofs_swept,
                 unjudged_cert_admissions: m.unjudged_cert_admissions,
             })
@@ -4237,6 +4247,8 @@ mod tests {
                 untaggable_drop_rate: 0.75,
                 seqno_resyncs: 7,
                 ogm_refloods_suppressed: 11,
+                ogm_echoes_dropped: 12,
+                ogm_tails_malformed: 13,
                 proofs_swept: 3,
                 unjudged_cert_admissions: 0,
             },
@@ -4265,6 +4277,8 @@ mod tests {
                 assert_eq!(m.untaggable_drop_rate, 0.75);
                 assert_eq!(m.seqno_resyncs, 7);
                 assert_eq!(m.ogm_refloods_suppressed, 11);
+                assert_eq!(m.ogm_echoes_dropped, 12);
+                assert_eq!(m.ogm_tails_malformed, 13);
                 assert_eq!(m.proofs_swept, 3);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),

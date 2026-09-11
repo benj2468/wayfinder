@@ -106,12 +106,14 @@ local WF_TVLV_CERT = 0x80
 local WF_TVLV_ORIGINATOR_SIG = 0x81
 local WF_TVLV_REVOKE = 0x82
 local WF_TVLV_CERTFP = 0x83
+local WF_TVLV_PREV_SENDER = 0x84
 local TVLV_TYPES = {
 	[BATADV_TVLV_MCAST] = "Multicast Membership",
 	[WF_TVLV_CERT] = "Membership Certificate",
 	[WF_TVLV_ORIGINATOR_SIG] = "Originator Signature",
 	[WF_TVLV_REVOKE] = "Revocation",
 	[WF_TVLV_CERTFP] = "Cert Fingerprint",
+	[WF_TVLV_PREV_SENDER] = "Previous Sender",
 }
 
 -- Length of the Ed25519 signature following a CertReq's requester cert (see
@@ -152,6 +154,13 @@ f.tvlv_type = ProtoField.uint8("wayfinder.tvlv.type", "TVLV Type", base.HEX, TVL
 f.tvlv_ver = ProtoField.uint8("wayfinder.tvlv.version", "TVLV Version", base.DEC)
 f.tvlv_vlen = ProtoField.uint16("wayfinder.tvlv.len", "TVLV Value Length", base.DEC)
 f.tvlv_value = ProtoField.bytes("wayfinder.tvlv.value", "TVLV Value")
+-- The neighbour a *relay* heard this Originator packet from (TVLV 0x84). Only
+-- present on a forwarded packet, and rewritten at every hop -- so unlike every
+-- other TVLV record this describes the relay rather than the originator, and is
+-- deliberately outside the originator's signature. A capture showing this field
+-- equal to the receiving node's own address is that node's re-flood coming back
+-- to it, which is what the receiver drops rather than learning as a path.
+f.tvlv_prev_sender = ProtoField.ether("wayfinder.tvlv.prev_sender", "Previous Sender")
 
 -- Multicast membership announcement: a back-to-back list of group MACs.
 f.mcast_group = ProtoField.ether("wayfinder.tvlv.mcast_group", "Multicast Group")
@@ -397,6 +406,8 @@ local function walk_tvlv(tree, tvb, start, tvlv_len, cap_end)
 				decode_revoke(rec, tvb, voff, vlen, cap_end)
 			elseif ttype == WF_TVLV_CERTFP then
 				rec:add(f.cert_fp, tvb(voff, vlen))
+			elseif ttype == WF_TVLV_PREV_SENDER and vlen == 6 then
+				rec:add(f.tvlv_prev_sender, tvb(voff, 6))
 			elseif ttype == BATADV_TVLV_MCAST then
 				local g = voff
 				while g + 6 <= voff + vlen do

@@ -637,6 +637,50 @@ impl<
         self.ogm_refloods_suppressed
     }
 
+    /// How many OGMs this node dropped as its own re-flood echoed back by a
+    /// neighbour — a `PrevSender` record naming this node (see
+    /// [`crate::wire::TvlvType::PrevSender`]).
+    ///
+    /// Steadily non-zero is normal and not a fault: it is the ordinary cost of
+    /// flooding out every interface. What it is *for* is sizing that cost — a
+    /// node whose echo count rivals its real OGM intake is spending a large
+    /// share of a shared segment's airtime on frames that are discarded on
+    /// arrival, which is an argument about topology rather than a bug here.
+    ///
+    /// Counts **frames**, not distinct phantom paths: one stub neighbour
+    /// echoing every originator's OGM contributes many increments against the
+    /// single path that is not learned. Read it against this node's OGM
+    /// intake, not on its own.
+    ///
+    /// A count rather than a rate — but not for the reason
+    /// [`seqno_resyncs`](Self::seqno_resyncs) is one, which is that a resync is
+    /// rare and bounded by a 30-second window. This signal is the opposite,
+    /// high-rate and continuous; it stays a count because the quantity an
+    /// operator compares it against is another count.
+    pub fn ogm_echoes_dropped(&self) -> u32 {
+        self.ogm_echoes_dropped
+    }
+
+    /// How many OGMs this node refused to re-flood because the TVLV tail the
+    /// sender supplied could not be parsed — a record claiming more bytes than
+    /// the tail holds, or a stated `tvlv_len` its frame cannot back.
+    ///
+    /// Distinct from [`relay_oversize_drops`](Self::relay_oversize_drops) on
+    /// purpose, because the two point an operator in opposite directions: an
+    /// oversize drop is this node's own scratchpad being too small for a link
+    /// it is relaying onto, and is fixed by sizing an MTU; a malformed tail is
+    /// a *peer* emitting frames this node cannot forward, and no amount of
+    /// buffer will help. Collapsing them into one counter — which an earlier
+    /// draft of this guard did — makes the oversize metric climb for a reason
+    /// resizing a buffer cannot fix.
+    ///
+    /// Any steady rate here means a peer is emitting frames no node in the
+    /// mesh can relay, so unlike [`ogm_echoes_dropped`](Self::ogm_echoes_dropped)
+    /// a persistently non-zero value *is* a fault worth chasing.
+    pub fn ogm_tails_malformed(&self) -> u32 {
+        self.ogm_tails_malformed
+    }
+
     /// How many next-hop proofs this node has dropped because the key behind
     /// them was no longer usable — see [`proofs_swept`](Self::proofs_swept).
     pub fn proofs_swept(&self) -> u32 {
@@ -1065,6 +1109,65 @@ impl<
             return RoutingAction::Consumed;
         }
 
+        // This OGM's TVLV region, bounded by the length the OGM itself states
+        // rather than by everything after the header. Two reasons, and the
+        // second is why a length the frame cannot back is refused outright
+        // instead of being read as an empty tail:
+        //
+        //   * A buffer a frame was parsed out of can carry trailing bytes this
+        //     OGM does not claim, and scanning those would let padding an
+        //     attacker chose be read as a record.
+        //   * `tvlv_len` is a remote-supplied `u16` that nothing else on the
+        //     receive path validates. Treating an over-claiming one as an
+        //     *empty* tail would let the re-flood below stamp that empty region
+        //     and forward it — silently stripping the certificate, signature,
+        //     memberships and revocations the originator sent, and leaving
+        //     every downstream neighbour on an authenticated mesh to reject the
+        //     laundered copy for a missing signature. One malformed frame per
+        //     interval would then suppress an originator through this relay.
+        let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+        let Some(ogm_tail) = frame
+            .payload
+            .get(ogm_hdr_len..ogm_hdr_len.saturating_add(u16::from_be(ogm.tvlv_len) as usize))
+        else {
+            trace!(
+                tvlv_len = u16::from_be(ogm.tvlv_len),
+                payload_len = frame.payload.len(),
+                "drop: OGM tvlv_len exceeds the frame",
+            );
+            self.ogm_tails_malformed = self.ogm_tails_malformed.saturating_add(1);
+            return RoutingAction::Consumed;
+        };
+
+        // Rule 1b: drop an OGM this node forwarded, coming back.
+        //
+        // The sender stamped who *it* heard this copy from; naming us means it
+        // is repeating our own re-flood rather than offering a path. Learning
+        // from it would manufacture a path that does not exist — and selecting
+        // that path is a loop, since the sender forwards right back here.
+        //
+        // It does not prove the sender's *route* to `orig` runs through us: a
+        // node re-floods only the first copy of each seqno it sees, so a
+        // neighbour that has a genuine independent path but happened to hear
+        // our copy first stamps us too, and is dropped with the phantoms. That
+        // is the accepted cost — it forgoes at most one seqno's worth of path
+        // evidence from that neighbour, and the next seqno re-tests it.
+        //
+        // Checked before the originator record is touched, so a laundered echo
+        // cannot create a record, occupy one of the four `paths` slots, or
+        // refresh an eviction key. An OGM with no such record (an originated
+        // one, or a peer too old to stamp it) is unaffected, which is what
+        // keeps this compatible with a mesh that has not fully upgraded.
+        if crate::wire::prev_sender(ogm_tail) == Some(self.self_ident) {
+            trace!(
+                orig = ?orig_ident,
+                relay = ?frame.src,
+                "drop: OGM we forwarded, echoed back by a neighbour",
+            );
+            self.ogm_echoes_dropped = self.ogm_echoes_dropped.saturating_add(1);
+            return RoutingAction::Consumed;
+        }
+
         let incoming_seqno = u32::from_be(ogm.seqno);
 
         // Whether the relaying neighbor may be *selected* as a next hop. Read
@@ -1333,25 +1436,58 @@ impl<
                 outbound_ogm.ttl -= 1;
                 outbound_ogm.tq = computed_tq;
 
-                // Write the fixed header into the caller's scratchpad, then copy
-                // the TVLV tail (membership announcements) verbatim from the
-                // incoming frame so it propagates unchanged with the re-flood.
+                // Build the outgoing TVLV tail directly in the caller's
+                // scratchpad: every record the originator sent propagates
+                // unchanged, with only our `PrevSender` stamp rewritten onto
+                // it. Naming the neighbour we heard this from is what lets
+                // *that* neighbour recognise its own re-flood when we send it
+                // back (see Rule 1b) — the guard is useless unless every
+                // forwarder stamps.
+                //
+                // The tail is written before the header because the header
+                // carries its length, which is only known once the rewrite has
+                // run: `stamp_prev_sender` drops any stamp the previous hop
+                // left, so the tail can shrink as well as grow.
                 let size = core::mem::size_of::<BatmanOgmPacket>();
-                let tvlv_len = u16::from_be(ogm.tvlv_len) as usize;
-                let total = size + tvlv_len;
 
-                // The reply scratchpad may be smaller than this OGM (e.g. it was
-                // received on a large-MTU link but is being re-flooded out one
-                // with a smaller one); drop the re-flood rather than panic.
-                if total <= reply.payload.len() {
+                // Ask how long the rewrite will be before attempting it, which
+                // is what lets the two ways it can fail be reported as the
+                // different faults they are: a tail this node cannot parse
+                // (a peer's problem, no buffer size fixes it) versus a reply
+                // scratchpad too small for the result (this node's own, e.g.
+                // received on a large-MTU link and re-flooded onto a smaller
+                // one). Both used to arrive as a single "oversize" drop, which
+                // sent an operator to resize an MTU that was never at fault.
+                let Some(out_tvlv_len) = crate::wire::stamped_len(ogm_tail) else {
+                    trace!(
+                        relay = ?frame.src,
+                        tvlv_len = ogm_tail.len(),
+                        "drop: OGM tail malformed, not re-flooded",
+                    );
+                    self.ogm_tails_malformed = self.ogm_tails_malformed.saturating_add(1);
+                    self.apply_topology_change(now);
+                    return RoutingAction::Consumed;
+                };
+
+                // Exact, not an upper bound: `stamped_len` has already
+                // accounted for the previous hop's record being replaced
+                // rather than appended, so this is the number an operator
+                // would size a link by.
+                let needed = size + out_tvlv_len;
+                let stamped = reply
+                    .payload
+                    .get_mut(size..)
+                    .filter(|out| out.len() >= out_tvlv_len)
+                    .and_then(|out| crate::wire::stamp_prev_sender(ogm_tail, out, frame.src))
+                    .and_then(|len| u16::try_from(len).ok());
+
+                if let Some(wire_len) = stamped {
+                    outbound_ogm.tvlv_len = wire_len.to_be();
                     reply.dst = Mac::BROADCAST;
                     reply.protocol = ETH_P_BATMAN;
                     reply.payload[..size].copy_from_slice(&outbound_ogm.as_bytes()[..size]);
-                    if let Some(src) = frame.payload.get(size..total) {
-                        reply.payload[size..total].copy_from_slice(src);
-                    }
                 } else {
-                    self.note_relay_oversize_drop("ogm_reflood", total, reply.payload.len());
+                    self.note_relay_oversize_drop("ogm_reflood", needed, reply.payload.len());
                 }
 
                 self.apply_topology_change(now);
@@ -2540,6 +2676,411 @@ mod tests {
         data.extend_from_slice(mac(src).as_bytes());
         data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
         data.extend_from_slice(ogm.as_bytes());
+        data
+    }
+
+    /// The steady-state relay case: an OGM that *already* carries someone
+    /// else's stamp is forwarded with that stamp replaced by ours, and the
+    /// header's `tvlv_len` follows the rewrite.
+    ///
+    /// The pure-function tests cover the replacement; this covers the header.
+    /// Past hop two every OGM in the mesh takes this path, and `tvlv_len` is
+    /// the one piece of arithmetic here that would corrupt all of them
+    /// silently — a header still stating the *incoming* length leaves a
+    /// `tvlv_len`-bounded reader parsing a truncated tail, losing the
+    /// certificate and signature rather than just the stamp.
+    #[test]
+    fn a_relayed_ogm_replaces_the_previous_hops_stamp_and_restates_its_length() {
+        let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
+        let mut tx = [0u8; 256];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        // A tail as hop two would emit it: a foreign record, then hop two's
+        // own stamp naming hop one.
+        let value = [7u8, 7, 7];
+        let hdr = crate::wire::BatmanTvlvHdr {
+            tvlv_type: TvlvType::Mcast.as_u8(),
+            version: 1,
+            len: (value.len() as u16).to_be(),
+        };
+        let mut tail = Vec::new();
+        tail.extend_from_slice(hdr.as_bytes());
+        tail.extend_from_slice(&value);
+        let mut stamped = [0u8; 64];
+        let stamped_len = crate::wire::stamp_prev_sender(&tail, &mut stamped, mac(9)).unwrap();
+
+        let bytes = ogm_with_tail(3, 2, 1, 235, &stamped[..stamped_len]);
+        let frame = LinkFrame::ref_from_prefix(&bytes).unwrap().0;
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply, &mut ());
+
+        let size = core::mem::size_of::<BatmanOgmPacket>();
+        let out = BatmanOgmPacket::ref_from_prefix(reply.payload).unwrap().0;
+        let out_len = u16::from_be(out.tvlv_len) as usize;
+        let out_tail = &reply.payload[size..size + out_len];
+
+        assert_eq!(reply.protocol, ETH_P_BATMAN);
+        assert_eq!(
+            out_len, stamped_len,
+            "one stamp replaces another, so the tail is the same size — and \
+             the header must say so"
+        );
+        assert_eq!(
+            crate::wire::prev_sender(out_tail),
+            Some(mac(2)),
+            "the stamp names who *we* heard it from"
+        );
+        assert_eq!(
+            crate::wire::find_tvlv(out_tail, TvlvType::Mcast),
+            Some(&value[..]),
+            "and the originator's record still rides along"
+        );
+        assert_eq!(
+            count_records(out_tail, TvlvType::PrevSender),
+            1,
+            "exactly one stamp — records must not accumulate per hop"
+        );
+    }
+
+    /// A re-flood that no longer fits the outgoing scratchpad once stamped is
+    /// dropped and counted as oversize — the small-MTU relay case the stamp's
+    /// wire cost actually bears on.
+    #[test]
+    fn a_reflood_that_does_not_fit_once_stamped_is_an_oversize_drop() {
+        let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
+
+        let value = [7u8; 8];
+        let hdr = crate::wire::BatmanTvlvHdr {
+            tvlv_type: TvlvType::Mcast.as_u8(),
+            version: 1,
+            len: (value.len() as u16).to_be(),
+        };
+        let mut tail = Vec::new();
+        tail.extend_from_slice(hdr.as_bytes());
+        tail.extend_from_slice(&value);
+
+        // Exactly big enough for the OGM and its incoming tail, one byte short
+        // of the stamp.
+        let size = core::mem::size_of::<BatmanOgmPacket>();
+        let mut tx = vec![0u8; size + tail.len() + crate::wire::PREV_SENDER_RECORD_LEN - 1];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        let bytes = ogm_with_tail(3, 2, 1, 235, &tail);
+        let frame = LinkFrame::ref_from_prefix(&bytes).unwrap().0;
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply, &mut ());
+
+        assert_eq!(reply.protocol, 0, "it must not be truncated onto the wire");
+        assert_eq!(engine.relay_oversize_drops(), 1);
+        assert_eq!(
+            engine.ogm_tails_malformed(),
+            0,
+            "the tail was well-formed; only the scratchpad was short"
+        );
+    }
+
+    /// Count records of one type in a TVLV region.
+    fn count_records(tail: &[u8], ty: TvlvType) -> usize {
+        crate::wire::iter_tvlv(tail, ty).count()
+    }
+
+    /// [`ogm_via`], with an arbitrary TVLV tail and an honest `tvlv_len`.
+    fn ogm_with_tail(orig: u8, src: u8, seqno: u32, tq: u8, tail: &[u8]) -> Vec<u8> {
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 5,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(orig),
+            reserved: 0,
+            tq,
+            tvlv_len: (tail.len() as u16).to_be(),
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(1).as_bytes());
+        data.extend_from_slice(mac(src).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(ogm.as_bytes());
+        data.extend_from_slice(tail);
+        data
+    }
+
+    /// An OGM whose `tvlv_len` claims more bytes than its frame carries is
+    /// dropped outright, not forwarded with a fabricated tail.
+    ///
+    /// `tvlv_len` is a remote-supplied `u16` that nothing on the receive path
+    /// validates against the frame, so a peer can state any length it likes.
+    /// Treating an out-of-range slice as an *empty* tail is the dangerous
+    /// reading: `stamp_prev_sender` then succeeds against nothing and the node
+    /// re-floods an OGM whose TVLV region holds only its own stamp — the
+    /// originator's certificate, signature, memberships and revocations all
+    /// silently stripped. Downstream neighbours on an authenticated mesh then
+    /// reject the laundered copy for a missing signature, so one malformed
+    /// frame per interval suppresses an originator through this relay with
+    /// nothing counted anywhere.
+    ///
+    /// It also disables Rule 1b, since the guard reads the same empty tail.
+    #[test]
+    fn an_ogm_whose_tvlv_len_exceeds_its_frame_is_dropped() {
+        let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
+        let mut tx = [0u8; 512];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        let mut bytes = ogm_via(3, 2, 1, 235);
+        // A real 10-byte Mcast record, but a `tvlv_len` that claims 0xFFFF.
+        let value = [9u8; 6];
+        let hdr = crate::wire::BatmanTvlvHdr {
+            tvlv_type: TvlvType::Mcast.as_u8(),
+            version: 1,
+            len: (value.len() as u16).to_be(),
+        };
+        bytes.extend_from_slice(hdr.as_bytes());
+        bytes.extend_from_slice(&value);
+        let ogm_off = 2 * core::mem::size_of::<Mac>() + core::mem::size_of::<u16>();
+        let tvlv_len_off = ogm_off + core::mem::size_of::<BatmanOgmPacket>() - 2;
+        bytes[tvlv_len_off..tvlv_len_off + 2].copy_from_slice(&0xFFFFu16.to_be_bytes());
+
+        let frame = LinkFrame::ref_from_prefix(&bytes).unwrap().0;
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply, &mut ());
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(
+            reply.protocol, 0,
+            "an OGM whose tvlv_len overruns its frame must not be re-flooded — \
+             forwarding it strips every record the originator sent"
+        );
+        assert!(
+            engine.originator_table.is_empty(),
+            "nor may it be learned from"
+        );
+    }
+
+    /// A malformed TVLV tail is reported as its own condition, not as the
+    /// scratchpad being too small.
+    ///
+    /// Both reach the same `None` from `stamp_prev_sender`, but they are
+    /// different faults with different fixes: an oversize drop tells an
+    /// operator to look at an MTU, while a malformed tail tells them to look
+    /// at a peer. Collapsing them makes `relay_oversize_drops` climb for a
+    /// reason resizing a buffer cannot fix — and emits a self-refuting log
+    /// line claiming 16 bytes did not fit a 512-byte buffer.
+    #[test]
+    fn a_malformed_tail_is_not_counted_as_an_oversize_drop() {
+        let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
+        let mut tx = [0u8; 512];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        // One record claiming 200 value bytes while carrying 2; `tvlv_len` is
+        // honest about the 6 bytes that follow the header.
+        let hdr = crate::wire::BatmanTvlvHdr {
+            tvlv_type: TvlvType::Mcast.as_u8(),
+            version: 1,
+            len: 200u16.to_be(),
+        };
+        let mut tail = Vec::new();
+        tail.extend_from_slice(hdr.as_bytes());
+        tail.extend_from_slice(&[1u8, 2]);
+
+        let mut bytes = ogm_with_tail(3, 2, 1, 235, &tail);
+        let ogm_off = 2 * core::mem::size_of::<Mac>() + core::mem::size_of::<u16>();
+        let tvlv_len_off = ogm_off + core::mem::size_of::<BatmanOgmPacket>() - 2;
+        bytes[tvlv_len_off..tvlv_len_off + 2].copy_from_slice(&(tail.len() as u16).to_be_bytes());
+
+        let frame = LinkFrame::ref_from_prefix(&bytes).unwrap().0;
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply, &mut ());
+
+        assert_eq!(
+            engine.relay_oversize_drops(),
+            0,
+            "the 512-byte scratchpad was never the problem"
+        );
+        assert_eq!(
+            engine.ogm_tails_malformed(),
+            1,
+            "the malformed tail must be counted as itself"
+        );
+    }
+
+    /// `stamp_prev_sender` refuses a tail whose record overruns it, rather
+    /// than forwarding a truncated one.
+    #[test]
+    fn stamping_refuses_a_malformed_tail() {
+        let hdr = crate::wire::BatmanTvlvHdr {
+            tvlv_type: TvlvType::Mcast.as_u8(),
+            version: 1,
+            len: 200u16.to_be(),
+        };
+        let mut tail = Vec::new();
+        tail.extend_from_slice(hdr.as_bytes());
+        tail.extend_from_slice(&[1u8, 2]);
+
+        let mut out = [0u8; 128];
+        assert_eq!(
+            crate::wire::stamp_prev_sender(&tail, &mut out, mac(4)),
+            None
+        );
+    }
+
+    /// `stamp_prev_sender` refuses rather than truncates when `out` cannot
+    /// hold the result.
+    #[test]
+    fn stamping_refuses_an_output_buffer_that_is_too_small() {
+        let mut out = [0u8; crate::wire::PREV_SENDER_RECORD_LEN - 1];
+        assert_eq!(crate::wire::stamp_prev_sender(&[], &mut out, mac(4)), None);
+    }
+
+    /// A `PrevSender` record whose value is not exactly one `Mac` is not a
+    /// stamp, and must not be read as one.
+    #[test]
+    fn a_prev_sender_record_of_the_wrong_length_is_not_a_stamp() {
+        let hdr = crate::wire::BatmanTvlvHdr {
+            tvlv_type: TvlvType::PrevSender.as_u8(),
+            version: 1,
+            len: 4u16.to_be(),
+        };
+        let mut tail = Vec::new();
+        tail.extend_from_slice(hdr.as_bytes());
+        tail.extend_from_slice(&[1u8, 2, 3, 4]);
+
+        assert_eq!(crate::wire::prev_sender(&tail), None);
+    }
+
+    /// A forwarded OGM names the neighbour it was heard from, so that
+    /// neighbour can recognise its own re-flood coming back.
+    ///
+    /// The stamp is what the whole loop guard rests on: it is written by the
+    /// forwarder and read by the node it is sent to, so a forwarder that
+    /// omitted it would silently disable the guard on its neighbours rather
+    /// than on itself.
+    #[test]
+    fn a_forwarded_ogm_names_the_neighbour_it_was_heard_from() {
+        let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
+        let mut tx = [0u8; 256];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        // mac(2) relays mac(3)'s OGM to us.
+        let bytes = ogm_via(3, 2, 1, 255);
+        let frame = LinkFrame::ref_from_prefix(&bytes).unwrap().0;
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply, &mut ());
+
+        let size = core::mem::size_of::<BatmanOgmPacket>();
+        assert_eq!(reply.protocol, ETH_P_BATMAN, "the OGM must be re-flooded");
+        assert_eq!(
+            crate::wire::prev_sender(&reply.payload[size..]),
+            Some(mac(2)),
+            "the stamp names who we heard it from, not ourselves"
+        );
+    }
+
+    /// An OGM a neighbour echoes back to us — one whose stamp names *this*
+    /// node — is dropped, and leaves no trace: no originator record, no path,
+    /// no re-flood.
+    ///
+    /// This is the defect the guard exists for. Without it the echo is learned
+    /// as a path to `orig`, which is a path that does not exist: the sender's
+    /// own route to `orig` runs back through this node, so selecting it is a
+    /// loop.
+    #[test]
+    fn an_ogm_we_forwarded_is_dropped_when_a_neighbour_echoes_it_back() {
+        let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
+        let mut tx = [0u8; 256];
+
+        // mac(2) relays mac(3)'s OGM, stamped as having been heard from *us*.
+        let bytes = ogm_via_stamped(3, 2, 1, 235, mac(1));
+        let frame = LinkFrame::ref_from_prefix(&bytes).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply, &mut ());
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0, "an echo must not be re-flooded");
+        assert!(
+            engine.originator_table.is_empty(),
+            "an echo must not even create an originator record, or it would \
+             occupy a `paths` slot and refresh an eviction key"
+        );
+        assert_eq!(engine.ogm_echoes_dropped(), 1);
+    }
+
+    /// A stamp from the previous hop is *replaced*, not accumulated, so the
+    /// cost of the guard is flat rather than proportional to path length.
+    #[test]
+    fn stamping_replaces_the_previous_hops_record() {
+        let mut out = [0u8; 128];
+        let first = crate::wire::stamp_prev_sender(&[], &mut out, mac(7)).unwrap();
+        assert_eq!(first, crate::wire::PREV_SENDER_RECORD_LEN);
+        assert_eq!(crate::wire::prev_sender(&out[..first]), Some(mac(7)));
+
+        // Re-stamping an already-stamped tail must not grow it.
+        let tail = out[..first].to_vec();
+        let mut out2 = [0u8; 128];
+        let second = crate::wire::stamp_prev_sender(&tail, &mut out2, mac(9)).unwrap();
+        assert_eq!(second, first, "a re-stamp replaces rather than appends");
+        assert_eq!(crate::wire::prev_sender(&out2[..second]), Some(mac(9)));
+    }
+
+    /// Records the relay is not entitled to touch — the originator's cert, its
+    /// signature, memberships — survive the rewrite byte-for-byte and in
+    /// order. Reordering or dropping any of them would break signature
+    /// verification downstream.
+    #[test]
+    fn stamping_preserves_every_other_record_in_order() {
+        // Two foreign records around where the stamp lands.
+        let mut tail = Vec::new();
+        for (ty, value) in [
+            (TvlvType::Mcast, &[9u8, 9, 9][..]),
+            (TvlvType::Revoke, &[1, 2]),
+        ] {
+            let hdr = crate::wire::BatmanTvlvHdr {
+                tvlv_type: ty.as_u8(),
+                version: 1,
+                len: (value.len() as u16).to_be(),
+            };
+            tail.extend_from_slice(hdr.as_bytes());
+            tail.extend_from_slice(value);
+        }
+
+        let mut out = [0u8; 128];
+        let len = crate::wire::stamp_prev_sender(&tail, &mut out, mac(4)).unwrap();
+
+        assert_eq!(
+            len,
+            tail.len() + crate::wire::PREV_SENDER_RECORD_LEN,
+            "an unstamped tail grows by exactly one record"
+        );
+        assert_eq!(
+            &out[..tail.len()],
+            &tail[..],
+            "foreign records pass through"
+        );
+        assert_eq!(crate::wire::prev_sender(&out[..len]), Some(mac(4)));
+        assert_eq!(
+            crate::wire::find_tvlv(&out[..len], TvlvType::Mcast),
+            Some(&[9u8, 9, 9][..])
+        );
+    }
+
+    /// [`ogm_via`], plus a `PrevSender` stamp naming `heard_from` — an OGM as
+    /// a relay actually puts it on the wire.
+    fn ogm_via_stamped(orig: u8, src: u8, seqno: u32, tq: u8, heard_from: Mac) -> Vec<u8> {
+        let mut tail = [0u8; 32];
+        let tail_len = crate::wire::stamp_prev_sender(&[], &mut tail, heard_from).unwrap();
+
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 5,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(orig),
+            reserved: 0,
+            tq,
+            tvlv_len: (tail_len as u16).to_be(),
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(1).as_bytes());
+        data.extend_from_slice(mac(src).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(ogm.as_bytes());
+        data.extend_from_slice(&tail[..tail_len]);
         data
     }
 

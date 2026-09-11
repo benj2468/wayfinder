@@ -1986,6 +1986,28 @@ message NodeMetrics {
   // flight.
   uint32 ogm_refloods_suppressed = 21;
 
+  // Count of OGMs dropped as this node's own re-flood, echoed back by a
+  // neighbour whose PrevSender record named this node.
+  //
+  // Steadily non-zero is normal and not a fault: it is the ordinary cost of
+  // flooding out every interface, and counts exactly the frames this node
+  // declined to learn a non-existent path from. What it is for is sizing that
+  // cost — a node whose echo count rivals its real OGM intake is spending a
+  // large share of a shared segment's airtime on frames discarded on arrival,
+  // which is an argument about topology rather than a fault here.
+  uint32 ogm_echoes_dropped = 24;
+
+  // Count of OGMs this node refused to re-flood because the TVLV tail the
+  // sender supplied could not be parsed.
+  //
+  // Unlike the echo count above, any steady rate here IS a fault worth
+  // chasing: it means a peer is emitting frames no node in the mesh can relay.
+  // Kept separate from relay_oversize_drops because the two point an operator
+  // in opposite directions — an oversize drop is this node's own scratchpad
+  // being too small for the link it relays onto and is fixed by sizing an MTU,
+  // while a malformed tail is a peer's problem that no buffer size will fix.
+  uint32 ogm_tails_malformed = 25;
+
   // Count of next-hop proofs dropped because the pairwise key they were
   // answered with stopped being usable — a neighbor's certificate lapsing, a
   // revocation, or its entry being pushed out of a full key cache.

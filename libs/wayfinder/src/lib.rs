@@ -366,6 +366,27 @@ fn link_frame_wire_len(payload_len: usize) -> usize {
     2 * core::mem::size_of::<Mac>() + core::mem::size_of::<u16>() + payload_len
 }
 
+/// The exact wire length of an OGM staged in `reply`, or `None` when the reply
+/// is not an OGM (or states a length its buffer cannot hold).
+///
+/// The engine writes a re-flood into a scratchpad far larger than the frame,
+/// so something has to say where the frame ends. For most forwards the
+/// incoming frame's length is the right answer — the reply is that same packet
+/// with its TTL decremented. A forwarded *OGM* is the exception: the relay
+/// rewrites its TVLV region (see `TvlvType::PrevSender`), so the outgoing
+/// frame is a different size from the one that prompted it, in either
+/// direction. Its header already carries the answer, so take it from there
+/// rather than inferring it.
+fn reply_ogm_wire_len(reply: &LinkFrameDataMut<'_>) -> Option<usize> {
+    let (ogm, _) = batman::wire::BatmanOgmPacket::ref_from_prefix(reply.payload).ok()?;
+    if ogm.packet_type != BatmanPacketType::Ogm.as_u8() {
+        return None;
+    }
+    let total = core::mem::size_of::<batman::wire::BatmanOgmPacket>()
+        .checked_add(u16::from_be(ogm.tvlv_len) as usize)?;
+    (total <= reply.payload.len()).then_some(total)
+}
+
 /// How the router intends to deliver a multicast frame for a given group,
 /// returned by [`CentralRouter::mcast_plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,6 +913,19 @@ impl<
     /// to explain it.
     pub fn ogm_refloods_suppressed(&self) -> u32 {
         self.batman.ogm_refloods_suppressed()
+    }
+
+    /// How many OGMs this node dropped as its own re-flood, echoed back by a
+    /// neighbour — see [`batman::BatmanEngine::ogm_echoes_dropped`].
+    pub fn ogm_echoes_dropped(&self) -> u32 {
+        self.batman.ogm_echoes_dropped()
+    }
+
+    /// How many OGMs this node refused to re-flood because the sender's TVLV
+    /// tail could not be parsed — see
+    /// [`batman::BatmanEngine::ogm_tails_malformed`].
+    pub fn ogm_tails_malformed(&self) -> u32 {
+        self.batman.ogm_tails_malformed()
     }
 
     /// How many next-hop proofs this node has dropped because the pairwise key
@@ -1676,9 +1710,12 @@ impl<
                 );
                 match action {
                     RoutingAction::Consumed => {
-                        // Trim the payload to the incoming frame size so that
-                        // trailing zeros from the scratchpad buffer are not
-                        // forwarded on the wire.
+                        // Trim the payload so trailing zeros from the
+                        // scratchpad buffer are not forwarded on the wire. An
+                        // OGM states its own length and is trimmed to that;
+                        // every other reply is the incoming packet with a
+                        // decremented TTL, so the incoming size is the right
+                        // bound for those.
                         let forward = if reply.protocol != 0 {
                             // A re-flood of an OGM *is* advertising its originator
                             // as reachable through us. Suppress it when the OGM
@@ -1698,7 +1735,21 @@ impl<
                                 );
                                 None
                             } else {
-                                let len = frame.payload.len().min(reply.payload.len());
+                                // An OGM states its own length exactly (fixed
+                                // header + `tvlv_len`), and a forwarded one is
+                                // deliberately *not* the size of the frame that
+                                // prompted it: the relay rewrites the TVLV
+                                // region, adding its own `PrevSender` stamp and
+                                // dropping the previous hop's. Sizing it from
+                                // the incoming frame — correct for every other
+                                // forward, where the reply is the same packet
+                                // with a decremented TTL — would silently
+                                // truncate exactly those trailing bytes, and
+                                // the loop guard that stamp exists for would
+                                // then never fire.
+                                let len = reply_ogm_wire_len(&reply).unwrap_or_else(|| {
+                                    frame.payload.len().min(reply.payload.len())
+                                });
                                 Some(LinkFrameData {
                                     dst: reply.dst,
                                     protocol: reply.protocol,

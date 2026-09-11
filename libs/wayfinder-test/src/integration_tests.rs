@@ -189,6 +189,13 @@ fn setup() {
 /// simulation, not of how fast the machine ran it.
 fn converge_at(h: &mut TestHarness, at: Duration) {
     h.converge(at);
+    // Every convergence in this suite also asserts the data plane it converged
+    // *to* is loop-free, not merely that the control plane went quiet. Wired in
+    // here rather than called per-test so a topology added later inherits it —
+    // which holds only while every convergence goes through this helper, so
+    // prefer it over `TestHarness::converge` even where the loop-freeness of a
+    // particular fixture is not the point of the test.
+    assert_forwarding_graph_loop_free(h);
 }
 
 /// Age out routes that have stopped being refreshed by advancing the virtual
@@ -542,7 +549,7 @@ fn test_authenticated_unicast_delivers_and_strips_tag() {
     // key (required to tag/verify directed frames), and settle so the
     // next-hop proof challenge/response round trip completes too — a route
     // whose next hop has not yet proven itself is refused by `send_local`.
-    harness.converge(Duration::from_secs(1));
+    converge_at(&mut harness, Duration::from_secs(1));
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 1);
     }
@@ -588,7 +595,7 @@ fn an_unanchored_mesh_still_routes_and_tags() {
     enable_auth_unanchored(harness.get_machine_mut("machine1"), &authority, 0);
     enable_auth_unanchored(harness.get_machine_mut("machine2"), &authority, 1);
 
-    harness.converge(Duration::from_secs(1));
+    converge_at(&mut harness, Duration::from_secs(1));
     for router in harness.machines.values() {
         assert_eq!(
             router.router().originator_table().count(),
@@ -1301,6 +1308,203 @@ fn ogms_stop_after_convergence() {
         after_settle,
         "OGMs must stop after a converged mesh floods one round; continued \
          OGM traffic indicates a forwarding loop",
+    );
+}
+
+/// Assert the mesh's **data plane** is loop-free: from every node, following
+/// `best_next_hop` toward every destination it holds a route to never revisits
+/// a node.
+///
+/// It does not assert the walk *reaches* the destination — see the narrowness
+/// note below, which is deliberate.
+///
+/// This is a different property from the one [`TestHarness::settle`] and
+/// [`ogms_stop_after_convergence`] check, and the distinction is the whole
+/// reason it exists. Those assert the *control plane* quiesces — that a flooded
+/// OGM stops circulating. A mesh can do that perfectly and still settle on
+/// routing tables that point at each other: the seqno gate stops the OGM going
+/// round while `best_next_hop` sends *data* frames round in a circle until
+/// their TTL drains. Nothing in the harness noticed that before this.
+///
+/// Deliberately narrow. A destination with no usable next hop, or a hop this
+/// harness does not own (a synthetic originator no machine plays), ends the
+/// walk rather than failing it — a black hole is a real bug but a different
+/// one, and an invariant that fails for two unrelated reasons gets switched
+/// off. This fails for exactly one reason: a cycle.
+fn assert_forwarding_graph_loop_free(h: &TestHarness) {
+    let by_ident: std::collections::HashMap<Mac, &TestRouter> = h
+        .machines
+        .values()
+        .map(|m| (m.router().self_ident(), m))
+        .collect();
+
+    let sources: Vec<Mac> = by_ident.keys().copied().collect();
+    let destinations = |src: Mac| -> Vec<Mac> {
+        by_ident
+            .get(&src)
+            .map(|m| {
+                m.router()
+                    .originator_table()
+                    .map(|r| r.neighbor_ident)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let next_hop = |at: Mac, dest: Mac| -> Option<Mac> {
+        by_ident
+            .get(&at)?
+            .router()
+            .originator_table()
+            .find(|r| r.neighbor_ident == dest)
+            .and_then(|r| r.best_next_hop)
+    };
+
+    assert_walks_are_acyclic(&sources, destinations, next_hop);
+}
+
+/// The cycle check itself, over an abstract forwarding table rather than a
+/// harness.
+///
+/// Split out so the assertion can be *tested*, which matters more here than
+/// the usual argument for extracting a function: this invariant has never been
+/// observed to fail. It was introduced green — it passed on all 84 existing
+/// topologies — so nothing so far distinguishes "no mesh in the suite loops"
+/// from "the walk breaks out before it can notice". A negative control against
+/// a synthetic looping table settles that, and cannot be built from real
+/// routers without corrupting one on purpose.
+///
+/// `next_hop(at, dest)` is how `at` would forward a frame addressed to `dest`;
+/// `None` ends that walk.
+fn assert_walks_are_acyclic<D, N>(sources: &[Mac], destinations: D, next_hop: N)
+where
+    D: Fn(Mac) -> Vec<Mac>,
+    N: Fn(Mac, Mac) -> Option<Mac>,
+{
+    for &src in sources {
+        for dest in destinations(src) {
+            if dest == src {
+                continue;
+            }
+
+            let mut at = src;
+            let mut visited = vec![src];
+            // Bounded by the node count regardless of what the tables say, so
+            // a cycle fails the assertion below rather than hanging here.
+            for _ in 0..=sources.len() {
+                let Some(hop) = next_hop(at, dest) else {
+                    break;
+                };
+                if hop == dest {
+                    break;
+                }
+                assert!(
+                    !visited.contains(&hop),
+                    "routing loop reaching {dest:?} from {src:?}: the path \
+                     revisits {hop:?} after {visited:?}. Each node forwards to \
+                     the next, so a data frame for {dest:?} circulates here \
+                     until its TTL drains.",
+                );
+                visited.push(hop);
+                at = hop;
+            }
+        }
+    }
+}
+
+/// The negative control for [`assert_walks_are_acyclic`]: a forwarding table
+/// that *does* loop must fail it.
+///
+/// Two nodes each naming the other as the next hop toward a third — the shape
+/// the production incident took, where a node routed the CA through a dongle
+/// whose own next hop for the CA was that node.
+#[test]
+#[should_panic(expected = "routing loop reaching")]
+fn the_loop_check_fails_on_a_forwarding_table_that_loops() {
+    let (a, b, dest) = (machine_ident(0), machine_ident(1), machine_ident(2));
+    assert_walks_are_acyclic(
+        &[a, b],
+        |_| vec![dest],
+        |at, _| Some(if at == a { b } else { a }),
+    );
+}
+
+/// And it must stay silent on a table that merely forwards.
+#[test]
+fn the_loop_check_passes_a_chain_that_reaches_its_destination() {
+    let (a, b, dest) = (machine_ident(0), machine_ident(1), machine_ident(2));
+    assert_walks_are_acyclic(
+        &[a, b],
+        |_| vec![dest],
+        |at, d| {
+            if at == a { Some(b) } else { Some(d) }
+        },
+    );
+}
+
+/// A stub neighbour must not become a *path* to the node behind this one.
+///
+/// [`line_of_three`] is `machine1 — machine2 — machine3`, so from `machine2`
+/// there is exactly one way to reach `machine1`: directly. `machine3` is a stub
+/// whose only route to `machine1` runs back through `machine2`.
+///
+/// But floods go out every interface including the ingress one
+/// (`driver_core::Egress::Auto`, and deliberately so — per-interface exclusion
+/// black-holed real topologies), so `machine2` re-floods `machine1`'s OGM to
+/// `machine3`, and `machine3` floods it straight back. Path learning is *also*
+/// deliberately not gated on the sequence number advancing (design 09 §8.11 —
+/// gating it turned one replayed frame into a targeted route denial), so
+/// `machine2` learns that echo as a second path to `machine1`.
+///
+/// Neither of those decisions is wrong on its own; together they manufactured a
+/// path that did not exist. Before the `PrevSender` guard landed, that was not
+/// merely cosmetic:
+///
+///   * `paths` holds **four** entries. A phantom occupies a slot a genuine
+///     redundant path would otherwise take.
+///   * It is regenerated from this node's own re-flood over whatever link the
+///     stub is on, so on a fast, lossless stub it is always fresh — while the
+///     real path ages on the far node's cadence.
+///   * Selecting it is a loop: `machine3`'s own next hop toward `machine1` is
+///     `machine2`.
+///
+/// Nothing in `BatmanOgmPacket` itself tells the two apart: `machine2` sees
+/// `orig = machine1` and `frame.src = machine3` in both the genuine and the
+/// laundered case. What separates them is the record the *forwarder* writes —
+/// `TvlvType::PrevSender`, naming the neighbour it heard the OGM from. Here
+/// `machine3` stamps `machine2`, so `machine2` recognises its own re-flood and
+/// drops it instead of booking a path.
+#[test]
+fn a_stub_neighbour_is_not_a_path_to_the_hub_behind_it() {
+    setup();
+    let mut harness = line_of_three();
+    converge_at(&mut harness, Duration::from_secs(1));
+
+    let hub = machine_ident(0);
+    let stub = machine_ident(2);
+    let us = harness.machines.get("machine2").unwrap().router();
+
+    let record = us
+        .originator_table()
+        .find(|r| r.neighbor_ident == hub)
+        .expect("machine2 must have a route to machine1");
+
+    assert_eq!(
+        record.best_next_hop,
+        Some(hub),
+        "machine1 is a direct neighbour, so it must be its own next hop",
+    );
+
+    let via_stub: Vec<_> = record
+        .paths
+        .iter()
+        .filter(|p| p.neighbor_ident == stub)
+        .collect();
+    assert!(
+        via_stub.is_empty(),
+        "machine3 is a stub whose only route to machine1 is back through \
+         machine2, so it must not appear as a path to machine1. Found \
+         {via_stub:?} among {:?}",
+        record.paths,
     );
 }
 
@@ -3498,7 +3702,7 @@ fn one_multicast_frame_crosses_the_wire_and_the_radio_once_each() {
     // Converge *forward* of whatever instant the precondition loop reached: a
     // fixed instant would run the virtual clock backwards once that loop
     // needed more than one round.
-    h.converge(at + Duration::from_secs(5));
+    converge_at(&mut h, at + Duration::from_secs(5));
 
     assert_eq!(
         radio.load(Ordering::Relaxed),
@@ -3702,5 +3906,44 @@ fn an_authenticated_neighbor_regains_a_next_hop_after_a_long_outage() {
         harness.get_machine("machine1").local_deliveries().len(),
         before + 1,
         "the reborn machine2's unicast data must reach machine1 again"
+    );
+}
+
+/// The limit of the phantom path's damage: it did **not** keep a silenced hub
+/// reachable — and eviction still works now the guard has removed the phantom.
+///
+/// Worth pinning down because it was the first thing to suspect and it was not
+/// true. The phantom that
+/// [`a_stub_neighbour_is_not_a_path_to_the_hub_behind_it`] now rules out was
+/// regenerated from this node's own re-flood, so the obvious worry was that it
+/// refreshed itself forever and an originator that had gone away was never
+/// evicted — leaving a node advertising a route it could not deliver on.
+///
+/// It never did, because a node only ever forwards an OGM it has just
+/// *received*; nothing re-emits another node's OGM on a timer. Silence the hub
+/// and the stub stops hearing about it too, so the real path and the phantom
+/// starved together and `purge_stale` took the record with them.
+///
+/// The defect was therefore confined to path *selection* and to the four-entry
+/// `paths` budget, never to liveness. This test bounded the damage before the
+/// `PrevSender` guard landed and stays as the regression that the guard did not
+/// change eviction behaviour in the course of fixing selection.
+#[test]
+fn a_silenced_hub_is_evicted_despite_the_stub_echo() {
+    setup();
+    let mut harness = line_of_three();
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round));
+    }
+
+    let hub = machine_ident(0);
+    harness.disconnect_machine("machine1");
+    age_out(&mut harness);
+
+    let us = harness.machines.get("machine2").unwrap().router();
+    let rec = us.originator_table().find(|r| r.neighbor_ident == hub);
+    assert!(
+        rec.is_none(),
+        "a silenced hub must be evicted, not kept alive by the stub's echo",
     );
 }

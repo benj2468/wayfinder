@@ -586,6 +586,8 @@ impl RouterReads for Mock {
             untaggable_drop_rate: 0.0,
             seqno_resyncs: 0,
             ogm_refloods_suppressed: 0,
+            ogm_echoes_dropped: 0,
+            ogm_tails_malformed: 0,
             proofs_swept: 0,
             unjudged_cert_admissions: 0,
         }

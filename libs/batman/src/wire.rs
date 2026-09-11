@@ -208,6 +208,193 @@ pub enum TvlvType {
     /// (unknown originator, or a changed fingerprint = rotation) triggers an
     /// on-demand `CertReq`/`CertReply` fetch rather than re-verifying inline.
     CertFp = 0x83,
+    /// The neighbour a *forwarder* heard this OGM from — six `Mac` bytes.
+    /// Wayfinder-specific, and the one TVLV a relay writes about itself rather
+    /// than carrying on the originator's behalf.
+    ///
+    /// Present only on **forwarded** OGMs. A node's own emission has no
+    /// previous sender, so an originated OGM carries no such record and costs
+    /// nothing — which matters on the small-MTU radios, where every byte is
+    /// fragments.
+    ///
+    /// # What it is for
+    ///
+    /// Floods go out every interface including the one they arrived on
+    /// (`driver_core::Egress::Auto`, deliberately — per-interface exclusion
+    /// black-holes real topologies), so a neighbour re-floods our own forward
+    /// straight back at us. Path learning is *also* deliberately not gated on
+    /// the sequence number advancing (design 09 §8.11), so without this record
+    /// that echo is learned as a path to the originator — a path that does not
+    /// exist, and whose selection is a routing loop.
+    ///
+    /// Naming who the forwarder heard it from is exactly enough to tell the
+    /// two apart, and nothing else on the wire can: `orig` names the
+    /// originator and the link header names the immediate sender, both of
+    /// which look identical in the genuine and the laundered case.
+    ///
+    /// # Semantics, which are easy to get backwards
+    ///
+    /// A forwarder stamps **the address it received the OGM from**, not its
+    /// own. A receiver drops an OGM whose record names *itself*: the sender
+    /// heard this copy from us, so it is repeating our own re-flood.
+    ///
+    /// It does not prove the sender's *route* to the originator runs back
+    /// through us. A node re-floods only the first copy of each seqno it sees,
+    /// so a neighbour with a genuine independent path that happened to hear
+    /// our copy first stamps us too, and is dropped alongside the phantoms.
+    /// That is the accepted cost: it forgoes at most one seqno's worth of path
+    /// evidence from that neighbour, and the next seqno re-tests it.
+    ///
+    /// Stamping one's own address instead would never match anything — B would
+    /// write `B`, and A would compare it against `A` — and the guard would
+    /// silently do nothing.
+    ///
+    /// # What it does not catch
+    ///
+    /// Only the two-hop bounce (`A → B → A`). A longer cycle
+    /// (`A → B → C → A`) reaches A naming `B`, which A cannot recognise; a
+    /// full path vector would be needed, at a cost this medium cannot pay.
+    /// The two-hop case is the one a stub neighbour manufactures continuously,
+    /// which is what makes it worth the ten bytes a record costs
+    /// ([`PREV_SENDER_RECORD_LEN`] — a four-byte TVLV header around the six
+    /// address bytes).
+    ///
+    /// # Not signed, and it must stay that way
+    ///
+    /// [`TvlvType::OgmSig`] spans the originator's immutable identity (`orig`,
+    /// `seqno`) and its certificate — and no TVLV bytes on the wire at all, so
+    /// this record is not an exception to a rule; it is like every other
+    /// record in that respect. What *is* specific to this one is that it is
+    /// rewritten at every hop like `ttl` and `tq`, so bringing it under the
+    /// signature would make every forwarded OGM fail verification.
+    ///
+    /// The consequence to keep in view: this is a **cooperative correctness
+    /// mechanism, not a security control**. It has no integrity protection,
+    /// the link-layer source it is compared against is unauthenticated, and a
+    /// hostile relay declines the guard for free by simply not stamping —
+    /// exactly as an un-upgraded peer does. It buys correct path selection
+    /// among cooperating nodes; it buys nothing against an adversary.
+    PrevSender = 0x84,
+}
+
+/// Length of a TVLV record header on the wire.
+const TVLV_HDR_LEN: usize = core::mem::size_of::<BatmanTvlvHdr>();
+
+/// Value length of a [`TvlvType::PrevSender`] record: one `Mac`.
+///
+/// Derived from `Mac` rather than written as `6`, so the record and the type
+/// it carries cannot drift apart.
+const PREV_SENDER_LEN: usize = core::mem::size_of::<Mac>();
+
+/// Total wire cost of a [`TvlvType::PrevSender`] record, header included —
+/// what forwarding an OGM adds to it.
+pub const PREV_SENDER_RECORD_LEN: usize = TVLV_HDR_LEN + PREV_SENDER_LEN;
+
+/// The exact number of bytes [`stamp_prev_sender`] would write for `tail`, or
+/// `None` if `tail` is malformed.
+///
+/// Exists so a caller can tell the two ways a rewrite fails apart *before*
+/// attempting it. `stamp_prev_sender` returns `None` both for a malformed tail
+/// and for an output buffer too small to hold the result, but those are
+/// opposite diagnoses: a small buffer is this node's own scratchpad being
+/// wrong for the link it is relaying onto, while a malformed tail is a peer
+/// emitting frames no buffer size will make forwardable. Reporting one as the
+/// other sends an operator to resize an MTU that was never the problem.
+///
+/// The count is exact rather than an upper bound, which matters because it is
+/// the number an operator sizes a link by: a tail that already carries a
+/// previous hop's stamp does not grow, since [`stamp_prev_sender`] replaces
+/// that record rather than appending to it.
+pub fn stamped_len(tail: &[u8]) -> Option<usize> {
+    let mut read = 0usize;
+    let mut kept = 0usize;
+
+    while read + TVLV_HDR_LEN <= tail.len() {
+        let (hdr, _) = BatmanTvlvHdr::ref_from_prefix(&tail[read..]).ok()?;
+        let value_end = (read + TVLV_HDR_LEN).checked_add(u16::from_be(hdr.len) as usize)?;
+        if value_end > tail.len() {
+            return None;
+        }
+        if hdr.tvlv_type != TvlvType::PrevSender.as_u8() {
+            kept = kept.checked_add(value_end - read)?;
+        }
+        read = value_end;
+    }
+
+    kept.checked_add(PREV_SENDER_RECORD_LEN)
+}
+
+/// Copy the TVLV region `tail` into `out`, dropping any
+/// [`TvlvType::PrevSender`] record already there and appending one naming
+/// `prev`.  Returns the number of bytes written, or `None` if `out` cannot
+/// hold the result, or a record in `tail` claims more bytes than `tail` holds.
+/// A trailing fragment shorter than a TVLV header is dropped rather than
+/// refused.
+///
+/// Callers needing to tell those two failures apart — they are opposite
+/// diagnoses — should ask [`stamped_len`] first.
+///
+/// **Replace rather than append**, which is the whole reason this is a
+/// function and not two calls: every hop stamps this record, so a tail
+/// carrying the previous hop's copy must lose it here. Appending instead
+/// would grow an OGM by [`PREV_SENDER_RECORD_LEN`] at every hop, so the cost
+/// would scale with path length rather than staying flat.
+///
+/// Every other record is copied through byte-for-byte and in order, since a
+/// relay is not entitled to alter what the originator said — the certificate,
+/// the signature over it, multicast memberships and revocations all propagate
+/// unchanged.
+pub fn stamp_prev_sender(tail: &[u8], out: &mut [u8], prev: Mac) -> Option<usize> {
+    let mut read = 0usize;
+    let mut written = 0usize;
+
+    while read + TVLV_HDR_LEN <= tail.len() {
+        let (hdr, _) = BatmanTvlvHdr::ref_from_prefix(&tail[read..]).ok()?;
+        let value_end = (read + TVLV_HDR_LEN).checked_add(u16::from_be(hdr.len) as usize)?;
+        // A record claiming more bytes than the tail holds makes the rest of
+        // the region unparseable; refuse rather than forward a truncated tail.
+        if value_end > tail.len() {
+            return None;
+        }
+        if hdr.tvlv_type != TvlvType::PrevSender.as_u8() {
+            let record = tail.get(read..value_end)?;
+            out.get_mut(written..written.checked_add(record.len())?)?
+                .copy_from_slice(record);
+            written += record.len();
+        }
+        read = value_end;
+    }
+
+    let hdr = BatmanTvlvHdr {
+        tvlv_type: TvlvType::PrevSender.as_u8(),
+        version: 1,
+        len: (PREV_SENDER_LEN as u16).to_be(),
+    };
+    out.get_mut(written..written.checked_add(TVLV_HDR_LEN)?)?
+        .copy_from_slice(hdr.as_bytes());
+    written += TVLV_HDR_LEN;
+    out.get_mut(written..written.checked_add(PREV_SENDER_LEN)?)?
+        .copy_from_slice(prev.as_bytes());
+    written += PREV_SENDER_LEN;
+
+    Some(written)
+}
+
+/// The neighbour the forwarder of this OGM heard it from, if it said — the
+/// value of the **first** [`TvlvType::PrevSender`] record in `tail`.
+///
+/// First rather than only: [`stamp_prev_sender`] emits exactly one, but a
+/// hand-crafted OGM can carry several and nothing on receipt rejects that.
+/// Reading the first is safe because the guard is cooperative either way (see
+/// [`TvlvType::PrevSender`]) — a sender wanting to evade it omits the record
+/// rather than duplicating it.
+///
+/// `None` for an originated OGM (which has no previous sender), for a peer
+/// too old to stamp one, and for a malformed record. All three mean "cannot
+/// tell", which leaves the pre-existing behaviour in place rather than
+/// dropping traffic on a guess.
+pub fn prev_sender(tail: &[u8]) -> Option<Mac> {
+    Mac::try_from(find_tvlv(tail, TvlvType::PrevSender)?).ok()
 }
 
 impl TvlvType {

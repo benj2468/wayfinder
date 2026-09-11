@@ -308,7 +308,8 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
              cert_store: {}\nin_flight_cert_requests: {}\npending_cert_replies: {}\n\
              cert_req_rate: {:.2}\ncert_reply_rate: {:.2}\n\
              untaggable_drop_rate: {:.2}\n\
-             seqno_resyncs: {}\nogm_refloods_suppressed: {}\nproofs_swept: {}",
+             seqno_resyncs: {}\nogm_refloods_suppressed: {}\n\
+             ogm_echoes_dropped: {}\nogm_tails_malformed: {}\nproofs_swept: {}",
             v.uptime_secs,
             v.neighbor_count,
             occ(&v.originators),
@@ -330,6 +331,8 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
             v.untaggable_drop_rate,
             v.seqno_resyncs,
             v.ogm_refloods_suppressed,
+            v.ogm_echoes_dropped,
+            v.ogm_tails_malformed,
             v.proofs_swept,
         )
     })
