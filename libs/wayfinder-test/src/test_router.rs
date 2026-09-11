@@ -22,6 +22,7 @@
 //!
 //! [`LinkT`]: wayfinder::link::LinkT
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use interfaces::frame::LinkFrame;
@@ -30,6 +31,7 @@ use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use wayfinder::CentralRouter;
 use wayfinder::config::TrickleConfig;
+use wayfinder_alarm::SharedBoard;
 use wayfinder_tick_driver::Driver;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
@@ -105,6 +107,18 @@ pub struct TestRouter {
     /// Inner frames the router handed up for local delivery (what would be
     /// written to the TAP), in arrival order.
     deliveries: Vec<Vec<u8>>,
+    /// This node's own alarm board — what it *reported*, as distinct from what
+    /// it routed.
+    ///
+    /// Per-node rather than the process-global board `alarm!` would otherwise
+    /// reach, for the reason `wayfinder-alarm`'s `with_board` exists: the
+    /// harness runs many nodes in one process, so a shared board would pool
+    /// every node's rows and no test could say *which* node raised one. Scoped
+    /// around both entry points that run engine code —
+    /// [`step_schedules`](Self::step_schedules) and
+    /// [`receive_with_metrics`](Self::receive_with_metrics) — so a row cannot
+    /// escape onto the global board depending on how a test drove the node.
+    board: Arc<SharedBoard>,
 }
 
 impl TestRouter {
@@ -127,6 +141,7 @@ impl TestRouter {
             ident,
             ports: interfaces,
             deliveries: Vec::new(),
+            board: Arc::new(SharedBoard::new()),
         }
     }
 
@@ -182,9 +197,26 @@ impl TestRouter {
     /// is how a test reproduces a node whose liveness signal has stopped while
     /// its routing chatter continues.
     pub fn step_schedules(&mut self, now: Duration, ogms: bool, keepalives: bool) {
-        self.pump_in();
-        self.driver.tick_schedules(now, ogms, keepalives);
-        self.pump_out();
+        // Everything this node does inside one step raises onto *its* board.
+        // The clone is what lets the closure borrow `self` mutably: the scope
+        // needs a board reference that does not alias the one in `self`.
+        let board = Arc::clone(&self.board);
+        wayfinder_alarm::with_board(&board, || {
+            self.pump_in();
+            self.driver.tick_schedules(now, ogms, keepalives);
+            self.pump_out();
+        });
+    }
+
+    /// The alarm rows this node has raised, newest window included.
+    ///
+    /// The counterpart to [`local_deliveries`](Self::local_deliveries) for the
+    /// reporting path: a routing assertion says what a node *did*, and this
+    /// says what it told an operator about it. A test that only checks routing
+    /// cannot see a detector firing continuously against an honest peer — which
+    /// is exactly how design 09 §8.12 reached hardware before it reached CI.
+    pub fn alarms(&self) -> Vec<wayfinder_alarm::Alarm> {
+        self.board.snapshot().alarms.to_vec()
     }
 
     /// Drive one periodic tick at `now`, emitting an OGM for each interface
@@ -263,14 +295,19 @@ impl TestRouter {
     ) {
         let mut buf = [0u8; MAX_LINK_FRAME_LEN];
         let frame = parse_frame(raw);
-        let _ = self.driver.router_mut().handle_frame_with_metrics(
-            now,
-            iface_idx,
-            frame,
-            metrics,
-            &mut buf,
-            &mut (),
-        );
+        // Scoped like `step_schedules`: this is the other way a test runs
+        // engine code, and anything it raises is this node's too.
+        let board = Arc::clone(&self.board);
+        wayfinder_alarm::with_board(&board, || {
+            let _ = self.driver.router_mut().handle_frame_with_metrics(
+                now,
+                iface_idx,
+                frame,
+                metrics,
+                &mut buf,
+                &mut (),
+            );
+        });
     }
 
     // ── port plumbing ────────────────────────────────────────────────────────

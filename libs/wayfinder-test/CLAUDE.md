@@ -64,6 +64,23 @@ the wrong reason.
 only *moves* frames already in flight, so periodic rounds stay under the test's
 explicit control.
 
+## Alarms
+
+Each `TestRouter` owns its **own** `wayfinder_alarm::SharedBoard`, scoped around
+the two entry points that run engine code (`step_schedules` and
+`receive_with_metrics`). Per-node rather than the process-global board `alarm!`
+would otherwise reach, for the reason `with_board` exists: the harness runs many
+nodes in one process, so one shared board would pool every node's rows and no
+test could say which node raised one.
+
+`TestRouter::alarms()` is the reporting-path counterpart to
+`local_deliveries()`: routing assertions say what a node *did*, this says what
+it told an operator about it. Reach for it whenever the behaviour under test has
+a detector attached — a healthy fixture that raises nothing is a cheap, broad
+net, and its absence is why design 09 §8.12 (a detector firing continuously
+against an honest peer) was found on hardware rather than here.
+`a_healthy_authed_mesh_raises_no_alarms` is the pattern to copy.
+
 ## Clock
 
 There is no wall clock and no executor. `TestHarness::clock` is a virtual

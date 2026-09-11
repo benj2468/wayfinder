@@ -13,6 +13,11 @@ wayfinder-tick-driver = { path = "../wayfinder-tick-driver" }
 # The std certificate authority, to mint certs for authenticated-mesh tests.
 wayfinder-auth = { workspace = true, features = ["std"] }
 interfaces.workspace = true
+# The alarm board every node raises onto. Held per-`TestRouter` and scoped
+# around each step, so a multi-node test can assert on what its nodes *reported*
+# and not only on what they routed — without the process-global board every
+# node in the simulation would otherwise share.
+wayfinder-alarm.workspace = true
 
 thiserror.workspace = true
 zerocopy.workspace = true
