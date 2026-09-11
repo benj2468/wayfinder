@@ -172,6 +172,20 @@ pub trait RouterOps {
     /// How many mesh interfaces are configured.
     fn num_interfaces(&self) -> usize;
 
+    /// This node's own mesh address — the link-layer `dst` a neighbor puts on a
+    /// *directed* frame it is handing to this hop. (A flood is addressed to a
+    /// group instead, which is why the caller below treats the two apart.)
+    ///
+    /// On the driver surface because the receive path has to tell a frame
+    /// addressed to this node from one merely overheard: a fan-out copy of a
+    /// next-hop challenge, or a neighbor's unicast to another neighbor on a
+    /// shared medium. Both reach `handle_mesh_frame` on every shell, and
+    /// answering them as though they were ours turned an honest neighbor into a
+    /// permanent `UnauthenticatedTraffic` row (design 09 §8.12).
+    ///
+    /// Same value as [`CentralRouter::self_ident`], which this forwards to.
+    fn self_ident(&self) -> Mac;
+
     /// Record one directed frame dropped for want of a pairwise key with its
     /// next hop.
     fn record_untaggable_drop(&mut self, now: Duration);
@@ -378,6 +392,10 @@ impl<
 
     fn num_interfaces(&self) -> usize {
         Self::num_interfaces(self)
+    }
+
+    fn self_ident(&self) -> Mac {
+        Self::self_ident(self)
     }
 
     fn record_untaggable_drop(&mut self, now: Duration) {

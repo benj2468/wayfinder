@@ -289,8 +289,11 @@ fn required_proof(payload: &[u8]) -> RequiredProof {
 /// when auth is enabled, returning the frame to route on: the original frame
 /// (auth off, or a sub-type that carries no pairwise tag), a shorter *view*
 /// over the same bytes with the trailer dropped, or `None` if the frame must be
-/// dropped (bad/missing tag from an unverified or foreign neighbor).
+/// dropped (bad/missing tag from an unverified or foreign neighbor, or a
+/// pairwise-tagged frame the link layer addressed to some other hop).
 fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
+    // Read before the mutable borrow of `auth` below, which lasts to the end.
+    let this_hop = router.self_ident();
     // Tagged-or-not is `required_proof`'s call, from the sub-type alone
     // and never from `frame.dst` — see its doc for why. With auth off nothing
     // is tagged at all.
@@ -313,6 +316,61 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
             trace!(src = ?frame.src, "drop: multicast naming an unknown auth form");
             return None;
         }
+    }
+
+    // A pairwise-tagged frame is handed to one hop at a time, and the
+    // link-layer `dst` names that hop — the final destination rides in the
+    // BATMAN header instead. So a unicast `dst` naming some *other* node says
+    // this frame was never for this hop: a fan-out copy of a
+    // `poll_due_challenges` emission, or a neighbor's unicast to another
+    // neighbor overheard on a shared medium (raw L2 on a LAN segment, the LoRa
+    // broadcast medium, BLE advertising). Dropped here with a `trace!` and
+    // pointedly *without* the alarm below, which is what turned a healthy
+    // mesh's own challenge fan-out into a permanent `UnauthenticatedTraffic`
+    // row against an honest neighbor (design 09 §8.12).
+    //
+    // Three boundaries, each load-bearing and none of them tidy-able:
+    //
+    // * **Only the pairwise proofs.** `Fanout` is deliberately not gated:
+    //   `verify_fanout` is an Ed25519 signature by `src` over the frame and
+    //   takes no `dst` at all, so here the check would be a genuinely *new*
+    //   refusal rather than a restatement of the verifier — and it would
+    //   quietly promote "Signature form implies a group `dst`" into a
+    //   receive-side invariant, where today it is only a property of the one
+    //   emitter (`flush_mcast_groups` always broadcasts a merged frame).
+    //   `Tag`/`NonceTag` are the opposite: the tag is keyed on
+    //   `K(sender, dst)` and this node verifies with `K(self, src)`, so a
+    //   frame addressed elsewhere could never have verified here and the gate
+    //   only moves the drop earlier. Earlier *does* buy one thing — a sender
+    //   that tags for us while writing a third party's `dst` can no longer
+    //   advance our replay high-water from a frame that was not ours.
+    // * **Never on a group `dst`.** A group address still reaches the
+    //   verifier, exactly as before — see
+    //   `a_tagged_unicast_is_accepted_even_under_a_group_link_dst` for why
+    //   rejecting there would be wrong. The alarm therefore remains reachable
+    //   under a group `dst`; what it is no longer spent on is a frame handed
+    //   to a different hop.
+    // * **An unrecognised sub-type is the one place the premise above does not
+    //   hold.** `route_by_dest` treats the link `dst` as the *end-to-end*
+    //   address, so this refuses its forward branch. That branch was already
+    //   dead under auth — an end-to-end `dst` means the sender tagged with
+    //   `K(sender, final_dest)`, which no intermediate hop can verify — so all
+    //   this removes is the false alarm that came with the drop.
+    //
+    // The check can only ever *narrow* what is accepted, and only on a value
+    // naming a third party, so an attacker choosing `dst` can use it to drop
+    // its own frames and nothing else.
+    if matches!(proof, RequiredProof::Tag | RequiredProof::NonceTag)
+        && !frame.dst.is_multicast()
+        && frame.dst != this_hop
+    {
+        trace!(
+            src = ?frame.src,
+            dst = ?frame.dst,
+            sub_type = ?frame.payload.first().copied().and_then(BatmanPacketType::from_u8),
+            "drop: directed frame addressed to another hop"
+        );
+        return None;
     }
 
     let Some(body_len) = frame.payload.len().checked_sub(trailer_len) else {
@@ -1949,6 +2007,184 @@ mod tests {
         assert_eq!(board.snapshot().alarms.len(), 2);
     }
 
+    /// A neighbor's next-hop challenge aimed at a *third* node, arriving here
+    /// only because it was fanned out onto this interface, is dropped without
+    /// raising anything.
+    ///
+    /// [`poll_due_challenges`] emits every challenge on *every* interface on
+    /// purpose — resolving the egress through the link-quality table would let
+    /// an attacker who has spoofed a member's source address collect the
+    /// challenge instead (see its doc) — so a node with two mesh interfaces
+    /// routinely puts a challenge meant for the neighbor on one of them onto
+    /// the other as well. Any shared medium produces the same shape without a
+    /// fan-out at all: a raw-L2 link on a LAN segment, the LoRa broadcast
+    /// medium and BLE advertising all deliver a neighbor's unicasts to every
+    /// other node that can hear them.
+    ///
+    /// The frame is genuinely tagged, under the pairwise key its sender shares
+    /// with the node it names — a key this node does not hold and never will,
+    /// so it can never verify. Alarming on it made `unauthenticated_traffic`
+    /// climb once per neighbor per `seed_interval()` on a perfectly healthy
+    /// mesh, burying the one alarm that reports a real attacker under expected
+    /// noise: exactly the flood `wayfinder-alarm` exists not to become.
+    #[test]
+    fn a_fanned_out_challenge_for_another_neighbor_raises_no_alarm() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+
+        // mac(2) and mac(3) verify each other, so mac(2) holds a real pairwise
+        // key with mac(3): the key the challenge below is tagged under, and the
+        // one mac(1) has no way to reproduce.
+        let mut third = member_auth(&authority, 3, mac(3));
+        let third_ogm = signed_ogm_bytes(&mut third, mac(3), 1);
+        assert_eq!(peer.verify_ogm(&third_ogm), OgmVerdict::Verified);
+
+        let hdr = wayfinder::batman::wire::BatmanNextHopChallengePacket {
+            packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
+            version: BATMAN_VERSION,
+        };
+        let mut body = hdr.as_bytes().to_vec();
+        body.extend_from_slice(&[0x5A; wayfinder::auth::CHALLENGE_NONCE_LEN]);
+        let inner_len = body.len();
+        body.resize(inner_len + DIRECTED_TRAILER_LEN, 0);
+        let (inner, trailer) = body.split_at_mut(inner_len);
+        peer.tag_directed(mac(3), inner, trailer)
+            .expect("mac(2) tags to its verified neighbor mac(3)");
+
+        // Addressed to mac(3) at the link layer; heard by mac(1) on its second
+        // interface, which is the whole bug.
+        let link = frame_bytes(mac(3), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                1,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &[],
+                &mut sink,
+            );
+        });
+
+        assert!(
+            board.snapshot().alarms.is_empty(),
+            "a frame addressed to another node is not this node's to alarm on"
+        );
+        assert!(
+            sink.mesh.is_empty() && sink.local.is_empty(),
+            "and it is dropped, not answered or delivered"
+        );
+    }
+
+    /// A **fan-out** (`Signature`-form) multicast is not subject to the
+    /// address gate, even under a unicast link `dst` naming a third party.
+    ///
+    /// The deliberate asymmetry with the test above, and the one an
+    /// over-eager tightening would break. `verify_fanout` is an Ed25519
+    /// signature by `src` over the frame; it takes no `dst`, so unlike a
+    /// pairwise tag it verifies perfectly well at a node the link layer did
+    /// not address. Gating it would therefore *newly* refuse a frame that
+    /// authenticates, and would make "Signature form implies a group `dst`" a
+    /// receive-side invariant — where today it is only a property of
+    /// `flush_mcast_groups`, the single emitter, which always broadcasts.
+    ///
+    /// Nothing is lost by leaving it open: a fan-out frame overheard on a
+    /// shared medium verifies, so it never reached the alarm this change
+    /// exists to silence in the first place.
+    #[test]
+    fn a_fanout_multicast_is_not_gated_by_the_link_dst() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+
+        let mut body = [0u8; 256];
+        let n = wayfinder::batman::wire::write_mcast(
+            50,
+            McastAuthForm::Signature,
+            &[mac(1)],
+            b"FANOUT-UNDER-A-THIRD-PARTY-DST",
+            &mut body,
+        )
+        .expect("one destination fits");
+        let mut trailer = [0u8; wayfinder::auth::FANOUT_TRAILER_LEN];
+        peer.sign_fanout(&body[..n], &mut trailer).expect("sign");
+        let mut payload = body[..n].to_vec();
+        payload.extend_from_slice(&trailer);
+
+        // mac(4) is neither this node nor a group address — the shape the gate
+        // drops for a pairwise-tagged sub-type.
+        let link = frame_bytes(mac(4), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+        let stripped = strip_directed(&mut router, LinkFrame::ref_from_bytes(&link).unwrap())
+            .expect("a signed fan-out frame authenticates whatever link dst it wears");
+        assert_eq!(
+            stripped.payload.len(),
+            n,
+            "and its trailer is stripped exactly as under a broadcast dst"
+        );
+    }
+
+    /// The other half of that rule, so the fix above cannot quietly become a
+    /// blanket silencing: a directed frame that really is addressed to this
+    /// node and really fails its proof still raises, over the whole
+    /// [`handle_mesh_frame`] path a shell drives rather than through
+    /// `strip_directed` on its own.
+    ///
+    /// Deliberately the *hardest* version of the positive control: a fully
+    /// verified neighbor, under this node's own link address, whose trailer is
+    /// one byte wrong. The uncredentialed-sender case is the easy one and is
+    /// already covered by
+    /// [`a_frame_failing_pairwise_auth_raises_an_alarm_against_its_source`];
+    /// this one differs from the frame above in exactly one field — the link
+    /// `dst` — so it pins that the new gate turns on that field and nothing
+    /// else.
+    #[test]
+    fn a_failed_proof_addressed_to_this_node_still_raises() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+
+        let inner = unicast_bytes(mac(1), b"CORRUPTED-IN-FLIGHT");
+        let mut payload = inner.clone();
+        payload.resize(inner.len() + DIRECTED_TRAILER_LEN, 0);
+        let (body, trailer) = payload.split_at_mut(inner.len());
+        peer.tag_directed(mac(1), body, trailer)
+            .expect("the verified peer tags toward this node");
+        // One flipped bit in an otherwise genuine tag: the sender is a member
+        // in good standing, and the frame still cannot verify.
+        payload[inner.len()] ^= 0x01;
+
+        let link = frame_bytes(mac(1), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                0,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &[],
+                &mut sink,
+            );
+        });
+
+        let snapshot = board.snapshot();
+        assert_eq!(snapshot.alarms.len(), 1, "addressed to us, so it is ours");
+        assert_eq!(snapshot.alarms[0].kind, AlarmKind::UnauthenticatedTraffic);
+        assert_eq!(
+            snapshot.alarms[0].subject,
+            Subject::Node(NodeId::new(&mac(2).0))
+        );
+        assert!(
+            sink.local.is_empty(),
+            "and it is still dropped, not delivered"
+        );
+    }
+
     // ---- plan_dispatch ----------------------------------------------------
     //
     // Egress resolution and the per-link transmit gate were written out in all
@@ -3303,6 +3539,14 @@ mod tests {
     /// wire-format change that buys nothing. Egress refuses to *produce* one
     /// only because no honest path stages one — that is a tightness check on
     /// ourselves, not a claim about what a peer may send.
+    ///
+    /// `strip_directed` *does* reject a dst naming another node outright, and
+    /// that is not the same decision: a group dst is a real addressing mode an
+    /// honest sender may use, while a third party's unicast address says the
+    /// frame was handed to a different hop. Read against this test, the rule is
+    /// "dst-blind among the addresses that could mean us", which is what
+    /// `a_fanned_out_challenge_for_another_neighbor_raises_no_alarm` pins from
+    /// the other side.
     #[test]
     fn a_tagged_unicast_is_accepted_even_under_a_group_link_dst() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);

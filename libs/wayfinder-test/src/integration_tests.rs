@@ -629,6 +629,62 @@ fn an_unanchored_mesh_still_routes_and_tags() {
     }
 }
 
+/// A healthy, fully-enrolled mesh raises **no** alarms at all.
+///
+/// The regression test for design 09 §8.12, and the one this suite could not
+/// have failed before: `TestRouter` now holds a per-node alarm board, so a test
+/// can assert on what a node *reported* and not only on what it routed.
+///
+/// `line_of_three` is exactly the shape that found the bug on hardware —
+/// `machine2` carries two mesh interfaces, and `poll_due_challenges` puts every
+/// next-hop challenge onto both of them. The copy that lands on the far switch
+/// is tagged under a pairwise key its listener does not hold, so before the fix
+/// `machine1` and `machine3` each accumulated a permanent
+/// `UnauthenticatedTraffic` row against `machine2` — a node that had done
+/// nothing wrong, on a mesh with no attacker in it.
+///
+/// Asserted as "no alarms whatsoever" rather than "no `UnauthenticatedTraffic`":
+/// every node here is credentialed, every link is lossless and nothing is
+/// revoked, so *any* row is a finding. That makes this the cheap net for the
+/// whole detector family, not just the one that regressed.
+#[test]
+fn a_healthy_authed_mesh_raises_no_alarms() {
+    setup();
+    let mut harness = line_of_three();
+
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    for (i, name) in ["machine1", "machine2", "machine3"].iter().enumerate() {
+        enable_auth(harness.get_machine_mut(name), &authority, i);
+    }
+
+    // Several rounds, not one: a challenge is re-issued once per
+    // `seed_interval()` in the steady state, so the false positive this pins is
+    // a *recurring* row rather than a one-off during convergence.
+    for secs in 1..=4 {
+        converge_at(&mut harness, Duration::from_secs(secs * 40));
+    }
+    for r in harness.machines.values() {
+        assert_eq!(
+            r.router().originator_count(),
+            2,
+            "the mesh has to actually converge, or an empty alarm board proves nothing"
+        );
+    }
+
+    for (name, r) in &harness.machines {
+        let alarms = r.alarms();
+        assert!(
+            alarms.is_empty(),
+            "{name} raised {} alarm(s) on a healthy mesh: {:?}",
+            alarms.len(),
+            alarms
+                .iter()
+                .map(|a| (a.kind, a.subject, a.count))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 /// An emergency revocation injected at one node floods across the mesh on
 /// normal OGM traffic and shuns the revoked node: in [`line_of_three`]
 /// (machine1–machine2–machine3) an operator revokes machine3 at machine1, and

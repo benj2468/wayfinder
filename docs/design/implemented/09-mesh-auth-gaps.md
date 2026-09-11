@@ -1002,12 +1002,21 @@ requires one, **including an unrecognised sub-type**: the engine falls back to
 exhaustive over `BatmanPacketType`, so a new variant cannot be added without
 classifying it.
 
-Note the deliberate asymmetry: ingress stays *dst-blind*. A genuinely tagged
-frame is accepted under a group link dst, because `verify_directed` binds the
-tag to `(pairwise key, counter, src, frame)` and the key is per-(sender,
-receiver) — only the intended peer can verify it, so shouting buys the sender
-nothing. Re-adding a dst check on ingress would reintroduce a decision keyed on
-the attacker's own field.
+Note the deliberate asymmetry: ingress stays *dst-blind* **among the addresses
+that could mean us** (§8.12 later narrowed it to exactly that; as first written
+this sentence had no qualifier). A genuinely tagged frame is accepted under a
+group link dst, because `verify_directed` binds the tag to `(pairwise key,
+counter, src, frame)` and the key is per-(sender, receiver) — only the intended
+peer can verify it, so shouting buys the sender nothing. Re-adding a dst check
+on ingress that could *admit* a frame would reintroduce a decision keyed on the
+attacker's own field.
+
+What §8.12 added is the other half: a group dst still reaches the verifier,
+unchanged, while a unicast dst naming a *third* node is dropped before it — and
+only for the two pairwise-keyed proofs, where the verifier would have refused it
+anyway. That drop can only ever refuse a frame, never admit one, which is what
+keeps it on the right side of the rule above. Its reasoning is there, not here.
+All three tests below still hold under it.
 
 ### Reproduced by
 
@@ -1513,6 +1522,177 @@ for benchmark fixtures.
 
 ---
 
+## 8.12 A fanned-out challenge alarmed against an honest neighbor — **fixed**
+
+Found live on 2026-09-10, on a USB-attached nRF52840 dongle, not by a sweep.
+An **observability** fault rather than an authentication gap: nothing was
+misrouted and nothing was admitted that should not have been. What it cost was
+the signal.
+
+### What happened
+
+Three individually-correct behaviours composed into a false positive.
+
+1. `poll_due_challenges` emits every next-hop challenge on **every** interface
+   that may carry data (`link_may_tx`). That is deliberate and well defended:
+   `get_egress_interface` resolves through a link-quality table written on
+   frame *receipt*, before any auth verdict, so letting the router choose where
+   a challenge goes hands an attacker a denial of service (its own doc carries
+   the argument).
+2. The trailer is tagged with the **destination's** pairwise key —
+   `auth.tag_directed(dst, …)`.
+3. `strip_directed` runs at the very top of `handle_mesh_frame`, and *verified
+   every directed frame from a neighbor before anything checked whether the
+   frame was addressed to this node at all*. This is the one of the three the
+   fix changed; 1 and 2 are unchanged and still true.
+
+So on a node with interfaces A and B, a challenge aimed at the neighbor on A
+also goes out B. The neighbor on B receives a frame tagged with a key it does
+not hold, fails to verify it, and raised `UnauthenticatedTraffic` against a
+peer that had done nothing wrong — once per `seed_interval()`, forever, at the
+`n − 1` rate derived below. Observed at exactly `link schedule`'s 32 s cadence
+with `body_len=18`
+(a 2-byte `BatmanNextHopChallengePacket` header plus a 16-byte nonce), across a
+link measuring 0% loss over 5 probes.
+
+It was never limited to the fan-out. Any **shared medium** — a raw-L2 link on a
+real LAN segment, the LoRa broadcast medium, BLE advertising — means a node
+routinely overhears its neighbors' unicasts addressed to *other* neighbors, and
+each one took the same path to the same false alarm.
+
+`wayfinder-alarm`'s design says an alarm system must not become the flood it
+reports. This made `unauthenticated_traffic` fire continuously in **normal**
+operation, so the one alarm that would report a real attacker was permanently
+buried in expected noise — and an operator who sees it every 32 s learns to
+ignore it.
+
+### The fix
+
+Not on the emission side; the fan-out is load-bearing for the reason in (1).
+
+On the receive side instead. A **pairwise-tagged** frame is handed to one hop at
+a time, and that hop is named by the link-layer `dst`: the final destination
+rides in the BATMAN header. So a `Tag`/`NonceTag` frame whose `dst` is a unicast
+address naming some other node was never for this hop — it is a fan-out copy, or
+shared-medium overhearing — and `strip_directed` now drops it at `trace!` before
+the verifier and before the alarm. The alarm is spent only on frames whose link
+`dst` could mean this node and that fail their proof.
+
+Three boundaries make that precise, and each is load-bearing:
+
+- **Only the pairwise proofs.** `Fanout` is excluded. `verify_fanout` is an
+  Ed25519 signature by `src` over the frame and takes no `dst` at all, so there
+  the check would be a genuinely *new* refusal rather than a restatement of what
+  the verifier already decides — and it would quietly promote "Signature form
+  implies a group `dst`" into a receive-side invariant, where today it is only a
+  property of the single emitter (`flush_mcast_groups` always broadcasts a
+  merged frame). Nothing is lost: a fan-out frame overheard on a shared medium
+  verifies, so it never reached this alarm in the first place. Pinned by
+  `a_fanout_multicast_is_not_gated_by_the_link_dst`.
+- **Never on a group `dst`**, which is why §8.7's asymmetry survives intact. The
+  alarm therefore remains reachable under a group `dst` — the §8.7 attack shape
+  still raises rows, bounded by `(kind, subject)` coalescing. What the alarm is
+  no longer spent on is a frame handed to a *different hop*.
+- **An unrecognised sub-type is the one place the premise does not hold.**
+  `route_by_dest` treats the link `dst` as the end-to-end address, so this
+  refuses its forward branch. That branch was already dead under auth — an
+  end-to-end `dst` means the sender tagged with `K(sender, final_dest)`, which
+  no intermediate hop can verify — so all this removes is the false alarm that
+  came with the drop.
+
+The drop sits *before* `verify_directed`, which buys one thing beyond ordering:
+a sender that tags for this node while writing a third party's `dst` can no
+longer advance this node's replay high-water from a frame that was not addressed
+to it. (For an honest fan-out copy there was never anything to spend — a tag
+keyed to someone else cannot verify, and the counter only advances on a
+verifying tag.)
+
+### Why this is not the dst check §8.7 removed
+
+§8.7 ends "re-adding a dst check on ingress would reintroduce a decision keyed
+on the attacker's own field", and this is a dst check on ingress. The
+difference is which values it acts on, and in which direction it can move the
+verdict.
+
+- A **group** dst still passes to the verifier, exactly as before. That is the
+  decision §8.7 removed and it stays removed —
+  `a_tagged_unicast_is_accepted_even_under_a_group_link_dst` still holds.
+- A **third party's unicast** dst is the new drop, and it only ever *narrows*
+  what is accepted. An attacker choosing the field can write this node's
+  address or a group address — both of which still face the full pairwise
+  check — or some other node's, which drops its own frame. No value of it buys
+  admission, so the field is not being trusted; it is being used to decline.
+
+Read together, ingress is dst-blind *among the addresses that could mean us*.
+
+One consequence to state plainly, since §8.9 leans on `UnauthenticatedTraffic`
+as the visible symptom of an attacker's directed frames: while admission is
+unchanged, **the detector's scope is now a field the attacker writes**. Putting
+a third party's address in `dst` makes an injected directed frame drop at
+`trace!` with no row. That costs the attacker delivery — the frame is refused
+either way — so it buys silence, not access, and the case §8.9 actually depends
+on is unaffected: a misissuance attacker has to address the victim node to be
+routed, so `dst == self` and the row still appears. A group `dst` also still
+raises. It is worth knowing that a keyless prober can now choose to be quiet
+about frames that were going to be dropped regardless.
+
+### The asymmetry in the report, explained
+
+The report noted, unexplained, that the compose node raised this against the
+dongle exactly **once** (count=1, consistent with the one-off restart re-anchor
+`required_proof` documents) while the dongle raised it against the node every
+32 s.
+
+It follows from the emitter's **path-neighbor count**, not from anything about
+the two nodes. `challenge_candidates` (`libs/batman/src/engine.rs`) walks every
+*path's* `neighbor_ident` and dedups, so a node with `n` path neighbors puts
+`n` challenges onto every interface each round — and a peer listening on one of
+them can verify exactly one of the `n`. The alarm rate a neighbor sees is
+therefore `n − 1` per round, where `n` is how many path neighbors the *sender*
+has.
+
+The report's own numbers fit that: the compose node showed `PATHS=2` with
+candidates `5e:94:…` (the dongle, usb0) and `b6:10:97:…` (the CA, vpn0), so
+`n − 1 = 1` — one CA-bound challenge onto usb0 per round, which is the
+dongle's 32 s row. For the dongle to have stayed quiet in the other direction
+it needs `n = 1`, the host being its only path neighbor; that is consistent
+with the single count=1 row on the compose node (the one-off restart re-anchor
+`required_proof` documents) but was inferred from the report rather than read
+off the board.
+
+What it is *not* is a `link_may_tx` suppression, the other candidate the report
+raised: next-hop proof rides the `tx_data` gate, which is on for any link that
+routes at all. That also settles the question the report attached to it — the
+fix needs no board-only `LinkFeatures` path exercised, because the gate lives
+in the shared `wayfinder-driver-core` receive path that all three driver shells
+reach through `handle_mesh_frame`.
+
+### Reproduced by
+
+Unit coverage in `libs/wayfinder-driver-core`:
+`a_fanned_out_challenge_for_another_neighbor_raises_no_alarm` — a challenge
+genuinely tagged under a third node's pairwise key, received on a second
+interface, raises nothing and is not answered — with
+`a_failed_proof_addressed_to_this_node_still_raises` as the positive control (a
+*verified* neighbor under this node's own link address with one flipped bit in
+an otherwise genuine tag, so the pair differs in exactly the one field the gate
+reads), and `a_fanout_multicast_is_not_gated_by_the_link_dst` pinning the
+`Fanout` exclusion above.
+
+The integration-level net matters more, because it is what would have caught
+this before hardware did. `TestRouter` now holds a **per-node alarm board**,
+scoped around the one place it runs engine code, so a multi-node test can assert
+on what a node *reported* and not only on what it routed — the capability
+`libs/wayfinder-test` lacked entirely, which is why an auth-on two-interface
+fixture (`line_of_three`, used by `test_revocation_floods_and_shuns_node`) was
+reproducing this bug on every run while passing.
+`a_healthy_authed_mesh_raises_no_alarms` is the assertion: a credentialed,
+lossless, unrevoked mesh must raise *nothing at all*. Reverting the gate turns
+it red with the reported symptom — `UnauthenticatedTraffic` against an honest
+neighbor, count climbing one per round.
+
+---
+
 ## 9. Key file map for the implementer
 
 | File | Gaps | What changes |
@@ -1549,6 +1729,9 @@ for benchmark fixtures.
 | `libs/wayfinder-protos` | §10 | `NodeMetrics` fields 20–22 and the `NodeMetricsData` dispatch — done |
 | `libs/wayfinder-server/src/adapter.rs` | §10 | the projection, and the test for it — the smoke test answers from a `Mock`, so it cannot reach this layer — done |
 | `bins/wayfinder-ctl/src/output.rs`, `bins/wayfinder-tui/src/ui.rs` | §10 | CLI and TUI rendering — done |
+| `libs/wayfinder-driver-core/src/lib.rs` | §8.12 | `strip_directed` drops a directed frame whose link `dst` names another hop, before the verifier and before the alarm — done |
+| `libs/wayfinder/src/router_ops.rs` | §8.12 | `RouterOps::self_ident` — how the shared receive path learns which `dst` means "this hop" — done |
+| `libs/wayfinder-test/src/test_router.rs` | §8.12 | a per-node alarm board scoped around `step_schedules`, plus `TestRouter::alarms` — the reporting-path assertion the suite had no way to make — done |
 
 ---
 

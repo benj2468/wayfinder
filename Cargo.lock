@@ -5538,6 +5538,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wayfinder",
+ "wayfinder-alarm",
  "wayfinder-auth",
  "wayfinder-driver",
  "wayfinder-tick-driver",

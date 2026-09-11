@@ -1592,6 +1592,15 @@ impl<
                 // field, so a regression in that sub-type table cannot silently
                 // reopen the reflection primitive on its own.
                 //
+                // Since design 09 §8.12 the layer above checks the address as
+                // well — `strip_directed` drops any directed frame whose link
+                // `dst` names a third party — so this guard is now the *third*
+                // gate rather than the second. It stays for the same reason it
+                // arrived: it is keyed on `self_ident` where the other two are
+                // keyed on a sub-type table and on "is this address mine or a
+                // group", and a proof frame under a *group* dst still reaches
+                // here for it to refuse.
+                //
                 // It is also the cheap early-out. Note it is not what protects
                 // an auth-*off* mesh: with no `auth`, both arms below are
                 // already inert — `answer_challenge` is never reached through
