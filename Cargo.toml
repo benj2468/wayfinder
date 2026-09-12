@@ -5,6 +5,7 @@ members = [
     "libs/rylr998-sim",
     "libs/wayfinder-link-utils",
     "libs/ieee802154",
+    "libs/lora-link",
     "libs/at86rf233",
     "libs/nrf-ieee802154",
     "libs/blue",

@@ -1,0 +1,16 @@
+[package]
+name = "lora-link"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+interfaces.workspace = true
+tracing = { version = "0.1.44", default-features = false }
+# Shared small-MTU fragmentation/reassembly, as `rylr998`, `blue` and
+# `ieee802154` all use.
+wayfinder-link-utils = { path = "../wayfinder-link-utils" }
+# `decode_frame`'s `LinkFrame::ref_from_bytes`, and nothing else.
+zerocopy = { workspace = true }

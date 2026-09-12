@@ -36,6 +36,9 @@ pub const INVENTORY_PATH_ENV: &str = "WAYFINDER_HIL_CONFIG";
 /// The distinction is not cosmetic: a DK has an onboard J-Link and is
 /// programmed and reset through it, while a dongle has no probe at all and is
 /// reached only by DFU over USB, with "reset" meaning a re-enumeration.
+///
+/// The set is closed on purpose — an unknown `kind` is a parse error rather
+/// than a board the harness cannot drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum BoardKind {
     /// nRF52840 DK (PCA10056): onboard J-Link, flashed with `probe-rs`.
@@ -44,6 +47,20 @@ pub enum BoardKind {
     /// nRF52840 dongle (PCA10059): no probe, flashed by DFU with `nrfutil`.
     #[serde(rename = "nrf52840-dongle")]
     Nrf52840Dongle,
+    /// NUCLEO-WL55JC (STM32WL55JC): onboard STLINK-V3E, flashed with
+    /// `probe-rs`.
+    ///
+    /// Unlike the nRF DK, **this board's probe and its management port are one
+    /// USB device** — the STLINK-V3E presents the debug interface and the VCP
+    /// together — so its `probe` and `usb` serials are the same string. That is
+    /// correct, not a copy-paste mistake; see
+    /// `a_probe_and_management_port_may_share_one_serial`.
+    ///
+    /// Dual-core, and the harness drives the **CM4** only: the CM0+ is never
+    /// released, which is also what lets the firmware claim all 64 KiB of SRAM
+    /// (design 25 §4.8).
+    #[serde(rename = "stm32wl55-nucleo")]
+    Stm32wl55Nucleo,
 }
 
 impl BoardKind {
@@ -53,13 +70,21 @@ impl BoardKind {
     /// board can be flashed by `probe-rs`, reset on demand, or run the
     /// on-target tests of design 21's Tier A.
     pub fn has_probe(self) -> bool {
-        matches!(self, BoardKind::Nrf52840Dk)
+        matches!(self, BoardKind::Nrf52840Dk | BoardKind::Stm32wl55Nucleo)
     }
 
     /// The `probe-rs --chip` argument for this part.
+    ///
+    /// Matched exhaustively rather than with a fallback, so adding a part
+    /// forces a decision here instead of silently inheriting another chip's
+    /// flash algorithm.
     pub fn chip(self) -> &'static str {
         match self {
             BoardKind::Nrf52840Dk | BoardKind::Nrf52840Dongle => "nRF52840_xxAA",
+            // `probe-rs chip list` names the 256 KiB / 64 KiB dual-core part
+            // this way; the `Ix` suffix is the package, which the flash
+            // algorithm needs.
+            BoardKind::Stm32wl55Nucleo => "STM32WL55JCIx",
         }
     }
 }
@@ -525,6 +550,76 @@ usb  = "111"
         )
         .unwrap();
         assert!(!inv.board("dongle").unwrap().kind.has_probe());
+    }
+
+    /// The WL55 Nucleo is a probed board with its own `probe-rs` chip name.
+    #[test]
+    fn a_wl55_nucleo_resolves_with_its_chip() {
+        let inv = parse(
+            r#"
+[[board]]
+role  = "wl55"
+kind  = "stm32wl55-nucleo"
+probe = "003900314142500E20353451"
+usb   = "003900314142500E20353451"
+"#,
+        )
+        .unwrap();
+
+        let board = inv.board("wl55").unwrap();
+        assert_eq!(board.kind, BoardKind::Stm32wl55Nucleo);
+        assert!(board.kind.has_probe());
+        assert_eq!(board.kind.chip(), "STM32WL55JCIx");
+    }
+
+    /// **This board's probe and management port are the same USB device**, so
+    /// its `probe` and `usb` serials are equal — the STLINK-V3E presents the
+    /// debug interface and the VCP from one device.
+    ///
+    /// Pinned because the nRF DK's `hil.toml` comment says the opposite for
+    /// *its* hardware ("the J-Link's two CDC-ACM interfaces share one serial
+    /// between them and are not the mgmt port"), which is easy to read as a
+    /// rule. Adding a uniqueness check between the two fields would reject a
+    /// correct WL55 inventory.
+    #[test]
+    fn a_probe_and_management_port_may_share_one_serial() {
+        let serial = "003900314142500E20353451";
+        let inv = parse(&format!(
+            r#"
+[[board]]
+role  = "wl55"
+kind  = "stm32wl55-nucleo"
+probe = "{serial}"
+usb   = "{serial}"
+"#
+        ))
+        .unwrap();
+
+        let board = inv.board("wl55").unwrap();
+        assert_eq!(board.probe.as_deref(), Some(serial));
+        assert_eq!(board.usb, serial);
+    }
+
+    /// ...and it is still held to the probe rule: a probed board with no probe
+    /// serial is something nothing can flash or reset.
+    #[test]
+    fn a_wl55_nucleo_without_a_probe_serial_is_rejected() {
+        let err = parse(
+            r#"
+[[board]]
+role = "wl55"
+kind = "stm32wl55-nucleo"
+usb  = "111"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            InventoryError::ProbeRequired { role, kind } => {
+                assert_eq!(role, "wl55");
+                assert_eq!(kind, BoardKind::Stm32wl55Nucleo);
+            }
+            other => panic!("expected ProbeRequired, got {other:?}"),
+        }
     }
 
     /// **The inventory is found by searching upward, not by trusting the
