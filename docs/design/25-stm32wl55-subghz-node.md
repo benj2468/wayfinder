@@ -693,18 +693,30 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
   like the `Some(1)` case, none of them declares it, and the method's own docs
   say it is dead weight until design 17 lands. Worth settling once, for all of
   them, rather than per driver.
-- **How to fit the management port in 256 KB of flash.** The single largest
-  open question, since without the port this board cannot be reached by
-  `libs/wayfinder-hil`, cannot be enrolled, and has no observability once SWD
-  is unavailable. The gap is 28.1 KiB. Two halves:
+- **How to fit the management port in 256 KB of flash — GitLab #73**, with
+  #69 (the `flt2dec` waste below), #70 (routing core), #71 (crypto) and #72
+  (async platform) under it. The single largest open question, since without
+  the port this board cannot be reached by `libs/wayfinder-hil`, cannot be
+  enrolled, cannot renew (design 24), and has no observability at all once SWD
+  is unavailable — its state on the bench today.
 
-  - **~13 KiB is recoverable waste, and it is the same `flt2dec` item below.**
-  - **The remaining ~16 KiB is a decision, not an optimization.** The cost is
-    the protobuf dispatch — `handle_router` 13.3 KiB, `wayfinder_protos`
-    22.6 KiB, `prost` 11.9 KiB — and trimming which request kinds a
-    constrained board answers cuts against `rpc_table!`'s declare-once
-    contract, where a kind missing from the table does not compile. That is a
-    change to a shipped crate's central invariant and wants its own design.
+  The gap is 28.8 KiB and splits into a bounded half and a decision:
+
+  - **~13 KiB is recoverable waste** with a known cause and fix (#69).
+    Necessary, and on its own not sufficient.
+  - **The remaining ~16 KiB is a decision.** The cost is the protobuf
+    dispatch — `handle_router` 13.3 KiB, `wayfinder_protos` 22.6 KiB, `prost`
+    11.9 KiB — and trimming which request kinds a constrained board answers
+    cuts against `rpc_table!`'s declare-once contract, where a kind missing
+    from the table does not compile *deliberately*, so that a request cannot
+    become silently unanswerable. Changing that is a change to a shipped
+    crate's central invariant and **wants its own design doc**; #73 records it
+    as unfiled.
+
+- **What the durable store costs.** Design 22's flash A/B store plus identity
+  persistence is the other thing this board needs to be a real mesh member
+  (§4.10), and its footprint is **not measured**. Given the budget above, it
+  should be measured before it is promised.
 
 - **`flt2dec` in a router image** (~11 KiB of visible `.text`, plus more in the
   tail, plus 1.7 KiB of `<u128>::_fmt_inner`). **Cause now known**, and it is
@@ -715,7 +727,7 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
   `record_debug` and relies on those defaults (its `rtt.rs:172` comment says
   exactly that). Overriding the three on bare metal with integer-only
   rendering should reclaim it, and would shrink both nRF images too. Its own
-  small MR, since it touches a crate every target links.
+  small MR, since it touches a crate every target links. **GitLab #69.**
 - **Whether `stack-budget.py` should validate `memory.x` against the chip**
   (§4.1). It passed on an image whose stack top was past the end of RAM. This
   design wants that gate, and it is arguably its own small MR.
