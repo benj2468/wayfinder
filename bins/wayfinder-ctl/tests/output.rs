@@ -3,6 +3,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use wayfinder_protos::wayfinder::v1alpha::BuildInfo;
+use wayfinder_protos::wayfinder::v1alpha::BuildSource;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::LogRecord;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
@@ -22,6 +24,12 @@ fn node_info_human_renders_mac_and_count() {
         runtime_config_active: true,
         clock_trusted: false,
         clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+        build_info: Some(BuildInfo {
+            version: "v0.4.0-12-g35dcaee-dirty".to_string(),
+            commit: "35dcaee".to_string(),
+            dirty: true,
+            source: BuildSource::Git as i32,
+        }),
     };
     let human = output::node_info(&v, OutputFormat::Human).unwrap();
     assert!(human.contains("aa:bb:cc:dd:ee:01"), "got: {human}");
@@ -35,6 +43,98 @@ fn node_info_human_renders_mac_and_count() {
         human.contains("credential operations refused"),
         "got: {human}"
     );
+    assert!(human.contains("v0.4.0-12-g35dcaee-dirty"), "got: {human}");
+}
+
+/// A node that does not report its build must read as *unknown*, not as a
+/// blank or a default-filled `BuildInfo` — the two mean different things to
+/// whoever is deciding whether a fix is deployed.
+#[test]
+fn node_info_human_says_so_when_the_build_is_not_reported() {
+    let v = NodeInfo {
+        node_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+        num_originators: 3,
+        auth_locked: false,
+        runtime_config_active: false,
+        clock_trusted: true,
+        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+        build_info: None,
+    };
+
+    let human = output::node_info(&v, OutputFormat::Human).unwrap();
+
+    assert!(human.contains("build: not reported"), "got: {human}");
+}
+
+/// A node that answered but could not identify its own build is a different
+/// thing from one that did not answer, and both are different from a healthy
+/// build. This is the arm a container built without the `--build-arg` hits.
+#[test]
+fn node_info_human_distinguishes_an_unidentified_build_from_a_missing_one() {
+    let unidentified = NodeInfo {
+        node_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+        num_originators: 0,
+        auth_locked: false,
+        runtime_config_active: false,
+        clock_trusted: true,
+        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+        build_info: Some(BuildInfo {
+            version: "unknown".to_string(),
+            commit: "unknown".to_string(),
+            dirty: false,
+            source: BuildSource::Unknown as i32,
+        }),
+    };
+
+    let human = output::node_info(&unidentified, OutputFormat::Human).unwrap();
+
+    assert!(human.contains("could not identify itself"), "got: {human}");
+    assert!(!human.contains("not reported"), "got: {human}");
+}
+
+/// A default-filled `BuildInfo` is a legal proto3 encoding — a zero-length
+/// submessage — so it is reachable from a truncated or forward-compatible
+/// encoder. Rendering it verbatim would print a bare `build: `, which reads as a
+/// bug in this tool rather than as a node that said nothing useful.
+#[test]
+fn node_info_human_does_not_render_an_empty_build_as_a_blank() {
+    let empty = NodeInfo {
+        node_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+        num_originators: 0,
+        auth_locked: false,
+        runtime_config_active: false,
+        clock_trusted: true,
+        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+        build_info: Some(BuildInfo::default()),
+    };
+
+    let human = output::node_info(&empty, OutputFormat::Human).unwrap();
+
+    assert!(human.contains("build: reported empty"), "got: {human}");
+}
+
+/// A dirty build is the case an operator most needs to notice, and the `-dirty`
+/// suffix is easy to miss at the end of a long hash. Say it in words too.
+#[test]
+fn node_info_human_calls_out_a_modified_tree() {
+    let v = NodeInfo {
+        node_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+        num_originators: 0,
+        auth_locked: false,
+        runtime_config_active: false,
+        clock_trusted: true,
+        clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+        build_info: Some(BuildInfo {
+            version: "35dcaee-dirty".to_string(),
+            commit: "35dcaee".to_string(),
+            dirty: true,
+            source: BuildSource::Git as i32,
+        }),
+    };
+
+    let human = output::node_info(&v, OutputFormat::Human).unwrap();
+
+    assert!(human.contains("modified"), "got: {human}");
 }
 
 #[test]
@@ -46,6 +146,12 @@ fn node_info_json_is_valid_and_complete() {
         runtime_config_active: true,
         clock_trusted: true,
         clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+        build_info: Some(BuildInfo {
+            version: "v0.4.0".to_string(),
+            commit: "35dcaee".to_string(),
+            dirty: false,
+            source: BuildSource::Injected as i32,
+        }),
     };
     let json = output::node_info(&v, OutputFormat::Json).unwrap();
     // Parse it back to confirm it is well-formed JSON with the expected fields.
@@ -54,6 +160,9 @@ fn node_info_json_is_valid_and_complete() {
     assert!(parsed["node_id"].is_array());
     assert_eq!(parsed["auth_locked"], true);
     assert_eq!(parsed["runtime_config_active"], true);
+    // A nested message, so this also pins that it does not flatten away.
+    assert_eq!(parsed["build_info"]["version"], "v0.4.0");
+    assert_eq!(parsed["build_info"]["dirty"], false);
 }
 
 #[test]

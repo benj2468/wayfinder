@@ -30,6 +30,10 @@ wayfinder = { path = "../wayfinder", default-features = false }
 # `wayfinder`; named here because this crate raises against it directly.
 wayfinder-alarm = { path = "../wayfinder-alarm" }
 wayfinder-embedded-driver = { path = "../wayfinder-embedded-driver" }
+# By path, like its neighbours: this crate is not a root-workspace member. A
+# zero-dependency `no_std` crate of consts — the build identity this firmware
+# logs at bring-up and reports over `GetNodeInfo`.
+wayfinder-version = { path = "../wayfinder-version" }
 wayfinder-server = { path = "../wayfinder-server", default-features = false, features = [
     "embedded",
 ] }

@@ -5,6 +5,8 @@ use crate::wayfinder::v1alpha::Alarms;
 use crate::wayfinder::v1alpha::AllInterfacesEgress;
 use crate::wayfinder::v1alpha::AuthenticateUserResponse;
 use crate::wayfinder::v1alpha::BeginUserRegistrationResponse;
+use crate::wayfinder::v1alpha::BuildInfo;
+use crate::wayfinder::v1alpha::BuildSource;
 use crate::wayfinder::v1alpha::CancelPingResponse;
 use crate::wayfinder::v1alpha::ClockPosture;
 use crate::wayfinder::v1alpha::CreateUserInviteResponse;
@@ -1853,6 +1855,45 @@ pub fn audit_request(request: &WayfinderRequest) {
     }
 }
 
+impl From<wayfinder_version::BuildSource> for BuildSource {
+    fn from(source: wayfinder_version::BuildSource) -> BuildSource {
+        match source {
+            wayfinder_version::BuildSource::Git => BuildSource::Git,
+            wayfinder_version::BuildSource::Injected => BuildSource::Injected,
+            wayfinder_version::BuildSource::Unknown => BuildSource::Unknown,
+        }
+    }
+}
+
+/// The build identity of the binary answering this request.
+///
+/// Read from a const compiled in by `wayfinder-version`'s build script rather
+/// than from a [`RouterReads`] method, because it describes the *binary*, not the
+/// router: a provider method would oblige every impl — the mocks included — to
+/// return this same const, and would let a node be built that reports nothing.
+///
+/// Costs two short `String` allocations on the response path and no computation.
+/// Worth being precise about rather than calling it free: the dongle answers
+/// this from a 32 KiB heap.
+fn build_info() -> BuildInfo {
+    build_info_from(wayfinder_version::BUILD)
+}
+
+/// Project a resolved build identity onto the wire message.
+///
+/// Split from [`build_info`] so the field-by-field mapping is testable with a
+/// fixture where `version` and `commit` differ. That matters more than it looks:
+/// in an untagged checkout the two consts are the *same string*, so a test
+/// against the ambient build would pass even if this function transposed them.
+fn build_info_from(build: wayfinder_version::Resolved<'static>) -> BuildInfo {
+    BuildInfo {
+        version: build.version.into(),
+        commit: build.commit.into(),
+        dirty: build.dirty,
+        source: BuildSource::from(build.source) as i32,
+    }
+}
+
 /// Answer `request` from router state, without mutating anything.
 ///
 /// Takes the provider by shared reference, which is the whole point: a host
@@ -1877,6 +1918,11 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
             runtime_config_active: provider.runtime_config_active(),
             clock_trusted: provider.clock_trusted(),
             clock_posture: ClockPosture::from(provider.clock_posture()) as i32,
+            // Not a provider method: a build identity is a compile-time
+            // property of the binary answering the request, not router state,
+            // so every `RouterReads` impl would return the same const. Filling
+            // it here means a node cannot be built that forgets to report it.
+            build_info: Some(build_info()),
         }),
         Some(RequestKind::GetRoutingTable(_)) => {
             let entries = provider
@@ -4086,6 +4132,66 @@ mod tests {
         match handle(provider, RequestKind::GetNodeInfo(GetNodeInfoRequest {})) {
             ResponseKind::NodeInfo(info) => assert!(info.runtime_config_active),
             other => panic!("expected NodeInfo, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// The whole point of the feature: *any* node answering a `GetNodeInfo`
+    /// says which build it is. Nothing is injected to make this true, so a
+    /// provider cannot be written that fails to report it.
+    #[test]
+    fn node_info_reports_the_build_it_was_compiled_from() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::GetNodeInfo(GetNodeInfoRequest {}),
+        ) {
+            ResponseKind::NodeInfo(info) => {
+                let build = info.build_info.expect("every node reports its build");
+
+                assert_eq!(build.version, wayfinder_version::VERSION);
+                assert_eq!(build.commit, wayfinder_version::COMMIT);
+                assert_eq!(build.dirty, wayfinder_version::DIRTY);
+                // Never the zero value: that means "a node too old to say",
+                // which a node carrying the field must not claim about itself.
+                assert_ne!(build.source, BuildSource::Unspecified as i32);
+            }
+            other => panic!("expected NodeInfo, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// Each field lands in its own slot. Non-obviously necessary: every other
+    /// test here compares against the ambient build, where an untagged checkout
+    /// makes `version` and `commit` the same string — so a transposition would
+    /// be invisible until someone cut the first release tag.
+    #[test]
+    fn the_build_identity_maps_field_for_field_onto_the_wire() {
+        let wire = build_info_from(wayfinder_version::Resolved {
+            version: "v0.4.0",
+            commit: "35dcaee",
+            dirty: true,
+            source: wayfinder_version::BuildSource::Injected,
+        });
+
+        assert_eq!(wire.version, "v0.4.0");
+        assert_eq!(wire.commit, "35dcaee");
+        assert!(wire.dirty);
+        assert_eq!(wire.source, BuildSource::Injected as i32);
+    }
+
+    /// The Rust enum has three variants and the wire enum four; the fourth
+    /// (`UNSPECIFIED`) means "a peer that filled the message but not this field"
+    /// and must never be something this node says about itself.
+    #[test]
+    fn every_build_source_maps_to_a_specified_wire_value() {
+        for source in [
+            wayfinder_version::BuildSource::Git,
+            wayfinder_version::BuildSource::Injected,
+            wayfinder_version::BuildSource::Unknown,
+        ] {
+            assert_ne!(
+                BuildSource::from(source),
+                BuildSource::Unspecified,
+                "{source:?} must not report as unspecified"
+            );
         }
     }
 

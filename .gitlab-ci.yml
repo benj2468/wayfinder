@@ -449,6 +449,22 @@ deploy:
           EXTRA_TAG="nightly"
         fi
       fi
+      # What the binaries inside report as their build, over `GetNodeInfo` and
+      # from `--version`. Deliberately the same expression as the image tag: a
+      # released image's reported version is then literally its tag, so "which
+      # build is this node running?" and "which image is deployed here?" have the
+      # same answer. The Dockerfile never copies `.git`, so passing these in is
+      # the only way the binaries can know — and the commit separately, because a
+      # tag carries no hash.
+      BUILD_VERSION="$IMAGE_TAG"
+      BUILD_COMMIT="$CI_COMMIT_SHORT_SHA"
+      # A published image that cannot say what it is defeats the point of
+      # publishing it identifiably. Empty here means the expression above broke,
+      # which is a pipeline bug, not something to ship past.
+      if [ -z "$BUILD_VERSION" ]; then
+        echo "refusing to build an unlabelled image: BUILD_VERSION is empty" >&2
+        exit 1
+      fi
       echo "Building wayfinder-tap, wayfinder-tui, wayfinder-ctl, wayfinder-ctl-vpn and wayfinder-web images (linux/amd64, linux/arm64) tagged '$IMAGE_TAG'${EXTRA_TAG:+ and '$EXTRA_TAG'}"
       for app in tap tui ctl ctl-vpn web; do
         image="$CI_REGISTRY_IMAGE/wayfinder-$app:$IMAGE_TAG"
@@ -463,6 +479,8 @@ deploy:
           --platform linux/amd64,linux/arm64 \
           -f containers/Dockerfile \
           --target "$app" \
+          --build-arg "WAYFINDER_BUILD_VERSION=$BUILD_VERSION" \
+          --build-arg "WAYFINDER_BUILD_COMMIT=$BUILD_COMMIT" \
           -t "$image" \
           $extra_tag_arg \
           --push \

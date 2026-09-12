@@ -26,7 +26,9 @@ use rylr998::WirelessMode;
 #[derive(Parser, Debug)]
 #[command(
     name = "rylr998-cli",
-    version,
+    // The build identity rather than `CARGO_PKG_VERSION`, which is 0.1.0 for
+    // every crate in this workspace and so identifies nothing.
+    version = wayfinder_version::VERSION,
     about = "Debug a RYLR998/RYLR498 LoRa module over its AT-command serial interface"
 )]
 pub struct Cli {

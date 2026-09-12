@@ -55,7 +55,10 @@ use crate::output::OutputFormat;
 #[derive(Parser, Debug)]
 #[command(
     name = "wayfinder-ctl",
-    version,
+    // The build identity, not `CARGO_PKG_VERSION` (which is pinned at 0.1.0
+    // workspace-wide and says nothing). This identifies the operator's own
+    // tooling, a separate question from what a node reports over the API.
+    version = wayfinder_version::VERSION,
     about = "Command-line client for the Wayfinder management API"
 )]
 pub struct Cli {
@@ -855,6 +858,20 @@ mod tests {
     fn the_command_tree_is_well_formed() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// `--version` reports the build, not the crate version. Clap's bare
+    /// `version,` shorthand expands to `CARGO_PKG_VERSION`, which is `0.1.0` for
+    /// every crate in this workspace and identifies nothing — so "tidying" the
+    /// attribute back to the shorthand is a silent regression this catches.
+    #[test]
+    fn the_version_flag_reports_the_build_identity() {
+        use clap::CommandFactory;
+
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(wayfinder_version::VERSION)
+        );
     }
 
     /// The suffixed forms an operator reaches for, and the bare one the

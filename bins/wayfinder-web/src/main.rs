@@ -54,7 +54,14 @@ async fn main() -> anyhow::Result<()> {
 
     /// Command-line arguments.
     #[derive(Parser, Debug)]
-    #[command(about = "Web dashboard for the Wayfinder management API", long_about = None)]
+    // `version` is the server half's own build; the node's is on the Overview
+    // tab. A container built from `:nightly` has the same "which build is this?"
+    // problem a board does.
+    #[command(
+        about = "Web dashboard for the Wayfinder management API",
+        long_about = None,
+        version = wayfinder_version::VERSION,
+    )]
     struct Args {
         /// Address to serve the dashboard on.
         ///

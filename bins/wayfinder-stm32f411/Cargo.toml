@@ -23,6 +23,9 @@ wayfinder = { path = "../../libs/wayfinder", default-features = false }
 # The *same* HAL-agnostic embedded driver the nRF board uses — this binary
 # exists to prove a non-Nordic Cortex-M (ST) runs the identical router loop.
 wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
+# The build identity this firmware logs at bring-up. Zero-dependency and
+# `no_std`; costs only the `.rodata` for the strings.
+wayfinder-version = { path = "../../libs/wayfinder-version" }
 # Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
 # records are observable over the debug probe (they are otherwise dropped).
 wayfinder-log = { path = "../../libs/wayfinder-log" }

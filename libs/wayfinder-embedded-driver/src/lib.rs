@@ -1275,6 +1275,14 @@ mod tests {
                     mac(1).as_bytes().to_vec(),
                     "the served NodeInfo carries this node's own MAC"
                 );
+                // The case the whole feature exists for: a board with no
+                // filesystem and possibly no probe still says which build it
+                // is. Nothing on this path injects it, so a board cannot be
+                // built that answers without it.
+                let build = info
+                    .build_info
+                    .expect("a board reports the build it was flashed with");
+                assert_eq!(build.version, wayfinder_version::VERSION);
             }
             other => panic!("expected a NodeInfo response, got {other:?}"),
         }

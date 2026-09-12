@@ -394,6 +394,33 @@ async fn node_info_query_renders_human_from_server() {
     assert!(out.contains("runtime config: yes"), "got: {out}");
 }
 
+/// End to end over a real authenticated TLS connection: a node reports the build
+/// it is running, and the client renders it.
+///
+/// The value is not mocked — the `Mock` provider has no say in it, because the
+/// build identity belongs to the binary answering the request rather than to
+/// router state. So this asserts against the same const the server was compiled
+/// with, which is what makes it a real check rather than a tautology about a
+/// fixture.
+#[tokio::test]
+async fn node_info_query_reports_the_servers_build() {
+    let endpoint = spawn_server().await;
+
+    let out = run_query(Command::NodeInfo, &endpoint, OutputFormat::Json)
+        .await
+        .expect("query succeeds");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+    assert_eq!(parsed["build_info"]["version"], wayfinder_version::VERSION);
+    assert_eq!(parsed["build_info"]["commit"], wayfinder_version::COMMIT);
+    assert_eq!(parsed["build_info"]["dirty"], wayfinder_version::DIRTY);
+
+    let human = run_query(Command::NodeInfo, &endpoint, OutputFormat::Human)
+        .await
+        .unwrap();
+    assert!(human.contains(wayfinder_version::VERSION), "got: {human}");
+}
+
 #[tokio::test]
 async fn keepalive_query_renders_json_from_server() {
     let endpoint = spawn_server().await;

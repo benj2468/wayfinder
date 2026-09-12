@@ -256,6 +256,18 @@ pub async fn run(
     spawner: Spawner,
     mut led: Output<'static>,
 ) -> ! {
+    // First thing in the record, before any bring-up that might fail: on a board
+    // with no probe attached this line and `GetNodeInfo` are the only ways to
+    // learn which firmware is actually running, and a board that halts during
+    // bring-up is exactly when that matters.
+    info!(
+        version = wayfinder_version::VERSION,
+        commit = wayfinder_version::COMMIT,
+        dirty = wayfinder_version::DIRTY,
+        source = ?wayfinder_version::SOURCE,
+        "build",
+    );
+
     let node_mac = identity.mac();
     // The same short address the 802.15.4 link derives, from the same `Mac`,
     // so a node's two radios agree on its short identity.

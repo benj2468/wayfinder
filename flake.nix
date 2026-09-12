@@ -41,12 +41,62 @@
       ...
     }:
     let
+      # What a Nix-built binary reports as its build identity.
+      #
+      # It has to come from here: `.git` reaches no Nix build — a flake's store
+      # source excludes it, `lib.cleanSource` filters it, and crane's
+      # `filterCargoSources` keeps only Rust/Cargo files — so
+      # `wayfinder-version`'s build script has nothing to ask. Flake metadata
+      # knows the answer exactly, which is the point: a release build's version
+      # is not a guess.
+      #
+      # `shortRev` is absent for a dirty tree and `dirtyShortRev` for a clean
+      # one, so both are tried; `null` falls through to whatever the build script
+      # can work out for itself (a `nix build` outside a git tree reports
+      # "unknown" rather than failing).
+      #
+      # Two couplings worth stating, because both are invisible from the Rust
+      # side:
+      #
+      #  - The *dirty* marker survives only because `dirtyShortRev` is formatted
+      #    `<rev>-dirty` and the resolver reads the suffix off the string.
+      #    Nothing injects a separate dirty flag.
+      #  - Nix calls a tree dirty when it holds *untracked* files, while the
+      #    `BuildInfo.dirty` field promises "untracked files do not count" (which
+      #    is true of the git tier, `git describe --dirty`). A stray scratch file
+      #    therefore makes a Nix build report a modified tree where a plain
+      #    `cargo build` of the same commit would not. `source` is on the wire so
+      #    a reader can tell which rule produced the answer.
+      buildVersion = inputs.self.dirtyShortRev or inputs.self.shortRev or null;
+
+      # The commit, passed separately because `buildVersion` above may be a bare
+      # revision with no other identity in it — and, once a release-tag
+      # convention exists, may be a tag with no hash at all. Without this every
+      # Nix-built node (the cloud CA, the Orin, every spoke) reports
+      # `commit: "unknown"`, which is exactly the question this feature exists to
+      # answer.
+      #
+      # Two normalisations, both needed: `dirtyRev` is the full revision with
+      # `-dirty` *appended*, which does not belong in a field whose only job is to
+      # name a commit (the version string beside it already carries dirtiness),
+      # and the git tier abbreviates to 7 so this matches rather than reporting 40
+      # characters for the same field on a different node.
+      buildCommit =
+        let
+          rev = inputs.self.rev or inputs.self.dirtyRev or null;
+        in
+        if rev == null then null else builtins.substring 0 7 rev;
+
       overlay = final: prev: {
         craneLib = inputs.crane.mkLib prev;
 
         cudaPackages = final.cudaPackages_13_0;
 
-        inherit (prev.callPackage ./nix { src = prev.lib.cleanSource ./.; })
+        inherit
+          (prev.callPackage ./nix {
+            src = prev.lib.cleanSource ./.;
+            inherit buildVersion buildCommit;
+          })
           wayfinder-tap
           wayfinder-tui
           wayfinder-ctl
