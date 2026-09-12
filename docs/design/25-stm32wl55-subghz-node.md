@@ -2,11 +2,15 @@
 
 **Status:** Partly implemented. `libs/lora-link`, `bins/wayfinder-wl55jc`,
 `libs/wayfinder-log`'s per-board ring and `libs/wayfinder-hil`'s `BoardKind`
-are built; the board **links, fits, and passes `just stack-budget-wl55jc`**,
-and §4.1's table now carries figures measured from the real image. Still
-unbuilt: the management port and the durable store (§4.9, §4.10), which is what
-this board needs before `libs/wayfinder-hil` can reach it, and the `fuzz/`
-target (§10).
+are built; the board **links, fits, and passes `just stack-budget-wl55jc`** as
+a LoRa relay, and §4.1's table carries figures measured from the real image.
+
+**The management port is built but does not fit**, by 28.1 KiB of flash — see
+§4.1's correction, and branch `bjc/wl55jc-mgmt-port`, which carries the working
+port and the measurement. Closing that gap is §9's first open question and the
+thing blocking `libs/wayfinder-hil`, enrolment, and observability without a
+debug probe. The durable store (§4.9) and the `fuzz/` target (§10) are also
+unbuilt.
 
 **Nothing here is hardware-verified and cannot be**: the board on the bench
 does not answer on SWD (§2.3), so every claim rests on the static gates this
@@ -151,10 +155,24 @@ capacity profile:
 | `panic="abort"`, `lto="fat"`, `opt-level="s"` | 233 KiB | fits, 23 KiB spare |
 | `panic="abort"`, `lto="fat"`, `opt-level="z"` | 197 KiB | fits, 58 KiB spare |
 
-**So flash is not the constraint, provided this board is built at
-`opt-level="z"` with fat LTO.** That is a required setting here, not a
+**So flash is not the constraint *for the relay*, provided this board is built
+at `opt-level="z"` with fat LTO.** That is a required setting here, not a
 preference, and it is why the table is in the design rather than in a commit
-message. Per-crate attribution of the 268 KiB `.text` at default settings, for
+message.
+
+> **Correction, measured after the fact.** That conclusion does not extend to
+> the finished node, and the reason is a flaw in how it was measured: the F411
+> image these figures come from **never linked the management path**. That
+> board calls `run()`, not `run_with_mgmt`, so LTO stripped the whole protobuf
+> dispatch — the table above describes a strictly smaller program than the one
+> it was reasoning about.
+>
+> Linking the management port on this board costs **+75,480 bytes of flash**
+> and takes the image to 290,916 against 262,144 available — **over by
+> 28.1 KiB** — while leaving only 18.1 KiB of stack. So flash *is* the binding
+> constraint for a node with a management port, and §4.10's budget is wrong in
+> the same way. The port itself is built and measured on branch
+> `bjc/wl55jc-mgmt-port`; §9 carries what closing the gap would take. Per-crate attribution of the 268 KiB `.text` at default settings, for
 whoever next wonders where it goes: `core` 52.5 KiB (a third of it float
 formatting — `flt2dec`'s `dragon`/`grisu`, ~15 KiB, which nothing on a router
 should need and which is worth chasing separately), `wayfinder` 46.5, `batman`
@@ -498,6 +516,13 @@ enroll, cannot renew (design 24), and re-derives a new identity on every reset.
 2 KiB, so the store costs two pages at the top of the 256 KiB region, and
 `wayfinder_embedded_driver::identity` supplies the rest unchanged.
 
+**Corrected by measurement:** the arithmetic below is sound but moot, because
+the management path does not fit in this part's flash at all (§4.1's
+correction). The 12 KiB figure was reached and the port built against it; the
+image then overflowed flash by 28.1 KiB, with the heap accounting for 10 KiB of
+a 12.2 KiB rise in statics. Treat the number as the *starting point for a
+retry*, not a settled budget.
+
 The heap floor follows from the management port rather than from choice:
 `wayfinder_server::framing::MAX_FRAME_LEN` is 4 KiB and `serve` holds one
 buffer per direction, so 8 KiB is pinned by a single session before any
@@ -668,8 +693,29 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
   like the `Some(1)` case, none of them declares it, and the method's own docs
   say it is dead weight until design 17 lands. Worth settling once, for all of
   them, rather than per driver.
-- **`flt2dec` in a router image** (~15 KiB of `core`, §4.1). Something formats
-  a float. Worth finding; not this design's job.
+- **How to fit the management port in 256 KB of flash.** The single largest
+  open question, since without the port this board cannot be reached by
+  `libs/wayfinder-hil`, cannot be enrolled, and has no observability once SWD
+  is unavailable. The gap is 28.1 KiB. Two halves:
+
+  - **~13 KiB is recoverable waste, and it is the same `flt2dec` item below.**
+  - **The remaining ~16 KiB is a decision, not an optimization.** The cost is
+    the protobuf dispatch — `handle_router` 13.3 KiB, `wayfinder_protos`
+    22.6 KiB, `prost` 11.9 KiB — and trimming which request kinds a
+    constrained board answers cuts against `rpc_table!`'s declare-once
+    contract, where a kind missing from the table does not compile. That is a
+    change to a shipped crate's central invariant and wants its own design.
+
+- **`flt2dec` in a router image** (~11 KiB of visible `.text`, plus more in the
+  tail, plus 1.7 KiB of `<u128>::_fmt_inner`). **Cause now known**, and it is
+  not a stray call site: `tracing_core::field::Visit` is used as `dyn Visit`,
+  so the trait's *default* `record_f64`/`record_i128`/`record_u128` — which
+  format via `Debug` — are in the vtable and cannot be stripped even though
+  nothing in this firmware logs a float. `wayfinder-log` implements only
+  `record_debug` and relies on those defaults (its `rtt.rs:172` comment says
+  exactly that). Overriding the three on bare metal with integer-only
+  rendering should reclaim it, and would shrink both nRF images too. Its own
+  small MR, since it touches a crate every target links.
 - **Whether `stack-budget.py` should validate `memory.x` against the chip**
   (§4.1). It passed on an image whose stack top was past the end of RAM. This
   design wants that gate, and it is arguably its own small MR.
