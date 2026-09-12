@@ -1,0 +1,27 @@
+[build]
+# **Soft float, unlike every other board here.** The STM32WL55's Cortex-M4 has
+# no FPU, so `thumbv7em-none-eabihf` would emit FPU instructions this core
+# traps on -- a HardFault at the first float, from an image that compiles and
+# links cleanly. Both `embassy-stm32` and `stm32-metapac` map `stm32wl.*` to
+# this triple; the nRF52840 and STM32F411 boards are `eabihf` and copying their
+# config here is the mistake to avoid.
+target = "thumbv7em-none-eabi"
+
+[env]
+# The `GetLogs` record ring, sized for this part rather than for bare metal in
+# general: the crate defaults to 64 records (~16 KiB), which is fine against
+# the nRF52840's 256 KiB of SRAM and a quarter of everything this board has.
+# 16 records still carries a bring-up sequence. Design 25 §4.7.
+WAYFINDER_LOG_RING_CAPACITY = "16"
+
+[target.thumbv7em-none-eabi]
+# `flip-link` puts the stack *below* the statics, for the reason the nRF boards
+# use it and more urgently: this part has no MPU guard region, so a descending
+# stack that reaches `.bss` corrupts it silently and the fault surfaces
+# somewhere unrelated. The margin here is a few KB, not tens.
+linker = "flip-link"
+# `defmt.x` alongside `link.x`: `defmt`'s interning sections must be placed even
+# though this board's logger discards every record. Without it the link fails
+# on undefined `_defmt_*` symbols rather than saying what is wrong.
+rustflags = ["-C", "link-arg=-Tlink.x", "-C", "link-arg=-Tdefmt.x"]
+runner = "probe-rs run --chip STM32WL55JCIx"

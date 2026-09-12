@@ -457,9 +457,19 @@ requests over any `embedded_io_async` byte stream, so a plain `BufferedUart` is
 a management port — **no USB device stack, unlike the nRF's `usb_mgmt`**, which
 is a meaningful saving on both flash and RAM here.
 
-Which UART the VCP lands on is a board fact to read out of UM2592 during
-implementation, not to assume (LPUART1 on PA2/PA3 is the likely answer and is
-stated here as a lead, not a fact).
+Which UART the VCP lands on is **LPUART1, on PA2 (TX) / PA3 (RX) at 115200**.
+Confirmed, not assumed: Zephyr's `boards/st/nucleo_wl55jc/nucleo_wl55jc.dts`
+makes `&lpuart1` both `zephyr,console` and `zephyr,shell-uart` with
+`pinctrl-0 = <&lpuart1_tx_pa2 &lpuart1_rx_pa3>`. The part also has `USART1`
+and `USART2`, which reach the Arduino/Morpho headers rather than the ST-LINK.
+
+**And the part has no USB at all** — no `USB` or `OTG` peripheral exists in
+`stm32-metapac`'s `stm32wl55jc-cm4` PAC, so the nRF's CDC-ACM approach is not
+merely unnecessary here, it is unavailable. That is a simplification rather
+than a limitation: `wayfinder_client::Client::connect_serial` already speaks
+the management protocol over a serial port, so a `BufferedUart` on LPUART1 is
+a complete management port with no device stack, no descriptors, and no VBUS
+handling.
 
 `wayfinder-hil` then needs a `BoardKind::Stm32wl55Nucleo`, with
 `chip() == "STM32WL55JCIx"` and `has_probe() == true`. One thing about this
@@ -736,7 +746,7 @@ Recorded as the design is built, per `docs/design/README.md`.
   computes it and `lora-link` takes a `u16`, rather than a LoRa crate depending
   on an 802.15.4 crate for two lines of arithmetic.
 
-- **Three hardware facts were wrong in the proposal and are corrected in the
+- **Four hardware facts were wrong in the proposal and are corrected in the
   code.** Each is the kind that links cleanly and fails at runtime, which is
   why they are listed rather than quietly fixed:
   - **The target is `thumbv7em-none-eabi`.** This part's Cortex-M4 has no FPU.
@@ -750,6 +760,16 @@ Recorded as the design is built, per `docs/design/README.md`.
     clock dead — which looks like a board that hung in `init`.
   - **The board has a TCXO** (`tcxo_ctrl: Some(Ctrl1V7)`). The proposal guessed
     `None`, which leaves the radio with no reference.
+  - **LD2 is PB9, not PB15.** This board has three user LEDs — LD1 blue on
+    PB15, LD2 green on PB9, LD3 red on PB11 — so the first draft lit the blue
+    one while its comment said green. The worst shape of wrong: the board
+    looks like it booted, and a bench test passes.
+
+  All four were settled against machine-readable sources rather than recall —
+  `stm32-metapac`/`embassy-stm32`'s own target mapping for the FPU question,
+  the `lora-rs` STM32WL example for the clocks and TCXO, and Zephyr's
+  `boards/st/nucleo_wl55jc/nucleo_wl55jc.dts` for the LEDs and the console
+  UART. Worth doing the same for anything else this board needs from UM2592.
 
 - **`init_primary`, not `init`.** `embassy-stm32` has no single-core `init` for
   a dual-core part, so the CM4-only decision (§4.8) is not just a claim in a
