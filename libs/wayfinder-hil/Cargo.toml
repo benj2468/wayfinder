@@ -24,6 +24,9 @@ workspace = true
 # (GitLab #57) is a harness change rather than a rewrite of the tests.
 wayfinder-client.workspace = true
 wayfinder-protos.workspace = true
+# The build identity of *this* checkout, to compare against what an attached
+# board reports. The whole point of a staleness check is that the two can differ.
+wayfinder-version.workspace = true
 wayfinder-auth = { workspace = true, features = ["std"] }
 tokio = { workspace = true }
 # Ephemeral key material for the throwaway mesh a hardware test installs. Never

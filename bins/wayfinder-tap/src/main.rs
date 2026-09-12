@@ -69,6 +69,10 @@ use crate::tap::TapDevice;
 
 /// Command-line arguments.
 #[derive(clap::Parser, Debug)]
+// `--version` reports the build this node is running, which is the same answer
+// `GetNodeInfo` gives over the management API — useful before the node is up, or
+// when there is no client to hand.
+#[command(version = wayfinder_version::VERSION)]
 pub struct Args {
     /// Path to the YAML configuration file.
     #[clap(short, long, default_value = "var/conf/install.yml")]
@@ -393,6 +397,16 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_yaml::from_slice(std::fs::read_to_string(args.config)?.as_bytes())?;
 
     tracing::info!("Welcome to Wayfinder");
+    // Logged at startup as well as served over `GetNodeInfo`, so the build is
+    // in the record even for a node nobody queried — and is readable through
+    // `GetLogs` on one that cannot be reached any other way.
+    tracing::info!(
+        version = wayfinder_version::VERSION,
+        commit = wayfinder_version::COMMIT,
+        dirty = wayfinder_version::DIRTY,
+        source = ?wayfinder_version::SOURCE,
+        "build",
+    );
     // The config can carry sensitive material (enrollment tokens, seed paths),
     // so keep the full dump at DEBUG rather than INFO.
     tracing::debug!(?config, "loaded configuration");

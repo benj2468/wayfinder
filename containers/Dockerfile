@@ -116,6 +116,26 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 # whether cargo then rebuilds it hinges on dep-info env tracking.
 ENV LEPTOS_OUTPUT_NAME=wayfinder-web
 
+# The build identity every binary in this stage reports over `GetNodeInfo` and
+# from `--version`. It has to be passed in: nothing below copies `.git` (see the
+# COPY list), so `wayfinder-version`'s build script has nothing to ask and bakes
+# in "unknown" — leaving a node from a `:nightly` image exactly as opaque as the
+# board this feature exists for.
+#
+# Unlike `LEPTOS_OUTPUT_NAME` above, these are referenced per-command rather than
+# set stage-wide. The value changes on every commit, and Docker cache-misses an
+# ARG's first *usage* onward, so naming them per-command keeps the four `COPY`
+# layers below cached and keeps the value out of every unrelated layer's cache
+# key. (It does not save the dependency compiles: this stage has no separate
+# deps-only layer, so those are inside the same `RUN` either way.)
+#
+# Empty is a real state and a bad one — it means the `--build-arg` was omitted,
+# misspelled, or expanded empty — so the build warns rather than silently
+# shipping an image that cannot say what it is. `.gitlab-ci.yml` refuses
+# outright, because for a release "unknown" is never acceptable.
+ARG WAYFINDER_BUILD_VERSION=""
+ARG WAYFINDER_BUILD_COMMIT=""
+
 WORKDIR /app
 
 # Copy the pieces cargo needs to resolve and build the workspace. Listing them
@@ -134,7 +154,13 @@ COPY assets ./assets
 # Binaries land under a target-triple-suffixed directory; copy them to a
 # fixed, arch-independent path so the final stages below don't need to know
 # the triple.
-RUN cargo build --release --workspace --target "$(cat /rust_target)" \
+RUN if [ -z "$WAYFINDER_BUILD_VERSION" ]; then \
+        echo "WARNING: no --build-arg WAYFINDER_BUILD_VERSION; the binaries in this" >&2; \
+        echo "         image will report their build as \"unknown\"." >&2; \
+    fi \
+    && WAYFINDER_BUILD_VERSION="$WAYFINDER_BUILD_VERSION" \
+       WAYFINDER_BUILD_COMMIT="$WAYFINDER_BUILD_COMMIT" \
+       cargo build --release --workspace --target "$(cat /rust_target)" \
     && mkdir /out \
     && cp target/"$(cat /rust_target)"/release/wayfinder-tap \
         target/"$(cat /rust_target)"/release/wayfinder-tui \
@@ -146,7 +172,9 @@ RUN cargo build --release --workspace --target "$(cat /rust_target)" \
 # dependencies the axum server hangs off), which means the workspace build above
 # produced a stub `main` that only panics. `--features ssr` is what compiles the
 # real server. The browser half it serves is built in the `site` stage below.
-RUN cargo build --release -p wayfinder-web --features ssr \
+RUN WAYFINDER_BUILD_VERSION="$WAYFINDER_BUILD_VERSION" \
+    WAYFINDER_BUILD_COMMIT="$WAYFINDER_BUILD_COMMIT" \
+    cargo build --release -p wayfinder-web --features ssr \
     --target "$(cat /rust_target)" \
     && cp target/"$(cat /rust_target)"/release/wayfinder-web /out/
 

@@ -61,6 +61,10 @@ embassy-sync.workspace = true
 # the feature does not reach a firmware build: dev-deps are not part of the
 # normal graph, and `cargo build` for a board never resolves them.
 wayfinder-auth = { workspace = true, features = ["std"] }
+# Test-only: the build identity this crate was compiled with, to assert the
+# board's served `NodeInfo` reports it. Reaches the firmware anyway through
+# `wayfinder-protos`; the dev-dependency is only so the test can name it.
+wayfinder-version.workspace = true
 # A minimal executor to drive the async loop in host unit tests.
 futures.workspace = true
 # Test-only: build/parse raw link frames (`as_bytes`/`ref_from_bytes`) to feed a

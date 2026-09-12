@@ -6,6 +6,8 @@
 
 use clap::ValueEnum;
 use serde::Serialize;
+use wayfinder_protos::wayfinder::v1alpha::BuildInfo;
+use wayfinder_protos::wayfinder::v1alpha::BuildSource;
 use wayfinder_protos::wayfinder::v1alpha::ClockPosture;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::IssuedCert;
@@ -116,7 +118,7 @@ pub fn node_info(v: &NodeInfo, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {
         format!(
             "node {}\noriginators: {}\nlocked: {}\nruntime config: {}\nclock: {}\n\
-             cert windows: {}",
+             cert windows: {}\nbuild: {}",
             format_mac(&v.node_id),
             v.num_originators,
             if v.auth_locked { "yes" } else { "no" },
@@ -138,9 +140,48 @@ pub fn node_info(v: &NodeInfo, fmt: OutputFormat) -> anyhow::Result<String> {
                 Ok(ClockPosture::Unknown) => "NONE (no anchor; expiry not enforced here)",
                 // A node too old to report it, not a fourth state.
                 Ok(ClockPosture::Unspecified) | Err(_) => "not reported",
-            }
+            },
+            build_line(v.build_info.as_ref()),
         )
     })
+}
+
+/// Describe the build a node is running, for the human output.
+///
+/// Three things an operator asking "is fix X deployed here?" needs to tell
+/// apart, which is why this is not just the version string: the build, whether
+/// the tree it came from was modified (easy to miss as a `-dirty` suffix at the
+/// end of a hash, and the common case on a bench), and a node that does not
+/// report a build at all — which is not the same as an unknown one.
+fn build_line(build: Option<&BuildInfo>) -> String {
+    let Some(build) = build else {
+        return "not reported".to_string();
+    };
+
+    // An all-defaults `BuildInfo` is a legal proto3 encoding (a zero-length
+    // submessage), so an empty version is reachable from a truncated or
+    // forward-compatible encoder. Rendering it verbatim would print a bare
+    // "build: ", which reads as a bug in this tool rather than as a node that
+    // told us nothing.
+    if build.version.is_empty() {
+        return "reported empty".to_string();
+    }
+
+    let mut line = build.version.clone();
+
+    if build.dirty {
+        line.push_str(" (built from a modified tree)");
+    }
+
+    // Worth surfacing only when it weakens the answer: `Injected` is the exact
+    // case and `Git` the everyday one, neither of which needs a caveat.
+    match BuildSource::try_from(build.source) {
+        Ok(BuildSource::Unknown) => line.push_str(" (build could not identify itself)"),
+        Ok(BuildSource::Unspecified) | Err(_) => line.push_str(" (source not reported)"),
+        Ok(BuildSource::Git | BuildSource::Injected) => {}
+    }
+
+    line
 }
 
 /// Render the [`RoutingTable`] as one line per originator plus its paths.

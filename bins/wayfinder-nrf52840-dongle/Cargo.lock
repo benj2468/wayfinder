@@ -1557,6 +1557,7 @@ dependencies = [
  "wayfinder-log",
  "wayfinder-server",
  "wayfinder-storage",
+ "wayfinder-version",
  "zerocopy",
 ]
 
@@ -1580,6 +1581,7 @@ dependencies = [
  "prost",
  "prost-build",
  "tracing",
+ "wayfinder-version",
 ]
 
 [[package]]
@@ -1605,6 +1607,10 @@ dependencies = [
  "embedded-storage",
  "tracing",
 ]
+
+[[package]]
+name = "wayfinder-version"
+version = "0.1.0"
 
 [[package]]
 name = "windows-link"

@@ -27,6 +27,7 @@ required-features = ["mock-node"]
 # deserializes the same proto types the server encodes, so `serde` is needed in
 # both the ssr and hydrate builds.
 wayfinder-protos = { workspace = true, features = ["serde"] }
+wayfinder-version.workspace = true
 
 # Unconditional for the same reason `wayfinder-protos` above is: the
 # registration page's QR code is drawn by the server *and* by the hydration

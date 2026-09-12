@@ -1553,6 +1553,77 @@ message NodeInfo {
   // while still holding a usable floor.  Three states, so a bool cannot carry
   // it without rounding one of them away.
   ClockPosture clock_posture = 6;
+
+  // Which build of the software this node is running.
+  //
+  // Absent on a node too old to report it.  This is the only way to learn what
+  // code a node is executing: a bare-metal board has no filesystem to inspect,
+  // no package manager, and often no probe attached, so an operator asking
+  // "does this node carry fix X?" has nothing else to go on.
+  BuildInfo build_info = 7;
+}
+
+// The build a node was compiled from.
+//
+// Baked in at compile time rather than computed, so answering costs only the
+// strings themselves, and it is available on a bare-metal target.  See
+// docs/design/23-build-provenance.md.
+message BuildInfo {
+  // Human-readable build identity, and the field to display.
+  //
+  // A tagged commit reports its *tag* (`v0.4.0`) -- for a release the tag is
+  // the identity and the hash beneath it is an implementation detail.  A commit
+  // past a tag reports the distance and hash (`v0.4.0-12-g35dcaee`), an
+  // untagged tree reports the bare short hash (`35dcaee`), and a modified tree
+  // carries a `-dirty` suffix on any of those.  "unknown" if the build could
+  // not determine it.
+  string version = 1;
+
+  // The short commit hash on its own, for a consumer that wants to look the
+  // build up rather than display it.  "unknown" if unavailable -- which happens
+  // independently of `version`, since an injected version need not name one.
+  string commit = 2;
+
+  // Whether the tree had uncommitted changes to tracked files when this was
+  // built.  Untracked files do not count.
+  //
+  // Reported separately from the `-dirty` suffix on `version` so a consumer can
+  // branch on it without parsing a string.  This is the field that matters most
+  // during bench bring-up, where most flashes are from a modified tree.
+  bool dirty = 3;
+
+  // How much to trust the fields above.
+  BuildSource source = 4;
+}
+
+// Where a node's reported build identity came from.
+//
+// The distinction is between an identity that is exact by construction and one
+// that was inferred at build time, which is worth reporting because the second
+// kind has a known failure mode.
+enum BuildSource {
+  // Unset.  A node too old to report a build at all omits the whole BuildInfo
+  // message rather than reaching here, so this means a peer that filled the
+  // message and left this field out -- read it as "this node does not say".
+  BUILD_SOURCE_UNSPECIFIED = 0;
+
+  // Derived by asking git in the source tree during the build.  Accurate in
+  // practice, but best-effort: an edit that never touched the git index can
+  // leave `dirty` one build stale.
+  BUILD_SOURCE_GIT = 1;
+
+  // Supplied by a build environment that knew the answer exactly -- a Nix
+  // flake's own revision, a CI variable, a container build argument.  The only
+  // kind available where git metadata is absent by construction: a Nix build
+  // (whose store source excludes .git) and a container image (whose Dockerfile
+  // never copies it).  Board firmware is built from a real checkout and so
+  // reports GIT even for a release.
+  BUILD_SOURCE_INJECTED = 2;
+
+  // Neither was available: a build from a source archive with no git metadata
+  // and nothing injected.  The build still succeeds; it just cannot say what it
+  // is.
+  BUILD_SOURCE_UNKNOWN = 3;
 }
 
 // What a node knows about the wall clock.  Only the validity-window check

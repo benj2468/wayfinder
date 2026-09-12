@@ -24,7 +24,8 @@ use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as ResponseKind;
 
 /// A `bytes` field survives the trip: `node_id` is a `Vec<u8>`, the shape every
-/// identifier in this API is carried as.
+/// identifier in this API is carried as. `build_info` also makes this the case
+/// covering a nested *message* field, which serde has to carry as an `Option`.
 #[test]
 fn node_info_round_trips_through_json() {
     let original = NodeInfo {
@@ -34,6 +35,12 @@ fn node_info_round_trips_through_json() {
         runtime_config_active: true,
         clock_trusted: true,
         clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+        build_info: Some(wayfinder_protos::wayfinder::v1alpha::BuildInfo {
+            version: "v0.4.0-12-g35dcaee-dirty".to_string(),
+            commit: "35dcaee".to_string(),
+            dirty: true,
+            source: wayfinder_protos::wayfinder::v1alpha::BuildSource::Git as i32,
+        }),
     };
 
     let json = serde_json::to_string(&original).unwrap();
@@ -100,6 +107,10 @@ fn response_oneof_round_trips_through_json() {
             runtime_config_active: false,
             clock_trusted: true,
             clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+            // Absent is a state a real peer reports — one too old to carry the
+            // field — so pin that it survives the trip as `None` rather than
+            // decoding into a default-filled message.
+            build_info: None,
         })),
     };
 

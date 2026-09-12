@@ -64,6 +64,12 @@ fn seeded_snapshot() -> NodeSnapshot {
             runtime_config_active: false,
             clock_trusted: true,
             clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+            build_info: Some(wayfinder_protos::wayfinder::v1alpha::BuildInfo {
+                version: "v0.4.0-12-g35dcaee".to_string(),
+                commit: "35dcaee".to_string(),
+                dirty: false,
+                source: wayfinder_protos::wayfinder::v1alpha::BuildSource::Git as i32,
+            }),
         }),
         // Explicit, because `Default` gives `logs: None` — which now means "a
         // read-only poll withheld the ring", not "an empty batch". A fixture

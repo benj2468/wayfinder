@@ -1,0 +1,14 @@
+[package]
+name = "wayfinder-version"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# No dependencies, on purpose. Every binary in the workspace ends up carrying
+# this crate — the board firmwares included, and their flash budget is the
+# tightest constraint in the repo — so it stays `no_std`, allocation-free and
+# dependency-free. `build.rs` shells out to `git` through `std::process`, which
+# is the build script's own environment and never the target's.
+[dependencies]

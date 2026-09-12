@@ -88,12 +88,32 @@ impl Diagnostics {
 
         let info = step("GetNodeInfo", node.node_info()).await.map(|info| {
             format!(
-                "node_id={} originators={} auth_locked={} clock_trusted={} clock_posture={:?}",
+                "node_id={} originators={} auth_locked={} clock_trusted={} clock_posture={:?} \
+                 build={}",
                 hex(&info.node_id),
                 info.num_originators,
                 info.auth_locked,
                 info.clock_trusted,
                 info.clock_posture(),
+                // The question every "do both ends carry fix X?" investigation
+                // starts with, and the reason this field exists at all: a board
+                // flashed weeks ago is otherwise indistinguishable from one
+                // flashed from this tree. The commit and source come too — a
+                // tagged build's version carries no hash, and a `dirty` build's
+                // version is the same string for every edit of that commit, so
+                // the bare version is not always enough to act on.
+                info.build_info.as_ref().map_or_else(
+                    || "not reported".to_string(),
+                    |b| {
+                        format!(
+                            "{} (commit={} dirty={} source={:?})",
+                            b.version,
+                            b.commit,
+                            b.dirty,
+                            b.source()
+                        )
+                    },
+                ),
             )
         });
 

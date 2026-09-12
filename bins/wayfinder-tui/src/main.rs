@@ -38,7 +38,10 @@ use wayfinder_tui::ui;
 #[derive(Parser, Debug)]
 #[command(
     about = "Terminal dashboard for the Wayfinder management API",
-    long_about = None
+    long_about = None,
+    // The dashboard's own build. The node's is on the Overview pane, and the
+    // two can differ — a mismatch is worth being able to see.
+    version = wayfinder_version::VERSION,
 )]
 struct Args {
     /// How to reach the node: address, credentials, or a serial port.
@@ -708,5 +711,18 @@ mod tests {
     fn the_command_tree_is_well_formed() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+    }
+
+    /// The dashboard had no `--version` at all before build provenance, and the
+    /// value has to be the build rather than clap's `CARGO_PKG_VERSION`
+    /// shorthand, which is `0.1.0` for every crate here.
+    #[test]
+    fn the_version_flag_reports_the_build_identity() {
+        use clap::CommandFactory;
+
+        assert_eq!(
+            Args::command().get_version(),
+            Some(wayfinder_version::VERSION)
+        );
     }
 }

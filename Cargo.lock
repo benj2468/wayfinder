@@ -3918,6 +3918,7 @@ dependencies = [
  "tokio-serial",
  "tracing",
  "tracing-subscriber",
+ "wayfinder-version",
 ]
 
 [[package]]
@@ -5337,6 +5338,7 @@ dependencies = [
  "wayfinder-client",
  "wayfinder-protos",
  "wayfinder-server",
+ "wayfinder-version",
  "zerocopy",
 ]
 
@@ -5398,6 +5400,7 @@ dependencies = [
  "wayfinder-protos",
  "wayfinder-server",
  "wayfinder-storage",
+ "wayfinder-version",
  "zerocopy",
 ]
 
@@ -5415,6 +5418,7 @@ dependencies = [
  "wayfinder-auth",
  "wayfinder-client",
  "wayfinder-protos",
+ "wayfinder-version",
  "zerocopy",
 ]
 
@@ -5450,6 +5454,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "wayfinder-version",
 ]
 
 [[package]]
@@ -5519,6 +5524,7 @@ dependencies = [
  "wayfinder-driver",
  "wayfinder-log",
  "wayfinder-server",
+ "wayfinder-version",
  "zerocopy",
 ]
 
@@ -5578,7 +5584,12 @@ dependencies = [
  "wayfinder-auth",
  "wayfinder-client",
  "wayfinder-protos",
+ "wayfinder-version",
 ]
+
+[[package]]
+name = "wayfinder-version"
+version = "0.1.0"
 
 [[package]]
 name = "wayfinder-web"
@@ -5613,6 +5624,7 @@ dependencies = [
  "wayfinder-protos",
  "wayfinder-server",
  "wayfinder-tls-mgmt",
+ "wayfinder-version",
  "web-sys",
  "zerocopy",
 ]

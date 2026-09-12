@@ -1938,6 +1938,7 @@ mod tests {
             runtime_config_active: false,
             clock_trusted: true,
             clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+            build_info: None,
         })
     }
 
@@ -3380,6 +3381,7 @@ mod tests {
             runtime_config_active: false,
             clock_trusted: true,
             clock_posture: wayfinder_protos::wayfinder::v1alpha::ClockPosture::At as i32,
+            build_info: None,
         });
         let (mut client, server) = spawn_authenticated_server_answering(key, ctx, big);
 

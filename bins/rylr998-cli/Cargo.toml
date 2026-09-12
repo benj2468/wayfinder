@@ -15,6 +15,7 @@ name = "rylr998_cli"
 path = "src/lib.rs"
 
 [dependencies]
+wayfinder-version.workspace = true
 # default-features = false: this CLI only drives the bare AT-command
 # interface, not the `link` feature's `LinkT`/mesh-frame integration
 # (wayfinder, zerocopy).

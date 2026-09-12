@@ -30,6 +30,8 @@ use wayfinder_protos::wayfinder::v1alpha::Alarm;
 use wayfinder_protos::wayfinder::v1alpha::AlarmKind;
 use wayfinder_protos::wayfinder::v1alpha::AlarmSeverity;
 use wayfinder_protos::wayfinder::v1alpha::Alarms;
+use wayfinder_protos::wayfinder::v1alpha::BuildInfo;
+use wayfinder_protos::wayfinder::v1alpha::BuildSource;
 use wayfinder_protos::wayfinder::v1alpha::ClockPosture;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
@@ -365,11 +367,48 @@ fn clock_windows(posture: i32) -> String {
     }
 }
 
+/// Describe the build the node under observation is running.
+///
+/// This pane is where someone lands when a node is misbehaving, and the first
+/// question about a misbehaving node is usually whether it is running the code
+/// they think it is. A modified tree is called out in words because `-dirty` at
+/// the end of a hash is easy to skim past, and it is the normal state of a
+/// bench flash.
+fn build_identity(build: Option<&BuildInfo>) -> String {
+    let Some(build) = build else {
+        return "not reported".to_string();
+    };
+
+    // A default-filled `BuildInfo` is a legal encoding, and rendering its empty
+    // version would leave the row blank — indistinguishable from a bug here.
+    if build.version.is_empty() {
+        return "reported empty".to_string();
+    }
+
+    let mut line = build.version.clone();
+
+    if build.dirty {
+        line.push_str(" (modified tree)");
+    }
+
+    // This pane is the bench bring-up surface, which is exactly the audience for
+    // the caveat `BuildSource` carries: a git-derived answer can lag an edit that
+    // never touched the index, and an unidentified build is not the same as a
+    // clean one. Mirrors `wayfinderctl node-info`.
+    match BuildSource::try_from(build.source) {
+        Ok(BuildSource::Unknown) => line.push_str(" (could not identify itself)"),
+        Ok(BuildSource::Unspecified) | Err(_) => line.push_str(" (source not reported)"),
+        Ok(BuildSource::Git | BuildSource::Injected) => {}
+    }
+
+    line
+}
+
 /// Draw the overview pane: node identity, capacity, and connection details.
 fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
-    let (node_id, num_orig, locked, clock, windows) = match &app.snapshot.node_info {
+    let (node_id, num_orig, locked, clock, windows, build) = match &app.snapshot.node_info {
         Some(info) => (
             format_id(&info.node_id),
             info.num_originators.to_string(),
@@ -384,9 +423,11 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
                 "NOT SYNCHRONIZED".to_string()
             },
             clock_windows(info.clock_posture),
+            build_identity(info.build_info.as_ref()),
         ),
         None => (
             "(waiting for data)".to_string(),
+            "—".to_string(),
             "—".to_string(),
             "—".to_string(),
             "—".to_string(),
@@ -399,6 +440,7 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(field("Locked", &locked));
     lines.push(field("Clock", &clock));
     lines.push(field("Cert windows", &windows));
+    lines.push(field("Build", &build));
     lines.push(field(
         "Routing entries",
         &app.snapshot.routing.entries.len().to_string(),

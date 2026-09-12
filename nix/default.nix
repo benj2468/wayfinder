@@ -1,4 +1,15 @@
-{ pkgs, src, ... }:
+{
+  pkgs,
+  src,
+  # The build identity to bake into each binary, from flake metadata. Optional
+  # so a plain `callPackage ./nix {}` still works: `null` leaves
+  # `wayfinder-version`'s build script to fall back on its own (which, with no
+  # `.git` in the store source, means it reports "unknown").
+  buildVersion ? null,
+  # The full commit, alongside the above — see `flake.nix` for why both.
+  buildCommit ? null,
+  ...
+}:
 with pkgs.craneLib;
 let
   protoFilter = path: type: builtins.match ".*proto$" path != null;
@@ -28,10 +39,25 @@ let
 
   cargoArtifacts = buildDepsOnly commonArgs;
 
+  # Deliberately *not* part of `commonArgs`: `cargoArtifacts` above is the
+  # `buildDepsOnly` shared by the plain-cargo packages (`wayfinder-web` builds
+  # its own, further down), and a revision-dependent variable there would change
+  # its derivation hash on every commit, throwing away the dependency cache each
+  # time. Workspace crates are compiled by `buildPackage` anyway, which is the
+  # only stage that needs this.
+  buildVersionEnv =
+    pkgs.lib.optionalAttrs (buildVersion != null) {
+      WAYFINDER_BUILD_VERSION = buildVersion;
+    }
+    // pkgs.lib.optionalAttrs (buildCommit != null) {
+      WAYFINDER_BUILD_COMMIT = buildCommit;
+    };
+
   mkWayfinderPkg =
     pname:
     buildPackage (
       commonArgs
+      // buildVersionEnv
       // {
         inherit cargoArtifacts pname;
         cargoExtraArgs = "-p ${pname}";
@@ -149,6 +175,7 @@ let
 
   wayfinder-web = craneLibWeb.buildPackage (
     commonArgs
+    // buildVersionEnv
     // {
       pname = "wayfinder-web";
       # Deliberately not sharing `cargoArtifacts`: those were built by a

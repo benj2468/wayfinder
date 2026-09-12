@@ -32,6 +32,7 @@ use rylr998::LoraError;
 use rylr998::RylrClient;
 use rylr998::SpreadingFactory;
 use tracing::error;
+use tracing::info;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_embedded_driver::Clock;
 use wayfinder_embedded_driver::Driver;
@@ -91,6 +92,16 @@ async fn main(_spawner: Spawner) {
 
     // After the allocator (the dispatcher allocates) and before any event.
     wayfinder_log::init();
+
+    // The first record this board emits: which firmware is running. There is no
+    // other way to ask a LoRa-only relay that — it has no management port.
+    info!(
+        version = wayfinder_version::VERSION,
+        commit = wayfinder_version::COMMIT,
+        dirty = wayfinder_version::DIRTY,
+        source = ?wayfinder_version::SOURCE,
+        "build",
+    );
 
     let p = embassy_stm32::init(Default::default());
 

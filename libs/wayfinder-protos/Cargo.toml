@@ -17,6 +17,11 @@ tracing = { version = "0.1.44", default-features = false }
 # --output json` emits them, `wayfinder-web` also decodes them in the browser.
 # Off by default so the no_std/embedded build pulls in no extra surface.
 serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+# The build identity this binary was compiled from, reported on every
+# `GetNodeInfo`. A zero-dependency `no_std` crate of consts; the whole feature
+# measured +1,240 bytes of flash on the tightest board (design 23 §8), most of
+# it `.text` rather than the strings.
+wayfinder-version.workspace = true
 
 [features]
 # Enable `#[derive(serde::Serialize, serde::Deserialize)]` on every generated
