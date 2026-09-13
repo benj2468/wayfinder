@@ -10,6 +10,17 @@ publish = false
 [workspace]
 members = ["."]
 
+# Matching both nRF boards. `panic = "abort"` is the load-bearing one: without
+# it the image carries unwinding machinery no bare-metal target can use, and
+# this crate had no `[profile]` section at all -- one more artifact of never
+# having been flashed.
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
 # `#[no_std]`/`#[no_main]` can't build the host `test` harness.
 [[bin]]
 name = "wayfinder-stm32f411"

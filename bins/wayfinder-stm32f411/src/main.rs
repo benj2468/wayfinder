@@ -45,6 +45,55 @@ static HEAP: Heap = Heap::empty();
 /// today; grow it if an allocation panics.
 const HEAP_SIZE_BYTES: usize = 1024;
 
+wayfinder::define_profile! {
+    /// The capacity profile this board is built at, sizing the routing core's
+    /// const-generic tables to a LoRa-only relay rather than to a gateway.
+    ///
+    /// **Not optional on this part.** `Driver::new` builds at the default
+    /// `host` capacities — 128 originators, 8 interfaces, 2048-byte frames —
+    /// which is a Linux gateway's sizing and overflows this part's 128 KB of
+    /// SRAM outright: `.bss` does not fit, by ~9 KB. That went unnoticed
+    /// because `memory.x` claimed the nRF52840's 256 KB, so the link
+    /// succeeded against RAM the STM32F411RE does not have.
+    ///
+    /// `interfaces: 1` is the hardware: one RYLR998 on USART1, no host device
+    /// and no second radio (unlike the nRF boards, which carry three).
+    ///
+    /// `max_frame_len` is the LoRa link's own ceiling. `rylr998`'s reassembler
+    /// refuses to send or reassemble past 512 bytes, so a larger value buys
+    /// nothing but RAM and a smaller one would silently drop frames the radio
+    /// is willing to carry. The constant is `pub(crate)` over there, so this
+    /// cannot be a static assertion the way `wayfinder-nrf` pins itself to
+    /// `ieee802154::MAX_REASSEMBLED_LEN` -- keep the two in step by hand.
+    ///
+    /// The rest carry headroom for the handful-of-nodes mesh a ~5 kbps link
+    /// can actually serve; `originators` and `ident_table` must stay powers of
+    /// two.
+    pub stm32f411 {
+        originators: 16,
+        interfaces: 1,
+        mcast_members: 8,
+        local_mcast: 4,
+        ident_table: 16,
+        ident_live: 12,
+        link_quality: 16,
+        neighbor_keys: 8,
+        revoked: 4,
+        in_flight_cert_requests: 2,
+        pending_replies: 2,
+        max_frame_len: 512,
+    }
+}
+
+/// This board's driver, at the [`stm32f411`] capacities: one RYLR998 LoRa link
+/// driven by the `embassy-time` clock.
+type BoardDriver = wayfinder_embedded_driver::driver_for!(
+    RylrClient<BufferedUart<'static>>,
+    EmbassyClock,
+    1,
+    stm32f411
+);
+
 /// This node's mesh identity. Must be distinct per physical node: it drives a
 /// distinct RYLR `AT+ADDRESS`, and the reassembler keys on that address.
 const NODE_MAC: Mac = Mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
@@ -171,6 +220,7 @@ async fn main(_spawner: Spawner) {
 
     // This board's one interface, named so the management API reports `lora`
     // rather than a bare `0`.
-    let mut driver = Driver::new(NODE_MAC, [client], EmbassyClock, &trickle, &[], &["lora"]);
+    let mut driver: BoardDriver =
+        Driver::with_capacities(NODE_MAC, [client], EmbassyClock, &trickle, &[], &["lora"]);
     driver.run().await
 }
