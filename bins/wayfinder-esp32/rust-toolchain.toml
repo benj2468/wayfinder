@@ -1,0 +1,10 @@
+# The Xtensa fork, by the name `espup` installs it under.
+#
+# Only rustup reads this file, and this repo's devShell deliberately keeps
+# rustup off PATH (see flake.nix's `espupWrapped`), so `just build-esp32` — which
+# invokes the fork's own cargo through `esp-cargo` — does not depend on it. It
+# is here so that a checkout *outside* the devShell, on a machine where rustup
+# is the way Rust is installed, resolves the right toolchain instead of failing
+# on an unknown target.
+[toolchain]
+channel = "esp"

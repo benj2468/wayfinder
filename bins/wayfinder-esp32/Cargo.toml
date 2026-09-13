@@ -1,0 +1,61 @@
+[package]
+name = "wayfinder-esp32"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent workspace, for the same reason every board binary is one: a
+# bare-metal target triple, linker script and panic handler must not leak into
+# the host workspace. This board has a second, harder reason — its target
+# (`xtensa-esp32-none-elf`) exists only in Espressif's rustc fork, so the root
+# workspace's toolchain cannot build this crate at all. See the `esp-toolchain`
+# section of the justfile.
+[workspace]
+members = ["."]
+
+# Matching the other boards. `panic = "abort"` is the load-bearing one: a
+# bare-metal image has no use for unwinding machinery.
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+
+# `#[no_std]`/`#[no_main]` can't build the host `test` harness.
+[[bin]]
+name = "wayfinder-esp32"
+path = "src/main.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+# The build identity this firmware prints at bring-up, so a flashed image can
+# be tied back to a commit. Zero-dependency and `no_std`; the only piece of
+# wayfinder in the image so far, and the piece that proves a path dependency on
+# the root workspace's crates resolves for this target.
+wayfinder-version = { path = "../../libs/wayfinder-version" }
+# Espressif's HAL. The `esp32` feature selects the original Xtensa LX6 part —
+# not interchangeable with the RISC-V ESP32-C/H parts, which need neither this
+# target nor the toolchain fork.
+esp-hal = { version = "~1.1.0", features = ["esp32"] }
+# Emits the app descriptor the ESP-IDF second-stage bootloader expects to find
+# in the image header. Without it the ROM bootloader refuses to start what we
+# flash, which looks like a dead board rather than a rejected image.
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
+# Bring-up observability, over the UART the USB-serial bridge on a dev board
+# already exposes: an ESP32 has no debug probe in the picture, so `println!`
+# over that UART is the equivalent of RTT on the nRF and STM32 boards.
+esp-println = { version = "0.17.0", features = ["esp32"] }
+# The panic handler, printing a decodable backtrace over that same UART. A
+# `loop {}` handler would be smaller and would turn every panic into a silent
+# hang — the one failure mode worth spending flash to avoid on a new board.
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32",
+    "panic-handler",
+    "println",
+] }

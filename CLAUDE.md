@@ -92,14 +92,22 @@ invocation from its own directory:
   must not leak into the main host build). Host-testable: `cd libs/wayfinder-py
   && cargo nextest run`. Wired into CI's `test:run:python` job, alongside pytest.
 - `bins/wayfinder-nrf52840`, `bins/wayfinder-nrf52840-dongle`,
-  `bins/wayfinder-stm32f411` — separate `[workspace]`s, `no_std`/`no_main`
-  firmware binaries with `test = false`; a host test harness can't link against
-  them at all. Their logic is exercised indirectly through the `libs/*` crates
-  they wire together (tested in the root workspace) plus CI's `build:embedded`
-  job (cross-compile + clippy for the real target). Behaviour beyond that needs
-  hardware-in-the-loop: `libs/wayfinder-hil` (`just hil`) drives a real board
-  over its management API, `#[ignore]`d so it compiles everywhere and runs only
-  where boards are attached — see `docs/design/21-hardware-in-the-loop-tests.md`.
+  `bins/wayfinder-stm32f411`, `bins/wayfinder-esp32` — separate `[workspace]`s,
+  `no_std`/`no_main` firmware binaries with `test = false`; a host test harness
+  can't link against them at all. Their logic is exercised indirectly through
+  the `libs/*` crates they wire together (tested in the root workspace) plus
+  CI's `build:embedded` job (cross-compile + clippy for the real target).
+  Behaviour beyond that needs hardware-in-the-loop: `libs/wayfinder-hil` (`just
+  hil`) drives a real board over its management API, `#[ignore]`d so it
+  compiles everywhere and runs only where boards are attached — see
+  `docs/design/21-hardware-in-the-loop-tests.md`. `bins/wayfinder-esp32` is the
+  one exception to "CI cross-compiles it": its target lives only in Espressif's
+  rustc fork, which `just esp-toolchain` installs out of band into `$HOME` (~2
+  GB) because no Nix package can supply it. So it is absent from
+  `build-embedded`, from `just ci` and from CI, and has its own
+  `build-esp32`/`clippy-esp32` recipes — a change that touches it is checked by
+  running those, and nothing else will catch a break.
+
   But not every board-only property needs a board. Anything
   decidable from the linked image is gatable without a board, and
   `build:stack-budget` (`just stack-budget`) is the one that exists: it reads
@@ -546,6 +554,13 @@ the root workspace" above)
   LFXO, less flash. Logs are readable only over the USB management port.
 - **bins/wayfinder-stm32f411** — NUCLEO-F411RE, a LoRa-only relay on a
   non-Nordic Cortex-M: the proof the driver is HAL-portable.
+- **bins/wayfinder-esp32** — the original ESP32 (Xtensa LX6), currently a
+  bring-up "hello world" over UART rather than a mesh node. It is here for the
+  toolchain, not yet for the routing: Xtensa has no upstream LLVM backend, so
+  this is the one board whose compiler the devShell cannot supply — see the
+  `esp-toolchain` section of the justfile and `espupWrapped` in `flake.nix`.
+  Flashed over its ROM serial bootloader with `espflash` (`just flash-esp32`),
+  not a debug probe.
 
 **Deployment targets** — the same `wayfinder-tap` binary, four ways
 - **nix/modules/wayfinder.nix** — the NixOS service module every host
