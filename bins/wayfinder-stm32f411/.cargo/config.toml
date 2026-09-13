@@ -2,4 +2,19 @@
 target = "thumbv7em-none-eabihf"
 
 [target.thumbv7em-none-eabihf]
+# `flip-link` moves the stack *below* the statics instead of leaving it at the
+# top of RAM growing down into them, for the same reason the nRF boards use it:
+# this part has no MPU guard region, so a descending stack that reaches `.bss`
+# silently scribbles over it and the fault surfaces later, somewhere unrelated
+# -- an unreproducible crash rather than a fault. With the stack at the bottom,
+# an overflow runs off the end of RAM and faults immediately, at the culprit.
+#
+# It matters more here than on the nRF: this part has 128 KB of RAM against the
+# nRF52840's 256 KB, and `scripts/stack-budget.py` reports the router's frame
+# chain needs most of what is left after the statics. An overflow is a live
+# possibility on this board, not a theoretical one.
+linker = "flip-link"
 rustflags = ["-C", "link-arg=-Tlink.x"]
+# Flashes *and* attaches RTT, so `cargo run` shows the boot output -- which is
+# the only way to observe this board, having no management port of its own.
+runner = "probe-rs run --chip STM32F411RE"
