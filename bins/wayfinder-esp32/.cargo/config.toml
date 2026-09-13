@@ -1,0 +1,19 @@
+[build]
+target = "xtensa-esp32-none-elf"
+# `-nostartfiles` because `esp-hal`'s runtime, not the C library's, owns the
+# reset vector and the entry point.
+rustflags = ["-C", "link-arg=-nostartfiles"]
+
+# The fork ships no precompiled `core` for the Xtensa bare-metal targets — only
+# `rust-src` — so every build compiles the sysroot from source. Without this a
+# build fails with `can't find crate for 'core'`, which reads like a missing
+# target rather than a missing prebuilt.
+[unstable]
+build-std = ["core"]
+
+[target.xtensa-esp32-none-elf]
+# An ESP32 is flashed over its serial bootloader in ROM, so bring-up needs a USB
+# cable rather than a debug probe: no `probe-rs run --chip ...` like the Cortex-M
+# boards. `--monitor` then stays attached to the same UART the firmware prints
+# on, which is how `cargo run` shows the boot output.
+runner = "espflash flash --monitor --chip esp32"

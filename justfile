@@ -478,6 +478,98 @@ clippy-loose-drivers:
         --features hardware,softdevice-log --target {{ bare_metal_target }} -- -D warnings
 
 # ---------------------------------------------------------------------------
+# ESP32 (Xtensa) toolchain
+# ---------------------------------------------------------------------------
+#
+# The one board family whose compiler the devShell cannot provide: Xtensa has
+# no upstream LLVM backend, so `xtensa-esp32-none-elf` exists only in
+# Espressif's rustc fork, which `espup` installs into `$HOME` as a prebuilt
+# tarball. flake.nix's `espupWrapped` comment carries the full reasoning,
+# including why `rustup` is deliberately absent from PATH and why a build runs
+# through `esp-cargo` instead of `cargo +esp`.
+#
+# These recipes are therefore *not* part of `just ci`, and never will be: they
+# download ~2 GB from GitHub and write outside the repo. Run `esp-toolchain`
+# once per machine; `esp-check` afterwards to confirm the fork can actually
+# execute here (on NixOS that is a question about nix-ld, not about Rust).
+#
+# `esp32` alone rather than espup's `all` default: each extra Xtensa target is
+# another multi-hundred-MB unpack, and the RISC-V ESP32s (C3/C6/H2) need none
+# of this — their target ships with the ordinary fenix toolchain.
+
+# Xtensa targets to install the fork for. `esp32,esp32s3` if an S3 joins the
+# bench; the RISC-V parts do not belong here.
+esp_targets := "esp32"
+
+# Bare-metal target triple for the original ESP32 (Xtensa LX6). `no_std`; the
+# `std` counterpart would be `xtensa-esp32-espidf`, which additionally needs
+# ESP-IDF and the `ldproxy`/`esp-idf-sys` machinery the devShell also carries.
+esp_target := "xtensa-esp32-none-elf"
+
+[doc("Install the Xtensa Rust toolchain for the ESP32 (~2 GB, writes to $HOME).")]
+esp-toolchain:
+    espup install --targets {{ esp_targets }}
+
+[doc("Update the installed Xtensa Rust toolchain in place.")]
+esp-toolchain-update:
+    espup update --targets {{ esp_targets }}
+
+[doc("Remove the Xtensa Rust toolchain and Espressif tools from $HOME.")]
+esp-toolchain-clean:
+    espup uninstall
+
+# Running the fork at all is the check worth having: the tarball unpacking
+# successfully says nothing about whether its FHS binaries execute on this host
+# (on NixOS that is a nix-ld question), and a target-list that names
+# `xtensa-esp32-none-elf` is what separates the fork from the stock rustc that
+# `cargo` otherwise means in this shell.
+#
+# It stops there on purpose — `build-esp32` below is the end-to-end check. The
+# fork ships *no prebuilt `core`* for the Xtensa bare-metal targets, so a listed
+# target is not a buildable one until `build-std` compiles the sysroot from
+# `rust-src` (see `bins/wayfinder-esp32/.cargo/config.toml`).
+[doc("Verify the Xtensa toolchain runs here and knows the ESP32 target.")]
+esp-check:
+    esp-env rustc --version --verbose
+    esp-env rustc --print target-list | grep -qx {{ esp_target }}
+    @echo "{{ esp_target }}: available"
+
+# ---------------------------------------------------------------------------
+# ESP32 firmware
+# ---------------------------------------------------------------------------
+#
+# Its own section rather than joining `build-embedded`/`clippy-embedded`: those
+# aggregates are reached by `just ci`, and this board's compiler is not the
+# workspace toolchain but a fork installed out of band by `esp-toolchain` above.
+# Folding it in would make the full local gate — and CI's `build:embedded` job —
+# fail on every machine that has not spent the ~2 GB. Run these explicitly while
+# working on the board; the `no_std` crates it will eventually link are covered
+# by the root workspace either way.
+#
+# `esp-cargo` rather than `cargo` throughout, for the reason flake.nix's
+# `espupWrapped` comment gives: `cargo +esp` needs a rustup this shell
+# deliberately does not have on PATH.
+
+[doc("Build the ESP32 (Xtensa LX6) firmware.")]
+build-esp32:
+    cd bins/wayfinder-esp32 && esp-cargo build --locked
+
+[doc("Lint the ESP32 firmware.")]
+clippy-esp32:
+    cd bins/wayfinder-esp32 && esp-cargo clippy --locked --all-targets -- -D warnings
+
+# `espflash` over the USB-serial bridge, then stays attached to the same UART the
+# firmware prints on — the ESP32 equivalent of `probe-rs run` on the Cortex-M
+# boards, and the only way to observe this image. Needs the board plugged in.
+[doc("Flash the ESP32 over USB and monitor its output.")]
+flash-esp32:
+    cd bins/wayfinder-esp32 && esp-cargo run --locked --release
+
+[doc("Remove the ESP32 firmware's target directory.")]
+clean-esp32:
+    cd bins/wayfinder-esp32 && esp-cargo clean
+
+# ---------------------------------------------------------------------------
 # Python test suite
 # ---------------------------------------------------------------------------
 
