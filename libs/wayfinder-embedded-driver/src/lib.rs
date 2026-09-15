@@ -51,14 +51,21 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::LinkT;
+use wayfinder::router_ops::RouterAuthOps;
 use wayfinder::router_ops::RouterOps;
 use wayfinder::wayfinder_auth::WallClock;
+use wayfinder_alarm::AlarmKind;
+use wayfinder_alarm::NodeId;
+use wayfinder_alarm::Severity;
+use wayfinder_alarm::Subject;
+use wayfinder_alarm::alarm;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
 use wayfinder_driver_core::OutgoingFrame;
 use wayfinder_driver_core::handle_link_result;
 use wayfinder_driver_core::plan_dispatch;
 use wayfinder_driver_core::poll_due_all;
+use wayfinder_driver_core::poll_due_renewal;
 
 pub mod identity;
 
@@ -444,7 +451,7 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
     }
 }
 
-impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
+impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterAuthOps>
     Driver<L, C, N, FRAME_LEN, R>
 {
     /// A board must not hand the driver more mesh links than its profile's
@@ -558,6 +565,13 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
                     .next_ping_after(now)
                     .unwrap_or(core::time::Duration::MAX),
             );
+        // **No renewal deadline here, and no renewal poll below.** This loop
+        // has no store: it is `run()`, the arm a board takes when it has no
+        // management port. A renewal it could not make durable would install a
+        // certificate, report success through `renewal_replies_accepted`, and
+        // be lost at the next reset — a board that reads healthy and comes back
+        // stale, which is worse than one that never renewed. Renewal lives in
+        // `run_once_with_mgmt`, which holds the store that finishes the job.
         trace!(?now, ?due, "run_once");
 
         // Destructure into disjoint field borrows so the planning step can hold
@@ -753,9 +767,78 @@ impl<
             return Restored::Refused(RefusalReason::CertifiedAddressMismatch);
         }
 
-        self.router
-            .set_auth(OgmAuth::with_capacities(record.keypair(), cert, anchor));
+        let mut auth = OgmAuth::with_capacities(record.keypair(), cert, anchor);
+        // Where this board renews, derived from the pinned provider key the
+        // record keeps — the same derivation `RouterAdapter::set_auth` makes
+        // when the credential is first installed, so a reboot inside the
+        // renewal window carries on renewing rather than waiting for an
+        // operator with a serial cable (design 24 §4.4).
+        auth.set_renewal_authority(record.renewal_provider_key.as_ref());
+        self.router.set_auth(auth);
         Restored::Authenticated
+    }
+
+    /// Write a certificate a renewal just installed back to `store`, if one is
+    /// waiting.
+    ///
+    /// The shell's half of a split the `no_std` core cannot close: it can
+    /// change the credential this node runs under, but it cannot write flash.
+    /// Without this a renewed board keeps routing until somebody power-cycles
+    /// it and then comes back under the certificate it renewed away from —
+    /// which by then is the one that has lapsed.
+    ///
+    /// Costs nothing when there is nothing to write, which is every turn of the
+    /// loop but a handful per certificate lifetime.
+    ///
+    /// A failed write is reported and **not retried**. The node keeps running
+    /// under the renewed certificate either way, and re-attempting a store that
+    /// just refused would spend the erase budget design 22 §4.5 sizes on a
+    /// write that is failing for a reason another attempt will not change. The
+    /// alarm is the operator-facing half: what it says is that this board will
+    /// come back stale, which is a thing to fix before the reset rather than
+    /// after.
+    fn persist_renewed_cert(&mut self, store: &mut dyn NodeStore) {
+        let Some(cert) = self.router.take_renewed_cert() else {
+            return;
+        };
+        // Every field but the certificate carried over from what is stored:
+        // this write replaces one blob, and rebuilding the identity from
+        // anything else would be a chance to drop the seed or the anchor that
+        // certificate chains to.
+        let Some(mut identity) = store.settings().identity.clone() else {
+            // Unreachable in the direction that matters: a renewal only ever
+            // answers a request a credentialed node made. Reported rather than
+            // ignored, because reaching it means the record and the running
+            // auth state disagree about whether this node has an identity.
+            warn!(
+                "a renewed certificate has nowhere to be written: this node holds no \
+                 stored identity to replace"
+            );
+            return;
+        };
+        identity.cert = cert.to_bytes().to_vec();
+        if let Err(e) = store.persist(wayfinder_server::NodeSettings {
+            identity: Some(identity),
+            ..Default::default()
+        }) {
+            warn!(
+                error = %e,
+                "could not make a renewed certificate durable; this node is running under it \
+                 but will come back to the previous one after a reset"
+            );
+            // `CertNotDurable`, **not** `CertExpiring`. The renewal-window row
+            // is cleared by the poll that finds this node no longer due — which
+            // is exactly what a successful renewal produces — so raising this
+            // under that kind would have the renewal retire the one row saying
+            // the renewal was not made durable. The board would then read as
+            // healthy right up until somebody power-cycled it.
+            alarm!(
+                Severity::Warning,
+                AlarmKind::CertNotDurable,
+                Subject::Node(NodeId::new(&self.router.self_ident().0)),
+                "renewed certificate not written to storage; a reset loses it"
+            );
+        }
     }
 
     /// Write the clock's current estimate back to `store`, if enough of it has
@@ -820,9 +903,15 @@ impl<
         // this loop wakes every few seconds, so a check costs nothing and
         // keeps the `select`'s `min` about the mesh.
         self.write_checkpoint_if_due(store);
+        // Beside the checkpoint, and on the same argument: this is a write that
+        // only ever happens when there is something new to say, and the thing
+        // it says — the certificate this node is now running under — is lost at
+        // the next reset if nothing writes it. It is the mgmt-arm loop rather
+        // than `run_once` that does so because this is where the store is.
+        self.persist_renewed_cert(store);
 
         let now = self.clock.now();
-        // Same four deadlines as `run_once`, and for the same reasons.
+        // Same five deadlines as `run_once`, and for the same reasons.
         let due = self
             .router
             .next_broadcast_after(now)
@@ -839,6 +928,14 @@ impl<
             .min(
                 self.router
                     .next_ping_after(now)
+                    .unwrap_or(core::time::Duration::MAX),
+            )
+            // The renewal check. Folded in here and not in `run_once` because
+            // this is the loop that holds the store, and so the only one that
+            // can finish a renewal by making it durable.
+            .min(
+                self.router
+                    .next_renewal_after(now)
                     .unwrap_or(core::time::Duration::MAX),
             );
 
@@ -865,7 +962,13 @@ impl<
             Either3::First((result, idx)) => {
                 handle_link_result(now, router, idx, result, tx_buffer, fan_out, stage)
             }
-            Either3::Second(()) => poll_due_all(router, now, tx_buffer, stage),
+            Either3::Second(()) => {
+                poll_due_all(router, now, tx_buffer, stage);
+                // Explicit, because `poll_due_all` deliberately excludes it:
+                // renewal is only safe to start on a shell that can make the
+                // answer durable, and this is that shell.
+                poll_due_renewal(router, now, tx_buffer, stage);
+            }
             Either3::Third(request) => {
                 trace!("servicing forwarded management query");
                 // Build the response against a fresh adapter at `now`, then hand
@@ -889,12 +992,19 @@ impl<
                 // `WayfinderService::handle` used to emit it and no longer runs
                 // on this path.
                 audit_request(&request);
-                // No renewal-provider slot, and none is wanted: a board cannot
-                // renew its own certificate — that path is the host driver's
-                // tokio loop — so a `SetAuth` carrying a provider installs the
-                // credential and drops the target, and `GetSecurityStatus` here
-                // reports none. Wire one through if an embedded node ever grows
-                // the ability to renew itself.
+                // No `with_renewal_provider` slot, which is now only about
+                // *reporting*. A board does renew itself — over the mesh, since
+                // design 24 — and the `SetAuth` below does record where: it
+                // reaches `RecordSettings` through `with_settings`, which
+                // persists the provider's pinned key, and `set_auth` arms the
+                // router from it.
+                //
+                // What is missing is the adapter's live slot, which is what
+                // `GetSecurityStatus` reads its `renewal_provider` field from.
+                // So a board reports no provider while renewing perfectly well,
+                // and an operator sees a non-zero `renewal_requests_sent`
+                // beside an empty target. Wire the slot through to fix the
+                // report; nothing about the renewal itself depends on it.
                 let response = handle_router(
                     &mut RouterAdapter::new(&mut *router, now)
                         .with_wall_clock(wall)
@@ -1710,6 +1820,112 @@ mod restore_tests {
         assert!(driver.router.auth_mut().is_none());
     }
 
+    /// A record credentialed by a real authority, so the renewal path — which
+    /// verifies every certificate it installs against the anchor — can be
+    /// driven end to end. The rest of this module's fixtures hand-build an
+    /// unsigned certificate, which `restore` accepts and `ingest_renew_reply`
+    /// rightly does not.
+    fn ca_credentialed(seed_byte: u8) -> (wayfinder::wayfinder_auth::Authority, NodeRecord) {
+        let ca = wayfinder::wayfinder_auth::Authority::from_seed(&[0x5A; 32], MESH_ID);
+        let seed = seed(seed_byte);
+        let kp = Keypair::from_seed(&seed);
+        let cert = ca.issue_cert(
+            kp.derived_mac(),
+            kp.ed_pubkey(),
+            kp.x_pubkey(),
+            1_700_000_000,
+            1_800_000_100,
+        );
+        let record = NodeRecord {
+            checkpoint_unix: 1_800_000_000,
+            cert: Some(*cert.as_bytes().first_chunk().expect("fixed-size cert")),
+            trust_anchor: Some(ca.trust_anchor().to_bytes()),
+            renewal_provider_key: Some([0x0B; 32]),
+            ..NodeRecord::fresh(seed)
+        };
+        (ca, record)
+    }
+
+    /// A certificate a renewal installed is made **durable**, or the board
+    /// comes back at its next reset under the credential it renewed away from
+    /// — which by then is the one that has lapsed.
+    ///
+    /// The router can change the credential it runs under; it cannot write
+    /// flash. This is the shell's half of that split, and it is the half that
+    /// turns design 24 from "a board keeps routing until someone power-cycles
+    /// it" into a board that stays a member.
+    #[test]
+    fn a_renewed_certificate_is_made_durable() {
+        let now = Duration::from_secs(30);
+        let (ca, record) = ca_credentialed(0x30);
+        let (mut settings, medium) = store_holding(record.clone());
+        let mut driver = driver_at(now, record.mac());
+        driver.restore(&record);
+        let before = *medium.saves.borrow();
+
+        // The exchange, driven through auth state rather than over a frame:
+        // the relay and delivery halves are `wayfinder`'s tests, and what is
+        // being pinned here is that the *shell* writes what they produce.
+        let mut buf = [0u8; 512];
+        driver
+            .router
+            .auth_mut()
+            .unwrap()
+            .build_renewal_request(&mut buf)
+            .expect("the record names an authority to renew against");
+        let kp = Keypair::from_seed(&seed(0x30));
+        let renewed = ca.issue_cert(
+            kp.derived_mac(),
+            kp.ed_pubkey(),
+            kp.x_pubkey(),
+            1_700_000_000,
+            1_900_000_000,
+        );
+        assert!(
+            driver
+                .router
+                .auth_mut()
+                .unwrap()
+                .ingest_renew_reply(renewed.as_bytes())
+        );
+
+        driver.persist_renewed_cert(&mut settings);
+
+        assert_eq!(*medium.saves.borrow(), before + 1);
+        assert_eq!(
+            settings.record().cert.as_ref().map(|c| &c[..]),
+            Some(renewed.as_bytes()),
+            "the record now holds the certificate the node is running under"
+        );
+        assert_eq!(
+            settings.record().checkpoint_unix,
+            1_800_000_000,
+            "and the clock checkpoint beside it is untouched"
+        );
+        assert_eq!(
+            settings.record().renewal_provider_key,
+            Some([0x0B; 32]),
+            "as is the authority it renews against"
+        );
+    }
+
+    /// With nothing renewed there is nothing to write. A board's erase budget
+    /// is the thing design 22 §4.5 sizes, and a write per loop turn would spend
+    /// it on saying nothing.
+    #[test]
+    fn a_board_with_no_renewal_to_record_spends_no_flash_wear() {
+        let now = Duration::from_secs(30);
+        let (_, record) = ca_credentialed(0x31);
+        let (mut settings, medium) = store_holding(record.clone());
+        let mut driver = driver_at(now, record.mac());
+        driver.restore(&record);
+        let before = *medium.saves.borrow();
+
+        driver.persist_renewed_cert(&mut settings);
+
+        assert_eq!(*medium.saves.borrow(), before);
+    }
+
     /// An unanchored board writes no checkpoint at all — it has nothing to
     /// write, and design 22 §4.5's whole budget is spent on writes that say
     /// something.
@@ -1927,6 +2143,37 @@ mod restore_tests {
             2,
             "and it does try again once the interval has passed"
         );
+    }
+    /// A restored credential arms renewal against the authority its enrollment
+    /// recorded — derived from the provider key the record keeps, so a board
+    /// that reboots inside its renewal window carries on renewing rather than
+    /// waiting for an operator with a serial cable.
+    #[test]
+    fn a_restored_credential_arms_renewal_against_its_recorded_authority() {
+        let now = Duration::from_secs(30);
+        let record = NodeRecord {
+            renewal_provider_key: Some([0x0B; 32]),
+            ..credentialed(0x21, 0, 1_800_000_000)
+        };
+        let mut driver = driver_at(now, record.mac());
+
+        assert_eq!(driver.restore(&record), Restored::Authenticated);
+        assert_eq!(
+            driver.router.auth().unwrap().renewal_authority(),
+            Some(wayfinder::wayfinder_auth::derive_mac(&[0x0B; 32])),
+        );
+    }
+
+    /// A record with no provider arms no renewal: the board asks nobody rather
+    /// than reaching back to an authority it may have left.
+    #[test]
+    fn a_restored_credential_with_no_provider_arms_no_renewal() {
+        let now = Duration::from_secs(30);
+        let record = credentialed(0x22, 0, 1_800_000_000);
+        let mut driver = driver_at(now, record.mac());
+
+        assert_eq!(driver.restore(&record), Restored::Authenticated);
+        assert_eq!(driver.router.auth().unwrap().renewal_authority(), None);
     }
 
     /// **A board hands the adapter the seed it holds**, so `SetAuth` can

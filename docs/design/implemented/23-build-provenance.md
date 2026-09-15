@@ -1,8 +1,7 @@
 # Design: which build is this node running?
 
-**Status:** Proposed — built in this session and awaiting review; §9 records what
-the implementing session decided. Flip to `Implemented` and move into
-`implemented/` when it lands on `main`.
+**Status:** Implemented — landed on `main` in `85dd963`. §9 records what the
+implementing session decided.
 
 Owns GitLab #59.
 

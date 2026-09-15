@@ -239,6 +239,12 @@ impl RouterReads for Mock {
             node_mac: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x07],
             cert_not_after: 1100,
             revocation_count: 1,
+            // A node that has asked five times and been answered four: the
+            // shape of the one thing these two counters exist to show, since a
+            // node asking and never being answered is invisible in either
+            // number on its own.
+            renewal_requests_sent: 5,
+            renewal_replies_accepted: 4,
             nodes: vec![
                 NodeSecurityData {
                     node_id: vec![0, 0, 0, 0, 0, 2],
@@ -611,6 +617,8 @@ async fn security_query_renders_json_from_server() {
     assert_eq!(parsed["auth_enabled"], true);
     assert_eq!(parsed["mesh_id"], 0xABCD);
     assert_eq!(parsed["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(parsed["renewal_requests_sent"], 5);
+    assert_eq!(parsed["renewal_replies_accepted"], 4);
 }
 
 #[tokio::test]
@@ -626,6 +634,10 @@ async fn security_query_renders_human_from_server() {
     assert!(out.contains("authentication: enabled"), "got: {out}");
     assert!(out.contains("revoked"), "got: {out}");
     assert!(out.contains("00:00:00:00:00:02"), "got: {out}");
+    assert!(
+        out.contains("mesh renewals: 5 asked / 4 answered"),
+        "the pair is rendered together, because the gap is the signal; got: {out}"
+    );
 }
 
 #[tokio::test]

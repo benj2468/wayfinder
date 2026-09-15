@@ -24,6 +24,11 @@ wayfinder-storage = { workspace = true, default-features = false }
 # Pinned directly (not workspace inheritance, which can't override
 # `default-features`) so the crate stays `no_std` — no `alloc`, no `std`.
 wayfinder = { path = "../wayfinder", default-features = false }
+# The node's alarm board, for the one condition this crate can detect and
+# nothing else can: a renewed certificate that could not be made durable, which
+# leaves a board running fine now and stale after its next reset. Default
+# features off to keep this crate `no_std`.
+wayfinder-alarm = { path = "../wayfinder-alarm", default-features = false }
 interfaces.workspace = true
 heapless.workspace = true
 # The record's flags byte, as a type rather than seven loose `1 << n`

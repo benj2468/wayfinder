@@ -370,6 +370,15 @@ pub struct Driver<Local: FrameIo> {
     /// publishing half is live on every node, including one that never runs an
     /// authority; see [`AuthorityComms`](wayfinder_server::AuthorityComms).
     authority: wayfinder_server::AuthorityComms,
+    /// The command channel to the certificate-authority task, when this node
+    /// runs one.
+    ///
+    /// `None` on every node that is not a provider, which is most of them — and
+    /// is why a mesh renewal reaching such a node is traced and dropped rather
+    /// than being a condition. Wired by
+    /// [`attach_authority`](Self::attach_authority) alongside the receiving
+    /// half, so the two cannot be half-connected.
+    authority_tx: Option<wayfinder_server::AuthorityTx>,
     /// Receive scratchpad for frames read from the host device.
     rx_buffer: [u8; MAX_LINK_FRAME_LEN],
     /// Transmit scratchpad the router builds outgoing frames into.
@@ -397,6 +406,22 @@ pub struct Driver<Local: FrameIo> {
     renewal_tx: tokio::sync::mpsc::Sender<anyhow::Result<Renewed>>,
     /// The receiving half of [`renewal_tx`](Self::renewal_tx).
     renewal_rx: tokio::sync::mpsc::Receiver<anyhow::Result<Renewed>>,
+    /// Where the certificate authority's answer to a renewal that arrived over
+    /// the **mesh** comes back, paired with the node that asked.
+    ///
+    /// Design 24 §4.3's fork, and the one asymmetry that keeps this off the
+    /// cert-reply path: a `CertReply` is built in the receive path from state
+    /// the router already holds, while this answer is a round trip to another
+    /// task. So the request is verified on one turn of the loop and answered on
+    /// a later one, and a channel is what holds it across the gap.
+    ///
+    /// A separate pair from [`renewal_tx`](Self::renewal_tx) because the two
+    /// are opposite directions of unrelated things: that one carries *this
+    /// node's own* renewal home from a socket, this one carries *another
+    /// node's* answer out onto the mesh.
+    mesh_renewal_tx: tokio::sync::mpsc::Sender<(Mac, wayfinder_server::RenewalOutcome)>,
+    /// The receiving half of [`mesh_renewal_tx`](Self::mesh_renewal_tx).
+    mesh_renewal_rx: tokio::sync::mpsc::Receiver<(Mac, wayfinder_server::RenewalOutcome)>,
 }
 
 impl<Local: FrameIo> Driver<Local> {
@@ -464,6 +489,12 @@ impl<Local: FrameIo> Driver<Local> {
         // Depth one: at most one renewal attempt is ever outstanding, so a
         // second result cannot exist to be queued behind the first.
         let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(1);
+        // A handful of slots rather than one: unlike this node's own renewal,
+        // which is a single conversation, several boards can be inside their
+        // renewal windows at once and each answer is independent. Still small —
+        // the answers are drained on every turn of the loop, and a depth that
+        // could absorb a flood would only be a buffer for one.
+        let (mesh_renewal_tx, mesh_renewal_rx) = tokio::sync::mpsc::channel(8);
         Self {
             local,
             interfaces,
@@ -485,8 +516,11 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             settings: None,
+            authority_tx: None,
             renewal_gate: RenewalGate::default(),
             renewal_tx,
+            mesh_renewal_tx,
+            mesh_renewal_rx,
             renewal_rx,
             auth_snapshot_rx: None,
         }
@@ -516,10 +550,21 @@ impl<Local: FrameIo> Driver<Local> {
     /// Only the revocation half is an edge running *into* this loop, and it is
     /// safe in that direction: this loop never waits on the authority for an
     /// answer, so no cycle can form back to it.
+    ///
+    /// Both halves of the command channel are taken, not just the receiving
+    /// one. Since design 24 this loop is itself a *sender*: a `RenewReq`
+    /// arriving over the mesh is verified by the router and then has to reach
+    /// the authority, which is exactly what this channel is for. Taking the
+    /// sender here rather than through a second setter keeps the
+    /// cannot-be-half-enabled property this method exists for — a driver wired
+    /// with the receiver and not the sender would verify renewals and answer
+    /// none of them, silently.
     pub fn attach_authority(
         &mut self,
+        commands_tx: wayfinder_server::AuthorityTx,
         commands: wayfinder_server::AuthorityRx,
     ) -> wayfinder_server::AuthorityPorts {
+        self.authority_tx = Some(commands_tx);
         self.authority.attach(commands)
     }
 
@@ -836,12 +881,21 @@ impl<Local: FrameIo> Driver<Local> {
             settings,
             auth_snapshot_rx,
             authority,
+            // Used by `poll_mesh_renewals` after `dispatch`, off this
+            // destructure.
+            authority_tx: _,
             // Serviced by `poll_cert_renewal` after `dispatch`, off this
             // destructure: a renewal is a network round trip, so it must not be
             // an arm that holds the loop.
             renewal_gate: _,
             renewal_tx: _,
             renewal_rx: _,
+            // Serviced by `poll_mesh_renewals` after `dispatch`, off this
+            // destructure, for the same reason the renewal slots above are: the
+            // answer is a round trip to another task and must not be an arm
+            // that holds the loop.
+            mesh_renewal_tx: _,
+            mesh_renewal_rx: _,
         } = self;
         let mac = *mac;
         // Two disjoint borrows in one call: `select!` builds every branch's
@@ -997,7 +1051,185 @@ impl<Local: FrameIo> Driver<Local> {
         // what a real node runs and never goes through `process_pending`, so a
         // check wired only there would leave a production node lapsing silently.
         self.poll_cert_renewal(now).await;
+        // And the other direction: renewals *other* nodes asked this one for.
+        // On a node that is not a certificate authority this is two channel
+        // polls that find nothing.
+        self.poll_mesh_renewals(now).await;
         Ok(())
+    }
+
+    /// Carry a mesh renewal through the fork design 13 forces: hand a verified
+    /// request to the certificate authority, and put the answer back on the
+    /// mesh.
+    ///
+    /// Both halves in one place because they are one cycle, and because the
+    /// second is the only thing that makes the first mean anything.
+    ///
+    /// Runs off the `select!`, after dispatch, like
+    /// [`poll_cert_renewal`](Self::poll_cert_renewal): the authority may be
+    /// mid-Argon2id on somebody else's login when this asks, and the router loop
+    /// never awaits that task (`authority_task`'s stated invariant).
+    ///
+    /// A node that is not a certificate authority normally does nothing here:
+    /// a board only ever routes a `RenewReq` toward the provider its enrollment
+    /// recorded, so nothing addresses one at a node that does not sign. That is
+    /// what *honest* peers do, not an invariant — the router surfaces a
+    /// verified request for any frame naming this node, so a peer can address
+    /// one here deliberately. The `None` branch below is that case, and it is
+    /// reachable rather than defensive.
+    async fn poll_mesh_renewals(&mut self, now: Duration) {
+        self.answer_finished_mesh_renewals(now).await;
+
+        // **One**, not a loop. The router holds a single verified request and
+        // displaces rather than queues, and nothing can refill that slot
+        // between iterations here — so a second take is always `None`. A bound
+        // of four read as though a burst were possible, which invited sizing it
+        // against a threat the one-slot design makes unreachable.
+        let Some(verified) = self.shared.write().await.router.take_renewal_request() else {
+            return;
+        };
+        let Some(authority_tx) = self.authority_tx.clone() else {
+            // Verified by the router and answerable by nobody: this node is
+            // not a provider. Reachable only if a peer addressed a renewal
+            // at a node that does not sign, which is a misconfiguration at
+            // the *asking* end — so it is traced, not alarmed, and the
+            // asker's retry budget is what bounds it.
+            trace!(
+                requester = ?verified.mac,
+                "drop: a renewal reached this node, which is not a certificate authority"
+            );
+            return;
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        // Dropped rather than awaited either way — awaiting is the coupling
+        // design 13 removed — but the two reasons are not the same
+        // condition and must not read the same. A full queue is ordinary
+        // backpressure and the asker retries; a *closed* one means the
+        // authority task is gone, which renews nobody and lapses every
+        // board on this mesh within a certificate lifetime.
+        if let Err(e) = authority_tx.try_send(wayfinder_server::AuthorityCommand::RenewOverMesh {
+            node_mac: verified.mac.0,
+            ed_pubkey: verified.ed_pubkey,
+            x_pubkey: verified.x_pubkey,
+            reply: reply_tx,
+        }) {
+            match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => trace!(
+                    requester = ?verified.mac,
+                    "drop: the certificate authority is busy; the asker will retry"
+                ),
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => error!(
+                    requester = ?verified.mac,
+                    "the certificate-authority task is gone: this node can no longer \
+                     renew any board on its mesh"
+                ),
+            }
+            return;
+        }
+
+        // Spawned so the answer can arrive on a later turn of the loop
+        // without anything here waiting for it.
+        let tx = self.mesh_renewal_tx.clone();
+        let requester = verified.mac;
+        tokio::spawn(async move {
+            let Ok(outcome) = reply_rx.await else {
+                // The authority dropped the reply channel mid-request: the
+                // task has died or panicked. There is nothing to report to
+                // the *asker* — it retries — but there is very much
+                // something to report to this node's operator, because a CA
+                // in this state renews nobody and every board on its mesh
+                // lapses within a certificate lifetime.
+                error!(
+                    ?requester,
+                    "the certificate-authority task dropped a mesh renewal without \
+                     answering; this node can no longer renew any board"
+                );
+                return;
+            };
+            match outcome {
+                Ok(outcome) => {
+                    let _ = tx.send((requester, outcome)).await;
+                }
+                Err(e) => {
+                    // Unserviceable, not refused — this node cannot issue
+                    // at all, today only for want of a clock. Already
+                    // `error!`ed by the authority task; nothing goes back on
+                    // the mesh either way.
+                    trace!(?requester, error = %e, "a mesh renewal was unserviceable");
+                }
+            }
+        });
+    }
+
+    /// Put finished mesh renewals back on the mesh, if any have come back since
+    /// the last turn.
+    ///
+    /// Non-blocking on purpose: this runs on the driver loop, and an
+    /// outstanding renewal must not stall the mesh waiting for it.
+    async fn answer_finished_mesh_renewals(&mut self, now: Duration) {
+        loop {
+            let Ok((requester, outcome)) = self.mesh_renewal_rx.try_recv() else {
+                return;
+            };
+            let cert = match outcome {
+                wayfinder_server::RenewalOutcome::Issued(bytes) => bytes,
+                wayfinder_server::RenewalOutcome::Refused(why) => {
+                    // Nothing goes back. A `RenewReply` carries a certificate or
+                    // it does not exist, so a node that cannot be renewed hears
+                    // silence and reads it off the gap in its own counters —
+                    // honest, and one fewer message for an attacker to forge.
+                    // Logged here, where the operator who can act on it is.
+                    info!(
+                        ?requester,
+                        reason = %why,
+                        "refused a membership renewal that arrived over the mesh"
+                    );
+                    continue;
+                }
+            };
+            let Some(cert) = wayfinder::wayfinder_auth::MembershipCert::from_bytes(&cert) else {
+                // This process signed it moments ago, so it is not a real
+                // condition — but an `error!` rather than an `unwrap`, since the
+                // authority going wrong must not take the router down.
+                error!(
+                    ?requester,
+                    "the certificate authority produced a certificate this node cannot parse"
+                );
+                continue;
+            };
+
+            let mut output = LoopOutput::none();
+            {
+                let mut guard = self.shared.write().await;
+                if let Some(frame) =
+                    guard
+                        .router
+                        .send_renew_reply(now, requester, &cert, &mut self.tx_buffer)
+                {
+                    output.mesh.push(OutgoingFrame {
+                        dst: frame.dst,
+                        protocol: frame.protocol,
+                        payload: frame.payload.to_vec(),
+                        egress: wayfinder_driver_core::Egress::Auto,
+                    });
+                } else {
+                    // The route the request arrived over has gone since. The
+                    // certificate is issued and durable either way, and the
+                    // asker's next attempt collects it — `renew_holder` is
+                    // idempotent for a live holder.
+                    trace!(
+                        ?requester,
+                        "no route back to a node whose renewal was just issued; it will retry"
+                    );
+                }
+            }
+            if !output.mesh.is_empty()
+                && let Err(e) = self.dispatch_output(now, output).await
+            {
+                warn!(error = %e, "could not send a renewal answer onto the mesh");
+            }
+        }
     }
 
     /// Apply a finished renewal, and start a new one if this node's certificate
@@ -1087,21 +1319,24 @@ impl<Local: FrameIo> Driver<Local> {
                 // provider recorded will *never* act on this row, and an operator reading
                 // "renewal due" beside a node that renews itself has no way to
                 // tell the two apart — so the row says which one this is.
+                // The distinguishing clause comes **first**. An alarm's detail
+                // is truncated at `DETAIL_CAP` (64 bytes), and these two used to
+                // differ only well past that boundary — so both rendered as the
+                // same row and the distinction this branch exists to draw
+                // reached nobody.
                 if provider.is_some() {
                     wayfinder_alarm::alarm!(
                         wayfinder_alarm::Severity::Warning,
                         wayfinder_alarm::AlarmKind::CertExpiring,
                         subject,
-                        "membership certificate is in the last quarter of its validity window"
+                        "renewing against its provider: certificate in its last quarter"
                     );
                 } else {
                     wayfinder_alarm::alarm!(
                         wayfinder_alarm::Severity::Warning,
                         wayfinder_alarm::AlarmKind::CertExpiring,
                         subject,
-                        "membership certificate is in the last quarter of its validity \
-                         window and no renewal provider is recorded: this node will not \
-                         renew itself and must be re-issued by hand"
+                        "no renewal provider recorded: certificate nearly expired"
                     );
                 }
             }
@@ -1117,9 +1352,7 @@ impl<Local: FrameIo> Driver<Local> {
                     wayfinder_alarm::Severity::Critical,
                     wayfinder_alarm::AlarmKind::CertExpiring,
                     subject,
-                    "membership certificate has expired; peers no longer accept this \
-                     node's OGMs and the authority no longer treats it as a renewing \
-                     holder, so it must be re-enrolled and approved"
+                    "expired: peers reject this node's OGMs; it must be re-enrolled"
                 );
                 // Deliberately no attempt: past `not_after` a CSR is parked for
                 // an operator's approval rather than re-issued, so retrying it
@@ -1137,6 +1370,15 @@ impl<Local: FrameIo> Driver<Local> {
             // how they find out.
             return;
         };
+        if provider.target.address.is_empty() {
+            // A provider with a pinned key and **no socket address**: the node
+            // renews over the mesh (design 24), not over this API. Nothing to
+            // dial, and nothing wrong — so this returns quietly rather than
+            // failing a connection every fifteen minutes over an address that
+            // was never meant to be one.
+            trace!("this node's renewal provider names no address; it renews over the mesh");
+            return;
+        }
         let Some(seed) = seed else {
             // A node holding a certificate but no seed cannot prove possession
             // of the key that certificate names, so it could not complete the
@@ -1481,6 +1723,14 @@ impl<Local: FrameIo> Driver<Local> {
                 drop(guard);
                 let _ = reply.send(snapshot);
             }
+
+            // Mesh renewals: verified requests waiting to reach the authority,
+            // and its answers waiting to go back onto the mesh. Inside the
+            // drain loop rather than after it, because a request that arrives
+            // on an earlier pass must be handed on by the same sweep — and
+            // because the answer arrives on a *later* one, which is the whole
+            // reason this is a channel and not a return value.
+            self.poll_mesh_renewals(self.start.elapsed()).await;
 
             if !progressed {
                 break;
@@ -2084,8 +2334,8 @@ mod tests {
     #[tokio::test]
     async fn an_untrusted_clock_does_not_gate_the_routers_view_of_time() {
         let mut driver = idle_driver();
-        let (_tx, rx) = tokio::sync::mpsc::channel(4);
-        let ports = driver.attach_authority(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(tx, rx);
         driver.set_clock_trust(ClockTrust::Never);
 
         driver.refresh_auth_clock(Duration::ZERO).await;
@@ -2269,8 +2519,8 @@ mod tests {
         let mut driver = idle_driver();
         driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(4);
-        let ports = driver.attach_authority(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(tx, rx);
 
         let seeded = ports.facts.borrow().unix_secs;
         assert!(
@@ -2291,8 +2541,8 @@ mod tests {
     #[tokio::test]
     async fn the_published_clock_is_epoch_plus_elapsed() {
         let mut driver = idle_driver();
-        let (_tx, rx) = tokio::sync::mpsc::channel(4);
-        let ports = driver.attach_authority(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(tx, rx);
         driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
 
         driver.refresh_auth_clock(Duration::from_secs(42)).await;
@@ -2315,8 +2565,8 @@ mod tests {
 
         // No `attach_authority`, and then one that is attached and dropped.
         driver.refresh_auth_clock(Duration::from_secs(1)).await;
-        let (_tx, rx) = tokio::sync::mpsc::channel(4);
-        drop(driver.attach_authority(rx));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(driver.attach_authority(tx, rx));
         driver.refresh_auth_clock(Duration::from_secs(2)).await;
     }
 
@@ -2397,8 +2647,8 @@ mod tests {
         // Deliberately the wrong order: handle first, authority second.
         let handle = driver.router_handle();
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(4);
-        let ports = driver.attach_authority(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(tx, rx);
         ports.policy.send_replace(Some(
             wayfinder_protos::service::EnrollmentPolicyStatusData {
                 auto_approve: true,
@@ -3191,7 +3441,7 @@ mod tests {
         );
 
         let (authority_tx, authority_rx) = tokio::sync::mpsc::channel(4);
-        let ports = driver.attach_authority(authority_rx);
+        let ports = driver.attach_authority(authority_tx.clone(), authority_rx);
 
         tokio::spawn(wayfinder_server::serve_authority(ca, ports));
         // The driver is not spawned: its link futures are not `Send`, so it is

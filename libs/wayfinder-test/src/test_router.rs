@@ -238,6 +238,38 @@ impl TestRouter {
         self.step_schedules(now, false, true);
     }
 
+    /// Play the provider end of a mesh renewal (design 24): answer every
+    /// request this node has verified, using `ca` to decide each.
+    ///
+    /// What a `wayfinder-tap` provider's tokio loop does in
+    /// `poll_mesh_renewals`, minus the task hop — the router has already
+    /// verified the requester against the trust anchor, checked revocation and
+    /// checked proof of possession, and this applies the holder match and puts
+    /// the answer back on the wire.
+    ///
+    /// Takes the real [`CertAuthority`](wayfinder_server::CertAuthority)
+    /// rather than a stub, because the holder match is half of what these tests
+    /// are about: a fixture that always re-issued could not tell a live holder
+    /// from a lapsed one, which is the distinction §5.2 turns on.
+    pub fn serve_mesh_renewals(&mut self, now: Duration, ca: &mut wayfinder_server::CertAuthority) {
+        let board = Arc::clone(&self.board);
+        wayfinder_alarm::with_board(&board, || {
+            self.driver.serve_mesh_renewals(now, |verified| {
+                match ca.renew_holder(&verified.mac.0, &verified.ed_pubkey, &verified.x_pubkey) {
+                    Ok(wayfinder_server::RenewalOutcome::Issued(bytes)) => {
+                        wayfinder::wayfinder_auth::MembershipCert::from_bytes(&bytes)
+                    }
+                    // A refusal sends nothing, which is what the asker
+                    // experiences: a `RenewReply` carries a certificate or it
+                    // does not exist.
+                    Ok(wayfinder_server::RenewalOutcome::Refused(_)) => None,
+                    Err(_) => None,
+                }
+            });
+            self.pump_out();
+        });
+    }
+
     /// Drain every frame the switch has delivered, through the driver, at
     /// `now`.
     pub fn drain_all(&mut self, now: Duration) {

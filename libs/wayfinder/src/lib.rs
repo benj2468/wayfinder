@@ -27,6 +27,8 @@ use batman::wire::BatmanEchoPacket;
 use batman::wire::BatmanNextHopChallengePacket;
 use batman::wire::BatmanNextHopResponsePacket;
 use batman::wire::BatmanPacketType;
+use batman::wire::BatmanRenewReplyPacket;
+use batman::wire::BatmanRenewReqPacket;
 use batman::wire::BatmanUnicastPacket;
 use batman::wire::ETH_P_BATMAN;
 use batman::wire::McastAuthForm;
@@ -46,6 +48,7 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use wayfinder_auth::MembershipCert;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -157,6 +160,17 @@ pub mod router_ops;
 /// EtherType demuxed to the BATMAN engine by
 /// [`handle_frame_with_metrics`](CentralRouter::handle_frame_with_metrics).
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
+
+/// Ingress demuxes on [`DEFAULT_BATMAN_ETHER_TYPE`] while the control-plane
+/// frames `auth/` builds are stamped with [`ETH_P_BATMAN`]. The two have always
+/// been the same number; this makes them the same *fact*.
+///
+/// Worth an assertion rather than a comment because of how the mismatch would
+/// present: `DEFAULT_BATMAN_ETHER_TYPE` is `pub` and reads like a knob, and a
+/// node that shipped with the two diverged would emit every cert request,
+/// cert reply, challenge, response and renewal under an EtherType its peers
+/// drop *before* any path that traces. Silent on both ends.
+const _: () = assert!(DEFAULT_BATMAN_ETHER_TYPE == ETH_P_BATMAN);
 
 /// Maximum number of interested listeners for which a multicast frame is sent
 /// as individual unicasts before falling back to flooding, matching the spirit
@@ -480,6 +494,23 @@ impl RxOutcome<'_, '_> {
     }
 }
 
+/// How often a node evaluates whether its membership certificate needs
+/// renewing over the mesh.
+///
+/// Fifteen minutes, matching the host renewer's `RENEWAL_CHECK_INTERVAL` and
+/// for the same reason: the question is answered from state already in memory,
+/// but it is asked from a path that also runs per frame, so it is paced rather
+/// than evaluated continuously. It is also this node's retry cadence when a
+/// renewal goes unanswered, which is what sets the floor.
+///
+/// **No backoff**, deliberately (design 24 §9.4). At the seven-day lifetime
+/// `wayfinder-ca` issues, the renewal window is about 42 hours, so a fixed
+/// quarter-hour cadence gives a partitioned board roughly 170 attempts to find
+/// a path back — and each attempt is one small frame against a window measured
+/// in days. Backoff would trade that margin for an airtime saving nothing has
+/// asked for, on a node that spends more on a single OGM round.
+pub const RENEWAL_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
 /// The central mesh router: it wraps the [`BatmanEngine`] with an ident table,
 /// a per-(neighbor, interface) link-quality table, opt-in OGM authentication,
 /// and the observability counters/estimators. It demuxes received frames by
@@ -591,15 +622,6 @@ pub struct CentralRouter<
     /// application, never on a rejected one. Sticky: once set, stays set for
     /// the life of the process. See [`runtime_config_active`](CentralRouter::runtime_config_active).
     runtime_config_active: bool,
-    /// Smoothed rate at which this node sends `CertReq` (lazy-cert-
-    /// distribution fetches, as a requester with an unresolved fingerprint).
-    /// Frames-per-second only (no byte size to a control packet is tracked
-    /// here); see [`RateEstimator`].
-    cert_req_tx_rate: RateEstimator,
-    /// Smoothed rate at which this node sends `CertReply` (answering a
-    /// `CertReq`, as the originator whose cert was asked for) — either
-    /// immediately or via the opportunistic parked-reply flush.
-    cert_reply_tx_rate: RateEstimator,
     /// Smoothed rate of directed frames dropped for want of a pairwise key with
     /// the chosen next hop. Lives here, not in a driver, so an embedded node —
     /// which has no driver loop — reports it too.
@@ -707,8 +729,6 @@ impl<
             mcast_group_drops: 0,
             mcast_unroutable_local: 0,
             runtime_config_active: false,
-            cert_req_tx_rate: RateEstimator::default(),
-            cert_reply_tx_rate: RateEstimator::default(),
             untaggable_drop_rate: RateEstimator::default(),
             link_features: [crate::features::LinkFeatures::default(); INTERFACES],
             // `InterfaceName` isn't `Copy`, so the array-repeat shorthand the
@@ -818,15 +838,24 @@ impl<
     /// Smoothed frames/sec at which this node sends `CertReq` (lazy-cert-
     /// distribution fetches), evaluated as of `now`. A rising rate signals
     /// growing cert-cache churn or a misresolving fingerprint.
+    ///
+    /// Zero on a node with auth disabled, which is not a gap: lazy
+    /// distribution is a thing an authenticated mesh does, so there is no
+    /// `CertReq` for an unauthenticated node to have sent.
     pub fn cert_req_tx_rate(&self, now: Duration) -> f64 {
-        self.cert_req_tx_rate.rate(now).1
+        self.auth.as_ref().map_or(0.0, |a| a.cert_req_tx_rate(now))
     }
 
     /// Smoothed frames/sec at which this node sends `CertReply` (answering
     /// `CertReq`s as the requested originator), evaluated as of `now`. A
     /// rising rate signals this node is serving cert lookups for many peers.
+    ///
+    /// Zero when auth is disabled — see
+    /// [`cert_req_tx_rate`](Self::cert_req_tx_rate).
     pub fn cert_reply_tx_rate(&self, now: Duration) -> f64 {
-        self.cert_reply_tx_rate.rate(now).1
+        self.auth
+            .as_ref()
+            .map_or(0.0, |a| a.cert_reply_tx_rate(now))
     }
 
     /// Record one directed frame dropped because this node holds no pairwise
@@ -1014,9 +1043,17 @@ impl<
     /// to an already-known neighbor.
     pub fn set_auth(
         &mut self,
-        auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
+        mut auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
     ) {
         debug!("updating auth state; resetting learned routing state");
+        // Everything this method discards below is scoped to the credential and
+        // is genuinely stale under a new one. The cert-control *send rates* are
+        // not: they count frames this node put on the wire, which a fresh
+        // certificate does not undo. Carried over explicitly rather than left
+        // to the wholesale replacement — see `OgmAuth::adopt_control_rates`.
+        if let Some(prev) = self.auth.as_ref() {
+            auth.adopt_control_rates(prev);
+        }
         // A re-admission clears the self-revoked latch, but only if the
         // certificate being installed actually survives the record. One the
         // record still cancels leaves the node latched: peers would drop it
@@ -1522,32 +1559,9 @@ impl<
                             // (it just relayed/originated this OGM). This
                             // copy is dropped either way; the next emission
                             // after the fetch resolves verifies normally.
-                            let hdr_len = core::mem::size_of::<BatmanCertReqPacket>();
-                            let forward = if hdr_len <= tx_buf.len()
-                                && let Some(body_len) = auth.build_cert_request(
-                                    orig,
-                                    fp,
-                                    frame.src,
-                                    &mut tx_buf[hdr_len..],
-                                ) {
-                                let req_hdr = BatmanCertReqPacket {
-                                    packet_type: BatmanPacketType::CertReq.as_u8(),
-                                    version: BATMAN_VERSION,
-                                    ttl: 50,
-                                    dest: orig,
-                                };
-                                tx_buf[..hdr_len].copy_from_slice(req_hdr.as_bytes());
-                                self.cert_req_tx_rate.observe(now, 0);
-                                Some(LinkFrameData {
-                                    dst: frame.src,
-                                    protocol: ETH_P_BATMAN,
-                                    payload: &tx_buf[..hdr_len + body_len],
-                                })
-                            } else {
-                                None
-                            };
                             return RxOutcome {
-                                forward,
+                                forward: auth
+                                    .build_cert_req_frame(now, orig, fp, frame.src, tx_buf),
                                 deliver_local: None,
                                 pin_egress_iface: None,
                             };
@@ -1621,42 +1635,12 @@ impl<
                     return RxOutcome::empty();
                 }
                 if packet_type == Some(BatmanPacketType::NextHopChallenge) {
-                    let hdr_len = core::mem::size_of::<BatmanNextHopChallengePacket>();
-                    let nonce = &frame.payload[hdr_len.min(frame.payload.len())..];
-                    let reply = self.auth.as_ref().and_then(|auth| {
-                        // Answering an unverified peer is refused inside
-                        // `answer_challenge`: there is no pairwise key, and a
-                        // reply would cost work while telling it nothing.
-                        auth.answer_challenge(frame.src, nonce)
-                    });
-                    let forward = match reply {
-                        Some(tag) => {
-                            let rsp_len = core::mem::size_of::<BatmanNextHopResponsePacket>();
-                            let total = rsp_len + tag.len();
-                            if tx_buf.len() < total {
-                                trace!("drop: tx buffer too small for challenge response");
-                                None
-                            } else {
-                                let hdr = BatmanNextHopResponsePacket {
-                                    packet_type: BatmanPacketType::NextHopResponse.as_u8(),
-                                    version: BATMAN_VERSION,
-                                };
-                                tx_buf[..rsp_len].copy_from_slice(hdr.as_bytes());
-                                tx_buf[rsp_len..total].copy_from_slice(&tag);
-                                Some(LinkFrameData {
-                                    dst: frame.src,
-                                    protocol: ETH_P_BATMAN,
-                                    payload: &tx_buf[..total],
-                                })
-                            }
-                        }
-                        None => {
-                            trace!(src = ?frame.src, "drop: challenge from an unverified peer");
-                            None
-                        }
-                    };
+                    let body = Self::inner_body(&frame.payload);
                     return RxOutcome {
-                        forward,
+                        forward: self
+                            .auth
+                            .as_ref()
+                            .and_then(|auth| auth.answer_challenge_frame(frame.src, body, tx_buf)),
                         deliver_local: None,
                         // Link-local by construction: the answer must go
                         // straight back out the interface this challenge
@@ -1665,8 +1649,11 @@ impl<
                     };
                 }
                 if packet_type == Some(BatmanPacketType::NextHopResponse) {
-                    let hdr_len = core::mem::size_of::<BatmanNextHopResponsePacket>();
-                    let tag = &frame.payload[hdr_len.min(frame.payload.len())..];
+                    let tag = Self::inner_body(&frame.payload);
+                    // Verifying is the auth module's; *crediting* the proof is
+                    // the engine's, and this is the seam between them. The
+                    // module never touches the proof table, so it can never
+                    // install a route on its own.
                     let proven = self
                         .auth
                         .as_mut()
@@ -1780,21 +1767,12 @@ impl<
                             // correctness issue — the requester's own retry
                             // (`OgmAuth::build_cert_request`) is the
                             // backstop.
-                            let flushed = Self::try_flush_pending_cert_reply(
-                                auth,
-                                &self.batman,
-                                now,
-                                ogm.orig,
-                                &mut reply,
-                            );
-                            if flushed.is_some() {
-                                self.cert_reply_tx_rate.observe(now, 0);
-                            }
-                            flushed.map(|(next, total)| LinkFrameData {
-                                dst: next,
-                                protocol: ETH_P_BATMAN,
-                                payload: &reply.payload[..total],
-                            })
+                            auth.flush_pending_cert_reply(now, &self.batman, ogm.orig, &mut reply)
+                                .map(|(next, total)| LinkFrameData {
+                                    dst: next,
+                                    protocol: ETH_P_BATMAN,
+                                    payload: &reply.payload[..total],
+                                })
                         } else {
                             None
                         };
@@ -1820,106 +1798,56 @@ impl<
                         }
                     }
                     RoutingAction::DeliverLocal => match packet_type {
-                        Some(BatmanPacketType::CertReply) => {
-                            // Terminates in our own auth state, never the
-                            // host TAP: verify against the trust anchor,
-                            // confirm it answers an outstanding request, and
-                            // cache it.
+                        // The credential-control sub-types terminate in this
+                        // node's own auth state, never on the host device, so
+                        // each is one call into the module that owns that
+                        // state. What a delivered `RenewReply` (or `RenewReq`,
+                        // or `CertReply`) *means* is decided there — see
+                        // `auth/renewal.rs` and `auth/distribution.rs`.
+                        Some(BatmanPacketType::RenewReply) => {
                             if let Some(auth) = self.auth.as_mut() {
-                                let body = frame
-                                    .payload
-                                    .get(Self::inner_offset(&frame.payload)..)
-                                    .unwrap_or(&[]);
-                                auth.ingest_cert_reply(body);
+                                auth.ingest_renew_reply(Self::inner_body(&frame.payload));
                             }
                             RxOutcome::empty()
                         }
-                        Some(BatmanPacketType::CertReq) => {
-                            // Terminates here: this node is the originator
-                            // whose cert was requested (the terminal-only
-                            // responder — an intermediate holder answering
-                            // early is a deferred optimization). Verify the
-                            // requester's self-authenticating body, then
-                            // either answer immediately (a route exists) or
-                            // park it for the opportunistic flush above.
-                            let body = frame
-                                .payload
-                                .get(Self::inner_offset(&frame.payload)..)
-                                .unwrap_or(&[]);
-                            let requester = self
-                                .auth
-                                .as_mut()
-                                .and_then(|auth| auth.verify_cert_request(body));
-                            let Some(requester) = requester else {
-                                return RxOutcome::empty();
-                            };
-
-                            let hdr_len = core::mem::size_of::<BatmanCertReplyPacket>();
-                            #[expect(
-                                clippy::expect_used,
-                                reason = "requester came from self.auth.verify_cert_request, so auth must still be Some"
-                            )]
-                            let own_cert = *self
-                                .auth
-                                .as_ref()
-                                .expect("auth present: requester was just verified through it")
-                                .own_cert();
-                            let cert_bytes = own_cert.as_bytes();
-                            let total = hdr_len + cert_bytes.len();
-
-                            // Proof-agnostic on purpose: the cert-control
-                            // plane is what *supplies* the keys proof depends
-                            // on, so gating it on proof would deadlock
-                            // bootstrap. See `next_hop_unproven_ok`.
-                            match self.batman.next_hop_unproven_ok(now, requester) {
-                                Some(next) if total <= reply.payload.len() => {
-                                    let reply_hdr = BatmanCertReplyPacket {
-                                        packet_type: BatmanPacketType::CertReply.as_u8(),
-                                        version: BATMAN_VERSION,
-                                        ttl: 50,
-                                        dest: requester,
-                                    };
-                                    reply.payload[..hdr_len].copy_from_slice(reply_hdr.as_bytes());
-                                    reply.payload[hdr_len..total].copy_from_slice(cert_bytes);
-                                    self.cert_reply_tx_rate.observe(now, 0);
-                                    return RxOutcome {
-                                        forward: Some(LinkFrameData {
-                                            dst: next,
-                                            protocol: ETH_P_BATMAN,
-                                            payload: &reply.payload[..total],
-                                        }),
-                                        deliver_local: None,
-                                        pin_egress_iface: None,
-                                    };
-                                }
-                                Some(_) => {
-                                    // A route exists, but the reply doesn't
-                                    // fit the transmit buffer — a local MTU
-                                    // misconfiguration (own cert + header is
-                                    // a fixed ~165 bytes), not "no route
-                                    // yet". Parking it wouldn't help (the
-                                    // opportunistic flush hits the same
-                                    // buffer), but the requester's own retry
-                                    // is a harmless no-op backstop either
-                                    // way, so park it anyway rather than add
-                                    // a second silent-drop path.
-                                    debug!(
-                                        total,
-                                        buf_len = reply.payload.len(),
-                                        "auth: cert reply does not fit the transmit buffer"
-                                    );
-                                }
-                                None => {
-                                    trace!(?requester, "auth: no route to cert requester yet");
-                                }
-                            }
-                            // Park it for the opportunistic flush once
-                            // verifying one of the requester's OGMs confirms
-                            // a route back.
+                        Some(BatmanPacketType::RenewReq) => {
                             if let Some(auth) = self.auth.as_mut() {
-                                auth.park_pending_reply(requester);
+                                auth.handle_renew_req(Self::inner_body(&frame.payload));
                             }
                             RxOutcome::empty()
+                        }
+                        Some(BatmanPacketType::CertReply) => {
+                            if let Some(auth) = self.auth.as_mut() {
+                                auth.ingest_cert_reply(Self::inner_body(&frame.payload));
+                            }
+                            RxOutcome::empty()
+                        }
+                        // The one credential-control sub-type whose answer is
+                        // built on the spot rather than on a later poll: the
+                        // reply is this node's own certificate, so nothing has
+                        // to be asked of anybody. Compare `RenewReq` above,
+                        // whose answer only the certificate authority can give.
+                        Some(BatmanPacketType::CertReq) => {
+                            let Some(auth) = self.auth.as_mut() else {
+                                return RxOutcome::empty();
+                            };
+                            match auth.answer_cert_request(
+                                now,
+                                &self.batman,
+                                Self::inner_body(&frame.payload),
+                                &mut reply,
+                            ) {
+                                Some((next, total)) => RxOutcome {
+                                    forward: Some(LinkFrameData {
+                                        dst: next,
+                                        protocol: ETH_P_BATMAN,
+                                        payload: &reply.payload[..total],
+                                    }),
+                                    deliver_local: None,
+                                    pin_egress_iface: None,
+                                },
+                                None => RxOutcome::empty(),
+                            }
                         }
                         Some(BatmanPacketType::EchoRequest) => {
                             // A peer is asking whether it can reach us.
@@ -2080,56 +2008,121 @@ impl<
             Some(BatmanPacketType::Bcast) => core::mem::size_of::<BatmanBroadcastPacket>(),
             Some(BatmanPacketType::CertReq) => core::mem::size_of::<BatmanCertReqPacket>(),
             Some(BatmanPacketType::CertReply) => core::mem::size_of::<BatmanCertReplyPacket>(),
+            Some(BatmanPacketType::RenewReq) => core::mem::size_of::<BatmanRenewReqPacket>(),
+            Some(BatmanPacketType::RenewReply) => core::mem::size_of::<BatmanRenewReplyPacket>(),
             Some(BatmanPacketType::EchoRequest) | Some(BatmanPacketType::EchoReply) => {
                 core::mem::size_of::<BatmanEchoPacket>()
+            }
+            // Never locally *delivered* — both terminate in auth state before
+            // routing sees them — but their bodies (a nonce, a tag) are read
+            // through [`inner_body`](Self::inner_body) like any other, and the
+            // catch-all below would hand the auth module the header too.
+            Some(BatmanPacketType::NextHopChallenge) => {
+                core::mem::size_of::<BatmanNextHopChallengePacket>()
+            }
+            Some(BatmanPacketType::NextHopResponse) => {
+                core::mem::size_of::<BatmanNextHopResponsePacket>()
             }
             _ => 0,
         }
     }
 
-    /// After an OGM that itself needed no re-flood, opportunistically flush
-    /// a parked pending `CertReply` for that OGM's originator (`orig`), now
-    /// that verifying it (re)confirms a route back to them (design doc
-    /// §3.3/§5.4). Builds the reply — this node's own cert, since a pending
-    /// reply is only ever parked for *this* node's own cert request (the
-    /// terminal-only responder; see [`OgmAuth::verify_cert_request`]) —
-    /// into `reply`'s scratch buffer and clears the pending entry only on
-    /// full success (route resolved and the buffer had room), so a failed
-    /// attempt leaves the entry parked for the next opportunity. Returns the
-    /// next hop and the written length; the caller (which owns `reply`
-    /// directly) builds the final borrowed [`LinkFrameData`] from it, since
-    /// that borrow cannot outlive this function's own `&mut` parameter.
-    fn try_flush_pending_cert_reply(
-        auth: &mut auth::OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
-        batman: &BatmanEngine<ORIGINATORS, INTERFACES, MCAST_MEMBERS, LOCAL_MCAST>,
+    /// The inner (host or control-plane) payload of a BATMAN packet: the
+    /// bytes past whatever header [`inner_offset`](Self::inner_offset) says
+    /// this sub-type carries.
+    ///
+    /// Empty when the offset runs past the end, which a malformed frame can
+    /// arrange — so every caller is handed a slice it can parse rather than an
+    /// index it has to bound itself.
+    fn inner_body(payload: &[u8]) -> &[u8] {
+        payload.get(Self::inner_offset(payload)..).unwrap_or(&[])
+    }
+
+    /// Emit this node's due `RenewReq`, if one is due and there is a path to
+    /// the authority to put it on.
+    ///
+    /// Lends the auth module a [`Paths`](crate::auth::Paths) view of the
+    /// routing engine and lets it build the whole frame — see
+    /// [`OgmAuth::poll_renewal`], which documents the pacing, the alarm and
+    /// every reason this answers `None`.
+    pub fn poll_renewal<'tx>(
+        &mut self,
         now: Duration,
-        orig: Mac,
-        reply: &mut LinkFrameDataMut<'_>,
-    ) -> Option<(Mac, usize)> {
-        if !auth.has_pending_reply(orig) {
-            return None;
-        }
-        // Proof-agnostic: see the `handle_cert_req` reply path above.
-        let next = batman.next_hop_unproven_ok(now, orig)?;
-        let cert = *auth.own_cert();
-        let cert_bytes = cert.as_bytes();
-        let hdr_len = core::mem::size_of::<BatmanCertReplyPacket>();
-        let total = hdr_len + cert_bytes.len();
-        if total > reply.payload.len() {
-            return None;
-        }
-        let hdr = BatmanCertReplyPacket {
-            packet_type: BatmanPacketType::CertReply.as_u8(),
-            version: BATMAN_VERSION,
-            ttl: 50,
-            dest: orig,
-        };
-        reply.payload[..hdr_len].copy_from_slice(hdr.as_bytes());
-        reply.payload[hdr_len..total].copy_from_slice(cert_bytes);
-        reply.dst = next;
-        reply.protocol = ETH_P_BATMAN;
-        auth.clear_pending_reply(orig);
-        Some((next, total))
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>> {
+        self.auth.as_mut()?.poll_renewal(now, &self.batman, tx_buf)
+    }
+
+    /// Time from `now` until this node next evaluates whether to renew, or
+    /// `None` when it has no authority recorded to renew against.
+    ///
+    /// A shell that sleeps must fold this into the same `min` as
+    /// [`next_broadcast_after`](Self::next_broadcast_after) and its siblings.
+    /// See [`OgmAuth::next_renewal_after`].
+    pub fn next_renewal_after(&self, now: Duration) -> Option<Duration> {
+        self.auth.as_ref()?.next_renewal_after(now)
+    }
+
+    /// Build the `RenewReply` carrying `cert` back to `requester`, addressed to
+    /// the next hop toward them.
+    ///
+    /// The authority's half of the exchange, called by the driver once the
+    /// certificate authority has re-issued. See [`OgmAuth::send_renew_reply`].
+    pub fn send_renew_reply<'tx>(
+        &mut self,
+        now: Duration,
+        requester: Mac,
+        cert: &MembershipCert,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>> {
+        self.auth
+            .as_mut()?
+            .send_renew_reply(now, &self.batman, requester, cert, tx_buf)
+    }
+
+    /// Take the verified renewal request this node is holding for its driver,
+    /// if any.
+    ///
+    /// The seam design 24 §4.3 opens: the auth module proved who asked, the
+    /// certificate authority decides whether to re-issue, and they are on
+    /// different executors since design 13. See
+    /// [`OgmAuth::take_renewal_request`].
+    pub fn take_renewal_request(&mut self) -> Option<crate::auth::VerifiedRenewal> {
+        self.auth.as_mut()?.take_renewal_request()
+    }
+
+    /// Take the renewed certificate this node has installed and not yet had
+    /// made durable, if any.
+    ///
+    /// The handoff from the `no_std` core, which can change the credential it
+    /// runs under, to the shell that owns the medium it has to be written to.
+    /// Taken once — see [`OgmAuth::take_renewed_cert`].
+    pub fn take_renewed_cert(&mut self) -> Option<MembershipCert> {
+        self.auth.as_mut()?.take_renewed_cert()
+    }
+
+    /// Renewal requests this node has put on the wire since boot.
+    ///
+    /// Zero when auth is disabled — there is no credential to renew.
+    pub fn renewal_requests_sent(&self) -> u64 {
+        self.auth
+            .as_ref()
+            .map(|a| a.renewal_requests_sent())
+            .unwrap_or(0)
+    }
+
+    /// Re-issued certificates this node has accepted and installed since boot.
+    ///
+    /// The **gap** from [`renewal_requests_sent`](Self::renewal_requests_sent)
+    /// is the signal, not either number alone (design 24 §7): a board that is
+    /// asking and not being answered is the failure this path exists to make
+    /// visible, and it looks identical to a healthy board in any single
+    /// counter.
+    pub fn renewal_replies_accepted(&self) -> u64 {
+        self.auth
+            .as_ref()
+            .map(|a| a.renewal_replies_accepted())
+            .unwrap_or(0)
     }
 
     /// Decide how to deliver a multicast frame for `group`: as individual
@@ -2420,31 +2413,15 @@ impl<
         // other candidate's proof behind it.
         self.batman.note_challenged(now, target);
 
-        let auth = self.auth.as_mut()?;
-        let nonce = auth.issue_challenge(target)?;
-
-        let hdr = BatmanNextHopChallengePacket {
-            packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
-            version: BATMAN_VERSION,
-        };
-        let hdr_len = core::mem::size_of::<BatmanNextHopChallengePacket>();
-        let total = hdr_len + nonce.len();
-        if tx_buf.len() < total {
-            trace!("drop: tx buffer too small for challenge");
-            return None;
-        }
-        tx_buf[..hdr_len].copy_from_slice(hdr.as_bytes());
-        tx_buf[hdr_len..total].copy_from_slice(&nonce);
-
+        // The whole of this method's routing content is the two lines above:
+        // *which* neighbour is due, and recording that it was asked. The frame
+        // itself is the auth module's — it holds the keys — and it is
+        // link-local, so there is no `Paths` view to lend. See `auth/proof.rs`
+        // for why the schedule and the keys stay on opposite sides of this
+        // line.
+        let frame = self.auth.as_mut()?.build_challenge_frame(target, tx_buf)?;
         debug!(neighbor = ?target, "auth: challenging candidate next hop");
-        Some((
-            target,
-            LinkFrameData {
-                dst: target,
-                protocol: DEFAULT_BATMAN_ETHER_TYPE,
-                payload: &tx_buf[..total],
-            },
-        ))
+        Some((target, frame))
     }
 
     /// Start a reachability-probe session against `target`, replacing whatever
@@ -3642,6 +3619,34 @@ mod cert_control_delivery {
 }
 
 #[cfg(test)]
+mod cert_control_rates_without_auth {
+    //! The cert-distribution send rates now live with the exchange that emits
+    //! them ([`auth::OgmAuth`]) rather than on the router, which makes them
+    //! unreachable on a node that has no auth state at all.
+    //!
+    //! Zero is the right answer there and not a gap — an unauthenticated node
+    //! never sends a `CertReq` or a `CertReply` — but it is a *different* answer
+    //! from the one a router-owned estimator gave, so it is pinned here.
+
+    use super::*;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// Both rates read zero, at the first instant and later, on a router with
+    /// no credential installed.
+    #[test]
+    fn a_router_without_auth_reports_no_cert_control_traffic() {
+        let router = CentralRouter::new(mac(1));
+        for now in [Duration::ZERO, Duration::from_secs(60)] {
+            assert_eq!(router.cert_req_tx_rate(now), 0.0);
+            assert_eq!(router.cert_reply_tx_rate(now), 0.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod untaggable_drop_metric {
     //! The drop this counts is invisible from anywhere else: the route
     //! resolved, the frame was planned, and then it simply never went out. See
@@ -3713,11 +3718,11 @@ mod cert_responder {
     /// Since the key↔address binding (design 09 §5) a certificate's subject is
     /// the address its key derives, so this module pairs `mac(n)` with the
     /// keypair seeded `n` rather than numbering addresses independently.
-    fn mac(n: u8) -> Mac {
+    pub(super) fn mac(n: u8) -> Mac {
         wayfinder_auth::Keypair::from_seed(&[n; 32]).derived_mac()
     }
 
-    fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
+    pub(super) fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(mac(dst).as_bytes());
         v.extend_from_slice(mac(src).as_bytes());
@@ -3729,7 +3734,12 @@ mod cert_responder {
     /// A signed OGM from `orig` (via `orig_auth`), to prime the responder's
     /// route table and cert cache — a 1-hop OGM, so the neighbor discovered
     /// is `orig` itself.
-    fn signed_ogm(orig_auth: &mut auth::OgmAuth, orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
+    pub(super) fn signed_ogm(
+        orig_auth: &mut auth::OgmAuth,
+        orig: Mac,
+        seqno: u32,
+        ttl: u8,
+    ) -> Vec<u8> {
         let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
         let mut buf = vec![0u8; 512];
         let ogm = BatmanOgmPacket {
@@ -3992,6 +4002,28 @@ mod cert_responder {
         assert!(
             router.cert_req_tx_rate(core::time::Duration::from_secs(1)) > 0.0,
             "fetching an unresolved cert must register on the cert-request send-rate metric"
+        );
+
+        // A re-enrollment must not zero the gauge. These two estimators live on
+        // `OgmAuth` so each `observe` sits beside the frame it counts, and
+        // `set_auth` replaces that struct wholesale — so without
+        // `adopt_control_rates` a host node completing a renewal over its
+        // socket (once per certificate lifetime) would zero its own
+        // cert-cache-churn signal and re-converge from nothing, reading as an
+        // idle mesh for a full decay window. `set_auth` is right to discard
+        // everything scoped to the credential; a count of frames this node put
+        // on the wire is not that.
+        let fresh_kp = wayfinder_auth::Keypair::from_seed(&[1; 32]);
+        let fresh_cert =
+            authority.issue_cert(mac(1), fresh_kp.ed_pubkey(), fresh_kp.x_pubkey(), 0, 2000);
+        router.set_auth(auth::OgmAuth::new(
+            fresh_kp,
+            fresh_cert,
+            authority.trust_anchor(),
+        ));
+        assert!(
+            router.cert_req_tx_rate(core::time::Duration::from_secs(1)) > 0.0,
+            "a new certificate does not undo the frames this node already sent"
         );
     }
 
@@ -4983,7 +5015,7 @@ mod ogm_auth_integration {
     /// Enabling auth turns on the next-hop proof gate, so an unproven relay
     /// carries no data — correct, but orthogonal to what most of these tests
     /// are about. The real challenge/response exchange has its own coverage
-    /// (`auth::tests`, `batman::engine::tests`, and this module's own
+    /// (`auth::proof::tests`, `batman::engine::tests`, and this module's own
     /// `an_uncredentialed_candidate_does_not_starve_a_legitimate_ones_proof`,
     /// which drives `poll_challenge` end to end); this shortcut keeps a test
     /// of *route selection* about route selection.
@@ -6526,7 +6558,8 @@ mod self_revocation {
     //! its membership certificate and trust anchor, go inert, and stay that
     //! way until an authority re-admits it.
     //!
-    //! The router half. `auth.rs` covers which records latch (the four gates);
+    //! The router half. `auth/revocation.rs` covers which records latch (the
+    //! four gates);
     //! these cover what the router does once one has.
 
     use super::*;
@@ -7354,6 +7387,449 @@ mod ping_router {
         assert!(
             receive(&mut router, secs(1), 2, &probe).is_none(),
             "a link that carries no data must not answer probes on it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mesh_renewal {
+    //! Certificate renewal over the mesh, at the router layer (design 24): a
+    //! board emits a `RenewReq` toward the authority its enrollment recorded,
+    //! the authority's router verifies the body and surfaces the identity for
+    //! its driver to hand to the certificate authority, and the `RenewReply`
+    //! that comes back terminates in the board's own auth state.
+
+    use super::*;
+    // Borrowed from the sibling module rather than copied: these three build a
+    // link frame and a signed OGM the same way for every router-level test in
+    // this file, and three exact duplicates is how two test modules end up
+    // disagreeing about what a well-formed fixture looks like.
+    use super::cert_responder::link_frame_bytes;
+    use super::cert_responder::mac;
+    use super::cert_responder::signed_ogm;
+    use batman::wire::BatmanRenewReplyPacket;
+    use batman::wire::BatmanRenewReqPacket;
+    use interfaces::frame::LinkFrame;
+    use wayfinder_auth::Authority;
+    use wayfinder_auth::Clocked;
+    use wayfinder_auth::Keypair;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
+
+    fn secs(n: u64) -> core::time::Duration {
+        core::time::Duration::from_secs(n)
+    }
+
+    /// Auth state for the node seeded `n`, certified to `valid_to`.
+    fn auth_for(authority: &Authority, n: u8, valid_to: u64) -> auth::OgmAuth {
+        let kp = Keypair::from_seed(&[n; 32]);
+        let cert = authority.issue_cert(mac(n), kp.ed_pubkey(), kp.x_pubkey(), 0, valid_to);
+        let mut a = auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        a.set_time(secs(100), Clocked::At(100));
+        a
+    }
+
+    /// A router for the node seeded `n`, holding its credential.
+    fn router_for(authority: &Authority, n: u8, valid_to: u64) -> CentralRouter {
+        let mut router: CentralRouter = CentralRouter::new(mac(n));
+        router.set_auth(auth_for(authority, n, valid_to));
+        router
+    }
+
+    /// A board, in its renewal window, that has learned a route to the
+    /// authority it renews against from that authority's own OGM.
+    fn board_with_route_to_ca(authority: &Authority, ca_auth: &mut auth::OgmAuth) -> CentralRouter {
+        // A window of [0, 1000] puts `renew_from` at 750.
+        let mut board = router_for(authority, 1, 1000);
+        board.set_auth_time(secs(100), Clocked::At(800));
+        board
+            .auth_mut()
+            .unwrap()
+            .set_renewal_authority(Some(&Keypair::from_seed(&[3; 32]).ed_pubkey()));
+
+        let ogm = signed_ogm(ca_auth, mac(3), 1, 50);
+        let bytes = link_frame_bytes(3, 0xff, &ogm);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 1024];
+        board.handle_frame(secs(100), 0, frame, &mut tx, &mut ());
+        assert_eq!(
+            board.originator_table().count(),
+            1,
+            "the authority must be reachable before renewal can be attempted"
+        );
+        // A renewal request is a directed frame and so needs a *proven* next
+        // hop, for the same reason a reachability probe does: the frame it
+        // becomes must carry a pairwise tag, and a hop this node has not proven
+        // is one it could not authenticate to anyway. Recorded directly rather
+        // than driven through a challenge round, which is a different subsystem
+        // and covered by its own tests.
+        board.batman.note_proven(secs(100), mac(3), 0);
+        board
+    }
+
+    /// A board inside its renewal window, holding a route to its authority,
+    /// emits a `RenewReq` addressed toward it.
+    #[test]
+    fn a_board_polls_a_renewal_toward_its_recorded_authority() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca_auth = auth_for(&authority, 3, 100_000);
+        let mut board = board_with_route_to_ca(&authority, &mut ca_auth);
+
+        let mut tx = [0u8; 1024];
+        let frame = board
+            .poll_renewal(secs(100), &mut tx)
+            .expect("due, with an authority recorded and a route to it");
+
+        assert_eq!(
+            frame.dst,
+            mac(3),
+            "addressed toward the next hop for the CA"
+        );
+        assert_eq!(frame.protocol, ETH_P_BATMAN);
+        let (hdr, _) = BatmanRenewReqPacket::ref_from_prefix(frame.payload).unwrap();
+        assert_eq!(hdr.packet_type, BatmanPacketType::RenewReq.as_u8());
+        assert_eq!(hdr.dest, mac(3));
+        assert_eq!(board.renewal_requests_sent(), 1);
+    }
+
+    /// A board with no route to its authority stays quiet and retries on the
+    /// next poll — the ordinary case on a partitioned mesh (design 24 §5.4).
+    #[test]
+    fn a_board_with_no_route_to_its_authority_emits_nothing() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut board = router_for(&authority, 1, 1000);
+        board.set_auth_time(secs(100), Clocked::At(800));
+        board
+            .auth_mut()
+            .unwrap()
+            .set_renewal_authority(Some(&Keypair::from_seed(&[3; 32]).ed_pubkey()));
+
+        let mut tx = [0u8; 1024];
+        assert!(board.poll_renewal(secs(100), &mut tx).is_none());
+        assert_eq!(board.renewal_requests_sent(), 0);
+    }
+
+    /// The poll is paced. It runs from the driver's periodic arm, and a board
+    /// that asked on every wake would spend a duty-cycled radio's airtime on a
+    /// question whose answer changes once a week.
+    ///
+    /// It must advance its own deadline **whatever it decides**, including on
+    /// the paths that emit nothing: a shell that sleeps on
+    /// `next_renewal_after` would otherwise wake on a deadline it can never
+    /// discharge and spin.
+    #[test]
+    fn the_renewal_poll_is_paced_however_it_ends() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca_auth = auth_for(&authority, 3, 100_000);
+        let mut board = board_with_route_to_ca(&authority, &mut ca_auth);
+        let mut tx = [0u8; 1024];
+
+        assert!(board.poll_renewal(secs(100), &mut tx).is_some());
+        assert!(
+            board.poll_renewal(secs(100), &mut tx).is_none(),
+            "a second poll on the same turn asks nothing"
+        );
+        // Re-primed at the later instant: a route learned fifteen minutes ago
+        // has aged out, and this test is about the pacing rather than about
+        // path staleness.
+        let later = secs(100) + RENEWAL_POLL_INTERVAL;
+        let ogm = signed_ogm(&mut ca_auth, mac(3), 2, 50);
+        let bytes = link_frame_bytes(3, 0xff, &ogm);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut ogm_tx = [0u8; 1024];
+        board.handle_frame(later, 0, frame, &mut ogm_tx, &mut ());
+        board.batman.note_proven(later, mac(3), 0);
+        assert!(
+            board.poll_renewal(later, &mut tx).is_some(),
+            "and the interval does elapse"
+        );
+
+        // A poll that emits nothing still spends the interval.
+        let mut quiet = router_for(&authority, 1, 1000);
+        quiet.set_auth_time(secs(100), Clocked::At(100));
+        quiet
+            .auth_mut()
+            .unwrap()
+            .set_renewal_authority(Some(&Keypair::from_seed(&[3; 32]).ed_pubkey()));
+        assert!(quiet.poll_renewal(secs(100), &mut tx).is_none());
+        assert_eq!(
+            quiet.next_renewal_after(secs(100)),
+            Some(RENEWAL_POLL_INTERVAL),
+            "the deadline moved even though nothing went out"
+        );
+    }
+
+    /// A node with no recorded authority has no renewal deadline at all, so a
+    /// shell folding this into its sleep is not woken for it.
+    #[test]
+    fn a_node_with_no_recorded_authority_has_no_renewal_deadline() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut board = router_for(&authority, 1, 1000);
+        assert_eq!(board.next_renewal_after(secs(100)), None);
+
+        board
+            .auth_mut()
+            .unwrap()
+            .set_renewal_authority(Some(&Keypair::from_seed(&[3; 32]).ed_pubkey()));
+        assert!(board.next_renewal_after(secs(100)).is_some());
+    }
+
+    /// **A board inside its renewal window and not yet renewed raises an
+    /// alarm** (design 24 §7), and the alarm is retired the moment it is.
+    ///
+    /// This is the operator-facing half, and the thing that turns a silent
+    /// weekly drop-off into a visible one. It is raised on every poll and
+    /// coalesces on `(kind, subject)`, which is exactly the shape for a
+    /// condition that persists and retries — a board asking every fifteen
+    /// minutes for two days must produce one row with a count, not two hundred
+    /// rows.
+    ///
+    /// Raised whether or not this node can act on it, because the two cases
+    /// say different things and an operator reading "renewal due" beside a node
+    /// that renews itself has no way to tell them apart.
+    #[test]
+    fn a_board_inside_its_renewal_window_raises_an_alarm() {
+        use wayfinder_alarm::AlarmKind;
+
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca_auth = auth_for(&authority, 3, 100_000);
+        let mut board = board_with_route_to_ca(&authority, &mut ca_auth);
+        let mut tx = [0u8; 1024];
+
+        let board_alarms = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board_alarms, || {
+            board.poll_renewal(secs(100), &mut tx);
+        });
+        let raised = board_alarms.snapshot();
+        assert_eq!(raised.alarms.len(), 1, "one row, not one per attempt");
+        assert_eq!(raised.alarms[0].kind, AlarmKind::CertExpiring);
+
+        // A second attempt coalesces into the same row rather than adding one.
+        let later = secs(100) + RENEWAL_POLL_INTERVAL;
+        wayfinder_alarm::with_board(&board_alarms, || {
+            board.poll_renewal(later, &mut tx);
+        });
+        let raised = board_alarms.snapshot();
+        assert_eq!(raised.alarms.len(), 1);
+        assert_eq!(raised.alarms[0].count, 2, "coalesced, and counted");
+
+        // Renewed: the condition has lifted, so the row goes. Retired here
+        // rather than at the moment the reply lands, so the one place that
+        // decides the condition holds is the one that decides it has not.
+        let kp = Keypair::from_seed(&[1; 32]);
+        let reissued = authority.issue_cert(mac(1), kp.ed_pubkey(), kp.x_pubkey(), 0, 100_000);
+        assert!(
+            board
+                .auth_mut()
+                .unwrap()
+                .ingest_renew_reply(reissued.as_bytes())
+        );
+        wayfinder_alarm::with_board(&board_alarms, || {
+            board.poll_renewal(later + RENEWAL_POLL_INTERVAL, &mut tx);
+        });
+        assert!(
+            board_alarms.snapshot().alarms.is_empty(),
+            "a renewed node is not a node with a renewal problem"
+        );
+    }
+
+    /// A node with no authority recorded raises the alarm too, and says so —
+    /// it will *never* act on the condition, and an operator who cannot tell
+    /// that from a node that renews itself is an operator who will wait for a
+    /// renewal that is not coming.
+    #[test]
+    fn a_node_with_nowhere_to_renew_says_so_in_its_alarm() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut board = router_for(&authority, 1, 1000);
+        board.set_auth_time(secs(100), Clocked::At(800));
+        let mut tx = [0u8; 1024];
+
+        let board_alarms = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board_alarms, || {
+            board.poll_renewal(secs(100), &mut tx);
+        });
+
+        let raised = board_alarms.snapshot();
+        assert_eq!(raised.alarms.len(), 1);
+        assert!(
+            raised.alarms[0].detail.contains("no renewal"),
+            "the row must name which of the two cases this is, got {:?}",
+            raised.alarms[0].detail
+        );
+    }
+
+    /// A `RenewReq` addressed to this node is verified and the identity it
+    /// proved is surfaced for the driver to hand to the certificate authority
+    /// — **and never reaches the host TAP** (design 24 §4.1, §4.3).
+    #[test]
+    fn a_renew_req_for_self_is_verified_and_surfaced_not_delivered() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca = router_for(&authority, 3, 100_000);
+        let mut board_auth = auth_for(&authority, 1, 1000);
+        board_auth.set_renewal_authority(Some(&Keypair::from_seed(&[3; 32]).ed_pubkey()));
+
+        let mut body = [0u8; 512];
+        let body_len = board_auth.build_renewal_request(&mut body).unwrap();
+
+        let hdr_len = core::mem::size_of::<BatmanRenewReqPacket>();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            BatmanRenewReqPacket {
+                packet_type: BatmanPacketType::RenewReq.as_u8(),
+                version: BATMAN_VERSION,
+                ttl: 50,
+                dest: mac(3),
+            }
+            .as_bytes(),
+        );
+        payload.extend_from_slice(&body[..body_len]);
+        assert_eq!(payload.len(), hdr_len + body_len);
+
+        let bytes = link_frame_bytes(1, 3, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 1024];
+        let outcome = ca.handle_frame(secs(100), 0, frame, &mut tx, &mut ());
+
+        assert!(
+            outcome.deliver_local.is_none(),
+            "credential-control traffic must never reach the host device"
+        );
+        assert!(
+            outcome.forward.is_none(),
+            "the answer is the authority's, and the authority is off this loop"
+        );
+
+        let verified = ca
+            .take_renewal_request()
+            .expect("the verified requester is surfaced for the driver");
+        assert_eq!(verified.mac, mac(1));
+        assert_eq!(verified.ed_pubkey, Keypair::from_seed(&[1; 32]).ed_pubkey());
+        assert!(
+            ca.take_renewal_request().is_none(),
+            "taken once: the driver owns it from here"
+        );
+    }
+
+    /// A `RenewReq` whose body does not verify surfaces nothing at all. The
+    /// driver must never be handed an identity the router did not prove.
+    #[test]
+    fn a_renew_req_that_fails_verification_surfaces_nothing() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca = router_for(&authority, 3, 100_000);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            BatmanRenewReqPacket {
+                packet_type: BatmanPacketType::RenewReq.as_u8(),
+                version: BATMAN_VERSION,
+                ttl: 50,
+                dest: mac(3),
+            }
+            .as_bytes(),
+        );
+        payload.extend_from_slice(&[0xab; 200]);
+
+        let bytes = link_frame_bytes(1, 3, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 1024];
+        ca.handle_frame(secs(100), 0, frame, &mut tx, &mut ());
+        assert!(ca.take_renewal_request().is_none());
+    }
+
+    /// The authority's answer: a `RenewReply` carrying the re-issued
+    /// certificate, addressed back toward the requester.
+    #[test]
+    fn an_authority_answers_with_a_reply_addressed_back_to_the_requester() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca = router_for(&authority, 3, 100_000);
+        let mut board_auth = auth_for(&authority, 1, 1000);
+
+        // A route back to the board, learned from its own OGM.
+        let ogm = signed_ogm(&mut board_auth, mac(1), 1, 50);
+        let bytes = link_frame_bytes(1, 0xff, &ogm);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 1024];
+        ca.handle_frame(secs(100), 0, frame, &mut tx, &mut ());
+        ca.batman.note_proven(secs(100), mac(1), 0);
+
+        let kp = Keypair::from_seed(&[1; 32]);
+        let reissued = authority.issue_cert(mac(1), kp.ed_pubkey(), kp.x_pubkey(), 0, 5000);
+
+        let mut tx = [0u8; 1024];
+        let out = ca
+            .send_renew_reply(secs(100), mac(1), &reissued, &mut tx)
+            .expect("a route to the requester exists");
+        assert_eq!(out.dst, mac(1));
+        let (hdr, body) = BatmanRenewReplyPacket::ref_from_prefix(out.payload).unwrap();
+        assert_eq!(hdr.packet_type, BatmanPacketType::RenewReply.as_u8());
+        assert_eq!(hdr.dest, mac(1));
+        assert_eq!(body, reissued.as_bytes());
+    }
+
+    /// An authority with no route back to the requester sends nothing. The
+    /// requester's own retry is the backstop, so there is nothing to park.
+    #[test]
+    fn an_authority_with_no_route_to_the_requester_sends_nothing() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca = router_for(&authority, 3, 100_000);
+        let kp = Keypair::from_seed(&[1; 32]);
+        let reissued = authority.issue_cert(mac(1), kp.ed_pubkey(), kp.x_pubkey(), 0, 5000);
+
+        let mut tx = [0u8; 1024];
+        assert!(
+            ca.send_renew_reply(secs(100), mac(1), &reissued, &mut tx)
+                .is_none()
+        );
+    }
+
+    /// The reply terminates in the board's own auth state — never on the host
+    /// device — and the certificate it installed is surfaced once, for the
+    /// shell to make durable.
+    #[test]
+    fn a_renew_reply_for_self_installs_and_is_surfaced_for_persistence() {
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut ca_auth = auth_for(&authority, 3, 100_000);
+        let mut board = board_with_route_to_ca(&authority, &mut ca_auth);
+
+        let mut tx = [0u8; 1024];
+        board
+            .poll_renewal(secs(100), &mut tx)
+            .expect("the request that this reply answers");
+
+        let kp = Keypair::from_seed(&[1; 32]);
+        let reissued = authority.issue_cert(mac(1), kp.ed_pubkey(), kp.x_pubkey(), 0, 5000);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            BatmanRenewReplyPacket {
+                packet_type: BatmanPacketType::RenewReply.as_u8(),
+                version: BATMAN_VERSION,
+                ttl: 50,
+                dest: mac(1),
+            }
+            .as_bytes(),
+        );
+        payload.extend_from_slice(reissued.as_bytes());
+
+        let bytes = link_frame_bytes(3, 1, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 1024];
+        let outcome = board.handle_frame(secs(100), 0, frame, &mut tx, &mut ());
+
+        assert!(outcome.deliver_local.is_none());
+        assert!(outcome.forward.is_none());
+        assert_eq!(board.renewal_replies_accepted(), 1);
+        assert_eq!(
+            board.auth().unwrap().own_cert().not_after.get(),
+            5000,
+            "the node runs under the renewed credential from here"
+        );
+        let persisted = board
+            .take_renewed_cert()
+            .expect("the shell is handed the certificate to make durable");
+        assert_eq!(persisted.not_after.get(), 5000);
+        assert!(
+            board.take_renewed_cert().is_none(),
+            "surfaced once, so a shell cannot persist the same install twice"
         );
     }
 }

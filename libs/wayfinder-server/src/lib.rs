@@ -203,6 +203,10 @@ pub use authority::DEFAULT_INVITE_TTL_SECS;
 pub use authority::InviteSummary;
 #[cfg(feature = "std")]
 pub use authority::MintedInvite;
+/// What an authority did with a renewal that arrived over the mesh — a
+/// certificate to send back, or a refusal. See [`CertAuthority::renew_holder`].
+#[cfg(feature = "std")]
+pub use authority::RenewalOutcome;
 #[cfg(feature = "std")]
 pub use authority::StartedRegistration;
 

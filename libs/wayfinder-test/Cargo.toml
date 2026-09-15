@@ -18,6 +18,11 @@ interfaces.workspace = true
 # and not only on what they routed — without the process-global board every
 # node in the simulation would otherwise share.
 wayfinder-alarm.workspace = true
+# The host certificate authority, so a test node can play the provider end of a
+# mesh renewal (design 24) — the same `CertAuthority` a `wayfinder-tap` provider
+# runs, reached through the same hook the tokio driver reaches it through.
+wayfinder-server.workspace = true
+wayfinder-protos.workspace = true
 
 thiserror.workspace = true
 zerocopy.workspace = true

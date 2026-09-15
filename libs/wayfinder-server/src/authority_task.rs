@@ -53,6 +53,7 @@ use wayfinder_auth::RevocationRecord;
 use crate::CertAuthority;
 use crate::MeshAuthority;
 use crate::authority::MAX_PENDING_INVITES;
+use crate::authority::RenewalOutcome;
 use crate::users::UserRole;
 
 /// Re-exported so a caller of this module does not have to reach into
@@ -123,6 +124,31 @@ pub enum AuthorityCommand {
     Request(WayfinderRequest, oneshot::Sender<WayfinderResponse>),
     /// Apply the enrollment half of a `SetConfig`.
     SetEnrollmentPolicy(EnrollmentPolicyData, oneshot::Sender<Result<(), String>>),
+    /// Re-issue for a holder that asked over the **mesh** (design 24).
+    ///
+    /// A command and not a [`Request`](Self::Request), because this is not a
+    /// management request and must never become one: nothing on the management
+    /// API can send it, and giving it a wire representation would put an
+    /// unauthenticated re-issue path on a socket for the sake of a channel's
+    /// shape. What authenticates it is the router, which verified the
+    /// requester's certificate against the trust anchor, checked revocation and
+    /// checked proof of possession before this was ever sent.
+    ///
+    /// The identity is the one the router *proved*, taken from the certificate
+    /// presented rather than from anything the requester could name
+    /// independently — see `wayfinder::auth::VerifiedRenewal`.
+    RenewOverMesh {
+        /// The requester's mesh address, as its certificate names it.
+        node_mac: [u8; 6],
+        /// Its verified Ed25519 identity key.
+        ed_pubkey: [u8; 32],
+        /// Its verified X25519 agreement key.
+        x_pubkey: [u8; 32],
+        /// Where the outcome goes: a certificate to put back on the mesh, a
+        /// refusal for this authority's own operator, or an `Err` for a request
+        /// this node cannot service at all.
+        reply: oneshot::Sender<Result<RenewalOutcome, String>>,
+    },
 }
 
 /// Sending half of the authority task's command channel.
@@ -678,6 +704,31 @@ pub async fn serve_authority(mut ca: CertAuthority, ports: AuthorityPorts) {
                 // The client hanging up between asking and being answered is
                 // ordinary, not an error: the work is already done and durable.
                 let _ = reply.send(response);
+            }
+            AuthorityCommand::RenewOverMesh {
+                node_mac,
+                ed_pubkey,
+                x_pubkey,
+                reply,
+            } => {
+                // Served inline rather than on the blocking pool, unlike
+                // `Request`: the holder match is a table scan and one Ed25519
+                // signature, with none of the memory-hard work that forced
+                // every management request onto `spawn_blocking`. It still
+                // persists — `issue` writes the log — which is exactly why it
+                // belongs on this task and not on the router loop.
+                let outcome = ca.renew_holder(&node_mac, &ed_pubkey, &x_pubkey);
+                if let Err(e) = &outcome {
+                    // An `error!`: this is not a peer refusing to behave, it is
+                    // this authority unable to do its job — today, only an
+                    // unusable clock — and every board on the mesh will lapse
+                    // if it is not fixed.
+                    tracing::error!(error = %e, "cannot service a mesh renewal");
+                }
+                // The driver hanging up between asking and being answered is
+                // ordinary: the certificate is already issued and durable, and
+                // the requester's own retry is the backstop.
+                let _ = reply.send(outcome);
             }
             AuthorityCommand::SetEnrollmentPolicy(update, reply) => {
                 let outcome = ca.set_enrollment_policy(&update);
@@ -1542,5 +1593,78 @@ mod tests {
             Some(RespKind::Error(_)) => {}
             other => panic!("an authority with no clock must refuse to issue, got {other:?}"),
         }
+    }
+
+    /// A renewal that arrived over the **mesh** reaches the authority on the
+    /// same command channel a management request does, and comes back as a
+    /// certificate.
+    ///
+    /// That it rides this channel is the whole of design 24 §4.3: the router
+    /// proved who asked, but it does not own a `CertAuthority` and must not
+    /// learn to, so the answer is asked for here — off the router loop, where
+    /// `spawn_blocking` and a durable write are affordable and on the loop they
+    /// are not.
+    #[tokio::test]
+    async fn a_mesh_renewal_is_served_off_the_router_loop() {
+        let mut ca = clocked_authority();
+        let ed = [7u8; 32];
+        let x = [8u8; 32];
+        let node = wayfinder_auth::derive_mac(&ed).0;
+        // Certified first: `renew_holder` re-issues a holder and refuses
+        // everyone else, so a live record is the precondition.
+        let CsrOutcome::Issued(_) = ca.submit_csr(&node, &ed, &x, "").unwrap() else {
+            panic!("the authority auto-approves");
+        };
+        let authority = TestAuthority::start(ca);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        authority
+            .commands
+            .send(AuthorityCommand::RenewOverMesh {
+                node_mac: node,
+                ed_pubkey: ed,
+                x_pubkey: x,
+                reply: reply_tx,
+            })
+            .await
+            .expect("the authority task is running");
+
+        let outcome = reply_rx
+            .await
+            .expect("the authority answers")
+            .expect("a serviceable request");
+        let RenewalOutcome::Issued(bytes) = outcome else {
+            panic!("expected a re-issue, got {outcome:?}");
+        };
+        let cert = wayfinder_auth::MembershipCert::from_bytes(&bytes).expect("well-formed");
+        assert_eq!(cert.node_mac, node);
+        assert_eq!(cert.ed_pubkey, ed);
+    }
+
+    /// A node the authority does not hold a live record for is refused, and the
+    /// refusal comes back as a value rather than as an error — the request was
+    /// perfectly serviceable, the answer is just "no".
+    #[tokio::test]
+    async fn a_mesh_renewal_from_a_stranger_comes_back_refused() {
+        let authority = TestAuthority::start(clocked_authority());
+        let ed = [9u8; 32];
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        authority
+            .commands
+            .send(AuthorityCommand::RenewOverMesh {
+                node_mac: wayfinder_auth::derive_mac(&ed).0,
+                ed_pubkey: ed,
+                x_pubkey: [3u8; 32],
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let outcome = reply_rx.await.unwrap().expect("serviceable");
+        assert!(
+            matches!(outcome, RenewalOutcome::Refused(_)),
+            "expected a refusal, got {outcome:?}"
+        );
     }
 }

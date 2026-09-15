@@ -85,7 +85,7 @@ pub trait DurableStore {
     /// durable at all. What it gives up is the fallback for a *later* torn
     /// write — but a `save` already begins by erasing the sibling, so that
     /// fallback only ever spanned the gap between two saves. See
-    /// `docs/design/22-embedded-node-record.md` §4.4.
+    /// `docs/design/implemented/22-embedded-node-record.md` §4.4.
     ///
     /// The default is a no-op, which is correct for a medium that keeps no
     /// second copy in the first place (a `rename`-based `FileStore`). An

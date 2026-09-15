@@ -719,6 +719,23 @@ pub struct SecurityStatusData {
     /// response by construction rather than by a mapping that remembers to drop
     /// it: this is the answer to a request a dashboard polls once a second.
     pub renewal_provider: Option<RenewalTargetData>,
+    /// How many membership-certificate renewal requests this node has put on
+    /// the **mesh** since boot (design 24).
+    ///
+    /// The pair with [`renewal_replies_accepted`](Self::renewal_replies_accepted)
+    /// is what carries the signal, not either number: a node asking and never
+    /// being answered reads identically to a healthy one here, and identically
+    /// to a node that has not started asking there. Only the gap names the
+    /// failure.
+    ///
+    /// Zero on a node that renews over the management API instead, which is
+    /// what a host with a socket does; its renewal is reported through
+    /// [`cert_due_renewal`](Self::cert_due_renewal) and
+    /// [`renewal_provider`](Self::renewal_provider).
+    pub renewal_requests_sent: u64,
+    /// Re-issued certificates this node has accepted and installed; see
+    /// [`renewal_requests_sent`](Self::renewal_requests_sent).
+    pub renewal_replies_accepted: u64,
 }
 
 /// The membership credential a node is running under: its certificate and the
@@ -845,6 +862,9 @@ pub enum AlarmKindData {
     /// This node holds a certificate naming a MAC other than the address it
     /// routes under; it clears itself on the restart that adopts the address.
     CertifiedAddressMismatch,
+    /// A renewed membership certificate could not be made durable, so this node
+    /// will come back to the previous one after a reset.
+    CertNotDurable,
 }
 
 /// Who or what an alarm is about.
@@ -1755,6 +1775,7 @@ fn proto_alarm_kind(kind: AlarmKindData) -> AlarmKind {
         AlarmKindData::IdentityConflict => AlarmKind::IdentityConflict,
         AlarmKindData::CertExpiring => AlarmKind::CertExpiring,
         AlarmKindData::CertifiedAddressMismatch => AlarmKind::CertifiedAddressMismatch,
+        AlarmKindData::CertNotDurable => AlarmKind::CertNotDurable,
     }
 }
 
@@ -2151,6 +2172,8 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                     address: t.address,
                     node_key: t.node_key.to_vec(),
                 }),
+                renewal_requests_sent: s.renewal_requests_sent,
+                renewal_replies_accepted: s.renewal_replies_accepted,
             })
         }
         Some(RequestKind::GetOwnCert(_)) => match provider.own_cert() {

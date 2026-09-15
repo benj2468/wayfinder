@@ -105,6 +105,16 @@ pub struct TestMesh {
     not_after: u64,
 }
 
+/// The smallest renewal window [`TestMesh::mint_in_renewal_window`] will issue.
+///
+/// It derives the window from how far `now` sits above
+/// [`MIN_PLAUSIBLE_UNIX`] rather than hardcoding one, so this is only a floor:
+/// below it the last quarter is too short to be worth asserting against a board
+/// whose clock may be days ahead of the host's, and the fixture says so rather
+/// than producing a certificate that reads as fresh for a reason the test's
+/// failure message cannot explain.
+const MIN_RENEWAL_WINDOW_SECS: u64 = 30 * 86_400;
+
 impl TestMesh {
     /// Mint a fresh mesh with a credential valid around `now`.
     ///
@@ -176,6 +186,69 @@ impl TestMesh {
         (self.not_before >= MIN_PLAUSIBLE_UNIX).then_some(self.not_before)
     }
 
+    /// Mint a mesh whose credential is **already deep inside its renewal
+    /// window** as of `now_unix` — the last quarter, which is the only state
+    /// design 24's renewal path is ever reached from.
+    ///
+    /// Its own constructor rather than a parameter on [`mint`](Self::mint),
+    /// because `mint` deliberately places a wide window either side of `now`:
+    /// those tests are about clock posture, and a narrow window would make them
+    /// fail for a reason they are not testing. This one wants exactly the
+    /// narrow window they avoid.
+    ///
+    /// `not_after` stays ahead of `now`, so the certificate is *renewable*
+    /// rather than lapsed — a lapsed one is a different state with a different
+    /// remedy (design 24 §5.2), and a fixture that confused the two would
+    /// assert the wrong half.
+    ///
+    /// The window is placed so `now_unix` lands exactly on `renew_from`, which
+    /// leaves the whole last quarter ahead of it.
+    ///
+    /// That slack is the point, and it is why the window is *derived* rather
+    /// than a constant. A board's clock is a floor it never rolls back (design
+    /// 20), and this suite's own clock tests anchor it deliberately far forward
+    /// — the reference bench sits a month ahead of the host, and a board that
+    /// has run the `SetTime` test is over a year ahead. Any floor from
+    /// `now_unix` up to `not_after` reads as due-and-not-expired, so the fixture
+    /// buys as much of that range as it can.
+    ///
+    /// The limit is [`MIN_PLAUSIBLE_UNIX`]: `not_before` cannot go below it
+    /// without being refused, so the widest usable window is
+    /// `4/3 × (now - MIN_PLAUSIBLE_UNIX)` — three quarters behind `now`, one
+    /// quarter ahead. Clamping `not_before` *after* choosing a fixed width is
+    /// what this replaces, and it failed silently: the clamp slid the whole
+    /// window forward, putting `renew_from` years in the future while the
+    /// certificate still looked perfectly well-formed.
+    pub fn mint_in_renewal_window(now_unix: u64) -> anyhow::Result<TestMesh> {
+        let mut mesh = TestMesh::mint(now_unix);
+        let headroom = now_unix.saturating_sub(MIN_PLAUSIBLE_UNIX);
+        // `now - not_before` is three quarters of the window, so the window is
+        // four thirds of the headroom and the final quarter is a third of it.
+        let window = headroom.saturating_mul(4) / 3;
+        anyhow::ensure!(
+            window >= MIN_RENEWAL_WINDOW_SECS,
+            "this host's clock ({now_unix}) is too close to the plausibility floor \
+             ({MIN_PLAUSIBLE_UNIX}) to place a renewal window: the widest one available \
+             is {window}s, under the {MIN_RENEWAL_WINDOW_SECS}s this fixture needs to \
+             stay meaningful against a board whose own clock runs ahead",
+        );
+        mesh.not_before = MIN_PLAUSIBLE_UNIX;
+        mesh.not_after = MIN_PLAUSIBLE_UNIX.saturating_add(window);
+        Ok(mesh)
+    }
+
+    /// End of the issued certificate's validity window.
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+
+    /// The instant this certificate becomes due for renewal: the start of its
+    /// last quarter, as [`MembershipCert::renew_from`] computes it.
+    pub fn renew_from(&self) -> u64 {
+        self.not_after
+            .saturating_sub((self.not_after - self.not_before) / 4)
+    }
+
     /// Install this credential on `node` over `SetAuth`, stamping
     /// `installer_unix`.
     ///
@@ -219,7 +292,21 @@ impl TestMesh {
     ///
     /// Every node certified against one `TestMesh` shares its trust anchor,
     /// which is what puts two boards on one mesh.
-    pub async fn certify(&self, node: &mut Node, installer_unix: u64) -> anyhow::Result<[u8; 6]> {
+    /// `provider_key`, when given, additionally records **where this node
+    /// renews**: the authority whose Ed25519 identity key that is (design 24).
+    ///
+    /// The key, not the address. A node's mesh address is the address its
+    /// identity key derives (design 09 §5), so a board stores the pinned key
+    /// and derives the MAC to route a renewal to — which is what makes it
+    /// impossible for the two to disagree. The socket address in the block is
+    /// left empty on purpose: a board has no IP stack to dial one with, and it
+    /// is the absence of that, not of a route, that design 24 works around.
+    pub async fn certify(
+        &self,
+        node: &mut Node,
+        installer_unix: u64,
+        provider_key: Option<&[u8; 32]>,
+    ) -> anyhow::Result<[u8; 6]> {
         let role = node.role().to_string();
         let status = node.security_status().await?;
         // Named, because with two boards in play "no usable key" says nothing
@@ -260,7 +347,13 @@ impl TestMesh {
             &[],
             cert.as_bytes(),
             &self.authority.trust_anchor().to_bytes(),
-            None,
+            provider_key.map(
+                |node_key| wayfinder_protos::wayfinder::v1alpha::RenewalProvider {
+                    address: String::new(),
+                    node_key: node_key.to_vec(),
+                    enrollment_token: String::new(),
+                },
+            ),
             installer_unix,
         )
         .await?;

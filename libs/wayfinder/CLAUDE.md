@@ -26,18 +26,46 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
   memberships to the engine.
 - `get_egress_interface` / `resolve_route` — choose the egress interface for a
   destination (metric-driven), the latter without mutating state.
-- `auth.rs` (`OgmAuth`) — opt-in OGM authentication, kept in the router (not the
-  engine) so the engine stays crypto-free. `augment_ogm` appends the
-  originator's membership cert + Ed25519 signature TVLVs; `verify_ogm` gates an
-  incoming OGM against the mesh trust anchor *before* it reaches the engine. Also
-  caches neighbor keys for pairwise data-plane tags.
+- `auth/` (`OgmAuth`) — opt-in OGM authentication and the node's whole
+  credential-control plane, kept in the router (not the engine) so the engine
+  stays crypto-free. `augment_ogm` appends the originator's membership cert +
+  Ed25519 signature TVLVs; `verify_ogm` gates an incoming OGM against the mesh
+  trust anchor *before* it reaches the engine. Also caches neighbor keys for
+  pairwise data-plane tags.
+
+  **One type, one file per exchange**, each with its tests alongside:
+  `mod.rs` (the struct, its capacities, the clock), `ogm.rs` (the OGM/keep-alive
+  TVLV envelope), `pairwise.rs` (neighbour key cache, directed tags, fan-out
+  signatures, replay counters), `revocation.rs`, `proof.rs` (next-hop
+  challenge/response), `distribution.rs` (lazy cert fetch, design 01) and
+  `renewal.rs` (membership renewal over the mesh, design 24). `testutil.rs`
+  holds the fixtures they share.
+
+  **`OgmAuth` builds its own frames, headers included.** Each exchange's
+  emission and ingress live next to the state they read, and the router only
+  lends a `Paths` view — `self_ident` plus the two next-hop questions (`paths.rs`,
+  implemented for `BatmanEngine`). That is what keeps `CentralRouter` from
+  growing a branch per control-plane packet type: `poll_renewal` and
+  `send_renew_reply` are one-line delegations, and the four `DeliverLocal`
+  arms (`CertReq`/`CertReply`/`RenewReq`/`RenewReply`) are one call each —
+  `CertReq`'s wraps its result into an `RxOutcome`, the rest are bare. **Add a
+  new exchange here, not in `lib.rs`.**
+
+  The one deliberate exception is next-hop proof, where the *schedule* stays in
+  the engine's per-neighbour proof table (`challenge_candidates`,
+  `note_challenged`, `note_proven`) and only the frames are auth's — `auth` must
+  never be able to install a route. `CentralRouter::poll_challenge` is where the
+  two meet; `auth/proof.rs`'s header carries the argument.
 
   `OgmAuth<MAX_NEIGHBOR_KEYS, MAX_REVOKED, MAX_IN_FLIGHT_CERT_REQUESTS,
   MAX_PENDING_REPLIES>` is const-generic over its table sizes; all four default
   to the module constants of the same name. The neighbour cache dominates the
-  footprint (`NeighborKeys` is 272 B, ×64 at host capacity), so a constrained
-  node picks a smaller profile: `OgmAuth<8, 4, 2, 2>` is 3,808 bytes against the
-  host profile's 25,000.
+  footprint (`NeighborKeys` is 360 B, ×64 at host capacity), so a constrained
+  node picks a smaller profile: `OgmAuth<8, 4, 2, 2>` is 5,744 bytes against the
+  host profile's 32,984. (Measured, not estimated — `size_of` at each profile.
+  `tiny_auth_profile_is_substantially_smaller` asserts only the *ratio*, so
+  these absolute figures have nothing keeping them honest; re-measure rather
+  than trust them if you are sizing a board.)
 
   **Capacity never reaches the wire** — a host-profile and a tiny-profile node
   interoperate unchanged; `profiles_do_not_change_the_wire_format` pins this.
@@ -47,11 +75,17 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
   position, so a generic `OgmAuth::new` would make every call site name its
   capacities (`E0284`). A profile-specific node calls `with_capacities` instead.
   Apply the same pattern to any future constructor here.
-- `router_ops.rs` (`RouterOps`, `OgmAuthOps`) — `CentralRouter`'s **driver
-  surface with the eleven capacities erased**, so code that merely *drives* a
-  router writes `R: RouterOps` instead of re-declaring eleven const arguments
-  and re-applying them to the router type. Implemented once, blanket, for every
-  profile.
+- `router_ops.rs` (`RouterOps`, `RouterAuthOps`, `OgmAuthOps`) —
+  `CentralRouter`'s **driver surface with the eleven capacities erased**, so
+  code that merely *drives* a router writes `R: RouterOps` instead of
+  re-declaring eleven const arguments and re-applying them to the router type.
+  Implemented once, blanket, for every profile.
+
+  `RouterAuthOps` is a **sibling** carrying the four credential verbs
+  (`poll_challenge`/`next_challenge_after`, `poll_renewal`/`next_renewal_after`)
+  — nothing on it is a routing decision, so a shell that drives frames but no
+  credentials is not handed them. Put the next control-plane exchange there, or
+  better, behind one of these rather than on `RouterOps`.
 
   Reach for it in any new generic function that takes a router. Before it,
   `wayfinder-embedded-driver`'s `dispatch` named fifteen generic parameters to
@@ -152,8 +186,9 @@ ephemeral, and safe to delete). The second, `seeds/verify_ogm/`, is a
 after the first, so a curated valid input there survives forever without
 being polluted by the fuzzer's own finds. `seeds/verify_ogm/seed_valid_ogm`
 is one fully valid, real-signed OGM (built once via the existing
-`member`/`bare_ogm`/`augment_ogm` test helpers in `src/auth.rs`, then copied
-out); it roughly doubles code coverage over an empty-corpus run, since
+`member`/`bare_ogm` fixtures in `src/auth/testutil.rs` plus the real
+`OgmAuth::augment_ogm`, then copied out); it roughly doubles code coverage
+over an empty-corpus run, since
 mutations near a structurally valid cert/signature reach much deeper into
 `verify_ogm` than random bytes ever will on their own.
 

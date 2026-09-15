@@ -217,7 +217,27 @@ TVLVs verbatim today. All cert verification stays in the router/`OgmAuth`.
 
 ---
 
-## 5. Router / `OgmAuth` changes (`libs/wayfinder/src/auth.rs`, `lib.rs`)
+## 5. Router / `OgmAuth` changes (`libs/wayfinder/src/auth/`, `lib.rs`)
+
+> **Where this landed.** This section is written in `CentralRouter`'s terms —
+> the router verifying bodies, building `CertReq`/`CertReply` headers and
+> resolving their next hop. That is how it shipped and it was the wrong seam:
+> the router was assembling the auth module's packets, interleaved with routing
+> state, and every sentence below that says "the router" is describing code that
+> belonged to auth.
+>
+> It now sits in `libs/wayfinder/src/auth/distribution.rs`: `OgmAuth` owns the
+> fetch, the parked-reply table, the rate limit, the two send-rate gauges and
+> **both frames, headers included**. The router lends a `Paths` view — its own
+> address and the two next-hop questions, read-only, so auth can never install a
+> route — and the `DeliverLocal` arms are one call each. `auth.rs` itself is now
+> the `auth/` directory, one file per exchange.
+>
+> The proof-agnostic hop this section argues for (`next_hop_unproven_ok`, §3.2)
+> is unchanged and is now the *only* caller of that method, which is the
+> property to preserve: gating this exchange on proof deadlocks the bootstrap it
+> exists to perform. See `auth/paths.rs`. The same correction applies to design
+> 24 §4.3.
 
 ### 5.1 Cert store with fingerprint indexing
 

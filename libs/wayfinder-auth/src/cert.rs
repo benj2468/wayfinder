@@ -166,6 +166,19 @@ impl MembershipCert {
         MembershipCert::read_from_prefix(bytes).ok().map(|(c, _)| c)
     }
 
+    /// This certificate's raw [`as_bytes`](zerocopy::IntoBytes::as_bytes) form,
+    /// owned — the exact inverse of [`from_bytes`](Self::from_bytes).
+    ///
+    /// The symmetric counterpart [`TrustAnchor::to_bytes`] already has, and it
+    /// exists for the same callers: a node storing a certificate needs the
+    /// bytes without also having to depend on `zerocopy` to name the trait that
+    /// produces them.
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_LEN] {
+        let mut out = [0u8; Self::SERIALIZED_LEN];
+        out.copy_from_slice(self.as_bytes());
+        out
+    }
+
     /// The byte range the signature covers: every field except the trailing
     /// 64-byte signature itself.  Both the issuer (when signing) and the
     /// verifier compute the signature over exactly these bytes.

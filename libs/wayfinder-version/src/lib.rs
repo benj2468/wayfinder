@@ -11,7 +11,7 @@
 //! This crate is the compile-time half of the answer: a build identity baked
 //! into `.rodata`, costing nothing at runtime, available to `no_std` targets,
 //! and reported over the management API by every node. See
-//! `docs/design/23-build-provenance.md`.
+//! `docs/design/implemented/23-build-provenance.md`.
 //!
 //! ```text
 //! tagged HEAD       -> v0.4.0

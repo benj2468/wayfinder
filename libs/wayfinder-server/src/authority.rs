@@ -392,6 +392,33 @@ fn invite_is_live(invite: &UserInvite, now_unix: u64) -> bool {
         } => now_unix < handle_expires_at,
     }
 }
+/// What an authority did with a renewal that arrived over the mesh.
+///
+/// Two outcomes, not three, and the missing one is the point: there is no
+/// `Pending`. A request this authority cannot answer is refused rather than
+/// queued for an operator — see
+/// [`renew_holder`](CertAuthority::renew_holder) for why a held row is
+/// something an unattended board must not be able to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewalOutcome {
+    /// Re-issued: the raw `MembershipCert` bytes to send back.
+    ///
+    /// No trust anchor travels with it, unlike `EnrollData`. The node asking
+    /// already holds the anchor — it is what it verified the certificate it is
+    /// *currently* running under against, and what it will verify this one
+    /// against before installing it — so sending a second copy would be bytes
+    /// on a radio that change nothing.
+    Issued(Vec<u8>),
+    /// Refused, with a reason for the authority's operator.
+    ///
+    /// Not sent back to the asker. A `RenewReply` carries a certificate or
+    /// nothing at all, so a refusal reaches the board as silence and then as
+    /// the gap between its own sent/accepted counters — which is the honest
+    /// channel, since a node that cannot be renewed needs an operator either
+    /// way and a message it could not act on would only be one more thing to
+    /// spoof.
+    Refused(String),
+}
 
 impl CertAuthority {
     /// Build a CA from a 32-byte root seed and its issuance policy.  Unless
@@ -739,6 +766,151 @@ impl CertAuthority {
             account_id: account.as_bytes().to_vec(),
         };
         (cert, record)
+    }
+    /// What this authority's issued log says about `mac` as of now: whether the
+    /// live certificate it holds was issued to `ed`, whether it is revoked, and
+    /// the window it was approved for.
+    ///
+    /// `None` when the address holds no certificate inside its validity window
+    /// — never certified here, or certified and lapsed.
+    ///
+    /// **Shared by both doors into re-issue** — `submit_csr` over the management
+    /// API and `renew_holder` over the mesh — because "is this a live holder"
+    /// is a security question the two must answer identically. They had this
+    /// expression byte-for-byte twice, which is exactly the shape that drifts:
+    /// a later change tightening one door and not the other would leave the
+    /// looser one as the way in.
+    fn live_holder(&self, mac: Mac, ed: &[u8; 32]) -> Option<(bool, bool, u64)> {
+        self.log
+            .issued()
+            .iter()
+            .find(|c| c.node_mac == mac.0 && self.now_unix() <= c.not_after)
+            .map(|c| {
+                (
+                    c.ed_pubkey == *ed,
+                    c.revoked,
+                    c.not_after.saturating_sub(c.not_before),
+                )
+            })
+    }
+
+    /// Re-issue for a holder that asked **over the mesh** (design 24).
+    ///
+    /// The holder match and nothing else: a node whose certificate is still
+    /// inside its validity window, under the key that record names and not
+    /// revoked, is re-issued on the spot for the window its own record carries
+    /// — the lifetime an operator approved this device for, not this
+    /// authority's current default.
+    ///
+    /// # Why this is not `submit_csr`
+    ///
+    /// The two agree exactly on the case that succeeds, and differ on every
+    /// case that does not, which is the whole reason this is a second entry
+    /// point rather than a second caller.
+    ///
+    /// `submit_csr` **parks** a request it cannot answer, so an operator can
+    /// approve it. That is right for a request arriving over authenticated TLS,
+    /// where somebody is standing at a terminal. It is wrong for one arriving
+    /// over the mesh: a held row is credential-bearing state, and a lapsed
+    /// board would create one unattended, once per rate-limit interval, for as
+    /// long as it stayed lapsed. So this refuses instead, and queues nothing.
+    ///
+    /// It also takes no enrollment token, because the request carries none: the
+    /// `RenewReq` body is a certificate this authority signed plus a proof of
+    /// possession, which the router has already verified. A token would add a
+    /// second secret for a board to hold and nothing to what is proved.
+    ///
+    /// # What a refusal means
+    ///
+    /// That this node cannot be renewed over the mesh at all — lapsed, revoked,
+    /// never certified here, or naming an address its key does not derive — and
+    /// that the remedy is an operator's, over the serial port. Renewal cannot
+    /// rescue it, and pretending otherwise would convert a certificate's
+    /// lifetime from a revocation bound into a formality (design 24 §5.2).
+    ///
+    /// `Err` is reserved for the request being *unserviceable* — this
+    /// authority has no usable clock — exactly as it is on
+    /// [`submit_csr`](MeshAuthority::submit_csr).
+    pub fn renew_holder(
+        &mut self,
+        node_mac: &[u8],
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+    ) -> Result<RenewalOutcome, String> {
+        // Fail closed on an unset clock, for `submit_csr`'s reason: a
+        // certificate issued against the epoch is already expired against any
+        // real clock, and here it would also fail the board's
+        // must-move-forward rule and be discarded after a full round trip.
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot issue certificates yet"
+                    .to_string(),
+            );
+        }
+        let mac = node_mac_of(node_mac)?;
+        let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
+        let x = fixed::<32>(x_pubkey, "x_pubkey")?;
+        // The address must be the one this key derives. Checked here as well as
+        // at `submit_csr` because this is a second door into the same act, and
+        // a binding enforced at one door is not enforced.
+        if let Err(why) = check_mac_derives_from(mac, &ed, false) {
+            return Ok(RenewalOutcome::Refused(why));
+        }
+
+        let holder = self.live_holder(mac, &ed);
+
+        let Some((same_key, revoked, held_ttl_secs)) = holder else {
+            // Either never certified here, or certified and lapsed. Told apart
+            // in the log — the two have different remedies — but not in the
+            // refusal, which is answered to a node that already knows which it
+            // is and would learn nothing from being told.
+            tracing::debug!(
+                node_mac = ?mac,
+                "refused a mesh renewal: no live certificate on file for this address"
+            );
+            return Ok(RenewalOutcome::Refused(
+                "this address holds no live certificate from this authority; it must be \
+                 enrolled and approved before it can renew"
+                    .to_string(),
+            ));
+        };
+
+        if !same_key {
+            // Reachable only through a legacy `issued` row: the binding above
+            // already refused any key that does not derive this address. Logged
+            // as a `warn!` for the reason `submit_csr`'s sibling is — an
+            // operator watching a MAC collision needs to tell it from a node
+            // that is merely stuck.
+            tracing::warn!(
+                node_mac = ?mac,
+                "drop: mesh renewal for a MAC already certified under a different key"
+            );
+            return Ok(RenewalOutcome::Refused(
+                "this MAC already has a certificate under a different key".to_string(),
+            ));
+        }
+        if revoked {
+            // Never re-issued, which would clear the `revoked` flag the record
+            // stands on. Revocation ejects a node that still holds its own key,
+            // so the key is exactly what the ejected party has.
+            tracing::warn!(
+                node_mac = ?mac,
+                "drop: mesh renewal from a revoked holder"
+            );
+            return Ok(RenewalOutcome::Refused(
+                "this node has been revoked from the mesh".to_string(),
+            ));
+        }
+
+        let issued = self.issue(mac, ed, x, Some(held_ttl_secs))?;
+        tracing::info!(
+            node_mac = ?mac,
+            ttl_secs = held_ttl_secs,
+            "re-issued a membership certificate to a holder renewing over the mesh"
+        );
+        Ok(RenewalOutcome::Issued(issued.cert))
     }
 
     /// Add a user account, refusing a name that already exists.
@@ -2057,18 +2229,7 @@ impl MeshAuthority for CertAuthority {
         //
         // Read the two facts out rather than keeping the record borrowed:
         // `issue` below takes `&mut self`.
-        let holder = self
-            .log
-            .issued()
-            .iter()
-            .find(|c| c.node_mac == mac.0 && self.now_unix() <= c.not_after)
-            .map(|c| {
-                (
-                    c.ed_pubkey == ed,
-                    c.revoked,
-                    c.not_after.saturating_sub(c.not_before),
-                )
-            });
+        let holder = self.live_holder(mac, &ed);
         // Named here because the case it describes is the one that *falls
         // through* the block below, and so is read again past it.
         let revoked_holder = matches!(holder, Some((_, true, _)));
@@ -6491,5 +6652,141 @@ mod tests {
     /// A lockout instant far enough ahead of the test clock to be in force.
     fn ca_locked_until() -> u64 {
         u64::MAX
+    }
+
+    // ── renewal over the mesh (design 24) ─────────────────────────────────────
+
+    /// A live holder asking over the mesh is re-issued on the spot, for the
+    /// window its own record carries rather than the authority's current
+    /// default — the same rule `SubmitCsr` applies to a holder re-enrolling,
+    /// because it is the same act reached by a different road.
+    #[test]
+    fn a_live_holder_is_re_issued_over_the_mesh() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let first = issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
+
+        ca.set_now_unix(900);
+        let outcome = ca
+            .renew_holder(&node_mac(2), &ed, &x)
+            .expect("a serviceable request");
+        let RenewalOutcome::Issued(bytes) = outcome else {
+            panic!("expected a re-issue, got {outcome:?}");
+        };
+
+        let renewed = MembershipCert::from_bytes(&bytes).expect("a well-formed certificate");
+        let previous = MembershipCert::from_bytes(&first).unwrap();
+        assert_eq!(renewed.node_mac, node_mac(2));
+        assert_eq!(renewed.ed_pubkey, ed);
+        assert!(
+            renewed.not_after.get() > previous.not_after.get(),
+            "a renewal has to move the credential forward, or the board refuses it"
+        );
+        assert_eq!(
+            renewed.not_after.get() - renewed.not_before.get(),
+            previous.not_after.get() - previous.not_before.get(),
+            "for the lifetime an operator approved this device for, not the default"
+        );
+    }
+
+    /// **A lapsed holder is refused, and never parked** (design 24 §5.2).
+    ///
+    /// One second past `not_after` a node is a stranger, not a renewing holder.
+    /// Over the management API that request joins the approval queue, which is
+    /// right: an operator is standing there. Over the mesh it must not, and the
+    /// difference is the whole reason this is its own entry point rather than a
+    /// second caller of `submit_csr`. A queue entry nobody asked for is a
+    /// credential-bearing row an unattended board can create, once per
+    /// rate-limit interval, for as long as it stays lapsed.
+    ///
+    /// It is also the deliberate outcome rather than a limitation to engineer
+    /// away: a certificate's lifetime is the only revocation bound that reaches
+    /// a member which was offline when the revocation flooded, and a mechanism
+    /// that let an expired credential bootstrap a fresh one would make that
+    /// bound a formality.
+    #[test]
+    fn a_renewal_request_from_a_lapsed_holder_is_refused() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
+
+        // Past the certificate's own `not_after` (issued at 100 for 1000s).
+        ca.set_now_unix(2_000);
+        let held_before = ca.list_pending().len();
+
+        let outcome = ca.renew_holder(&node_mac(2), &ed, &x).unwrap();
+        assert!(
+            matches!(outcome, RenewalOutcome::Refused(_)),
+            "expected a refusal, got {outcome:?}"
+        );
+        assert_eq!(
+            ca.list_pending().len(),
+            held_before,
+            "and nothing was queued for an operator: recovery is the serial-port ritual"
+        );
+    }
+
+    /// A node this authority has never certified is refused, and likewise
+    /// queues nothing. Enrollment over the mesh is a non-goal — a node with no
+    /// credential cannot route authenticated, so it could not reach here in the
+    /// first place, and an authority that answered as if it could would be one
+    /// an attacker could fill a queue through.
+    #[test]
+    fn a_stranger_renewing_over_the_mesh_is_refused_and_never_parked() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(7);
+
+        let outcome = ca.renew_holder(&node_mac(7), &ed, &x).unwrap();
+        assert!(
+            matches!(outcome, RenewalOutcome::Refused(_)),
+            "expected a refusal, got {outcome:?}"
+        );
+        assert!(ca.list_pending().is_empty());
+    }
+
+    /// A revoked holder is refused. Revocation ejects a node that still holds
+    /// its own key, so the key is exactly what the ejected party has — and
+    /// re-issuing here would clear the `revoked` flag the record stands on.
+    #[test]
+    fn a_revoked_holder_renewing_over_the_mesh_is_refused() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
+        ca.revoke(&node_mac(2)).expect("the holder is on file");
+
+        let outcome = ca.renew_holder(&node_mac(2), &ed, &x).unwrap();
+        assert!(
+            matches!(outcome, RenewalOutcome::Refused(_)),
+            "expected a refusal, got {outcome:?}"
+        );
+        assert!(ca.list_pending().is_empty());
+    }
+
+    /// A key that does not derive the address it names is refused before
+    /// anything is looked up — the key↔address binding (design 09 §5), applied
+    /// at this entry point too rather than only at `SubmitCsr`.
+    #[test]
+    fn a_renewal_naming_an_address_its_key_does_not_derive_is_refused() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
+
+        let outcome = ca.renew_holder(&node_mac(3), &ed, &x).unwrap();
+        assert!(
+            matches!(outcome, RenewalOutcome::Refused(_)),
+            "expected a refusal, got {outcome:?}"
+        );
+    }
+
+    /// An authority with no usable clock services nothing. It would otherwise
+    /// issue a certificate whose window starts at the unix epoch and is already
+    /// expired against any real clock — the same fail-closed rule `submit_csr`
+    /// keeps, and an `Err` rather than a refusal because the request is not
+    /// wrong, this node is.
+    #[test]
+    fn an_unclocked_authority_cannot_renew_over_the_mesh() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
+        let (ed, x) = node_keys(2);
+        assert!(ca.renew_holder(&node_mac(2), &ed, &x).is_err());
     }
 }

@@ -283,6 +283,29 @@ pub fn Security() -> impl IntoView {
                             }
                             mono=true
                         />
+                        // Mesh renewal (design 24), shown only once this node
+                        // has asked: a host renews over its management API and
+                        // leaves both at zero, where a row reading "0 / 0"
+                        // would look like a failure rather than a path this
+                        // node does not use.
+                        //
+                        // Rendered as the pair, because the pair is the signal:
+                        // a node asking and never being answered is the failure
+                        // this exists to surface, and it is invisible in either
+                        // number alone.
+                        {(sec.renewal_requests_sent > 0)
+                            .then(|| {
+                                view! {
+                                    <Field
+                                        label="Mesh renewals"
+                                        value=format!(
+                                            "{} asked / {} answered",
+                                            sec.renewal_requests_sent,
+                                            sec.renewal_replies_accepted,
+                                        )
+                                    />
+                                }
+                            })}
                         // Shown only when it applies, and phrased as what the
                         // operator has to do. A revoked node otherwise reads as
                         // "no certificate", which is true and points at an

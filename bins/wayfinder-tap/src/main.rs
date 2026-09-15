@@ -1192,14 +1192,14 @@ async fn main() -> anyhow::Result<()> {
         // Opened above iff `config.provider` was set, which is the branch we are
         // in — matched rather than unwrapped so the two stay tied together by
         // the compiler instead of by a comment.
-        let Some((_, authority_rx)) = authority_channel.take() else {
+        let Some((authority_tx, authority_rx)) = authority_channel.take() else {
             bail!("internal: provider configured but its command channel was never opened");
         };
         // Every direction wired in one call, so provider mode cannot be
         // half-enabled. Without the clock the authority's `now_unix` stays 0,
         // which every issuing path treats as fail-closed — so it would refuse
         // every request, silently.
-        let ports = driver.attach_authority(authority_rx);
+        let ports = driver.attach_authority(authority_tx, authority_rx);
         join_set.spawn(async move {
             wayfinder_server::serve_authority(ca, ports).await;
             Ok(())

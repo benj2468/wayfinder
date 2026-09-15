@@ -1916,6 +1916,15 @@ mod tests {
                     crate::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
                         let _ = reply.send(Ok(()));
                     }
+                    // Unreachable from a connection task, which is what these
+                    // harnesses drive: a mesh renewal arrives from the router
+                    // loop, never off a socket. Answered rather than ignored so
+                    // a caller cannot hang on a dropped oneshot.
+                    crate::AuthorityCommand::RenewOverMesh { reply, .. } => {
+                        let _ = reply.send(Ok(crate::RenewalOutcome::Refused(
+                            "this stub authority does not renew".into(),
+                        )));
+                    }
                 }
             }
         });

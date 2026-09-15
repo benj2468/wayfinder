@@ -242,6 +242,9 @@ impl RouterReads for NodeMock {
             self_revoked: false,
             self_revocation_not_after: 0,
             renewal_provider: None,
+            // Nothing to renew, so nothing asked and nothing answered.
+            renewal_requests_sent: 0,
+            renewal_replies_accepted: 0,
         }
     }
 }
@@ -413,6 +416,13 @@ async fn spawn_node(has_identity: bool) -> (Endpoint, Arc<Mutex<Vec<SetAuthCall>
                     wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
                         let _ = reply.send(Ok(()));
                     }
+                    // Unreachable here: a mesh renewal arrives from a router
+                    // loop, and this harness drives the CLI over a socket.
+                    wayfinder_server::AuthorityCommand::RenewOverMesh { reply, .. } => {
+                        let _ = reply.send(Ok(wayfinder_server::RenewalOutcome::Refused(
+                            "this harness does not renew".into(),
+                        )));
+                    }
                 },
                 else => break,
             }
@@ -495,6 +505,13 @@ async fn spawn_provider_node() -> Endpoint {
                     }
                     wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
                         let _ = reply.send(Ok(()));
+                    }
+                    // Unreachable here: a mesh renewal arrives from a router
+                    // loop, and this harness drives the CLI over a socket.
+                    wayfinder_server::AuthorityCommand::RenewOverMesh { reply, .. } => {
+                        let _ = reply.send(Ok(wayfinder_server::RenewalOutcome::Refused(
+                            "this harness does not renew".into(),
+                        )));
                     }
                 },
                 else => break,

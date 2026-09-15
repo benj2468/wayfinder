@@ -255,6 +255,23 @@ pub enum AlarmKind {
     /// bad case — a credential it cannot use — and means its address is not
     /// derived from its seed.
     CertifiedAddressMismatch,
+    /// A renewed membership certificate was installed in memory but could not
+    /// be written to durable storage.
+    ///
+    /// **Its own kind rather than a second use of
+    /// [`CertExpiring`](Self::CertExpiring)**, and the distinction is
+    /// load-bearing rather than tidy. The renewal-window row is *cleared* by
+    /// the poll that finds the node no longer due — which is exactly the state
+    /// a successful renewal produces. Raising this condition under that kind
+    /// would have the renewal retire the very row reporting that the renewal
+    /// was not made durable, leaving a board that is fine now and stale at its
+    /// next reset with nothing on the board to say so.
+    ///
+    /// The node keeps routing under the renewed certificate meanwhile, which is
+    /// why this is a warning and not a critical: nothing is broken until
+    /// somebody power-cycles it, and that is precisely the window in which an
+    /// operator can still act.
+    CertNotDurable,
 }
 
 impl AlarmKind {
@@ -275,6 +292,7 @@ impl AlarmKind {
             Self::IdentityConflict => 10,
             Self::CertExpiring => 11,
             Self::CertifiedAddressMismatch => 12,
+            Self::CertNotDurable => 13,
         }
     }
 
@@ -295,6 +313,7 @@ impl AlarmKind {
             Self::IdentityConflict => "identity_conflict",
             Self::CertExpiring => "cert_expiring",
             Self::CertifiedAddressMismatch => "certified_address_mismatch",
+            Self::CertNotDurable => "cert_not_durable",
         }
     }
 }

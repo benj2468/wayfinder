@@ -495,6 +495,15 @@ pub async fn spawn_provider_full(
                     wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
                         let _ = reply.send(Ok(()));
                     }
+                    // Unreachable here: a mesh renewal arrives from a router
+                    // loop, and this harness drives the CLI over a socket.
+                    // Answered rather than ignored so nothing can hang on a
+                    // dropped oneshot.
+                    wayfinder_server::AuthorityCommand::RenewOverMesh { reply, .. } => {
+                        let _ = reply.send(Ok(wayfinder_server::RenewalOutcome::Refused(
+                            "this harness does not renew".into(),
+                        )));
+                    }
                 },
                 else => break,
             }

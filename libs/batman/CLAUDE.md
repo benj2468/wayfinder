@@ -62,7 +62,7 @@ Protocol constants: `ETH_P_BATMAN` (0x4305) and the `BatmanPacketType`
 `#[repr(u8)]` enum — `Ogm` (0x01), `Bcast` (0x02), `Unicast` (0x03), `Mcast`
 (0x04), `CertReq` (0x05), `CertReply` (0x06), `Keepalive` (0x07),
 `NextHopChallenge` (0x08), `NextHopResponse` (0x09), `EchoRequest` (0x0a),
-`EchoReply` (0x0b). Modelled as an
+`EchoReply` (0x0b), `RenewReq` (0x0c), `RenewReply` (0x0d). Modelled as an
 enum (not free consts) so the compiler guarantees the type bytes are unique;
 `as_u8()` is the wire byte, `from_u8()` decodes a received one (`None` = a type
 this build doesn't know, routed by destination). Header structs keep
@@ -189,13 +189,13 @@ engine free of any crypto dependency. See `libs/wayfinder`'s `OgmAuth` and
 `docs/design/implemented/09-mesh-auth-gaps.md` §4.
 
 **Reachability probes** (`handle_rx`, `EchoRequest`/`EchoReply` arms →
-`handle_echo`): the `handle_cert_req` twin — delivered locally at `dest` (a
+`handle_echo`): the `handle_credential_control` twin — delivered locally at `dest` (a
 request so the router can answer it, a reply so the router can credit it),
 relayed toward the next live hop otherwise, dropped at `ttl <= 1`. The relay
 also increments `hops`, saturating rather than wrapping: a rolled-over count
 would report a two-hop path as a 258-hop one, and `ttl` is what actually bounds
-the relay. Measurement-free at this layer, in the same spirit as `handle_cert_req`
-being crypto-free — what a probe *means* (a session, an interval, a round-trip
+the relay. Measurement-free at this layer, in the same spirit as
+`handle_credential_control` being crypto-free — what a probe *means* (a session, an interval, a round-trip
 time) lives in `libs/wayfinder`'s `ping.rs`.
 
 **Unicast forwarding** (`handle_rx`, `BatmanPacketType::Unicast` arm):

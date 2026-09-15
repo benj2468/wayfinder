@@ -475,6 +475,7 @@ fn alarm_kind_data(kind: wayfinder_alarm::AlarmKind) -> AlarmKindData {
         wayfinder_alarm::AlarmKind::CertifiedAddressMismatch => {
             AlarmKindData::CertifiedAddressMismatch
         }
+        wayfinder_alarm::AlarmKind::CertNotDurable => AlarmKindData::CertNotDurable,
     }
 }
 
@@ -906,6 +907,13 @@ impl<
             // "authentication: disabled" before reaching it, so today this is
             // carried on the wire for a client that asks rather than shown.
             renewal_provider: self.renewal_provider.clone(),
+            // Reported with the posture rather than with the auth block below,
+            // so a node whose credential has been dropped — revoked, or never
+            // enrolled — still shows how many times it asked. A counter that
+            // vanished at the moment the asking stopped mattering would hide
+            // precisely the history an operator is looking for.
+            renewal_requests_sent: self.router.renewal_requests_sent(),
+            renewal_replies_accepted: self.router.renewal_replies_accepted(),
             ..SecurityStatusData::default()
         };
 
@@ -1357,6 +1365,21 @@ impl<
 /// stricter on purpose: nothing listens there, so a record naming it can only
 /// ever dial nowhere.
 fn validate_provider_address(address: &str) -> Result<(), String> {
+    // **Empty means "nowhere to dial", and that is a real posture, not a
+    // missing field.** A board renews over the *mesh* (design 24 §4.4): its
+    // provider block carries the pinned key it derives an authority's mesh
+    // address from, and there is no socket for it to name because it has no IP
+    // stack to open one with. Refusing the empty string here is what made a
+    // mesh-only provider uninstallable over `SetAuth` — found on real hardware,
+    // because every x86 test reached the router's setter directly and never
+    // travelled this path.
+    //
+    // A *host* handed one simply does not renew over its management API; see
+    // `renew.rs`, which treats an unaddressed provider as "no socket renewal"
+    // rather than retrying a dial it cannot make.
+    if address.is_empty() {
+        return Ok(());
+    }
     let Some((host, port)) = address.rsplit_once(':') else {
         return Err(format!(
             "the renewal provider's address must be host:port, but '{address}' names no port"
@@ -1555,7 +1578,23 @@ impl<
             );
         }
 
-        let auth = OgmAuth::with_capacities(key_pair, parsed_cert, anchor);
+        let mut auth = OgmAuth::with_capacities(key_pair, parsed_cert, anchor);
+        // Where this node renews, as a mesh address rather than a socket
+        // address — design 24 §4.4. **Derived from the key the provider block
+        // already pins, never carried beside it.** Since design 09 §5 a node's
+        // mesh address is the address its identity key derives, so the two can
+        // no more disagree than a certificate and its own subject can, and
+        // there is no second field for an operator to fill in wrong.
+        //
+        // Installed alongside the credential and replaced by every install, on
+        // exactly the terms the provider record itself is: an install that
+        // names no provider records no authority, so the node asks nobody
+        // rather than reaching back to one a previous credential came from.
+        //
+        // Not a trust input. A `RenewReply` is a certificate, and one that does
+        // not verify against the anchor installed above is discarded whatever
+        // MAC it arrived from.
+        auth.set_renewal_authority(provider.as_ref().map(|p| &p.target.node_key));
         self.router.set_auth(auth);
         // Recorded last, once installation has actually succeeded: write the
         // now-current seed back into the caller's slot (a no-op when this is
@@ -3183,6 +3222,162 @@ mod tests {
             live.as_ref(),
             Some(&provider("ca.example:7700")),
             "and visible to the running driver now, not only after a restart"
+        );
+    }
+
+    /// **The renewal counters are reported, and the gap between them is the
+    /// signal** (design 24 §7).
+    ///
+    /// Either number alone says nothing an operator can act on. A board that is
+    /// asking and never being answered — a partition, a provider that is down,
+    /// a holder record that lapsed — looks identical to a healthy board in
+    /// `renewal_requests_sent`, and identical to a board that has not started
+    /// asking in `renewal_replies_accepted`. It is only the difference that
+    /// names the failure.
+    ///
+    /// Reported beside `cert_due_renewal` and the provider rather than through
+    /// a request of their own, because they are three facts about one thing:
+    /// whether this node is going to stay a member.
+    #[test]
+    fn security_status_reports_the_renewal_counters() {
+        let ca = wayfinder::wayfinder_auth::Authority::from_seed(&[9; 32], 0xABCD);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let mut router = CentralRouter::new(kp.derived_mac());
+        router.set_auth(wayfinder::auth::OgmAuth::new(
+            wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]),
+            ca.issue_cert(kp.derived_mac(), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000),
+            ca.trust_anchor(),
+        ));
+        router.set_auth_time(Duration::ZERO, Clocked::At(100));
+
+        let status = RouterAdapter::new(&mut router, Duration::ZERO).security_status();
+        assert_eq!(status.renewal_requests_sent, 0);
+        assert_eq!(status.renewal_replies_accepted, 0);
+
+        // One request goes out, and is not answered — the shape of the failure
+        // these two exist to make visible.
+        router
+            .auth_mut()
+            .unwrap()
+            .set_renewal_authority(Some(&[0x0B; 32]));
+        let mut buf = [0u8; 512];
+        router
+            .auth_mut()
+            .unwrap()
+            .build_renewal_request(&mut buf)
+            .unwrap();
+
+        let status = RouterAdapter::new(&mut router, Duration::ZERO).security_status();
+        assert_eq!(status.renewal_requests_sent, 1);
+        assert_eq!(
+            status.renewal_replies_accepted, 0,
+            "the gap is what an operator reads"
+        );
+    }
+
+    /// A node renews over the mesh against a MAC, and that MAC is **derived
+    /// from the key already pinned in the provider block** rather than carried
+    /// beside it.
+    ///
+    /// Design 24 §9.3 left open whether the block should grow a second address
+    /// field so one encoding could serve a host and a board. It does not need
+    /// to: since design 09 §5 a node's mesh address *is* the address its
+    /// identity key derives, so the authority's MAC is a function of
+    /// `node_key`. Deriving it is strictly better than storing it — there is no
+    /// second field for an operator to get wrong and no way for the two halves
+    /// to disagree — and it keeps the derivation (and the crypto it needs) in
+    /// this crate rather than in the proto crate every board links.
+    #[test]
+    fn set_auth_records_the_mesh_address_derived_from_the_pinned_provider_key() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .set_auth(
+                &[3; 32],
+                &cert,
+                &anchor,
+                Some(provider("ca.example:7700")),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            router.auth().expect("auth installed").renewal_authority(),
+            Some(wayfinder::wayfinder_auth::derive_mac(&[9u8; 32])),
+            "the provider's pinned key names the node to route a renewal to"
+        );
+    }
+
+    /// **A provider with a pinned key and no socket address installs.** That is
+    /// what a board renewing over the mesh has (design 24 §4.4): there is no
+    /// address because there is no IP stack to dial one with.
+    ///
+    /// Regression test — this was refused, and only the hardware suite caught
+    /// it, because every other test reached `set_renewal_authority` directly
+    /// instead of travelling the `SetAuth` path a real `csr install` takes.
+    #[test]
+    fn set_auth_accepts_a_provider_that_names_no_socket_address() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .set_auth(&[3; 32], &cert, &anchor, Some(provider("")), 0)
+            .expect("a mesh-only provider is installable");
+
+        assert_eq!(
+            router.auth().expect("auth installed").renewal_authority(),
+            Some(wayfinder::wayfinder_auth::derive_mac(&[9u8; 32])),
+            "and the board still knows which node to route a renewal to"
+        );
+    }
+
+    /// An install that names no provider records no renewal authority, so the
+    /// node asks nobody — the same rule the host renewer keeps. Reaching back
+    /// to an authority a previous credential came from is the one thing worse
+    /// than waiting for an operator.
+    #[test]
+    fn set_auth_without_a_provider_records_no_renewal_authority() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .set_auth(&[3; 32], &cert, &anchor, None, 0)
+            .unwrap();
+
+        assert_eq!(
+            router.auth().expect("auth installed").renewal_authority(),
+            None
         );
     }
 
