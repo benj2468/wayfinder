@@ -81,6 +81,29 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
 # the way down.
 esp-println = { version = "0.17.0", features = ["esp32"] }
 
+# Raw SPI-flash access for the durable identity store, through the partition
+# `partitions.csv` declares for it. `NorFlash` with a 4096-byte erase size,
+# which is what `wayfinder-storage`'s `FlashStore` wants for its A/B pages.
+#
+# **`bytewise-read` is required, not a nicety.** Without it this backend's
+# `READ_SIZE` is a 4-byte word and `read_nor` rejects any read whose *offset or
+# length* is not a multiple of four. `FlashStore` streams a stored blob through
+# CRC in bounded chunks, so its last chunk is `len % CRC_CHUNK` and almost never
+# word-aligned: every load of a real record failed with
+# `Store(Flash(NotAligned))` and the board fell back to no identity at all. The
+# feature drops `READ_SIZE` to 1 and has the backend reassemble unaligned reads
+# through a word buffer of its own.
+esp-storage = { version = "0.10.0", features = [
+    "esp32",
+    "embedded-storage",
+    "bytewise-read",
+] }
+# The A/B two-page durable store itself. `flash` rather than `std`: the same
+# abstraction the nRF boards persist through, over a different medium.
+wayfinder-storage = { path = "../../libs/wayfinder-storage", default-features = false, features = [
+    "flash",
+] }
+
 # The embassy time driver and executor for this chip. The nRF and STM32 boards
 # run `embassy-executor` over their vendor HAL's time driver, and this is the
 # Espressif equivalent -- so all three boards drive the same `Driver::run` loop

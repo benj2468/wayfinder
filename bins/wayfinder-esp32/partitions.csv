@@ -1,0 +1,40 @@
+# ESP-IDF partition table for the wayfinder ESP32 node.
+#
+# **This file is to this board what `memory.x` is to the Cortex-M ones**, and
+# for the same reason: it is the only statement of where in flash anything
+# lives. There is no linker script to carve a durable store out of here — the
+# image layout is whatever table the second-stage bootloader reads at
+# `0x8000`, so a durable store has to come from a partition declared here and
+# written by `espflash` at flash time.
+#
+# Getting it wrong writes over the application. The node does *not* hardcode
+# the offset: `identity.rs` reads this table back at runtime and asks for the
+# partition by name, so the two cannot drift apart — this file is the single
+# source of truth and the firmware follows it.
+#
+# `espflash` is told to use it by the runner in `.cargo/config.toml`; without
+# that flag espflash generates its own default table, which has no free space
+# after `factory` and so no home for the store.
+#
+# Offsets and sizes must be 4 KiB (0x1000) aligned, and an `app` partition must
+# additionally start on a 64 KiB (0x10000) boundary.
+#
+# Name,      Type, SubType,   Offset,   Size,     Flags
+nvs,         data, nvs,       0x9000,   0x6000,
+phy_init,    data, phy,       0xf000,   0x1000,
+factory,     app,  factory,   0x10000,  0x3E0000,
+# The durable store: this node's identity seed, its membership certificate and
+# trust anchor, and the clock checkpoint — the `NodeRecord` the management API
+# writes through.
+#
+# `wayfinder-storage`'s `FlashStore` needs exactly **two** erase pages, which it
+# ping-pongs so a reader never sees a torn old/new mix across a reset. 0x10000
+# is sixteen of them rather than two: shrinking a partition later means moving
+# everything above it, and the space is free anyway — `factory` is 3.9 MB
+# against an image well under 1 MB. The extra pages are unused, not a second
+# store.
+#
+# `undefined` rather than `nvs`: this is not ESP-IDF's NVS format and nothing
+# but wayfinder reads it. Labelling it `nvs` would invite an ESP-IDF component
+# to treat the blob as a key-value store and rewrite it.
+wayfinder,   data, undefined, 0x3F0000, 0x10000,
