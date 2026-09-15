@@ -164,7 +164,9 @@ impl EmbeddedQueryRx<'_> {
 /// [`ErrorResponse`] rather than the connection being torn down — a garbled
 /// frame must not kill the management link — but it **is** answered: the caller
 /// blocked on that request's reply must never be left hanging just because this
-/// one frame didn't parse. A desynchronising [`FrameError::Oversized`] or a
+/// one frame didn't parse. A [`FrameError::Empty`] (a zero-length prefix,
+/// which is not a request — see [`read_frame`]), a desynchronising
+/// [`FrameError::Oversized`] or a
 /// genuine I/O error is returned so the caller can reset the link.
 pub async fn serve<S>(
     stream: &mut S,

@@ -41,10 +41,9 @@ wayfinder-storage = { path = "../wayfinder-storage", default-features = false, f
     "flash",
 ] }
 wayfinder-log = { path = "../wayfinder-log" }
-rylr998 = { path = "../rylr998", features = ["link"] }
 nrf-ieee802154 = { path = "../nrf-ieee802154" }
-# Only `short_address_of`, so a board's LoRa `AT+ADDRESS` and its 802.15.4
-# source address are the same derivation from the same `Mac`.
+# `MAX_REASSEMBLED_LEN`, which the capacity profile's `max_frame_len` is pinned
+# to by a static assertion in `lib.rs`.
 ieee802154 = { path = "../ieee802154" }
 
 embassy-sync = "0.8.0"

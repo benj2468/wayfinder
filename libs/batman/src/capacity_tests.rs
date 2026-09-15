@@ -103,3 +103,61 @@ fn host_profile_keeps_todays_local_mcast_capacity() {
 
     assert_eq!(engine.local_mcast_groups().len(), 6);
 }
+
+// ── Record footprint ──────────────────────────────────────────────────────
+//
+// The originator table dominates the engine, and `NeighborStats` dominates the
+// originator table: four paths per originator, each holding two timestamps.
+// Stamping those with `interfaces::time::Millis` rather than
+// `core::time::Duration` is worth twelve bytes on each of the nine stamps a
+// record holds -- eight across its four paths, one its own. These are ceilings
+// somebody has to raise deliberately,
+// in the spirit of `a_ping_session_stays_small_enough_for_a_board`.
+
+/// One path to an originator. The dominant term in the whole routing core: it
+/// is held four times per originator and `MAX_ORIGINATORS` times over.
+#[test]
+fn a_path_record_stays_small() {
+    let stats = size_of::<crate::NeighborStats>();
+    assert!(
+        stats <= 24,
+        "NeighborStats is {stats} B; it is held four times per originator and \
+         once per originator slot, so every byte here is multiplied by the \
+         profile's whole originator capacity"
+    );
+}
+
+/// One originator, paths included.
+#[test]
+fn an_originator_record_stays_small() {
+    let record = size_of::<crate::OriginatorRecord>();
+    assert!(
+        record <= 160,
+        "OriginatorRecord is {record} B; it was 264 B when its nine timestamps \
+         were `Duration`s"
+    );
+}
+
+/// The two ageing records that are held per neighbour rather than per path.
+#[test]
+fn the_ageing_records_stay_small() {
+    let keepalive = size_of::<crate::KeepAliveStats>();
+    let seqno = size_of::<crate::BroadcastSeqnoEntry>();
+    assert!(keepalive <= 16, "KeepAliveStats is {keepalive} B, was 32 B");
+    assert!(seqno <= 28, "BroadcastSeqnoEntry is {seqno} B, was 48 B");
+}
+
+/// What the whole exercise is for, stated end to end: a board-profile engine
+/// against what it cost before the records were re-stamped.
+#[test]
+fn a_board_profile_engine_fits_a_board() {
+    // The `nrf52840` profile exactly: 32 originators and -- since the LoRa link
+    // came out -- **two** interfaces. The second parameter is `MAX_INTERFACES`,
+    // so a `3` here would measure a shape no board is built at.
+    let engine = size_of::<BatmanEngine<32, 2, 16, 4>>();
+    assert!(
+        engine <= 10_000,
+        "a 32-originator engine is {engine} B; the equivalent three-interface \
+         engine was 15,240 B when its records were stamped with `Duration`"
+    );
+}

@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 use crate::filter::Level;
 use crate::filter::TARGET_CAP;
+#[cfg(feature = "ring")]
 use crate::sync::Lock;
 
 /// Longest message retained per record, in bytes. Generous for the rendered
@@ -28,16 +29,28 @@ pub const MESSAGE_CAP: usize = 160;
 /// Records retained before the oldest is evicted.
 ///
 /// Sized per target, since the constraint differs by two orders of magnitude:
-/// on a board this is a `static` competing with the router for 256 KiB of RAM
-/// (at roughly 240 bytes a record, 64 of them is ~15 KiB), while a host node has
+/// on a board this is a `static` competing with the router for the whole part
+/// (256 KiB on an nRF52840, 128 KB on an STM32F411, 192 KB of DRAM on an
+/// ESP32); at 256 bytes a record, 64 of them is 16,416 B, while a host node has
 /// no such pressure and benefits from surviving a longer client absence.
-#[cfg(target_os = "none")]
+#[cfg(all(feature = "ring", target_os = "none"))]
 pub const RING_CAPACITY: usize = 64;
 /// Records retained before the oldest is evicted. See the bare-metal definition.
-#[cfg(not(target_os = "none"))]
+#[cfg(all(feature = "ring", not(target_os = "none")))]
 pub const RING_CAPACITY: usize = 512;
+/// Records retained before the oldest is evicted — none, in a build without
+/// the `ring` feature.
+///
+/// **Not reachable by a client.** `LogRecords` has no capacity field, so over
+/// the management API a ring-less node is indistinguishable from a quiet one:
+/// an empty batch with `dropped: 0`. This constant is a build-time fact for
+/// whoever is choosing the feature, not a signal on the wire. Surfacing it
+/// would mean adding a field to the proto.
+#[cfg(not(feature = "ring"))]
+pub const RING_CAPACITY: usize = 0;
 
 /// Records returned when a caller does not specify a batch size.
+#[cfg(feature = "ring")]
 const DEFAULT_BATCH: usize = RING_CAPACITY;
 
 /// Bytes charged against [`BATCH_BYTE_BUDGET`] for a record's fixed parts, on
@@ -48,6 +61,7 @@ const DEFAULT_BATCH: usize = RING_CAPACITY;
 /// field tags and length prefixes of both the record and its enclosing repeated
 /// field. 40 rounds the ~33 that accounts for up, since the point is a bound
 /// rather than a prediction.
+#[cfg(feature = "ring")]
 const RECORD_OVERHEAD: usize = 40;
 
 /// Roughly how many serialized bytes one batch may total.
@@ -69,17 +83,18 @@ const RECORD_OVERHEAD: usize = 40;
 ///
 /// Truncating costs a caller nothing — [`LogSnapshot::next_seq`] resumes it
 /// exactly where the batch stopped.
-#[cfg(target_os = "none")]
+#[cfg(all(feature = "ring", target_os = "none"))]
 pub const BATCH_BYTE_BUDGET: usize = 2 * 1024;
 /// Roughly how many serialized bytes one batch may total. See the bare-metal
 /// definition — a host has neither the framing cap nor the heap pressure that
 /// motivates it, so this is set where it never binds in practice (the whole ring
 /// at maximum record size is ~135 KiB) and exists only so both targets run the
 /// same path.
-#[cfg(not(target_os = "none"))]
+#[cfg(all(feature = "ring", not(target_os = "none")))]
 pub const BATCH_BYTE_BUDGET: usize = 256 * 1024;
 
 /// What one record is charged against [`BATCH_BYTE_BUDGET`].
+#[cfg(feature = "ring")]
 fn record_size(record: &LogRecord) -> usize {
     record.target.len() + record.message.len() + RECORD_OVERHEAD
 }
@@ -119,6 +134,7 @@ pub struct LogSnapshot {
 
 /// Truncate `s` to at most `N` bytes on a character boundary — logging must
 /// never fail, and the protobuf `string` this ends up in requires valid UTF-8.
+#[cfg(feature = "ring")]
 fn truncated<const N: usize>(s: &str) -> heapless::String<N> {
     let mut end = s.len().min(N);
     while !s.is_char_boundary(end) {
@@ -129,6 +145,7 @@ fn truncated<const N: usize>(s: &str) -> heapless::String<N> {
 
 /// The record store: a fixed-capacity queue plus the sequence counter that
 /// numbers what goes into it.
+#[cfg(feature = "ring")]
 struct Ring {
     /// Retained records, oldest at the front, seqs strictly ascending and
     /// contiguous.
@@ -138,6 +155,7 @@ struct Ring {
     next_seq: u64,
 }
 
+#[cfg(feature = "ring")]
 impl Ring {
     /// An empty ring whose first record will be seq 0. `const` so the global
     /// lives in a `static` with no initializer.
@@ -241,27 +259,54 @@ impl Ring {
 /// subscriber — is itself process-wide, with no way to carry a handle. That is
 /// also what lets `RouterAdapter` answer `GetLogs` without threading a reference
 /// through the router, the driver, and every board's bring-up.
+#[cfg(feature = "ring")]
 static RING: Lock<Ring> = Lock::new(Ring::new());
 
 /// Append one record to the global ring.
 ///
 /// Callers gate on [`crate::filter::enabled`] first: this does no filtering of
 /// its own, so an unfiltered call would evict records an operator asked for.
+///
+/// A no-op without the `ring` feature; the text sink still gets the record.
+#[cfg(feature = "ring")]
 pub fn record(level: Level, target: &str, message: &str) {
     let uptime_ms = crate::clock::uptime_ms();
     RING.with(|ring| ring.push(level, target, message, uptime_ms));
 }
+
+/// Append one record to the global ring — a no-op in this build, which has no
+/// ring. See [`RING_CAPACITY`].
+#[cfg(not(feature = "ring"))]
+pub fn record(_level: Level, _target: &str, _message: &str) {}
 
 /// Read records from the global ring, from `since_seq` onward.
 ///
 /// `max_records` of 0 means "the server's default batch" — a client that did not
 /// specify one wants records, not an empty answer that would wedge its polling
 /// loop.
+#[cfg(feature = "ring")]
 pub fn logs_since(since_seq: u64, max_records: usize) -> LogSnapshot {
     RING.with(|ring| ring.since(since_seq, max_records))
 }
 
-#[cfg(test)]
+/// Read records from the global ring — always empty in this build, which has
+/// no ring.
+///
+/// Reported as "nothing retained since `since_seq`" rather than as a gap:
+/// [`dropped`](LogSnapshot::dropped) counts records this node *had* and lost,
+/// and a build with no ring never had any. A client cannot tell this from a
+/// node that simply has nothing to say — see [`RING_CAPACITY`].
+#[cfg(not(feature = "ring"))]
+pub fn logs_since(since_seq: u64, _max_records: usize) -> LogSnapshot {
+    LogSnapshot {
+        records: Vec::new(),
+        next_seq: since_seq,
+        dropped: 0,
+    }
+}
+
+/// The ring's own behaviour, which only exists with the feature on.
+#[cfg(all(test, feature = "ring"))]
 mod tests {
     use super::*;
 
@@ -566,5 +611,48 @@ mod tests {
                 .any(|r| r.message == "global record" && r.target == "wayfinder-log::test"),
             "the pushed record is visible through the global reader"
         );
+    }
+}
+
+/// What the ring-less build promises, since the `ring` feature is off in the
+/// images that need it most and nothing in a default `cargo test` exercises
+/// this path.
+///
+/// Run it with `cargo test -p wayfinder-log --no-default-features`.
+#[cfg(all(test, not(feature = "ring")))]
+mod no_ring_tests {
+    use super::*;
+
+    /// Recording must stay callable and do nothing: the subscribers call it
+    /// unconditionally, so a `todo!`/panic here would take down every board
+    /// built without the feature on its first log line.
+    #[test]
+    fn recording_is_a_no_op_that_does_not_panic() {
+        record(Level::Info, "t", "a message");
+        record(Level::Error, "t", "another");
+    }
+
+    /// A query resumes exactly where it asked and reports no gap. `dropped`
+    /// counts records this node *had* and lost; one with no ring never had
+    /// any, so reporting a gap would tell a client to go looking for records
+    /// that never existed.
+    #[test]
+    fn a_query_is_empty_without_claiming_a_gap() {
+        record(Level::Info, "t", "a message");
+
+        let snap = logs_since(7, 16);
+        assert!(snap.records.is_empty());
+        assert_eq!(snap.next_seq, 7, "resumes where the caller asked");
+        assert_eq!(snap.dropped, 0, "nothing was retained, so nothing was lost");
+    }
+
+    /// The capacity this build reports, which is what a *reader of the source
+    /// or the Cargo features* uses to tell "no records kept" from "nothing has
+    /// been logged yet". Deliberately not a wire-visible signal — see
+    /// [`RING_CAPACITY`] — so this pins the build-time constant and claims
+    /// nothing about what a client can observe.
+    #[test]
+    fn the_advertised_capacity_is_zero() {
+        assert_eq!(RING_CAPACITY, 0);
     }
 }

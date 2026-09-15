@@ -140,6 +140,10 @@ embassy-sync = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The ring, for this crate's own tests only. A `[dev-dependencies]` feature is
+# not visible to anything downstream, which is the point: a board linking this
+# crate must stay free to build without the ring. See the workspace entry.
+wayfinder-log = { workspace = true, features = ["ring"] }
 # `test-util` for the paused clock: the handshake-timeout test would otherwise
 # have to wait out `HANDSHAKE_TIMEOUT` in real seconds.
 tokio = { workspace = true, features = ["test-util"] }

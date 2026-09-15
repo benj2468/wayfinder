@@ -26,6 +26,7 @@ use core::time::Duration;
 use heapless::Vec as HVec;
 use heapless::index_map::FnvIndexMap;
 use interfaces::frame::Mac;
+use interfaces::time::Millis;
 
 pub use trickle::TrickleTimer;
 
@@ -58,9 +59,9 @@ pub const MAX_INTERFACES: usize = 8;
 /// [`purge_stale`](BatmanEngine::purge_stale).
 ///
 /// Ageing is keyed on each path's *learned* emission cadence
-/// ([`NeighborStats::interval_estimate`]), not on this node's own OGM rate, so a
+/// ([`NeighborStats::interval_estimate_ms`]), not on this node's own OGM rate, so a
 /// well-connected node that talks fast no longer ages out a neighbour that talks
-/// slow.  The purge budget is `MAX_MISSED_OGMS × interval_estimate`: a neighbour
+/// slow.  The purge budget is `MAX_MISSED_OGMS × interval_estimate_ms`: a neighbour
 /// that has quietened into a long Trickle interval is given a correspondingly
 /// long grace, and a chatty one is reclaimed quickly.  Six intervals preserves
 /// the few-consecutive-misses tolerance of the former 60 s/10 s timeout.
@@ -241,7 +242,7 @@ pub struct SeqnoResyncWatch {
     /// When the run began. Not refreshed by later frames in the same run — the
     /// run has to *persist*, and refreshing it would let an attacker hold the
     /// correction off indefinitely by continuing to send.
-    pub since: Duration,
+    pub since: Millis,
     /// The sequence number that started the run, and the value the high-water
     /// resynchronises to when it completes. Deliberately not the value carried
     /// by the frame that trips the deadline: an attacker must not be able to
@@ -269,7 +270,7 @@ pub struct BroadcastSeqnoEntry {
     /// unlike the originator and keep-alive tables' `last_heard`, which every
     /// frame bumps. An attacker's stream of non-advancing frames must not be
     /// able to pin a poisoned entry at the top of the eviction order.
-    pub last_updated: Duration,
+    pub last_updated: Millis,
     /// The run of implausible sequence numbers currently being watched, or
     /// `None` if the last frame from this originator advanced the high-water.
     pub resync_watch: Option<SeqnoResyncWatch>,
@@ -297,8 +298,8 @@ pub(crate) struct SeqnoBands {
     /// stale copy rather than as evidence against the high-water.
     reorder_tolerance: i32,
     /// How long a run of non-advancing numbers must persist before the
-    /// high-water resynchronises to it.
-    reset_protection: Duration,
+    /// high-water resynchronises to it, in milliseconds.
+    reset_protection_ms: u32,
 }
 
 impl SeqnoBands {
@@ -322,10 +323,21 @@ impl SeqnoBands {
             reorder_tolerance < i32::MAX as u32,
             "seqno reorder tolerance must survive negation in the i32 comparison"
         );
+        // The third field needs its own guard for the same reason the two above
+        // have one: this is a bare `as` cast, so a window longer than 49.7 days
+        // would silently become a short one. `as_millis_u32` saturates and would
+        // be the right helper, but this is a `const fn` and that one is not —
+        // hence an assertion rather than a clamp. Reset protection is what stops
+        // an outsider forcing a high-water resync, so a silently-shortened value
+        // here is the security-relevant member of the family.
+        assert!(
+            reset_protection.as_millis() <= u32::MAX as u128,
+            "seqno reset protection must survive the u32 millisecond conversion"
+        );
         Self {
             window: window as i32,
             reorder_tolerance: reorder_tolerance as i32,
-            reset_protection,
+            reset_protection_ms: reset_protection.as_millis() as u32,
         }
     }
 
@@ -473,8 +485,9 @@ pub(crate) fn admit_seqno(
             exact: seqno == *last_seqno,
         },
         SeqnoVerdict::Implausible => {
+            let now = Millis::from_duration(now);
             let watch = *resync_watch.get_or_insert(SeqnoResyncWatch { since: now, seqno });
-            if now.saturating_sub(watch.since) < bands.reset_protection {
+            if now.elapsed_since(watch.since) < bands.reset_protection_ms {
                 return SeqnoAdmission::Watching;
             }
             // The run has persisted. Restore the high-water to where the run
@@ -506,7 +519,7 @@ impl BroadcastSeqnoEntry {
     pub fn seeded(seqno: u32, now: Duration) -> Self {
         Self {
             last_seqno: seqno,
-            last_updated: now,
+            last_updated: Millis::from_duration(now),
             resync_watch: None,
         }
     }
@@ -539,7 +552,7 @@ impl BroadcastSeqnoEntry {
             &SeqnoBands::BROADCAST,
         );
         if admission.high_water_written() {
-            self.last_updated = now;
+            self.last_updated = Millis::from_duration(now);
         }
         admission
     }
@@ -554,15 +567,15 @@ impl BroadcastSeqnoEntry {
 pub struct KeepAliveStats {
     /// Monotonic engine clock at the moment the most recent keep-alive from
     /// this neighbor was received.
-    pub last_heard: Duration,
+    pub last_heard: Millis,
     /// Slow-decaying peak hold of the wall-clock interval between successive
     /// keep-alives from this neighbor — the same technique as
-    /// [`NeighborStats::interval_estimate`], for the same reason: it tracks
+    /// [`NeighborStats::interval_estimate_ms`], for the same reason: it tracks
     /// the *slowest* cadence this neighbor settles into rather than an
     /// average, so a burst of closely-spaced heartbeats doesn't shrink the
     /// miss budget below the neighbor's real configured rate. Zero until a
     /// second heartbeat gives a first gap to measure.
-    pub interval_estimate: Duration,
+    pub interval_estimate_ms: u32,
 }
 
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
@@ -578,13 +591,13 @@ pub struct NeighborStats {
     pub last_seqno: u32,
     /// Monotonic engine clock (the `now` passed to `handle_rx`) at the moment
     /// the most recent OGM refreshed this path.  A path is stale once `now` has
-    /// advanced more than [`MAX_MISSED_OGMS`] × [`interval_estimate`] beyond
-    /// this stamp: its neighbor has gone quiet relative to the cadence we
-    /// learned for it, so it is skipped when selecting a next hop and pruned by
-    /// [`BatmanEngine::purge_stale`].
+    /// advanced more than [`MAX_MISSED_OGMS`] × [`interval_estimate_ms`]
+    /// beyond this stamp: its neighbor has gone quiet relative to the cadence
+    /// we learned for it, so it is skipped when selecting a next hop and
+    /// pruned by [`BatmanEngine::purge_stale`].
     ///
-    /// [`interval_estimate`]: Self::interval_estimate
-    pub last_heard: Duration,
+    /// [`interval_estimate_ms`]: Self::interval_estimate_ms
+    pub last_heard: Millis,
     /// Slow-decaying **peak hold** of the wall-clock interval between successive
     /// OGMs accepted on this path: the *slowest* cadence at which we settle into
     /// hearing this originator via this neighbor.  Tracking the peak (not the
@@ -596,7 +609,7 @@ pub struct NeighborStats {
     /// purge budget tracks this observed rate instead of any fixed timeout.
     /// Keyed per path, not per node, so each relaying neighbor ages on its own
     /// measured rate.
-    pub interval_estimate: Duration,
+    pub interval_estimate_ms: u32,
 }
 
 /// A destination node in the mesh network
@@ -607,7 +620,7 @@ pub struct OriginatorRecord {
     /// [`NeighborStats::last_heard`]).  Used to evict the least-recently-heard
     /// originator when the table is full; per-path ageing
     /// ([`BatmanEngine::purge_stale`]) drives the actual staleness decision.
-    pub last_heard: Duration,
+    pub last_heard: Millis,
     /// This originator's own address — the *destination* this record
     /// describes, and the key it is stored under in the originator table.
     ///
@@ -768,7 +781,7 @@ pub struct BatmanEngine<
     /// unforgeable, but the interface is whichever link delivered the answer
     /// first, which a wormhole relaying the genuine answer can be (see
     /// "Residual: wormhole" in `docs/design/implemented/09-mesh-auth-gaps.md`).
-    pub(crate) proven: FnvIndexMap<Mac, (Duration, usize), MAX_ORIGINATORS>,
+    pub(crate) proven: FnvIndexMap<Mac, (Millis, usize), MAX_ORIGINATORS>,
     /// When each neighbor was last *challenged*, and how many attempts have
     /// gone unanswered since it last proved itself — so a candidate is
     /// re-probed on a bounded cadence rather than on every driver tick.
@@ -788,7 +801,7 @@ pub struct BatmanEngine<
     /// settles at one frame per `seed_interval` for a peer that genuinely
     /// never answers, so the duty-cycle budget in
     /// `docs/design/implemented/09-mesh-auth-gaps.md` is unchanged.
-    pub(crate) challenged: FnvIndexMap<Mac, (Duration, u32), MAX_ORIGINATORS>,
+    pub(crate) challenged: FnvIndexMap<Mac, (Millis, u32), MAX_ORIGINATORS>,
     /// How many times this node has resynchronised a sequence-number
     /// high-water — concluded that its own recorded state, not the frame in
     /// front of it, was the thing that was wrong.

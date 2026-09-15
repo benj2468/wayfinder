@@ -1134,19 +1134,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "rylr998"
-version = "0.1.0"
-dependencies = [
- "embedded-io-async 0.7.0",
- "heapless",
- "thiserror",
- "tracing",
- "wayfinder",
- "wayfinder-link-utils",
- "zerocopy",
-]
-
-[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1549,7 +1536,6 @@ dependencies = [
  "ieee802154",
  "nrf-ieee802154",
  "rtt-target",
- "rylr998",
  "static_cell",
  "tracing",
  "wayfinder",

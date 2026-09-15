@@ -32,14 +32,14 @@ wayfinder::define_profile! {
     /// routing core's const-generic tables to this mesh rather than a gateway's.
     ///
     /// Two figures come from hardware: `interfaces` is the board's link count
-    /// (LoRa + 802.15.4 + the CDC-NCM USB link), and `max_frame_len` is the
-    /// largest frame any link can deliver — `rylr998` reassembly caps at 512
-    /// and `ieee802154`'s `MAX_REASSEMBLED_LEN` is pinned to this very number
-    /// — so lowering it would silently drop reassembled frames from either
-    /// radio. **Raising it means raising `ieee802154::MAX_REASSEMBLED_LEN`
-    /// too**, or the 802.15.4 link refuses frames the router considers legal.
-    /// The rest carry headroom for a handful-of-nodes mesh; `originators` and
-    /// `ident_table` must stay powers of two.
+    /// (802.15.4 + the CDC-NCM USB link), and `max_frame_len` is the largest
+    /// frame any link can deliver — `ieee802154`'s `MAX_REASSEMBLED_LEN` is
+    /// pinned to this very number, so lowering it would silently drop
+    /// reassembled frames from the radio. **Raising it means raising
+    /// `ieee802154::MAX_REASSEMBLED_LEN` too**, or the 802.15.4 link refuses
+    /// frames the router considers legal. The rest carry headroom for a
+    /// handful-of-nodes mesh; `originators` and `ident_table` must stay powers
+    /// of two.
     ///
     /// `max_frame_len` deliberately does *not* rise for the USB link, which
     /// could carry a full 1500-byte host MTU: it is the router's frame
@@ -49,7 +49,7 @@ wayfinder::define_profile! {
     /// [`usb_link::UsbNcmLink`].
     pub nrf52840 {
         originators: 32,
-        interfaces: 3,
+        interfaces: 2,
         mcast_members: 16,
         local_mcast: 4,
         ident_table: 32,
@@ -140,22 +140,4 @@ pub fn init_platform(ram_floor: usize) -> embassy_nrf::Peripherals {
     let peripherals = embassy_nrf::init(config);
     debug!("HFXO running");
     peripherals
-}
-
-/// `'static` scratch buffers for a board's [`BufferedUarte`], whose `rx` length
-/// must be even.
-///
-/// [`BufferedUarte`]: embassy_nrf::buffered_uarte::BufferedUarte
-pub fn uarte_buffers() -> (&'static mut [u8], &'static mut [u8]) {
-    static RX: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();
-    static TX: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();
-    (RX.init([0; 256]), TX.init([0; 256]))
-}
-
-/// UART settings for a RYLR998: its factory default is 115200 8N1.
-pub fn uarte_config() -> embassy_nrf::uarte::Config {
-    let mut config = embassy_nrf::uarte::Config::default();
-    config.baudrate = embassy_nrf::uarte::Baudrate::BAUD115200;
-    config.parity = embassy_nrf::uarte::Parity::EXCLUDED;
-    config
 }

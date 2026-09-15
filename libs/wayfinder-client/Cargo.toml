@@ -58,5 +58,7 @@ anyhow.workspace = true
 wayfinder-server.workspace = true
 # Test-only: `tests/transport.rs` drives records into the real log ring so the
 # GetLogs/SetLogLevel path is exercised end to end over the wire, rather than
-# against a canned provider value.
-wayfinder-log.workspace = true
+# against a canned provider value. `ring` is named here rather than on the
+# workspace entry because a `[dev-dependencies]` feature is invisible
+# downstream — a board linking this crate must stay free to build without it.
+wayfinder-log = { workspace = true, features = ["ring"] }

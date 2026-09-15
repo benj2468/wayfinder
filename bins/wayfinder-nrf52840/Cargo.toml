@@ -20,10 +20,13 @@ members = ["."]
 # durable identity store. Optimizing for size in dev too keeps debuginfo but
 # shrinks the image well under the limit, so `cargo build` links.
 [profile.dev]
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 
 [profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
 panic = "abort"
 
 # `#[no_std]`/`#[no_main]` can't build the host `test` harness.

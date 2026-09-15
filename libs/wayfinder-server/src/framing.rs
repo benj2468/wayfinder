@@ -37,6 +37,11 @@ pub enum FrameError<E> {
     /// locally, before anything is sent, since a peer bounded by the same cap
     /// would reject it anyway).
     Oversized(u32),
+    /// A length prefix of zero. There is no such thing as a request with no
+    /// body, so this is the stream carrying something that is not framing —
+    /// and the caller closes it rather than answering, for the reason
+    /// [`read_frame`] gives.
+    Empty,
 }
 
 /// Collapse a [`ReadExactError`] into a [`FrameError`]: a short read becomes
@@ -56,6 +61,23 @@ fn from_read_exact<E>(err: ReadExactError<E>) -> FrameError<E> {
 /// consumed but not stored), so a caller can reuse one buffer across frames
 /// rather than allocating per request. A declared length above [`MAX_FRAME_LEN`]
 /// is rejected as [`FrameError::Oversized`] before any body is read.
+///
+/// # A zero length is not a frame
+///
+/// Four zero bytes decode as a well-formed prefix for a body of nothing, and an
+/// empty protobuf is a *valid* `WayfinderRequest` with no variant set — so
+/// without this check the server answers it, politely, with "empty request".
+/// That is harmless once and ruinous as a steady state: on a raw UART an idle-
+/// low line or a break condition delivers zero bytes continuously, so every
+/// four of them cost a router query, a protobuf encode and a response on the
+/// wire. Measured on an ESP32 whose host had just closed the port: ~1 MB of
+/// replies in five seconds, at line rate, from a node nobody was talking to.
+///
+/// It is [`FrameError::Empty`] rather than a silent skip because the stream has
+/// stopped being framing at that point and there is nothing to resynchronise
+/// on; the caller drops the session and starts the next one clean. A transport
+/// with real connections (the nRF's CDC-ACM port) never sees this, which is why
+/// it took a UART to find.
 pub async fn read_frame<R: Read>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -66,6 +88,9 @@ pub async fn read_frame<R: Read>(
         .await
         .map_err(from_read_exact)?;
     let len = u32::from_be_bytes(len_prefix);
+    if len == 0 {
+        return Err(FrameError::Empty);
+    }
     if len as usize > MAX_FRAME_LEN {
         return Err(FrameError::Oversized(len));
     }
@@ -265,5 +290,35 @@ mod tests {
         let err = block_on(write_frame(&mut writer, &body)).unwrap_err();
         assert!(matches!(err, FrameError::Oversized(_)));
         assert!(writer.written.is_empty(), "nothing is written on refusal");
+    }
+
+    /// Four zero bytes are not a request. See [`read_frame`]'s docs for what
+    /// answering them costs on a UART.
+    #[test]
+    fn a_zero_length_prefix_is_refused_rather_than_answered() {
+        let wire = [0, 0, 0, 0];
+        let mut reader = ChunkReader {
+            data: &wire,
+            pos: 0,
+            chunk: 1,
+        };
+        let mut buf = Vec::new();
+        let err = block_on(read_frame(&mut reader, &mut buf)).unwrap_err();
+        assert!(matches!(err, FrameError::Empty), "got {err:?}");
+    }
+
+    /// A one-byte body still works, so the check is on *zero* and not on some
+    /// minimum size a future request could trip over.
+    #[test]
+    fn a_one_byte_frame_still_reads() {
+        let wire = [0, 0, 0, 1, 0x42];
+        let mut reader = ChunkReader {
+            data: &wire,
+            pos: 0,
+            chunk: 1,
+        };
+        let mut buf = Vec::new();
+        block_on(read_frame(&mut reader, &mut buf)).expect("a one-byte body is a frame");
+        assert_eq!(buf, vec![0x42]);
     }
 }

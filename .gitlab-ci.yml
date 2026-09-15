@@ -232,11 +232,23 @@ build:stack-budget:
     - job: build-image
       optional: true
   script:
-    # Same per-board profiles the boards are flashed and linted at: debug for
-    # the 1 MB nRF parts, --release for the STM32F411RE, which only fits
-    # optimized. A profile change here measures an image nobody runs.
-    - (cd bins/wayfinder-nrf52840 && cargo build --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840 --memory-x memory.x)
-    - (cd bins/wayfinder-nrf52840-dongle && cargo build --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840-dongle --memory-x memory.x)
+    # `--release` for every board: that is the profile each one is flashed at
+    # (`cargo run --release`), and a profile change here measures an image
+    # nobody runs.
+    #
+    # The nRF boards used to be checked at `debug`, which was exactly that
+    # mistake. The two profiles did not merely differ by a margin, they
+    # disagreed about *which symbol carries the frame*: at `debug` rustc
+    # emitted `node::run`'s body as its own symbol and left a 932-byte
+    # trampoline for this gate to find, while at `--release` the body inlined
+    # into the poll and carried 72,908 bytes -- **before the changes on this
+    # branch**. The gate had passed for as long as it has existed on an image
+    # nobody flashes.
+    #
+    # The nRF boards' 18% share is argued in the `justfile` next to
+    # `stack-budget-nrf52840`; keep the two in step.
+    - (cd bins/wayfinder-nrf52840 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x --task-poll-pct 18)
+    - (cd bins/wayfinder-nrf52840-dongle && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x --task-poll-pct 18)
     - (cd bins/wayfinder-stm32f411 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x)
     - sccache --show-stats
 # `bins/wayfinder-web` needs its own job for two reasons. Its `default` feature

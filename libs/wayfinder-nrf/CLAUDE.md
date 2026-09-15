@@ -11,9 +11,9 @@ A board binary owns only what is genuinely board-specific:
 | Board-owned | Shared here |
 | --- | --- |
 | `memory.x` and the two constants tracking it (`DURABLE_STORE_BASE`, `RAM_ORIGIN`) | `fault` — panic/HardFault handling, the retained fault record |
-| LED and UART pins | `stack` — high-water painting and reporting |
+| LED pin | `stack` — high-water painting and reporting |
 | `bind_interrupts!` | `identity` — the durable node record: a seed minted from the RNG, the MAC derived from it, and the FICR board id |
-| `.cargo/config.toml` runner | `link` — the `MeshLink` LoRa/802.15.4/USB/absent enum |
+| `.cargo/config.toml` runner | `link` — the `MeshLink` 802.15.4/USB/absent enum |
 | | `usb_mgmt` — the USB device: CDC-ACM management port + the shared `Builder` |
 | | `usb_link` — the CDC-NCM mesh interface |
 | | `node::run` — the whole bring-up sequence |
@@ -33,7 +33,7 @@ binary is a behaviour the other silently lacks.
    MBR must leave its first 8 bytes alone (see "Board differences"). **`RAM_ORIGIN`
    is not automatically `0x20000000`** — a board that boots through Nordic's
    MBR must leave its first 8 bytes alone (see "Board differences").
-3. Fix the LED pin, the two UART pins and the `.cargo/config.toml` runner.
+3. Fix the LED pin and the `.cargo/config.toml` runner.
 4. Add the build and clippy lines to `.gitlab-ci.yml`'s `build:embedded`.
 
 Nothing else should need touching. If it does, that is a sign the thing you are
@@ -44,7 +44,6 @@ reaching for should move into this crate first.
 |  | DK (PCA10056) | Dongle (PCA10059) |
 | --- | --- | --- |
 | Liveness LED | `P0_13`, active-low | `P0_06`, active-low (`P0_13` is not routed) |
-| RYLR998 UART | `P0_02` RX / `P0_26` TX | `P0_31` RX / `P0_29` TX (castellated edge) |
 | App flash | `0x0..0xFE000` (1016K) | `0x1000..0xDE000` (884K) |
 | Identity store | `0xFE000` | `0xDE000` |
 | Mesh address | the seed's `derived_mac()`, persisted since design 22 | same |
@@ -204,8 +203,8 @@ Three things here fail silently:
   of 4.** A third function needs the `max-interface-count-6` feature. This one at
   least panics in the builder rather than truncating the descriptor.
 
-The link is point-to-point and wired, so it gets the tightest Trickle schedule of
-the three interfaces (`node::TRICKLE`) — there is no airtime budget to respect.
+The link is point-to-point and wired, so it gets the tighter Trickle schedule of
+the two interfaces (`node::TRICKLE`) — there is no airtime budget to respect.
 
 ## The management port is unauthenticated, and that is the decision
 
@@ -378,10 +377,12 @@ Nothing is reserved. The SoftDevice used to claim RADIO, RTC0, TIMER0, POWER,
 CLOCK, RNG, ECB, CCM_AAR, TEMP and SWI5_EGU5, and most of the awkwardness in
 this crate descended from that list. What is left of it:
 
-- `BufferedUarte` still uses **TIMER1**, not TIMER0, for its RX idle-gap
-  detection. TIMER0 was the SoftDevice's; it is free now, and the choice is
-  kept only because changing it buys nothing and would invalidate a measured
-  stack budget.
+- **UARTE0, TIMER1 and the PPI channels are free.** They carried a RYLR998
+  LoRa module, which these boards no longer link: the radio was never used in
+  practice, and dropping it took 17,236 bytes of flash and 16,756 of `.bss`
+  (the `MeshLink` enum was sized by its RYLR variant, so the whole link array
+  shrank). `libs/rylr998` is unchanged and still carries
+  `bins/wayfinder-stm32f411`.
 - USB VBUS state is read straight off `POWER` by `HardwareVbusDetect`, and the
   HF crystal is started once by `init_platform`. Both used to be SoftDevice
   syscalls — see `usb_mgmt`.

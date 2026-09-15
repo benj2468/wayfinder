@@ -15,10 +15,13 @@ members = ["."]
 # this crate had no `[profile]` section at all -- one more artifact of never
 # having been flashed.
 [profile.dev]
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 
 [profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
 panic = "abort"
 
 # `#[no_std]`/`#[no_main]` can't build the host `test` harness.
@@ -39,7 +42,16 @@ wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
 wayfinder-version = { path = "../../libs/wayfinder-version" }
 # Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
 # records are observable over the debug probe (they are otherwise dropped).
-wayfinder-log = { path = "../../libs/wayfinder-log" }
+#
+# `default-features = false` drops the `GetLogs` record ring, and costs this
+# board nothing: the ring exists to be read over the management API, and this
+# board has no management port -- RTT over the probe is the only way to observe
+# it, and that is the other sink entirely. It is a `static`, so keeping it
+# would spend 16,416 bytes of a 128 KB part's SRAM on records nothing can ever
+# read. Restore the feature the moment this board grows a management port.
+wayfinder-log = { path = "../../libs/wayfinder-log", default-features = false, features = [
+    "sink-rtt",
+] }
 rylr998 = { path = "../../libs/rylr998", features = ["link"] }
 # For `warn!` on a fatal bring-up error; `std` off (routed to RTT by
 # `wayfinder-log`).

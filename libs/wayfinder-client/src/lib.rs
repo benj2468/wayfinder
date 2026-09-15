@@ -40,9 +40,14 @@ use futures::SinkExt;
 use futures::StreamExt;
 use prost::Message;
 use rustls::pki_types::ServerName;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tokio_serial::SerialPort;
 use tokio_serial::SerialStream;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
@@ -460,8 +465,90 @@ impl Client {
     /// length-delimited prost envelope — is identical, so every typed request
     /// method works unchanged once connected.
     pub async fn connect_serial(path: &str, baud: u32) -> anyhow::Result<Self> {
-        let serial = SerialStream::open(&tokio_serial::new(path, baud))
+        let mut serial = SerialStream::open(&tokio_serial::new(path, baud))
             .with_context(|| format!("opening serial port {path} at {baud} baud"))?;
+
+        // Discard whatever the port was already holding before the first frame
+        // goes out.
+        //
+        // A serial link has no connection to open, so there is no point at
+        // which the two ends agree the stream starts — whatever the board said
+        // before we arrived is still queued, and the framing has no marker to
+        // resynchronise on. One stale byte offsets every 4-byte length prefix
+        // that follows, and the symptom is not a decode failure but
+        // `frame size too big`: the codec reads four bytes of someone else's
+        // ASCII as a length. An ESP32 makes this the normal case rather than an
+        // edge one — its ROM and second-stage bootloaders log ~1.2 KB to the
+        // very UART the management API is served on, on every reset.
+        //
+        // Best-effort: a port that cannot be flushed is not a reason to refuse
+        // to talk to it, and the failure it guards against is one this call
+        // cannot detect anyway.
+        let _ = serial.clear(tokio_serial::ClearBuffer::Input);
+
+        // ...and then wait out whatever the *act of opening* set off.
+        //
+        // Flushing alone is not enough on an ESP32, and the reason is worth
+        // stating because it cannot be designed around from this side: **on
+        // Linux the kernel raises DTR when a tty is opened**, which is wired to
+        // the auto-reset circuit on every ESP32 dev board, so connecting
+        // reboots the node. `serialport`'s own `dtr_on_open` documentation says
+        // as much — the pulse happens whatever the flag is set to. The board
+        // then emits ~1.2 KB of ROM and second-stage bootloader logging onto
+        // the very UART the management API is served on, arriving *after* the
+        // flush and in front of the first response.
+        //
+        // So discard until the line has been quiet for `QUIET` — but not before
+        // `SETTLE` has passed, however quiet it is. Both halves are needed and
+        // the second is the unobvious one: a reset triggered by this very open
+        // has not produced a single byte yet when the drain starts, so quiet
+        // alone ends it immediately and the banner lands in front of the first
+        // response anyway. Measured on an ESP32: first byte 16 ms after open,
+        // last at ~300 ms, never a mid-stream gap over 9 ms.
+        //
+        // `DEADLINE` bounds a port that is simply always noisy, so a wrong
+        // `--serial` argument fails rather than hanging here forever.
+        //
+        // The cost is `SETTLE` on every serial connect, including the nRF's
+        // CDC-ACM port, which has no reset circuit and nothing to wait for.
+        // That is a real half-second on a one-shot `wayfinderctl` call, and it
+        // buys the difference between a transport that works and one that fails
+        // on whichever invocation happens to follow a reset.
+        const SETTLE: Duration = Duration::from_millis(400);
+        const QUIET: Duration = Duration::from_millis(250);
+        const DEADLINE: Duration = Duration::from_secs(3);
+        let opened_at = Instant::now();
+        let give_up_at = opened_at + DEADLINE;
+        let mut scratch = [0u8; 512];
+        let mut settled = false;
+        while Instant::now() < give_up_at {
+            match timeout(QUIET, serial.read(&mut scratch)).await {
+                // Still talking: keep discarding.
+                Ok(Ok(n)) if n > 0 => continue,
+                // Quiet for a whole window, or the stream ended. Done only if
+                // the board has also had long enough to start.
+                _ if opened_at.elapsed() >= SETTLE => {
+                    settled = true;
+                    break;
+                }
+                // Not yet settled. Anything that resolved *ready* — an EOF, or
+                // an I/O error the port returns without awaiting — would spin
+                // here, so yield rather than re-poll it immediately.
+                _ => tokio::time::sleep(QUIET).await,
+            }
+        }
+        // Falling out of the loop on the deadline is a failure, not a default.
+        // Returning a `Client` over a stream still mid-sentence just moves the
+        // symptom: the next request dies inside the length codec with
+        // `frame size too big`, which is the opaque error this whole drain
+        // exists to stop anyone seeing.
+        anyhow::ensure!(
+            settled,
+            "serial port {path} was still sending after {DEADLINE:?} and never went quiet; \
+             it does not look like a wayfinder management port — is {path} the right device?"
+        );
+        let _ = serial.clear(tokio_serial::ClearBuffer::Input);
+
         let framed = LengthDelimitedCodec::builder().new_framed(serial);
         Ok(Self {
             conn: Conn::Serial(Box::new(framed)),

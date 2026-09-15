@@ -100,6 +100,10 @@ impl Keypair {
 
     /// Sign `msg` (e.g. an OGM's immutable header) with the Ed25519 identity key.
     /// Verify with [`verify_signature`] against [`Keypair::ed_pubkey`].
+    /// `#[inline(never)]` for the reason spelled out on [`verify_signature`]:
+    /// a multi-kilobyte curve25519 frame must not be folded into a caller's
+    /// coroutine poll frame.
+    #[inline(never)]
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
         self.signing.sign(msg).to_bytes()
     }
@@ -110,6 +114,11 @@ impl Keypair {
     /// public key — no handshake.  The raw Diffie-Hellman output is hashed
     /// (with domain separation) into the returned key, which feeds
     /// [`frame_tag`](crate::frame_tag).
+    /// `#[inline(never)]` for the reason spelled out on [`verify_signature`]:
+    /// a multi-kilobyte curve25519 frame must not be folded into a caller's
+    /// coroutine poll frame. This one runs once per neighbour, at the point
+    /// its certificate first verifies.
+    #[inline(never)]
     pub fn pairwise_key(&self, peer_x_pubkey: &[u8; 32]) -> [u8; 32] {
         let shared = self
             .x_secret
@@ -125,6 +134,15 @@ impl Keypair {
 /// `false` for a malformed public key or a signature that does not verify;
 /// `true` only on a valid signature.  Used to check OGM origin signatures and
 /// (via the trust anchor) certificate signatures.
+/// `#[inline(never)]`, and deliberately so. curve25519-dalek's verify path
+/// carries a multi-kilobyte stack frame; inlined into an `async` caller it
+/// becomes part of that coroutine's *poll* frame, which an executor reserves
+/// for the task's entire life rather than unwinding after the call. Under LTO
+/// that turned this crate's ~5 KB into a permanent reservation in the boards'
+/// main task and pushed `scripts/stack-budget.py` over its budget. A signature
+/// is checked at most once per received OGM, so there is nothing to gain by
+/// inlining it and a board's whole RAM margin to lose.
+#[inline(never)]
 pub fn verify_signature(ed_pubkey: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
     let Ok(vk) = VerifyingKey::from_bytes(ed_pubkey) else {
         return false;

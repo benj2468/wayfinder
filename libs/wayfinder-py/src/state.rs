@@ -9,11 +9,14 @@
 //! `Duration` fields are flattened to whole milliseconds, matching the
 //! `now_ms` the simulation already ticks on.
 
+use core::time::Duration;
+
 use interfaces::frame::Mac;
 use pyo3::prelude::*;
 use wayfinder::LinkQualityRecord;
 use wayfinder::batman::NeighborStats;
 use wayfinder::batman::OriginatorRecord;
+use wayfinder::interfaces::time::Millis;
 
 use crate::types::PyMac;
 
@@ -41,8 +44,21 @@ pub struct PyNeighborStats {
     pub interval_estimate_ms: u64,
 }
 
-impl From<&NeighborStats> for PyNeighborStats {
-    fn from(stats: &NeighborStats) -> Self {
+impl PyNeighborStats {
+    /// Project one path, as of the driver's `now`.
+    ///
+    /// **`now` is not decoration.** The engine stores `last_heard` as a
+    /// `Millis` — a four-byte stamp that wraps every 49.7 days — and this
+    /// field is a *non-wrapping* millisecond count that Python does arithmetic
+    /// on (`ml`'s feature extractor computes `now_ms - last_heard_ms`, and
+    /// `sim` takes `max()` over it). Handing out the raw stamp would move a
+    /// hazard Rust's type system now catches into a language that cannot,
+    /// under a name and a docstring that both still promise the old meaning.
+    ///
+    /// So it is reconstructed rather than read: `elapsed_since` is
+    /// wrap-correct, and subtracting it from the driver's own full-width clock
+    /// recovers exactly the value this field carried before the stamp shrank.
+    fn project(stats: &NeighborStats, now: Duration) -> Self {
         // Destructured (not field-accessed) so a field added to
         // `NeighborStats` is a compile error here instead of silently never
         // reaching Python.
@@ -51,16 +67,26 @@ impl From<&NeighborStats> for PyNeighborStats {
             last_tq,
             last_seqno,
             last_heard,
-            interval_estimate,
+            interval_estimate_ms,
         } = stats;
         Self {
             neighbor: PyMac(*neighbor_ident),
             last_tq: *last_tq,
             last_seqno: *last_seqno,
-            last_heard_ms: last_heard.as_millis() as u64,
-            interval_estimate_ms: interval_estimate.as_millis() as u64,
+            last_heard_ms: absolute_ms(now, *last_heard),
+            interval_estimate_ms: u64::from(*interval_estimate_ms),
         }
     }
+}
+
+/// Recover the absolute, non-wrapping millisecond reading a `Millis` stamp was
+/// taken at, given the driver's current full-width clock.
+///
+/// Saturates at zero, which is only reachable for a stamp from before this
+/// driver's clock started — there is no such stamp in a live table.
+fn absolute_ms(now: Duration, stamp: Millis) -> u64 {
+    let elapsed = u64::from(Millis::from_duration(now).elapsed_since(stamp));
+    (now.as_millis().min(u128::from(u64::MAX)) as u64).saturating_sub(elapsed)
 }
 
 /// A known destination and every candidate path to it — mirrors
@@ -99,9 +125,11 @@ pub struct PyOriginatorRecord {
     pub paths: Vec<PyNeighborStats>,
 }
 
-impl From<&OriginatorRecord> for PyOriginatorRecord {
-    fn from(record: &OriginatorRecord) -> Self {
-        // Destructured for the same reason as `PyNeighborStats::from`: a new
+impl PyOriginatorRecord {
+    /// Project one originator and its paths, as of the driver's `now`. See
+    /// [`PyNeighborStats::project`] for why the clock is a parameter.
+    pub(crate) fn project(record: &OriginatorRecord, now: Duration) -> Self {
+        // Destructured for the same reason as `PyNeighborStats::project`: a new
         // `OriginatorRecord` field must fail to compile here, not vanish.
         let OriginatorRecord {
             last_heard,
@@ -118,8 +146,11 @@ impl From<&OriginatorRecord> for PyOriginatorRecord {
             best_next_hop: best_next_hop.map(PyMac),
             max_tq: *max_tq,
             last_seqno: *last_seqno,
-            last_heard_ms: last_heard.as_millis() as u64,
-            paths: paths.iter().map(PyNeighborStats::from).collect(),
+            last_heard_ms: absolute_ms(now, *last_heard),
+            paths: paths
+                .iter()
+                .map(|p| PyNeighborStats::project(p, now))
+                .collect(),
         }
     }
 }

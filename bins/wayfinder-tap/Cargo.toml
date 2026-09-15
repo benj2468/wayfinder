@@ -16,7 +16,10 @@ wayfinder-server.workspace = true
 # The node's logging stack: installs the console + log-ring subscriber and owns
 # the runtime filter the management API's SetLogLevel drives. `subscriber` is
 # the host-side layer (the boards use the same crate's RTT facade instead).
-wayfinder-log = { workspace = true, features = ["subscriber"] }
+# `ring` as well as `subscriber`: this binary serves `GetLogs`, and the ring is
+# what it serves *from*. The workspace entry deliberately names no features —
+# see the comment there for why a shared entry must not.
+wayfinder-log = { workspace = true, features = ["subscriber", "ring"] }
 tracing.workspace = true
 clap.workspace = true
 anyhow.workspace = true

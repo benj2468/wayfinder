@@ -8,8 +8,14 @@ rustflags = ["-C", "link-arg=-nostartfiles"]
 # `rust-src` — so every build compiles the sysroot from source. Without this a
 # build fails with `can't find crate for 'core'`, which reads like a missing
 # target rather than a missing prebuilt.
+#
+# `alloc` as well as `core`: `tracing-core` does an unconditional
+# `extern crate alloc`, so the moment this board links the log plumbing the
+# sysroot has to carry it. The failure is `can't find crate for 'alloc'`
+# pointing into `tracing-core`, which reads like a dependency problem rather
+# than a sysroot one.
 [unstable]
-build-std = ["core"]
+build-std = ["core", "alloc"]
 
 [target.xtensa-esp32-none-elf]
 # An ESP32 is flashed over its serial bootloader in ROM, so bring-up needs a USB
