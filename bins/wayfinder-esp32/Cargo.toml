@@ -35,22 +35,72 @@ bench = false
 
 [dependencies]
 # The build identity this firmware prints at bring-up, so a flashed image can
-# be tied back to a commit. Zero-dependency and `no_std`; the only piece of
-# wayfinder in the image so far, and the piece that proves a path dependency on
-# the root workspace's crates resolves for this target.
+# be tied back to a commit.
 wayfinder-version = { path = "../../libs/wayfinder-version" }
+# The routing core, at this board's capacity profile. `default-features = false`
+# keeps `std`/`alloc` host helpers out.
+wayfinder = { path = "../../libs/wayfinder", default-features = false }
+# The same HAL-agnostic event loop the nRF and STM32 boards run. This board
+# supplies only a `Clock` and its links.
+wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
+# **No text sink at all**, and the ring on. UART0 carries the management API
+# (`src/mgmt.rs`), and a console sharing it would desynchronise the framing;
+# RTT is not an option either, since this board has no debug probe. So records
+# go to the `GetLogs` ring and are read back over that same port with
+# `wayfinderctl logs` -- the nRF dongle's posture. See
+# `libs/wayfinder-log/src/sink.rs`, which supports exactly this case.
+wayfinder-log = { path = "../../libs/wayfinder-log", default-features = false, features = [
+    "ring",
+] }
+# The embedded framing and the query channel bridging the management port to the
+# single-threaded router loop. `default-features = false` drops the tokio/TLS
+# host transport.
+wayfinder-server = { path = "../../libs/wayfinder-server", default-features = false, features = [
+    "embedded",
+] }
+# For the bring-up records the router emits; `std` off, routed to the sink
+# above by `wayfinder-log`.
+tracing = { version = "0.1.44", default-features = false }
 # Espressif's HAL. The `esp32` feature selects the original Xtensa LX6 part —
 # not interchangeable with the RISC-V ESP32-C/H parts, which need neither this
 # target nor the toolchain fork.
-esp-hal = { version = "~1.1.0", features = ["esp32"] }
+# `unstable` is not optional here despite the name: `esp-rtos` drives the
+# scheduler through esp-hal APIs that sit behind it, and esp-hal's build script
+# fails outright ("the `unstable` feature is required by a dependent crate")
+# rather than at the call site.
+esp-hal = { version = "~1.2.1", features = ["esp32", "unstable"] }
 # Emits the app descriptor the ESP-IDF second-stage bootloader expects to find
 # in the image header. Without it the ROM bootloader refuses to start what we
 # flash, which looks like a dead board rather than a rejected image.
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
-# Bring-up observability, over the UART the USB-serial bridge on a dev board
-# already exposes: an ESP32 has no debug probe in the picture, so `println!`
-# over that UART is the equivalent of RTT on the nRF and STM32 boards.
+# Not a logging sink -- `wayfinder-log` selects none on this board, see above.
+# It is here only because `esp-backtrace`'s panic handler renders through it.
+# A panic does write onto UART0 and so onto the management port, which garbles
+# whatever frame was in flight; that is accepted, because a panic ends the
+# session anyway and a decodable backtrace is worth more than clean framing on
+# the way down.
 esp-println = { version = "0.17.0", features = ["esp32"] }
+
+# The embassy time driver and executor for this chip. The nRF and STM32 boards
+# run `embassy-executor` over their vendor HAL's time driver, and this is the
+# Espressif equivalent -- so all three boards drive the same `Driver::run` loop
+# with the same `select!` semantics rather than this one inventing its own.
+esp-rtos = { version = "0.4.0", features = ["esp32", "embassy", "esp-alloc"] }
+# **Pinned to what `esp-rtos` itself depends on** (0.10 -- the same major the
+# nRF boards are on; only `bins/wayfinder-stm32f411` still sits at 0.9). `#[esp_rtos::main]` hands the body a `Spawner` from
+# *its* copy, so a second major version in the graph is two incompatible
+# `Spawner` types and a `mismatched types` error on the macro rather than at
+# any line a reader would look at. Deliberately no `arch-*` feature: `esp-rtos`
+# provides the executor, and the crate docs say not to.
+embassy-executor = "0.10"
+embassy-time = "0.5.1"
+# `join`, to run the router loop and the management port concurrently on one
+# task -- the same primitive `libs/wayfinder-nrf`'s `node::run` uses.
+embassy-futures = "0.1.2"
+# `tracing-core` does an unconditional `extern crate alloc`, so any binary
+# linking the log plumbing needs a real allocator -- the same reason the
+# Cortex-M boards carry `embedded-alloc`.
+esp-alloc = "0.11.0"
 # The panic handler, printing a decodable backtrace over that same UART. A
 # `loop {}` handler would be smaller and would turn every panic into a silent
 # hang — the one failure mode worth spending flash to avoid on a new board.

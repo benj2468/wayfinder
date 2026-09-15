@@ -1,9 +1,9 @@
 //! A mesh interface over the USB device peripheral, as a CDC-NCM (USB
 //! Ethernet) function.
 //!
-//! This is the wired counterpart to the board's LoRa and BLE radios: the host
+//! This is the wired counterpart to the board's radio: the host
 //! the dongle is plugged into becomes a mesh neighbour, so a Linux node can
-//! reach the LoRa/BLE mesh through the board without a second radio.
+//! reach the 802.15.4 mesh through the board without a radio of its own.
 //!
 //! # Why NCM, and why there is no host-side driver
 //!
@@ -119,8 +119,7 @@ const NTB_LANDING_LEN: usize = MAX_LINK_FRAME_LEN;
 /// The producer drops rather than blocking when this fills (see
 /// [`usb_ncm_rx_task`] for why blocking is not an option on USB), so this is
 /// the burst the link absorbs while the driver's event loop is busy elsewhere —
-/// a BLE advertising session or a LoRa `send`, either of which can stall it for
-/// hundreds of milliseconds. Four frames at the router's frame capacity is
+/// an in-flight 802.15.4 transmission. Four frames at the router's frame capacity is
 /// ~2 KB, the point where widening it costs more RAM than the extra tolerance
 /// is worth on this part.
 const RX_QUEUE_DEPTH: usize = 4;
@@ -211,9 +210,9 @@ async fn usb_ncm_rx_task(mut rx: Receiver<'static, UsbDriver>) -> ! {
         //
         // Blocking here would look like backpressure and isn't: with no read
         // armed, the nRF NAKs the bulk OUT endpoint for as long as the driver
-        // is busy — and the driver's event loop stalls for a whole BLE
-        // advertising session or a multi-hundred-millisecond LoRa `send`. The
-        // host controller times a transfer out long before that, which
+        // is busy — and the driver's event loop stalls for a whole in-flight
+        // 802.15.4 transmission. The host controller times a transfer out long
+        // before that, which
         // surfaces as an xHCI transaction error and a device reset, not as a
         // slowed-down sender. A mesh link is lossy by definition and OGMs
         // repeat, so shedding a frame is the cheap failure.

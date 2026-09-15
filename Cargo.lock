@@ -1521,6 +1521,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-metadata-generated"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c2ee95b945a4780796e4359e72c033aed3b45073880e8029458f538532db8a"
+
+[[package]]
+name = "esp-println"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42dee1e9ac7c3539bf6464db1707b0edd7557168f98278cf3c84fe70e63c6ce6"
+dependencies = [
+ "document-features",
+ "esp-metadata-generated",
+ "log",
+]
+
+[[package]]
 name = "etherparse"
 version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5438,6 +5455,7 @@ version = "0.1.0"
 dependencies = [
  "critical-section",
  "embassy-time",
+ "esp-println",
  "heapless",
  "log",
  "rtt-target",

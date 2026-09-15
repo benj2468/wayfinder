@@ -427,7 +427,7 @@ pub struct KeepAliveEntry {
     pub ms_since_last_heard: u64,
     /// The learned heartbeat cadence, in milliseconds — zero until a second
     /// heartbeat has provided a real gap to measure (see
-    /// `batman::KeepAliveStats::interval_estimate`).
+    /// `batman::KeepAliveStats::interval_estimate_ms`).
     pub interval_estimate_ms: u64,
     /// Whether this neighbor has missed its keep-alive budget
     /// ([`BatmanEngine::keepalive_missed`](batman::BatmanEngine::keepalive_missed))
@@ -3145,8 +3145,15 @@ impl<
     /// `(used, capacity)` of the originator (routing) table — how full the
     /// fixed-capacity routing table is.  At capacity the least-recently-heard
     /// originator is evicted to admit a new one.
+    ///
+    /// The capacity is **this router's** `ORIGINATORS`, not
+    /// [`ORIGINATOR_CAPACITY`]. It used to be the latter, which made every
+    /// gauge on a profiled node report a gateway's numbers — an ESP32 built
+    /// for 32 originators answered `GetMetrics` with `0/128`. A constrained
+    /// node is the one this metric exists for, so reading the crate default
+    /// understated occupancy by exactly the factor that mattered.
     pub fn originator_occupancy(&self) -> (usize, usize) {
-        (self.batman.originator_table.len(), ORIGINATOR_CAPACITY)
+        (self.batman.originator_table.len(), ORIGINATORS)
     }
 
     /// `(used, capacity)` of the broadcast-deduplication table (one entry per
@@ -3159,19 +3166,19 @@ impl<
     /// full table no longer means broadcasts are being dropped — it did before
     /// eviction was added.
     pub fn broadcast_dedup_occupancy(&self) -> (usize, usize) {
-        (self.batman.broadcast_seqno.len(), ORIGINATOR_CAPACITY)
+        (self.batman.broadcast_seqno.len(), ORIGINATORS)
     }
 
     /// `(used, capacity)` of the locally-joined multicast group table — groups
     /// this node announces in its OGMs.
     pub fn local_mcast_occupancy(&self) -> (usize, usize) {
-        (self.batman.local_mcast.len(), batman::MAX_LOCAL_MCAST)
+        (self.batman.local_mcast.len(), LOCAL_MCAST)
     }
 
     /// `(used, capacity)` of the learned multicast-membership table —
     /// `(group, remote listener)` pairs learned from other nodes' OGMs.
     pub fn mcast_member_occupancy(&self) -> (usize, usize) {
-        (self.batman.mcast_members.len(), batman::MAX_MCAST_MEMBERS)
+        (self.batman.mcast_members.len(), MCAST_MEMBERS)
     }
 
     /// The number of distinct directly-reachable (one-hop) neighbours: known
@@ -3202,12 +3209,10 @@ impl<
             let neighbor = *neighbor;
             KeepAliveEntry {
                 neighbor,
-                ms_since_last_heard: now
-                    .saturating_sub(stats.last_heard)
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64,
-                interval_estimate_ms: stats.interval_estimate.as_millis().min(u64::MAX as u128)
-                    as u64,
+                ms_since_last_heard: u64::from(
+                    interfaces::time::Millis::from_duration(now).elapsed_since(stats.last_heard),
+                ),
+                interval_estimate_ms: u64::from(stats.interval_estimate_ms),
                 missed: self.batman.keepalive_missed(now, neighbor),
             }
         })

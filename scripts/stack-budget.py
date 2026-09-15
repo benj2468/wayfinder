@@ -60,6 +60,16 @@ that still fits) and roughly 7x tighter than the frame that actually failed.
 Set the percentage per board if one has a reason; do not raise it to make a
 red pipeline green without first checking the body chain still fits under it.
 
+**The overhead model above does not hold for every board, and the `justfile`
+carries the exception.** Where a task body inlines wholesale into its own poll
+-- which is what the nRF images do in `--release`, where the compiled poll makes
+no calls at all -- the poll frame *is* the body rather than overhead on top of
+it, so measuring it against a share meant for overhead compares two different
+things. Those boards pass `--task-poll-pct` with the arithmetic written out
+beside the recipe. The `24-100` and `29,060` figures quoted above are
+`debug`-image measurements from before the gate read `--release`; treat them as
+history rather than as what this prints today.
+
 What this does not replace: a worst-case call-graph sum (`cargo-call-stack`),
 which needs nightly and resolves the executor's indirect task dispatch badly,
 and the board's own `stack::report()` high-water, which is the ground truth but

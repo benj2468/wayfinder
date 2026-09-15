@@ -133,7 +133,7 @@ impl PyDriver {
         self.inner
             .router()
             .originator_table()
-            .map(PyOriginatorRecord::from)
+            .map(|r| PyOriginatorRecord::project(r, self.last_now))
             .collect()
     }
 

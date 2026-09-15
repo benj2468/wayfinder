@@ -2729,16 +2729,42 @@ fn real_keepalive_tick_switches_route_when_it_stops() {
 
     // Two real keep-alive ticks from `c`, `keepalive_interval` apart, teach
     // `a` the learned cadence — delivered through the actual `ac` switch.
+    //
+    // **Two ticks per heartbeat, and that is load-bearing.** `tick()` has each
+    // node take delivery *before* the switches pick up what was just
+    // transmitted, so one tick only moves a frame onto the wire; `a` receives
+    // it on the following one. With a single tick per iteration both
+    // heartbeats reached `a` inside the same tick, at the same instant, and
+    // the cadence this loop exists to teach was never taught — see the
+    // assertion below, which is what pins it.
     for _ in 0..2u32 {
         harness.clock += keepalive_interval;
         let t = harness.clock;
         harness.get_machine_mut("c").poll_due_keepalive(t);
+        harness.tick();
         harness.tick();
     }
     assert_eq!(
         ka_counter.load(Ordering::Relaxed),
         2,
         "both keep-alive ticks must have produced a real, wire-delivered frame"
+    );
+
+    // The fixture must prove the state it claims to set up. Without this the
+    // test still passed while `a` had learned *no* cadence at all: the miss
+    // budget then fell back to the 5 s default seed, and the route switched —
+    // or didn't — for reasons unrelated to the keep-alive schedule under test.
+    let learned = harness
+        .get_machine("a")
+        .router()
+        .keepalive_table(harness.clock)
+        .find(|e| e.neighbor == dest)
+        .expect("`a` has a keep-alive record for `c`");
+    assert_eq!(
+        learned.interval_estimate_ms,
+        keepalive_interval.as_millis() as u64,
+        "the two heartbeats must have taught `a` c's real cadence, since it is \
+         that cadence the miss budget below is three of"
     );
 
     let (next_hop, _) = harness

@@ -22,7 +22,43 @@ workspace = true
 # ring/filter locks, since `critical-section` has no impl registered there.
 
 [features]
-default = []
+default = ["ring", "sink-rtt"]
+# The bounded in-memory record ring `GetLogs` is served from (`ring.rs`).
+#
+# On by default: it is the only way a node with no debug probe attached — an
+# nRF52840 dongle, a container, a host node an operator reaches over the
+# management API — has readable logs at all, and on a host its cost is
+# irrelevant.
+#
+# Worth turning off for a board that has no management API to serve it *to*:
+# there the ring is written on every record and can never be read, and it is a
+# `static`. At the bare-metal `RING_CAPACITY` of 64 that is 16,416 bytes of
+# `.bss`, which is 13% of an STM32F411's entire SRAM. Turning it off does not
+# cost that board a single log line — `wayfinder-log`'s text sink (RTT on a
+# board, the console on a host) is a separate path and is unaffected.
+#
+# Do not turn it off on a board that *does* serve `GetLogs`, or the management
+# API answers every log query with silence -- and silence is all a client sees,
+# since `LogRecords` carries no capacity field. The distinction between "this
+# node keeps no records" and "nothing has been logged" is a build-time fact
+# here, not something the wire reports.
+ring = []
+# The bare-metal **text sink**: which transport a rendered line is written to.
+# Exactly one, or neither -- see `src/sink.rs`. Both are inert off bare metal,
+# where the transport dependency does not exist for the target at all.
+#
+# It is a feature rather than a `cfg(target_os = "none")` because that `cfg`
+# stopped discriminating the moment a second bare-metal target existed: the
+# Cortex-M boards have a debug probe and the ESP32 does not.
+
+# RTT over a debug probe: both nRF52840 boards and the STM32F411. Default, so a
+# board that says nothing keeps the sink it had.
+sink-rtt = ["dep:rtt-target"]
+# `esp-println` over the UART an ESP32 dev board's USB-serial bridge exposes.
+# The board crate must also depend on `esp-println` with its own chip feature
+# (`esp32`); this only names the transport.
+sink-esp-println = ["dep:esp-println"]
+
 # The host-side `tracing-subscriber` layer stack (`subscriber.rs`): a filter
 # layer gating on this crate's runtime directives plus a layer feeding the ring,
 # so a `std` node serves the same `GetLogs` the boards do. Off by default so
@@ -50,9 +86,12 @@ tracing-subscriber = { workspace = true, optional = true }
 # here (not just the code) keeps the host build from pulling a backend it can't
 # link.
 [target.'cfg(target_os = "none")'.dependencies]
-# The RTT transport + `rprintln!`; uses the `critical-section-single-core` impl
-# the boards already enable via `cortex-m`.
-rtt-target = "0.5"
+# The RTT transport, behind `sink-rtt`. Uses the `critical-section-single-core`
+# impl the Cortex-M boards already enable via `cortex-m`.
+rtt-target = { version = "0.5", optional = true }
+# The UART transport, behind `sink-esp-println`. No chip feature here: the
+# board crate selects its own, and cargo unifies them.
+esp-println = { version = "0.17.0", default-features = false, optional = true }
 # The *other* logging facade. The third-party embedded crates (`embassy-*`,
 # `nrf-softdevice`) log through their own `fmt.rs`, which emits either `defmt`
 # or `log` records — never `tracing`. `defmt` defers formatting to a host

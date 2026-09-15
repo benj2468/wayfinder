@@ -1,17 +1,20 @@
-//! The RTT-backed adapters for both logging facades, compiled only for bare
-//! metal. Each renders through [`crate::fmt::LineBuf`] onto the same RTT print
-//! channel, so `tracing` and `log` records interleave in one stream — and each
-//! also pushes the record into [`crate::ring`], which is how a board with no
-//! debug probe attached still has observable logs.
+//! The bare-metal adapters for both logging facades. Each renders through
+//! [`crate::fmt::LineBuf`] onto the same text sink, so `tracing` and `log`
+//! records interleave in one stream — and each also pushes the record into
+//! [`crate::ring`], which is how a board with no console attached still has
+//! observable logs.
 //!
 //! Both facades gate on [`crate::filter`] first, so one `SetLogLevel` moves
 //! every sink at once.
+//!
+//! Nothing here names a transport: which one a board writes to is
+//! [`crate::sink`]'s single pair of functions, chosen by feature. This file
+//! used to be `rtt.rs` and hard-coded `rprintln!`, which was fine while every
+//! `no_std` target in the repo had a debug probe; the ESP32 has none.
 
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use rtt_target::rprintln;
-use rtt_target::rtt_init_print;
 use tracing_core::Dispatch;
 use tracing_core::Event;
 use tracing_core::Interest;
@@ -27,6 +30,7 @@ use crate::filter;
 use crate::filter::Level;
 use crate::fmt::LineBuf;
 use crate::ring;
+use crate::sink;
 
 /// Map a `log` level onto this crate's own, which the ring and the filter speak.
 fn level_from_log(level: log::Level) -> Level {
@@ -39,35 +43,35 @@ fn level_from_log(level: log::Level) -> Level {
     }
 }
 
-/// Initialize RTT and install both facades' global sinks: [`RttSubscriber`] for
-/// `tracing` and [`RttLogger`] for `log`. A failure to install either (one is
-/// already registered) is ignored — logging is best-effort and must never fault
-/// the router.
+/// Initialize the text sink and install both facades' global subscribers:
+/// [`BareSubscriber`] for `tracing` and [`BareLogger`] for `log`. A failure to
+/// install either (one is already registered) is ignored — logging is
+/// best-effort and must never fault the router.
 pub fn init() {
-    rtt_init_print!();
-    let _ = tracing_core::dispatcher::set_global_default(Dispatch::new(RttSubscriber::new()));
-    let _ = log::set_logger(&RttLogger);
-    // A *static* ceiling applied before `RttLogger` is consulted, so anything
+    sink::init();
+    let _ = tracing_core::dispatcher::set_global_default(Dispatch::new(BareSubscriber::new()));
+    let _ = log::set_logger(&BareLogger);
+    // A *static* ceiling applied before `BareLogger` is consulted, so anything
     // lower would put records permanently out of the runtime filter's reach and
     // make `SetLogLevel trace` a lie. Same reason no crate here may set a
     // `max_level_*` Cargo feature on `log`/`tracing`.
     log::set_max_level(log::LevelFilter::Trace);
 }
 
-/// The `log` sink for the third-party embedded crates (`embassy-*`,
-/// `nrf-softdevice`), which emit `log` records rather than `tracing` ones.
+/// The `log` sink for the third-party embedded crates (`embassy-*`, `esp-hal`),
+/// which emit `log` records rather than `tracing` ones.
 ///
 /// A unit struct so it can be installed as the `&'static dyn Log`
 /// `log::set_logger` wants; the boxing alternative needs `std`.
-struct RttLogger;
+struct BareLogger;
 
-impl log::Log for RttLogger {
+impl log::Log for BareLogger {
     /// Whether a record passes the installed runtime filter.
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         filter::enabled(level_from_log(metadata.level()), metadata.target())
     }
 
-    /// Render one record to RTT and push it to the ring, in the same shape as a
+    /// Render one record to the text sink and push it to the ring, in the same shape as a
     /// `tracing` event. `log` formats eagerly, so the message arrives as one
     /// preformatted `Arguments` rather than as structured fields.
     ///
@@ -81,30 +85,30 @@ impl log::Log for RttLogger {
         let level = level_from_log(record.level());
         let mut line = LineBuf::new(record.level(), record.target());
         line.push_args(record.args());
-        rprintln!("{}", line.as_str());
+        sink::write_line(line.as_str());
         ring::record(level, record.target(), line.body());
     }
 
-    /// RTT writes are already pushed to the control block synchronously, so
-    /// there is nothing buffered on this side to flush.
+    /// Both sinks write synchronously, so there is nothing buffered on this
+    /// side to flush.
     fn flush(&self) {}
 }
 
-/// A `no_std`, heap-free tracing subscriber that prints each event to the RTT
-/// up-channel.
+/// A `no_std`, heap-free tracing subscriber that prints each event to the
+/// board's text sink.
 ///
 /// Spans are handed monotonically increasing ids so the dispatcher's contract
 /// is satisfied, but are otherwise not tracked: the mesh stack carries its
 /// per-frame context in event *fields*, not span state.
-struct RttSubscriber {
+struct BareSubscriber {
     /// Source of unique span ids, which must be non-zero and distinct.
     /// 32-bit because Cortex-M4 has no 64-bit atomics, so at one span per
     /// received frame a long-lived node really does reach the wrap —
-    /// [`RttSubscriber::new_span`] tolerates it rather than assuming it away.
+    /// [`BareSubscriber::new_span`] tolerates it rather than assuming it away.
     next_span: AtomicU32,
 }
 
-impl RttSubscriber {
+impl BareSubscriber {
     /// Create a subscriber whose first issued span id is 1.
     fn new() -> Self {
         Self {
@@ -113,7 +117,7 @@ impl RttSubscriber {
     }
 }
 
-impl Subscriber for RttSubscriber {
+impl Subscriber for BareSubscriber {
     /// Whether an event passes the installed runtime filter.
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         filter::enabled(Level::from(*metadata.level()), metadata.target())
@@ -149,14 +153,14 @@ impl Subscriber for RttSubscriber {
     /// Span causal links are not tracked.
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
 
-    /// Render one event to RTT as `LEVEL target: message field=value …` in a
+    /// Render one event to the text sink as `LEVEL target: message field=value …` in a
     /// fixed stack buffer, and push the same record to the ring. One formatting
     /// pass feeds both. Write failures are truncations, intentionally ignored.
     fn event(&self, event: &Event<'_>) {
         let meta = event.metadata();
         let mut line = LineBuf::new(meta.level(), meta.target());
         event.record(&mut FieldVisitor(&mut line));
-        rprintln!("{}", line.as_str());
+        sink::write_line(line.as_str());
         ring::record(Level::from(*meta.level()), meta.target(), line.body());
     }
 

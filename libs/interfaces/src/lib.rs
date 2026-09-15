@@ -19,6 +19,9 @@ pub mod frame;
 /// Per-frame link measurements ([`LinkMetrics`](link::LinkMetrics)) and the
 /// link-layer error type ([`LinkError`](link::LinkError)).
 pub mod link;
+/// The compact monotonic instant ([`Millis`](time::Millis)) the routing core's
+/// records are stamped with, four bytes where a `Duration` is sixteen.
+pub mod time;
 /// Ethernet-shaped framing shared by every carrier whose medium is real
 /// Ethernet ([`frame_into_buf`](wire::frame_into_buf),
 /// [`retag_ethertype`](wire::retag_ethertype)).

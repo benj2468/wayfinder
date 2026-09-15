@@ -63,7 +63,7 @@ tracing-subscriber = { workspace = true, optional = true }
 # --- mock-node only: a stand-in node to develop the dashboard against -------
 wayfinder-server = { workspace = true, optional = true }
 wayfinder-tls-mgmt = { workspace = true, optional = true }
-wayfinder-log = { workspace = true, optional = true }
+wayfinder-log = { workspace = true, optional = true, features = ["ring"] }
 
 # --- hydrate only ----------------------------------------------------------
 console_error_panic_hook = { version = "0.1", optional = true }
@@ -157,7 +157,7 @@ zerocopy.workspace = true
 # The integration tests drive a poll against the real `serve_tls_server` (see
 # the `mock-node` feature) rather than a stubbed client, so they catch a framing
 # or field-wiring mistake the way a live node would.
-wayfinder-log.workspace = true
+wayfinder-log = { workspace = true, features = ["ring"] }
 # So `tests/session.rs` can present a live TOTP code the way an authenticator
 # app would, against a secret it reads out of an `otpauth://` URI. Registering
 # by invitation requires one — there is no `no_totp` on that path — so the whole

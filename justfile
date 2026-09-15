@@ -406,18 +406,60 @@ clippy-embedded: clippy-nrf52840 clippy-nrf52840-dongle clippy-stm32f411 clippy-
 # Reads the linked ELF, so it depends on the build rather than on clippy (which
 # never links). Mirrors CI's `build:stack-budget`; see `scripts/stack-budget.py`
 # for what it gates and why it gates task polls rather than frame size at large.
+#
+# **Every board is checked in `--release`, which is the profile that gets
+# flashed.** The nRF boards used to be checked in `debug`, and the two profiles
+# disagreed completely: rustc emitted `node::run`'s body as its own symbol in
+# `debug`, leaving a 932-byte trampoline for the gate to find, while in
+# `release` the body inlined wholesale into the poll and carried 72,908 bytes
+# **before the changes on this branch** (it is 26,756 after them; see the
+# budget note below).
+# So the gate passed for as long as it has existed on an image nobody flashes,
+# while the one that ships sat 5x over budget. Checking `debug` also measures the wrong inlining
+# decisions generally; `opt-level` is what moves a frame between a transient
+# call and a permanent reservation.
 [doc("Check every board image fits the stack the linker left it.")]
 stack-budget: stack-budget-nrf52840 stack-budget-nrf52840-dongle stack-budget-stm32f411
 
+# 18% rather than the default 8%, and the reason is structural rather than a
+# concession. The 8% share models a task poll frame as *overhead* sitting on
+# top of the body's own call chain, which holds while the poll is a trampoline.
+# Here it is not: `node::run`'s body inlines into its poll end to end -- the
+# compiled poll issues no calls at all -- so the poll frame *is* the body, and
+# measuring it against a share meant for overhead compares two different
+# things.
+#
+# What the budget has to establish instead is that the whole chain still fits.
+# Worst-case nesting, measured off the release image:
+#
+#     poll frame                      26,756
+#     Driver::run_with_mgmt           21,220
+#     embassy_futures MaybeDone       14,436
+#     wayfinder_auth verify_signature  5,236
+#     ------------------------------ -------
+#     worst case                      67,648   of a 164,016-byte region
+#
+# ~42% of the stack, and that sum is pessimistic (`MaybeDone` wraps
+# `run_with_mgmt` rather than nesting beneath it). Re-derive it before raising
+# this again; do not raise it to turn a pipeline green.
+#
+# **This number has moved twice and that is the real signal.** It is ten points
+# of the region -- about 16 KB -- worth of bring-up locals -- identity, the link array, the USB device
+# setup -- that only run once but are reserved for the node's life, because the
+# body and the steady-state loop share one coroutine. Splitting bring-up from
+# the run loop is the fix; raising this percentage is not, and a third increase
+# should be spent on that instead.
 [doc("Check the nRF52840-DK image's stack budget.")]
-stack-budget-nrf52840: build-nrf52840
+stack-budget-nrf52840: build-nrf52840-release
     cd bins/wayfinder-nrf52840 && python3 ../../scripts/stack-budget.py \
-        target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840 --memory-x memory.x
+        target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x \
+        --task-poll-pct 18
 
 [doc("Check the nRF52840 dongle image's stack budget.")]
-stack-budget-nrf52840-dongle: build-nrf52840-dongle
+stack-budget-nrf52840-dongle: build-nrf52840-dongle-release
     cd bins/wayfinder-nrf52840-dongle && python3 ../../scripts/stack-budget.py \
-        target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840-dongle --memory-x memory.x
+        target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x \
+        --task-poll-pct 18
 
 [doc("Check the NUCLEO-F411RE image's stack budget.")]
 stack-budget-stm32f411: build-stm32f411
@@ -436,6 +478,14 @@ clean-embedded:
 build-nrf52840:
     cd bins/wayfinder-nrf52840 && cargo build --locked
 
+# The profile that is actually flashed (`cargo run --release`), and so the one
+# `stack-budget-nrf52840` reads. `build-nrf52840` stays on `debug` because that
+# is what CI's cross-compile check wants -- a fast type-and-link check of the
+# bare-metal target.
+[doc("Build the nRF52840-DK firmware in release, as flashed.")]
+build-nrf52840-release:
+    cd bins/wayfinder-nrf52840 && cargo build --release --locked
+
 [doc("Lint the nRF52840-DK firmware.")]
 clippy-nrf52840:
     cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings
@@ -445,6 +495,10 @@ clippy-nrf52840:
 [doc("Build the nRF52840 dongle (PCA10059) firmware.")]
 build-nrf52840-dongle:
     cd bins/wayfinder-nrf52840-dongle && cargo build --locked
+
+[doc("Build the nRF52840 dongle firmware in release, as flashed.")]
+build-nrf52840-dongle-release:
+    cd bins/wayfinder-nrf52840-dongle && cargo build --release --locked
 
 [doc("Lint the nRF52840 dongle firmware.")]
 clippy-nrf52840-dongle:

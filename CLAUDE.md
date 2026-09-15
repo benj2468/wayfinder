@@ -250,8 +250,14 @@ remotely-supplied frames are `trace!`, not `warn!` — a malformed packet must n
 flood the logs.
 
 **Logs are readable over the management API.** `libs/wayfinder-log` installs the
-subscribers on every target and feeds two things: a text sink (RTT on a board,
-the console on a host) and a bounded record ring that `GetLogs` serves. That
+subscribers on every target and feeds two things, *each now a Cargo feature the
+leaf binary chooses*: a text sink (`sink-rtt` over a debug probe,
+`sink-esp-println` over a UART, or none) and a bounded record ring (`ring`) that
+`GetLogs` serves. The STM32F411 takes the ring off — nothing can read it there —
+and the ESP32 takes the sink off, since its one byte stream carries the
+management API. **Features are additive, so this choice belongs to the binary**:
+naming one on a shared dependency puts it back on every board downstream, which
+is exactly how the STM32's saving was silently undone once already. That
 ring is how a node with no debug probe attached — an nRF52840 dongle, or any
 board whose cable is out — has observable logs at all. `SetLogLevel` changes the
 runtime filter across *every* sink at once; its grammar is a `RUST_LOG` subset
@@ -417,9 +423,14 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   (encoding, versioning, migration) stay the caller's concern.
 - **libs/wayfinder-log** — the logging plumbing every target shares: the runtime
   `RUST_LOG`-style filter, the bounded record ring behind `GetLogs`, and the line
-  formatter. Two facades on top — the RTT subscriber/logger for `target_os =
-  "none"`, and a `tracing-subscriber` layer stack (`subscriber` feature) for a
-  host node.
+  formatter. Two facades on top — `bare.rs` for `target_os = "none"`, and a
+  `tracing-subscriber` layer stack (`subscriber` feature) for a host node. The
+  bare facade's **text sink is a feature, not a `cfg`** (`sink-rtt` for the
+  Cortex-M boards' debug probe, `sink-esp-println` for the ESP32's UART, or
+  neither): `cfg(target_os = "none")` stopped discriminating the moment there
+  were two bare-metal targets with different transports. The `ring` feature is
+  separately optional, for a board with no management API to serve `GetLogs`
+  to.
 - **libs/wayfinder-alarm** — the node's alarm board: the bounded set of
   conditions it currently believes are wrong. Where a log record is one line
   about one moment, an alarm is a latched `(kind, subject)` condition with a
@@ -554,13 +565,41 @@ the root workspace" above)
   LFXO, less flash. Logs are readable only over the USB management port.
 - **bins/wayfinder-stm32f411** — NUCLEO-F411RE, a LoRa-only relay on a
   non-Nordic Cortex-M: the proof the driver is HAL-portable.
-- **bins/wayfinder-esp32** — the original ESP32 (Xtensa LX6), currently a
-  bring-up "hello world" over UART rather than a mesh node. It is here for the
-  toolchain, not yet for the routing: Xtensa has no upstream LLVM backend, so
-  this is the one board whose compiler the devShell cannot supply — see the
-  `esp-toolchain` section of the justfile and `espupWrapped` in `flake.nix`.
-  Flashed over its ROM serial bootloader with `espflash` (`just flash-esp32`),
-  not a debug probe.
+- **bins/wayfinder-esp32** — the original ESP32 (Xtensa LX6). Runs the same
+  `wayfinder_embedded_driver::Driver` the other boards do, on `esp-rtos`'s
+  embassy executor, at its own capacity profile — but **has no mesh medium
+  yet**: ESP-NOW is a separate ticket, so every interface is `MeshLink::Absent`
+  and the node routes over nothing while still pacing its timers and ageing its
+  tables. It does serve the management API, over UART0 — the part has no USB
+  peripheral at all, so a dev board's USB socket is an external CP2102/CH340
+  bridge and `wayfinderctl --serial` is the only way in. **That UART carries
+  the management API and no console of ours**: one sharing it would
+  desynchronise the framing, so this board selects no `wayfinder-log` text sink
+  and its records are read back over the same port with `wayfinderctl logs`.
+  Two things still write there and neither can be stopped from the application
+  — the ROM and second-stage bootloaders on every reset, which is why
+  `connect_serial` drains before its first frame, and `esp-backtrace` rendering
+  a panic.
+  Xtensa has no upstream LLVM backend, so this is the one board whose
+  compiler the devShell cannot supply — see the `esp-toolchain` section of the
+  justfile and `espupWrapped` in `flake.nix`. Flashed over its ROM serial
+  bootloader with `espflash` (`just flash-esp32`), not a debug probe.
+
+  Two numbers worth knowing before sizing anything here. `esp-hal` gives the
+  application `0x3ffb0000..0x3ffe0000` — **192 KB of DRAM**, not the part's
+  headline 320 KB, the rest being ROM and Bluetooth reservations — and statics
+  and stack share it, so a `.stack` of ~190 KB in a near-empty image is the
+  linker handing out the remainder rather than a cost (194,684 bytes, i.e.
+  ~190 KiB — every other DRAM figure here is bytes or KiB, so read it that
+  way). The image uses 82,168
+  bytes of statics in `--release` and leaves 114,440 for stack — 32 KiB of
+  those statics is the heap the management API's framing buffers need.
+
+  Note there is **no `just stack-budget` for this board**: that gate reads a
+  `memory.x`, and `esp-hal` generates `linkall.x` instead. The `.stack` section
+  size is right there in the ELF, but `scripts/stack-budget.py`'s frame parser
+  matches ARM prologues and embassy's `TaskStorage::poll` mangling, so an
+  Xtensa backend is the larger half of the job.
 
 **Deployment targets** — the same `wayfinder-tap` binary, four ways
 - **nix/modules/wayfinder.nix** — the NixOS service module every host

@@ -5,6 +5,7 @@ use interfaces::frame::LinkFrame;
 use interfaces::frame::LinkFrameData;
 use interfaces::frame::LinkFrameDataMut;
 use interfaces::frame::Mac;
+use interfaces::time::Millis;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
@@ -12,6 +13,51 @@ use tracing::warn;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
+
+/// The oldest a stored [`Millis`] stamp is allowed to get, in milliseconds.
+///
+/// **This is a type precondition, not a routing decision.**
+/// [`Millis::elapsed_since`] answers on the *signed* wrapping difference, so it
+/// is correct only while the two stamps lie within 24.8 days of each other —
+/// half the `u32` millisecond range. Past that the sign flips and an ancient
+/// stamp reads as **zero elapsed**, which every caller here takes to mean "just
+/// now". A proof that should have expired reads as current and stops being
+/// re-challenged; a neighbour dead for a month reports a live heartbeat.
+///
+/// The originator table cannot reach it — `purge_stale` prunes paths on their
+/// own learned cadence, in minutes. `proven`, `challenged` and `keepalive` can:
+/// each is otherwise removed only when its table is full, on a revocation, or
+/// on a re-anchor, so an entry for a neighbour that walked away sits untouched
+/// for as long as the node runs.
+///
+/// A day is chosen to be far past every real ageing rule in this engine (the
+/// longest is `MAX_MISSED_OGMS` × a 128 s Trickle `i_max`, under fourteen
+/// minutes) and far short of the 24.8-day limit it defends. So dropping at this
+/// point is never the decision that ages something out — by a day every one of
+/// these entries is long since stale by its own rule — it only stops a stamp
+/// living long enough to lie.
+///
+/// **This works because `purge_stale` runs far more often than the half-range,
+/// not because it can detect a stamp that already wrapped.** Age is measured
+/// with the same `elapsed_since` the ceiling defends, so a stamp already past
+/// 24.8 days reads as zero and is unreachable. Every shell calls `purge_stale`
+/// on its periodic tick — seconds to minutes — so an entry is caught at a day
+/// and never approaches the limit. `the_ceiling_needs_purge_to_run_before_the_
+/// half_range` pins that boundary rather than leaving it to be discovered.
+const STAMP_AGE_CEILING_MS: u32 = 24 * 60 * 60 * 1000;
+
+/// A configured interval as whole milliseconds, saturating.
+///
+/// The inputs are Trickle bounds and the crate's default intervals — values of
+/// seconds, set by configuration rather than measured — so saturating at 49.7
+/// days is unreachable in practice and is the safe direction if it ever were:
+/// an over-long seed makes a path age out later, never sooner.
+///
+/// Distinct from [`Millis::from_duration`], which *wraps* because it converts a
+/// monotonic `now` that legitimately runs past the rollover.
+fn as_millis_u32(d: core::time::Duration) -> u32 {
+    d.as_millis().min(u128::from(u32::MAX)) as u32
+}
 
 use crate::BatmanEngine;
 use crate::BroadcastSeqnoEntry;
@@ -92,12 +138,12 @@ impl<
     ///
     /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
     pub fn next_hop(&self, now: core::time::Duration, destination: Mac) -> Option<Mac> {
-        let seed = self.seed_interval();
+        let seed_ms = self.seed_interval_ms();
         let record = self.originator_table.get(&destination)?;
         record
             .paths
             .iter()
-            .filter(|p| !Self::path_stale(now, p, seed))
+            .filter(|p| !Self::path_stale(Millis::from_duration(now), p, seed_ms))
             // The proof gate. Separate from `recompute_best`'s because this is
             // the hot path: it recomputes from `paths` rather than reading the
             // cached `best_next_hop`, so gating only the cache would leave
@@ -124,12 +170,12 @@ impl<
     /// the air, and can at worst blackhole cert distribution — which it could
     /// already do by jamming. **The data plane must never use this.**
     pub fn next_hop_unproven_ok(&self, now: core::time::Duration, destination: Mac) -> Option<Mac> {
-        let seed = self.seed_interval();
+        let seed_ms = self.seed_interval_ms();
         let record = self.originator_table.get(&destination)?;
         record
             .paths
             .iter()
-            .filter(|p| !Self::path_stale(now, p, seed))
+            .filter(|p| !Self::path_stale(Millis::from_duration(now), p, seed_ms))
             .max_by_key(|p| self.effective_tq(now, p))
             .map(|p| p.neighbor_ident)
     }
@@ -139,17 +185,22 @@ impl<
     /// Called by the router when a challenge response verifies; the engine
     /// holds the timestamp but never the key material.
     pub fn note_proven(&mut self, now: core::time::Duration, neighbor: Mac, iface: usize) {
-        if self.proven.insert(neighbor, (now, iface)).is_err() {
+        let now_ms = Millis::from_duration(now);
+        if self.proven.insert(neighbor, (now_ms, iface)).is_err() {
             // Table full: evict the least-recently-proven to make room, rather
             // than refusing a fresh proof and stranding the route it unlocks.
+            //
+            // "Least recently" is the *largest* elapsed rather than the
+            // smallest stamp: stamps wrap every 49.7 days, and a raw `min`
+            // would then evict the freshest entry. See `interfaces::time`.
             if let Some(oldest) = self
                 .proven
                 .iter()
-                .min_by_key(|(_, (t, _))| *t)
+                .max_by_key(|(_, (t, _))| now_ms.elapsed_since(*t))
                 .map(|(m, _)| *m)
             {
                 self.proven.remove(&oldest);
-                let _ = self.proven.insert(neighbor, (now, iface));
+                let _ = self.proven.insert(neighbor, (now_ms, iface));
             }
         }
         // The peer answered, so whatever backoff its unanswered attempts had
@@ -176,7 +227,7 @@ impl<
     /// for the next periodic sweep would leave the management API reporting no
     /// route for a link that already works.
     fn recompute_all_best(&mut self, now: core::time::Duration) {
-        let seed = self.seed_interval();
+        let seed_ms = self.seed_interval_ms();
         // Snapshot which neighbors are selectable before taking the mutable
         // borrow on the table, since the proof check reads `&self`.
         let require_proof = self.require_proof;
@@ -185,10 +236,10 @@ impl<
             .iter()
             .filter(|(_, (last, _))| {
                 !Self::is_stale(
-                    now,
+                    Millis::from_duration(now),
                     *last,
-                    core::time::Duration::ZERO,
-                    seed,
+                    0,
+                    seed_ms,
                     crate::MAX_MISSED_PROOFS,
                 )
             })
@@ -211,13 +262,13 @@ impl<
         if !self.require_proof {
             return true;
         }
-        let seed = self.seed_interval();
+        let seed_ms = self.seed_interval_ms();
         self.proven.get(&neighbor).is_some_and(|(last, _)| {
             !Self::is_stale(
-                now,
+                Millis::from_duration(now),
                 *last,
-                core::time::Duration::ZERO,
-                seed,
+                0,
+                seed_ms,
                 crate::MAX_MISSED_PROOFS,
             )
         })
@@ -233,13 +284,13 @@ impl<
         if !self.require_proof {
             return None;
         }
-        let seed = self.seed_interval();
+        let seed_ms = self.seed_interval_ms();
         self.proven.get(&neighbor).and_then(|(last, iface)| {
             (!Self::is_stale(
-                now,
+                Millis::from_duration(now),
                 *last,
-                core::time::Duration::ZERO,
-                seed,
+                0,
+                seed_ms,
                 crate::MAX_MISSED_PROOFS,
             ))
             .then_some(*iface)
@@ -263,10 +314,10 @@ impl<
     /// every proof cycle. The gap between the two thresholds is the margin the
     /// exchange gets to complete in.
     fn proof_needs_refresh(&self, now: core::time::Duration, neighbor: Mac) -> bool {
-        let seed = self.seed_interval();
+        let seed_ms = self.seed_interval_ms();
         match self.proven.get(&neighbor) {
             None => true,
-            Some((last, _)) => Self::is_stale(now, *last, core::time::Duration::ZERO, seed, 1),
+            Some((last, _)) => Self::is_stale(Millis::from_duration(now), *last, 0, seed_ms, 1),
         }
     }
 
@@ -296,7 +347,8 @@ impl<
                 // `challenged` field for why the first attempt is the one that
                 // most often needs a prompt retry.
                 if let Some((last, misses)) = self.challenged.get(m)
-                    && now.saturating_sub(*last) < self.challenge_backoff(*misses)
+                    && Millis::from_duration(now).elapsed_since(*last)
+                        < self.challenge_backoff_ms(*misses)
                 {
                     return false;
                 }
@@ -316,19 +368,21 @@ impl<
     /// which is what keeps a long-silent peer's backoff at the cap instead of
     /// snapping back to `i_min`.
     pub fn note_challenged(&mut self, now: core::time::Duration, neighbor: Mac) {
+        let now_ms = Millis::from_duration(now);
         let misses = self
             .challenged
             .get(&neighbor)
             .map_or(0, |(_, n)| n.saturating_add(1));
-        if self.challenged.insert(neighbor, (now, misses)).is_err()
+        // Evicted by largest elapsed, not smallest stamp -- see `note_proven`.
+        if self.challenged.insert(neighbor, (now_ms, misses)).is_err()
             && let Some(oldest) = self
                 .challenged
                 .iter()
-                .min_by_key(|(_, (t, _))| *t)
+                .max_by_key(|(_, (t, _))| now_ms.elapsed_since(*t))
                 .map(|(m, _)| *m)
         {
             self.challenged.remove(&oldest);
-            let _ = self.challenged.insert(neighbor, (now, misses));
+            let _ = self.challenged.insert(neighbor, (now_ms, misses));
         }
     }
 
@@ -341,22 +395,23 @@ impl<
     /// interface at once (see `poll_due_challenges`), so the cadence that
     /// matters is the one of the fastest link carrying the attempt, and the
     /// budget that matters is the one of the slowest.
-    fn challenge_backoff(&self, misses: u32) -> core::time::Duration {
-        let cap = self.seed_interval();
-        let floor = self
-            .ogm_timers
-            .iter()
-            .map(|t| t.i_min())
-            .min()
-            .unwrap_or(crate::DEFAULT_OGM_INTERVAL)
-            .min(cap);
+    fn challenge_backoff_ms(&self, misses: u32) -> u32 {
+        let cap_ms = self.seed_interval_ms();
+        let floor_ms = as_millis_u32(
+            self.ogm_timers
+                .iter()
+                .map(|t| t.i_min())
+                .min()
+                .unwrap_or(crate::DEFAULT_OGM_INTERVAL),
+        )
+        .min(cap_ms);
         // `checked_mul` rather than a shift: the doubling reaches the cap after
         // a handful of misses and must saturate there, not overflow into a
         // short wait.
         1u32.checked_shl(misses)
-            .and_then(|factor| floor.checked_mul(factor))
-            .unwrap_or(cap)
-            .min(cap)
+            .and_then(|factor| floor_ms.checked_mul(factor))
+            .unwrap_or(cap_ms)
+            .min(cap_ms)
     }
 
     /// How long until the soonest next-hop challenge falls due, or `None` when
@@ -371,6 +426,7 @@ impl<
         if !self.require_proof {
             return None;
         }
+        let now_ms = Millis::from_duration(now);
         let mut seen: heapless::Vec<Mac, MAX_ORIGINATORS> = heapless::Vec::new();
         let mut soonest: Option<core::time::Duration> = None;
         for neighbor in self
@@ -387,19 +443,19 @@ impl<
             // still fresh is not due however long ago it was last attempted,
             // and an attempt inside its backoff is not due however stale the
             // proof is.
-            let refresh = match self.proven.get(&neighbor) {
-                None => core::time::Duration::ZERO,
+            let refresh_ms = match self.proven.get(&neighbor) {
+                None => 0,
                 Some((last, _)) => self
-                    .seed_interval()
-                    .saturating_sub(now.saturating_sub(*last)),
+                    .seed_interval_ms()
+                    .saturating_sub(now_ms.elapsed_since(*last)),
             };
-            let retry = match self.challenged.get(&neighbor) {
-                None => core::time::Duration::ZERO,
+            let retry_ms = match self.challenged.get(&neighbor) {
+                None => 0,
                 Some((last, misses)) => self
-                    .challenge_backoff(*misses)
-                    .saturating_sub(now.saturating_sub(*last)),
+                    .challenge_backoff_ms(*misses)
+                    .saturating_sub(now_ms.elapsed_since(*last)),
             };
-            let due = refresh.max(retry);
+            let due = core::time::Duration::from_millis(u64::from(refresh_ms.max(retry_ms)));
             soonest = Some(soonest.map_or(due, |s: core::time::Duration| s.min(due)));
         }
         soonest
@@ -425,47 +481,43 @@ impl<
         }
     }
 
-    /// Whether a `(last_heard, interval_estimate)` pair has aged out as of
+    /// Whether a `(last_heard, interval_estimate_ms)` pair has aged out as of
     /// `now`: true once `now` has advanced more than `max_missed` of the
     /// *expected* interval past the last refresh. The expected interval is the
-    /// learned cadence (`interval_estimate`), or `seed` until a second sample
+    /// learned cadence (`interval_estimate_ms`), or `seed` until a second sample
     /// has been measured. Saturating arithmetic keeps the budget finite.
     /// Shared by [`path_stale`](Self::path_stale) (OGM paths) and
     /// [`keepalive_missed`](Self::keepalive_missed) (keep-alive heartbeats) —
     /// the same ageing shape, applied to two independent signals.
     fn is_stale(
-        now: core::time::Duration,
-        last_heard: core::time::Duration,
-        interval_estimate: core::time::Duration,
-        seed: core::time::Duration,
+        now: Millis,
+        last_heard: Millis,
+        interval_estimate_ms: u32,
+        seed_ms: u32,
         max_missed: u32,
     ) -> bool {
-        let expected = if interval_estimate.is_zero() {
-            seed
+        let expected_ms = if interval_estimate_ms == 0 {
+            seed_ms
         } else {
-            interval_estimate
+            interval_estimate_ms
         };
-        let budget = expected.saturating_mul(max_missed);
-        now.saturating_sub(last_heard) > budget
+        let budget_ms = expected_ms.saturating_mul(max_missed);
+        now.elapsed_since(last_heard) > budget_ms
     }
 
     /// Whether `path` has aged out as of `now`: true once `now` has advanced
     /// more than [`MAX_MISSED_OGMS`] of the path's *expected* OGM interval past
     /// its last refresh.  The expected interval is the path's learned cadence
-    /// ([`NeighborStats::interval_estimate`]), or `seed` until the second OGM
+    /// ([`NeighborStats::interval_estimate_ms`]), or `seed` until the second OGM
     /// has been measured.  Saturating arithmetic keeps the budget finite.
     ///
     /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
-    fn path_stale(
-        now: core::time::Duration,
-        path: &NeighborStats,
-        seed: core::time::Duration,
-    ) -> bool {
+    fn path_stale(now: Millis, path: &NeighborStats, seed_ms: u32) -> bool {
         Self::is_stale(
             now,
             path.last_heard,
-            path.interval_estimate,
-            seed,
+            path.interval_estimate_ms,
+            seed_ms,
             crate::MAX_MISSED_OGMS,
         )
     }
@@ -476,13 +528,15 @@ impl<
     /// cadence a stable link settles into), or
     /// [`DEFAULT_KEEPALIVE_INTERVAL`](crate::DEFAULT_KEEPALIVE_INTERVAL) if no
     /// interface has keep-alive configured.
-    fn keepalive_seed_interval(&self) -> core::time::Duration {
-        self.keepalive_timers
-            .iter()
-            .filter_map(|t| t.as_ref())
-            .map(|t| t.i_max())
-            .max()
-            .unwrap_or(crate::DEFAULT_KEEPALIVE_INTERVAL)
+    fn keepalive_seed_interval_ms(&self) -> u32 {
+        as_millis_u32(
+            self.keepalive_timers
+                .iter()
+                .filter_map(|t| t.as_ref())
+                .map(|t| t.i_max())
+                .max()
+                .unwrap_or(crate::DEFAULT_KEEPALIVE_INTERVAL),
+        )
     }
 
     /// Whether `neighbor` has missed its keep-alive budget as of `now`.
@@ -502,10 +556,10 @@ impl<
         match self.keepalive.get(&neighbor) {
             None => false,
             Some(stats) => Self::is_stale(
-                now,
+                Millis::from_duration(now),
                 stats.last_heard,
-                stats.interval_estimate,
-                self.keepalive_seed_interval(),
+                stats.interval_estimate_ms,
+                self.keepalive_seed_interval_ms(),
                 crate::MAX_MISSED_KEEPALIVES,
             ),
         }
@@ -517,12 +571,14 @@ impl<
     /// Falls back to [`DEFAULT_OGM_INTERVAL`] when no interface is configured.
     ///
     /// [`DEFAULT_OGM_INTERVAL`]: crate::DEFAULT_OGM_INTERVAL
-    fn seed_interval(&self) -> core::time::Duration {
-        self.ogm_timers
-            .iter()
-            .map(|t| t.i_max())
-            .max()
-            .unwrap_or(crate::DEFAULT_OGM_INTERVAL)
+    fn seed_interval_ms(&self) -> u32 {
+        as_millis_u32(
+            self.ogm_timers
+                .iter()
+                .map(|t| t.i_max())
+                .max()
+                .unwrap_or(crate::DEFAULT_OGM_INTERVAL),
+        )
     }
 
     /// Fold a freshly observed inter-OGM `gap` into a path's cadence estimate as
@@ -541,18 +597,15 @@ impl<
     /// the budget always covers the next, longer interval as the backoff grows,
     /// and only a neighbor that has genuinely gone silent ages out.  The gentle
     /// `×7/8` decay lets the estimate relax back down after a transient long gap.
-    fn blend_interval(
-        old: core::time::Duration,
-        gap: core::time::Duration,
-    ) -> core::time::Duration {
-        if old.is_zero() {
-            return gap;
+    fn blend_interval_ms(old_ms: u32, gap_ms: u32) -> u32 {
+        if old_ms == 0 {
+            return gap_ms;
         }
-        // Decay the held peak by 1/8, in nanos to stay no_std, then hold the max
-        // against the freshly observed gap.
-        let decayed =
-            core::time::Duration::from_nanos((old.as_nanos() * 7 / 8).min(u64::MAX as u128) as u64);
-        decayed.max(gap)
+        // Decay the held peak by 1/8, then hold the max against the freshly
+        // observed gap. Widened to `u64` for the multiply so the decay of a
+        // near-`u32::MAX` estimate cannot overflow.
+        let decayed_ms = (u64::from(old_ms) * 7 / 8) as u32;
+        decayed_ms.max(gap_ms)
     }
 
     /// Drop routing state that has aged out as of `now`: any individual path not
@@ -566,13 +619,15 @@ impl<
     ///
     /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
     pub fn purge_stale(&mut self, now: core::time::Duration) {
-        let seed = self.seed_interval();
+        let seed_ms = self.seed_interval_ms();
         let before = self.originator_table.len();
 
         let mut pruned_path = false;
         for record in self.originator_table.values_mut() {
             let paths_before = record.paths.len();
-            record.paths.retain(|p| !Self::path_stale(now, p, seed));
+            record
+                .paths
+                .retain(|p| !Self::path_stale(Millis::from_duration(now), p, seed_ms));
             pruned_path |= record.paths.len() != paths_before;
         }
         self.recompute_all_best(now);
@@ -583,6 +638,23 @@ impl<
         if self.originator_table.len() != before || pruned_path {
             self.topology_changed = true;
         }
+
+        // Bound the age of every stamp the engine still holds, so
+        // `Millis::elapsed_since`'s signed half-range is never approached. See
+        // [`STAMP_AGE_CEILING_MS`] — this enforces a precondition of the
+        // timestamp type rather than making a routing judgement, and by a day
+        // each of these is already stale under its own rule.
+        //
+        // Deliberately *not* folded into the ageing above: these tables are
+        // keyed by neighbour rather than by originator and have their own
+        // freshness rules (`proof_current`, `keepalive_missed`), which stay
+        // exactly as they were. Nothing observable changes at any age below the
+        // ceiling.
+        let now_ms = Millis::from_duration(now);
+        let recent = |stamp: &Millis| now_ms.elapsed_since(*stamp) < STAMP_AGE_CEILING_MS;
+        self.proven.retain(|_, (last, _)| recent(last));
+        self.challenged.retain(|_, (last, _)| recent(last));
+        self.keepalive.retain(|_, s| recent(&s.last_heard));
     }
 
     /// Recompute `best_next_hop` and `max_tq` from a record's current paths,
@@ -1099,6 +1171,7 @@ impl<
         local_quality: Option<u8>,
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
+        let now_ms = Millis::from_duration(now);
         let Ok((ogm, _)) = BatmanOgmPacket::read_from_prefix(&frame.payload) else {
             trace!("drop: malformed OGM");
             return RoutingAction::Consumed;
@@ -1184,18 +1257,20 @@ impl<
         if is_new_orig {
             // Table full: evict the least-recently-heard originator to make room
             // rather than dropping this newly heard one.
+            // Least-recently-heard is the *largest* elapsed, not the smallest
+            // stamp -- see `note_proven` and `interfaces::time`.
             if self.originator_table.len() >= MAX_ORIGINATORS
                 && let Some(oldest) = self
                     .originator_table
                     .values()
-                    .min_by_key(|r| r.last_heard)
+                    .max_by_key(|r| now_ms.elapsed_since(r.last_heard))
                     .map(|r| r.neighbor_ident)
             {
                 trace!(orig = ?oldest, "originator table full, evicting least-recently-heard");
                 self.originator_table.remove(&oldest);
             }
             let new_record = OriginatorRecord {
-                last_heard: now,
+                last_heard: now_ms,
                 neighbor_ident: orig_ident,
                 // Deliberately not `Some(frame.src)`: a first-contact sender
                 // is exactly what must not be installed before the proof gate
@@ -1307,7 +1382,7 @@ impl<
             // which cures the jam outright. Path liveness is tracked separately
             // in `NeighborStats::last_heard` below and is what routing reads.
             if admission.contents_are_current() {
-                record.last_heard = now;
+                record.last_heard = now_ms;
             }
 
             // Attenuate the advertised path TQ by one hop, then clamp it by our
@@ -1336,21 +1411,22 @@ impl<
                 // still heard, but the gap across the restart is not an
                 // interval it will ever emit at again.
                 if incoming_seqno > path.last_seqno {
-                    let gap = now.saturating_sub(path.last_heard);
-                    path.interval_estimate = Self::blend_interval(path.interval_estimate, gap);
+                    let gap_ms = now_ms.elapsed_since(path.last_heard);
+                    path.interval_estimate_ms =
+                        Self::blend_interval_ms(path.interval_estimate_ms, gap_ms);
                 }
                 path.last_tq = computed_tq;
                 path.last_seqno = incoming_seqno;
-                path.last_heard = now;
+                path.last_heard = now_ms;
             } else if record.paths.len() < 4 {
                 let _ = record.paths.push(NeighborStats {
                     neighbor_ident: frame.src,
                     last_tq: computed_tq,
                     last_seqno: incoming_seqno,
-                    last_heard: now,
+                    last_heard: now_ms,
                     // Unsampled until a second OGM gives a gap to measure; the
                     // seed budget covers the gap (see `path_stale`).
-                    interval_estimate: core::time::Duration::ZERO,
+                    interval_estimate_ms: 0,
                 });
             }
 
@@ -1534,23 +1610,26 @@ impl<
 
     /// Record one keep-alive heartbeat from `neighbor` at `now`: folds the
     /// observed gap into its learned cadence via the same peak-hold technique
-    /// as OGM paths ([`blend_interval`](Self::blend_interval)) on any second
+    /// as OGM paths ([`blend_interval_ms`](Self::blend_interval_ms)) on any second
     /// or later heartbeat, or arms a fresh entry on first sight. Evicts the
     /// least-recently-heard neighbor when the table is full, mirroring
     /// [`handle_ogm`](Self::handle_ogm)'s originator-table eviction.
     fn note_keepalive(&mut self, now: core::time::Duration, neighbor: Mac) {
+        let now_ms = Millis::from_duration(now);
         if let Some(stats) = self.keepalive.get_mut(&neighbor) {
-            let gap = now.saturating_sub(stats.last_heard);
-            stats.interval_estimate = Self::blend_interval(stats.interval_estimate, gap);
-            stats.last_heard = now;
+            let gap_ms = now_ms.elapsed_since(stats.last_heard);
+            stats.interval_estimate_ms =
+                Self::blend_interval_ms(stats.interval_estimate_ms, gap_ms);
+            stats.last_heard = now_ms;
             return;
         }
 
+        // Least-recently-heard is the largest elapsed -- see `note_proven`.
         if self.keepalive.len() >= MAX_ORIGINATORS
             && let Some(oldest) = self
                 .keepalive
                 .iter()
-                .min_by_key(|(_, s)| s.last_heard)
+                .max_by_key(|(_, s)| now_ms.elapsed_since(s.last_heard))
                 .map(|(m, _)| *m)
         {
             self.keepalive.remove(&oldest);
@@ -1558,8 +1637,8 @@ impl<
         let _ = self.keepalive.insert(
             neighbor,
             KeepAliveStats {
-                last_heard: now,
-                interval_estimate: core::time::Duration::ZERO,
+                last_heard: now_ms,
+                interval_estimate_ms: 0,
             },
         );
     }
@@ -1632,7 +1711,7 @@ impl<
                 && let Some(evicted) = self
                     .broadcast_seqno
                     .iter()
-                    .min_by_key(|(_, e)| e.last_updated)
+                    .max_by_key(|(_, e)| Millis::from_duration(now).elapsed_since(e.last_updated))
                     .map(|(m, _)| *m)
             {
                 trace!(orig = ?evicted, "broadcast dedup table full, evicting least-recently-updated");
@@ -2556,7 +2635,7 @@ mod tests {
 
     /// One keep-alive from a neighbor arms `keepalive_missed` (no longer
     /// unconditionally `false`); a second heartbeat folds the observed gap
-    /// into the learned `interval_estimate` via the same peak-hold technique
+    /// into the learned `interval_estimate_ms` via the same peak-hold technique
     /// as OGM paths.
     #[test]
     fn handle_rx_keepalive_arms_and_learns_gap() {
@@ -2588,8 +2667,8 @@ mod tests {
         );
 
         let stats = engine.keepalive.get(&mac(2)).expect("armed after 1st hb");
-        assert_eq!(stats.last_heard, core::time::Duration::ZERO);
-        assert_eq!(stats.interval_estimate, core::time::Duration::ZERO);
+        assert_eq!(stats.last_heard, Millis::ZERO);
+        assert_eq!(stats.interval_estimate_ms, 0);
 
         let frame2 = keepalive_frame(2, 1);
         let parsed2 = LinkFrame::ref_from_prefix(&frame2).unwrap().0;
@@ -2602,8 +2681,102 @@ mod tests {
             &mut (),
         );
         let stats = engine.keepalive.get(&mac(2)).unwrap();
-        assert_eq!(stats.last_heard, core::time::Duration::from_secs(5));
-        assert_eq!(stats.interval_estimate, core::time::Duration::from_secs(5));
+        assert_eq!(stats.last_heard, Millis::from_millis(5_000));
+        assert_eq!(stats.interval_estimate_ms, 5_000);
+    }
+
+    /// `Millis::elapsed_since` clamps a gap past its 24.8-day signed half-range
+    /// to **zero**, which reads as "just now". That is the right answer for a
+    /// clock that stepped backwards and exactly the wrong one for a stamp that
+    /// is genuinely ancient — so nothing in these tables may be allowed to get
+    /// that old.
+    ///
+    /// Only `purge_stale` can enforce it. `proven`, `challenged` and
+    /// `keepalive` are otherwise removed only when their table is full, on a
+    /// revocation, or on a re-anchor, so an entry for a neighbour that walked
+    /// away sits untouched forever. Past the half-range its proof reads as
+    /// current and it stops being re-challenged — the freshness gate silently
+    /// `Millis::elapsed_since` clamps a gap past its 24.8-day signed half-range
+    /// to **zero**, which reads as "just now". That is the right answer for a
+    /// clock that stepped backwards and exactly the wrong one for a stamp that
+    /// is genuinely ancient — so nothing in these tables may be allowed to get
+    /// that old.
+    ///
+    /// Only `purge_stale` can enforce it. `proven`, `challenged` and
+    /// `keepalive` are otherwise removed only when their table is full, on a
+    /// revocation, or on a re-anchor, so an entry for a neighbour that walked
+    /// away sits untouched for as long as the node runs. Past the half-range
+    /// its proof reads as current and it stops being re-challenged — the
+    /// freshness gate silently stops holding.
+    #[test]
+    fn a_day_old_proof_is_dropped_before_its_stamp_can_wrap() {
+        let secs = core::time::Duration::from_secs;
+        let mut engine: BatmanEngine<16> = BatmanEngine::new(mac(1));
+        engine.set_require_proof(true);
+        engine.note_proven(secs(0), mac(2), 0);
+        assert!(
+            engine.proof_current(secs(1), mac(2)),
+            "fresh a second later"
+        );
+
+        engine.purge_stale(secs(25 * 3600));
+        assert!(
+            !engine.proven.contains_key(&mac(2)),
+            "past the stamp ceiling the record is dropped, not left to wrap"
+        );
+        assert!(
+            engine.proof_needs_refresh(secs(25 * 3600), mac(2)),
+            "and the neighbour is challenged again rather than trusted"
+        );
+    }
+
+    /// The ceiling is enforced while the stamp is still *readable*, which is
+    /// why it lives on the periodic path. A single jump past the half-range
+    /// cannot be detected — age is measured with the very function the ceiling
+    /// defends — and no shell produces one, because every one of them purges
+    /// on its Trickle tick. Pinned so the limitation is stated rather than
+    /// discovered.
+    #[test]
+    fn the_ceiling_needs_purge_to_run_before_the_half_range() {
+        let secs = core::time::Duration::from_secs;
+        let mut engine: BatmanEngine<16> = BatmanEngine::new(mac(1));
+        engine.note_proven(secs(0), mac(2), 0);
+
+        engine.purge_stale(secs(30 * 24 * 3600));
+        assert!(
+            engine.proven.contains_key(&mac(2)),
+            "not a bug to fix here but a precondition to keep: a shell that \
+             skipped a month of ticks is outside what this can repair"
+        );
+    }
+
+    /// The same ceiling for the keep-alive table, which feeds the liveness
+    /// The same ceiling for the keep-alive table, which feeds the liveness
+    /// overlay `next_hop` reads — and it must leave that table's own rule
+    /// untouched at every age below it.
+    #[test]
+    fn a_day_old_keepalive_record_is_dropped_before_its_stamp_can_wrap() {
+        let secs = core::time::Duration::from_secs;
+        let mut engine: BatmanEngine<16> = BatmanEngine::new(mac(1));
+        engine.note_keepalive(secs(0), mac(2));
+        engine.note_keepalive(secs(5), mac(2));
+
+        engine.purge_stale(secs(60));
+        assert!(
+            engine.keepalive.contains_key(&mac(2)),
+            "still within the day"
+        );
+        assert!(
+            engine.keepalive_missed(secs(60), mac(2)),
+            "and still deprioritised by its own rule, which the ceiling leaves alone"
+        );
+
+        engine.purge_stale(secs(25 * 3600));
+        assert!(
+            !engine.keepalive.contains_key(&mac(2)),
+            "past the ceiling it is dropped; left in place its stamp would wrap \
+             and report a month-dead peer as live"
+        );
     }
 
     /// A keep-alive from a neighbor with no OGM-established originator-table
@@ -4284,7 +4457,7 @@ mod tests {
             assert_ne!(*orig, engine.self_ident, "own ident must never be tracked");
             if let Some(watch) = entry.resync_watch {
                 assert!(
-                    watch.since >= entry.last_updated,
+                    watch.since.is_at_or_after(entry.last_updated),
                     "a watch is opened by a refusal, which always postdates the \
                      last acceptance"
                 );
@@ -4440,7 +4613,7 @@ mod tests {
         let entry = engine.broadcast_seqno.get(&mac(2)).expect("entry");
         assert_eq!(
             entry.last_updated,
-            secs(0),
+            Millis::ZERO,
             "a duplicate must not refresh the eviction key"
         );
     }
@@ -4578,7 +4751,7 @@ mod tests {
                 .get(&mac(2))
                 .expect("entry")
                 .last_updated,
-            later,
+            Millis::from_duration(later),
             "a resync writes the high-water, so it must restamp the eviction key \
              too — the one thing `SeqnoAdmission::high_water_written` is for, and \
              not something the verdict alone can tell a caller"

@@ -50,14 +50,16 @@ extern crate alloc;
 
 // Host builds compile the formatter for its unit tests but link no transport,
 // so every `LineBuf` method is unused there.
+#[cfg(target_os = "none")]
+mod bare;
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 mod fmt;
-#[cfg(target_os = "none")]
-mod rtt;
 
 mod clock;
 mod filter;
 mod ring;
+#[cfg(target_os = "none")]
+mod sink;
 #[cfg(feature = "subscriber")]
 pub mod subscriber;
 mod sync;
@@ -97,5 +99,5 @@ pub use sync::Lock;
 /// called; only the sinks that feed them are installed here.
 pub fn init() {
     #[cfg(target_os = "none")]
-    rtt::init();
+    bare::init();
 }

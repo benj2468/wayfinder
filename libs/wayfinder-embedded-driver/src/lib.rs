@@ -439,6 +439,10 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
     /// Build a driver for node `mac` over the given mesh `links` and `clock`,
     /// at the default capacities. See
     /// [`with_capacities`](Driver::with_capacities) for the arguments.
+    /// `#[inline(never)]` for the reason given on
+    /// [`with_capacities`](Driver::with_capacities): this returns the same
+    /// oversized value and must not be built in a caller's poll frame.
+    #[inline(never)]
     pub fn new(
         mac: Mac,
         links: [L; N],
@@ -477,6 +481,17 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterAuthOp
     /// [`LinkFeatures::default`] (full participation) / unnamed.
     ///
     /// [`LinkFeatures::default`]: wayfinder::features::LinkFeatures
+    /// `#[inline(never)]` is load-bearing on a board, not a codegen hint. A
+    /// `Driver` is tens of kilobytes (it owns the router and every link), and
+    /// a board builds one inside its `async` main. Inlined, the constructor's
+    /// result is materialised in a *stack temporary* that the enclosing
+    /// coroutine's poll prologue reserves — and an executor holds a task's
+    /// poll frame for the task's whole life, so that temporary becomes
+    /// permanently-reserved stack rather than transient. Out of line, the
+    /// caller passes the coroutine's own slot as the return pointer and no
+    /// temporary exists. Under LTO this was worth 13 KB of the STM32F411's
+    /// stack, enough to fail `scripts/stack-budget.py`.
+    #[inline(never)]
     pub fn with_capacities(
         mac: Mac,
         links: [L; N],

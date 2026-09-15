@@ -98,6 +98,18 @@ wayfinder-driver-core = { path = "./libs/wayfinder-driver-core" }
 wayfinder-driver = { path = "./libs/wayfinder-driver" }
 wayfinder-embedded-driver = { path = "./libs/wayfinder-embedded-driver" }
 wayfinder-client = { path = "./libs/wayfinder-client" }
+# **No features here, and that is deliberate.** Cargo features are additive and
+# unify across the graph, so anything this shared entry turns on can never be
+# turned off by a crate downstream of it. Naming `ring` here looked like the fix
+# for a host `GetLogs` outage and was not: it reached `bins/wayfinder-stm32f411`
+# through `wayfinder-alarm` and silently put back the 16,416-byte ring that
+# board's `default-features = false` exists to drop, with nothing failing to say
+# so.
+#
+# So the **leaf binary** decides. A host node or a board that serves `GetLogs`
+# names `ring` in its own manifest; a crate in the middle inherits whatever the
+# binary linking it chose. Library *tests* that need a live ring name it in
+# `[dev-dependencies]`, which downstream consumers do not see at all.
 wayfinder-log = { path = "./libs/wayfinder-log", default-features = false }
 wayfinder-version = { path = "./libs/wayfinder-version" }
 wayfinder-alarm = { path = "./libs/wayfinder-alarm", default-features = false }

@@ -193,3 +193,54 @@ fn a_ping_session_stays_small_enough_for_a_board() {
          an nRF52840, so growing it past 512 B should be a deliberate call"
     );
 }
+
+/// Every occupancy gauge must report the *router's own* capacity, not the
+/// crate default.
+///
+/// These are `(used, capacity)` pairs the management API serves as
+/// current-vs-capacity gauges, and the capacity half was read from the
+/// crate-wide constants — so a profiled node reported a gateway's numbers. An
+/// ESP32 at 32 originators answered `GetMetrics` with `originators: 0/128`,
+/// found by pointing `wayfinderctl` at a real board.
+///
+/// It is the constrained node that this metric exists for: "how full is the
+/// routing table" is the question a 32-entry table raises and a 128-entry one
+/// does not, and reporting 128 understates occupancy by exactly the factor that
+/// matters.
+#[test]
+fn occupancy_gauges_report_the_profile_capacity() {
+    let tiny = TinyRouter::with_capacities(mac(1));
+
+    assert_eq!(
+        tiny.originator_occupancy(),
+        (0, 16),
+        "the originator table is the profile's 16, not the crate's 128"
+    );
+    assert_eq!(
+        tiny.broadcast_dedup_occupancy(),
+        (0, 16),
+        "broadcast dedup is bounded by the same originator capacity"
+    );
+    assert_eq!(
+        tiny.local_mcast_occupancy(),
+        (0, 4),
+        "locally joined groups are the profile's 4"
+    );
+    assert_eq!(
+        tiny.mcast_member_occupancy(),
+        (0, 8),
+        "mesh-wide memberships are the profile's 8"
+    );
+}
+
+/// The host profile keeps reporting today's numbers, so this is a fix to the
+/// *profiled* case rather than a change to what a gateway says.
+#[test]
+fn a_host_router_still_reports_the_crate_capacities() {
+    let host = CentralRouter::new(mac(1));
+
+    assert_eq!(host.originator_occupancy(), (0, 128));
+    assert_eq!(host.broadcast_dedup_occupancy(), (0, 128));
+    assert_eq!(host.local_mcast_occupancy(), (0, 16));
+    assert_eq!(host.mcast_member_occupancy(), (0, 64));
+}

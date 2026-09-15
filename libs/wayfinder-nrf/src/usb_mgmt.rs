@@ -327,6 +327,13 @@ async fn serve_forever(stream: &mut CdcAcmStream, query_tx: &EmbeddedQueryTx<'_>
             Err(e @ FrameError::Oversized(_)) => {
                 warn!(?e, "management link reset: oversized frame");
             }
+            // A zero-length prefix: the stream is carrying something that is
+            // not framing (a break, or an idle line read as zero bytes), and
+            // there is no marker to resynchronise on. Reset rather than answer
+            // it — see `read_frame`.
+            Err(FrameError::Empty) => {
+                debug!("management link reset: zero-length frame");
+            }
             Ok(()) => unreachable!("serve only returns via an error"),
         }
 
