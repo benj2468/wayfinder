@@ -8,7 +8,7 @@
 //! [`crate::identity`]'s record: the record is *what* is kept, this is *who*
 //! writes it.
 //!
-//! Designed in `docs/design/22-embedded-node-record.md` §4.1.
+//! Designed in `docs/design/implemented/22-embedded-node-record.md` §4.1.
 //!
 //! # Two shapes of the same state
 //!
@@ -21,6 +21,10 @@
 //! are only ever advanced together, and a persist that fails advances neither.
 
 use alloc::string::String;
+
+use wayfinder_protos::service::RenewalProviderData;
+use wayfinder_protos::service::RenewalTargetData;
+use wayfinder_protos::service::SharedSecret;
 
 use wayfinder_server::NodeIdentity;
 use wayfinder_server::NodeSettings;
@@ -96,11 +100,25 @@ fn project(record: &NodeRecord) -> NodeSettings {
                 seed: record.seed.to_vec(),
                 cert: cert.to_vec(),
                 trust_anchor: trust_anchor.to_vec(),
-                // Never persisted, so never presented. A board cannot renew
-                // its own certificate — the embedded mgmt arm discards the
-                // target for the same reason — and reporting one would be a
-                // claim about something this node will not do. Design 22 §4.2.
-                provider: None,
+                // The pinned key and nothing else, because that is all the
+                // record keeps — see `NodeRecord::renewal_provider_key`. A
+                // board renews over the mesh (design 24), so it has no use for
+                // the socket address or the enrollment token a host's client
+                // connection presents, and reporting either would be a claim
+                // about something this node does not do.
+                //
+                // Design 22 §4.2 had this as a flat `None`, on the reasoning
+                // that a board cannot renew at all. That reasoning is what
+                // design 24 overturned.
+                provider: record
+                    .renewal_provider_key
+                    .map(|node_key| RenewalProviderData {
+                        target: RenewalTargetData {
+                            address: String::new(),
+                            node_key,
+                        },
+                        enrollment_token: SharedSecret::new(""),
+                    }),
             }),
         self_revocation: record.self_revocation.map(|r| r.to_vec()),
     }
@@ -121,6 +139,10 @@ fn apply(base: &NodeRecord, settings: &NodeSettings) -> Result<NodeRecord, Strin
         next.seed = fixed(&identity.seed, "seed")?;
         next.cert = Some(fixed(&identity.cert, "certificate")?);
         next.trust_anchor = Some(fixed(&identity.trust_anchor, "trust anchor")?);
+        // Replaced wholesale with the credential it arrived beside, never
+        // merged: an install naming no provider leaves none behind, so a board
+        // re-enrolled somewhere else stops renewing against where it was.
+        next.renewal_provider_key = identity.provider.as_ref().map(|p| p.target.node_key);
     }
 
     // `settings` is always a *merged* value, and `NodeSettings::merge` has
@@ -201,10 +223,11 @@ where
         // place that remembers a change the medium does not.
         //
         // Projected from the record rather than assigned from `merged`, so the
-        // two cannot differ in *content* either. They could: the record drops
-        // the renewal provider on purpose (§4.2), and a view carrying one the
-        // medium does not would report a renewal target that vanishes at the
-        // next reset — the same durable lie §4.2 refuses, told in memory.
+        // two cannot differ in *content* either. They could: the record keeps
+        // only the pinned half of a renewal provider (design 24 §4.4), and a
+        // view carrying the address and token the medium does not would report
+        // a renewal target that vanishes at the next reset — a durable lie told
+        // in memory.
         self.view = project(self.record.get());
         Ok(())
     }
@@ -564,14 +587,23 @@ mod tests {
         assert!(err.contains("trust anchor"), "got: {err}");
         assert_eq!(store.settings().identity, None);
     }
-
-    /// **The renewal provider is deliberately dropped.** A board cannot renew
-    /// its own certificate — that path is the host driver's tokio loop, and
-    /// the embedded mgmt arm already discards the target for the same reason.
-    /// Persisting one would be a durable claim about something this node will
-    /// never do. Design 22 §4.2.
+    /// **A board persists the authority it renews against.**
+    ///
+    /// This replaces `a_renewal_provider_is_not_persisted`, which guarded the
+    /// opposite behaviour and is deleted here because design 24 makes it false.
+    /// The comment it stood on said a board "cannot renew its own certificate",
+    /// which was true only because renewal meant opening a client connection
+    /// and a board has no IP stack to open one with. It is a routing member of
+    /// a mesh the authority is also on, so it renews over that.
+    ///
+    /// What is kept is the provider's **pinned key** and nothing else. The MAC
+    /// to route a renewal to is derived from it (design 09 §5), so storing both
+    /// would store one fact twice with the two able to disagree; the socket
+    /// address and the enrollment token are for the client connection a board
+    /// will never open, and keeping them would be a durable claim about
+    /// something this node does not do.
     #[test]
-    fn a_renewal_provider_is_not_persisted() {
+    fn a_board_persists_the_provider_it_renews_against() {
         use wayfinder_protos::service::RenewalProviderData;
         use wayfinder_protos::service::RenewalTargetData;
         use wayfinder_protos::service::SharedSecret;
@@ -585,7 +617,7 @@ mod tests {
                             address: "ca.example:7700".into(),
                             node_key: [0x0B; 32],
                         },
-                        enrollment_token: SharedSecret::new(""),
+                        enrollment_token: SharedSecret::new("s3cret"),
                     }),
                     ..identity(0x17)
                 }),
@@ -593,13 +625,22 @@ mod tests {
             })
             .unwrap();
 
+        let reloaded = reload(medium);
+        let provider = reloaded
+            .settings()
+            .identity
+            .as_ref()
+            .and_then(|i| i.provider.clone())
+            .expect("the authority to renew against survives a reset");
+        assert_eq!(provider.target.node_key, [0x0B; 32]);
         assert_eq!(
-            reload(medium)
-                .settings()
-                .identity
-                .as_ref()
-                .and_then(|i| i.provider.as_ref()),
-            None,
+            provider.target.address, "",
+            "a board keeps no socket address: it has no stack to dial one with"
+        );
+        assert_eq!(
+            provider.enrollment_token.expose(),
+            "",
+            "and no enrollment token, which only the client connection would present"
         );
     }
 

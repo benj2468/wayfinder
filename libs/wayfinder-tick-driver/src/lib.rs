@@ -37,11 +37,13 @@ use wayfinder::CentralRouter;
 use wayfinder::MAX_INTERFACES;
 use wayfinder::McastPlan;
 use wayfinder::auth::MAX_TRAILER_LEN;
+use wayfinder::auth::VerifiedRenewal;
 use wayfinder::config::TrickleConfig;
 use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
 use wayfinder_driver_core::OutgoingFrame;
@@ -51,6 +53,7 @@ use wayfinder_driver_core::poll_due_challenges;
 use wayfinder_driver_core::poll_due_keepalives;
 use wayfinder_driver_core::poll_due_ogms;
 use wayfinder_driver_core::poll_due_pings;
+use wayfinder_driver_core::poll_due_renewal;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -452,11 +455,71 @@ impl Driver {
         // caller started, not to a schedule the caller steps. The router paces
         // it from `now`, so ticking often does not mean probing often.
         poll_due_pings(&mut self.router, now, &mut self.tx_buffer, &mut stage);
+        // And unconditional again: a renewal is owed to the credential this
+        // node holds, not to anything the caller steps. The router paces it at
+        // `RENEWAL_POLL_INTERVAL` and answers `None` outside the window, so a
+        // node with no credential — which is most of a simulation — pays two
+        // comparisons per tick.
+        poll_due_renewal(&mut self.router, now, &mut self.tx_buffer, &mut stage);
 
         for staged in stage.frames.drain(..) {
             self.dispatch_one(now, staged);
         }
         self.local_rx.extend(stage.local.drain(..));
+    }
+
+    /// Answer every membership renewal this node has verified and not yet
+    /// replied to, deciding each with `issue`.
+    ///
+    /// The synchronous counterpart of `wayfinder-driver`'s
+    /// `poll_mesh_renewals` — the provider end of design 24's exchange, for a
+    /// caller that drives its own clock. The router has already done
+    /// everything decidable without policy: the requester's certificate
+    /// verified against the trust anchor, is not revoked, and its holder proved
+    /// possession of the key it names. What `issue` decides is the part this
+    /// crate must not know about — whether this node is an authority at all,
+    /// and whether that identity is still a holder it will re-issue for.
+    ///
+    /// A closure rather than a certificate-authority argument, deliberately.
+    /// This crate is `no_std` + `alloc` and a `CertAuthority` is a host type
+    /// that persists to a filesystem; taking one would put the whole authority
+    /// in the dependency graph of a simulation that mostly does not run one.
+    ///
+    /// `issue` returning `None` sends nothing. A `RenewReply` carries a
+    /// certificate or it does not exist, so a refusal reaches the asker as
+    /// silence and then as the gap between its own counters.
+    pub fn serve_mesh_renewals(
+        &mut self,
+        now: Duration,
+        mut issue: impl FnMut(&VerifiedRenewal) -> Option<MembershipCert>,
+    ) {
+        // One, not a loop: the router holds a single verified request and
+        // displaces rather than queues, and nothing refills that slot between
+        // iterations here — so a second take would always be `None`.
+        let Some(verified) = self.router.take_renewal_request() else {
+            return;
+        };
+        let Some(cert) = issue(&verified) else {
+            return;
+        };
+        let staged = {
+            let Some(frame) =
+                self.router
+                    .send_renew_reply(now, verified.mac, &cert, &mut self.tx_buffer)
+            else {
+                // The route the request arrived over has gone since. The
+                // certificate is issued either way and the asker retries.
+                trace!(requester = ?verified.mac, "drop: no route back to a renewing node");
+                return;
+            };
+            StagedFrame {
+                dst: frame.dst,
+                protocol: frame.protocol,
+                payload: frame.payload.to_vec(),
+                egress: Egress::Auto,
+            }
+        };
+        self.dispatch_one(now, staged);
     }
 
     /// Resolve one staged frame's egress (tagging it for pairwise auth first,

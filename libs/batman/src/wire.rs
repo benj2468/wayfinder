@@ -92,6 +92,24 @@ pub enum BatmanPacketType {
     /// counterpart.  Header: [`BatmanEchoPacket`], the request's pad bytes
     /// echoed verbatim as body.
     EchoReply = 0x0b,
+    /// A membership-certificate renewal request, routed hop-by-hop toward the
+    /// certificate authority's mesh address. Wayfinder-specific, no batman-adv
+    /// counterpart.
+    ///
+    /// Its own packet type rather than a [`BatmanPacketType::Unicast`] payload
+    /// for the same reason [`BatmanPacketType::CertReq`] is: credential-control
+    /// traffic stays identifiable on the wire, separate from data, so a
+    /// dissector and an operator can both see it — and it keeps the frame off
+    /// the host TAP by construction, since a local delivery of this type
+    /// terminates in auth state rather than in the local device.  Header:
+    /// [`BatmanRenewReqPacket`], the requester's `MembershipCert` + signature
+    /// as body.
+    RenewReq = 0x0c,
+    /// The answer to a [`BatmanPacketType::RenewReq`]: a freshly issued
+    /// `MembershipCert`, routed hop-by-hop back toward the node that asked.
+    /// Wayfinder-specific, no batman-adv counterpart.  Header:
+    /// [`BatmanRenewReplyPacket`], the re-issued certificate as body.
+    RenewReply = 0x0d,
 }
 
 impl BatmanPacketType {
@@ -118,6 +136,8 @@ impl BatmanPacketType {
             0x09 => Some(Self::NextHopResponse),
             0x0a => Some(Self::EchoRequest),
             0x0b => Some(Self::EchoReply),
+            0x0c => Some(Self::RenewReq),
+            0x0d => Some(Self::RenewReply),
             _ => None,
         }
     }
@@ -727,6 +747,42 @@ pub struct BatmanCertReplyPacket {
     pub dest: Mac,
 }
 
+/// Header for a [`BatmanPacketType::RenewReq`] packet. Structurally a unicast
+/// header: the requester's `MembershipCert` followed by a signature (see the
+/// router's renewal-request logic) follows it, and the packet is routed hop by
+/// hop toward `dest` — the certificate authority's mesh address, recorded by
+/// the enrollment that certified this node — TTL-limited, delivered to the
+/// local auth state on arrival at `dest`.
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct BatmanRenewReqPacket {
+    /// Always [`BatmanPacketType::RenewReq`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+    /// Time-to-live, decremented per hop to prevent routing loops.
+    pub ttl: u8,
+    /// The certificate authority this request is routed toward.
+    pub dest: Mac,
+}
+
+/// Header for a [`BatmanPacketType::RenewReply`] packet. Structurally a unicast
+/// header: the re-issued `MembershipCert` follows it, and the packet is routed
+/// hop by hop back toward `dest` — the node that asked to renew — TTL-limited,
+/// delivered to the local auth state on arrival at `dest`.
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct BatmanRenewReplyPacket {
+    /// Always [`BatmanPacketType::RenewReply`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+    /// Time-to-live, decremented per hop to prevent routing loops.
+    pub ttl: u8,
+    /// The renewing node this reply is addressed back to.
+    pub dest: Mac,
+}
+
 /// Header for both halves of the reachability-probe pair
 /// ([`BatmanPacketType::EchoRequest`] and [`BatmanPacketType::EchoReply`]) —
 /// one struct, because a reply is the request with the addresses swapped and
@@ -1002,6 +1058,8 @@ mod tests {
         assert_eq!(BatmanPacketType::NextHopResponse.as_u8(), 0x09);
         assert_eq!(BatmanPacketType::EchoRequest.as_u8(), 0x0a);
         assert_eq!(BatmanPacketType::EchoReply.as_u8(), 0x0b);
+        assert_eq!(BatmanPacketType::RenewReq.as_u8(), 0x0c);
+        assert_eq!(BatmanPacketType::RenewReply.as_u8(), 0x0d);
     }
 
     /// `from_u8` is the exact inverse of `as_u8` over the known types, and
@@ -1021,12 +1079,14 @@ mod tests {
             BatmanPacketType::NextHopResponse,
             BatmanPacketType::EchoRequest,
             BatmanPacketType::EchoReply,
+            BatmanPacketType::RenewReq,
+            BatmanPacketType::RenewReply,
         ];
         for ty in all {
             assert_eq!(BatmanPacketType::from_u8(ty.as_u8()), Some(ty));
         }
         assert_eq!(BatmanPacketType::from_u8(0x00), None);
-        assert_eq!(BatmanPacketType::from_u8(0x0c), None);
+        assert_eq!(BatmanPacketType::from_u8(0x0e), None);
         assert_eq!(BatmanPacketType::from_u8(0xff), None);
     }
 
@@ -1067,6 +1127,44 @@ mod tests {
         let (parsed, _) = BatmanCertReqPacket::ref_from_prefix(req.as_bytes()).unwrap();
         assert_eq!(parsed.packet_type, BatmanPacketType::CertReq.as_u8());
         assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 9]));
+    }
+
+    /// `BatmanRenewReqPacket`/`BatmanRenewReplyPacket` are cut from the same
+    /// pattern as the cert-control pair and so must keep the same layout: all
+    /// four share **one** generic relay in the engine
+    /// (`handle_credential_control`), which reads `dest` and `ttl` through a
+    /// trait that assumes this shape, so a header that drifted would relay by
+    /// reading a `dest` out of the wrong offset.
+    #[test]
+    fn renew_packets_mirror_unicast_layout() {
+        assert_eq!(
+            core::mem::size_of::<BatmanRenewReqPacket>(),
+            core::mem::size_of::<BatmanUnicastPacket>()
+        );
+        assert_eq!(
+            core::mem::size_of::<BatmanRenewReplyPacket>(),
+            core::mem::size_of::<BatmanUnicastPacket>()
+        );
+
+        let req = BatmanRenewReqPacket {
+            packet_type: BatmanPacketType::RenewReq.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 10,
+            dest: Mac([0, 0, 0, 0, 0, 9]),
+        };
+        let (parsed, _) = BatmanRenewReqPacket::ref_from_prefix(req.as_bytes()).unwrap();
+        assert_eq!(parsed.packet_type, BatmanPacketType::RenewReq.as_u8());
+        assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 9]));
+
+        let reply = BatmanRenewReplyPacket {
+            packet_type: BatmanPacketType::RenewReply.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 10,
+            dest: Mac([0, 0, 0, 0, 0, 1]),
+        };
+        let (parsed, _) = BatmanRenewReplyPacket::ref_from_prefix(reply.as_bytes()).unwrap();
+        assert_eq!(parsed.packet_type, BatmanPacketType::RenewReply.as_u8());
+        assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 1]));
     }
 
     /// `BatmanEchoPacket` round-trips through `zerocopy` parsing, and its

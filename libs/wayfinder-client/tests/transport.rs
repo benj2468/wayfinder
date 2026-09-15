@@ -584,6 +584,13 @@ async fn client_roundtrips_against_real_tls_server() {
                 wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
                     let _ = reply.send(Ok(()));
                 }
+                // Unreachable here: a mesh renewal arrives from a router loop,
+                // and this harness drives a client over a socket.
+                wayfinder_server::AuthorityCommand::RenewOverMesh { reply, .. } => {
+                    let _ = reply.send(Ok(wayfinder_server::RenewalOutcome::Refused(
+                        "this harness does not renew".into(),
+                    )));
+                }
             }
         }
     });

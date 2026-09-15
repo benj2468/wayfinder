@@ -504,6 +504,17 @@ pub fn security(v: &GetSecurityStatusResponse, fmt: OutputFormat) -> anyhow::Res
             },
             v.revocation_count,
         );
+        // Mesh renewal (design 24), shown only once this node has asked: a host
+        // renews over its management API and leaves both at zero, where a line
+        // reading "0 / 0" would look like a failure rather than a path this
+        // node does not use. The pair is the signal — a node asking and never
+        // being answered is invisible in either number alone.
+        if v.renewal_requests_sent > 0 {
+            out.push_str(&format!(
+                "\nmesh renewals: {} asked / {} answered",
+                v.renewal_requests_sent, v.renewal_replies_accepted
+            ));
+        }
         if v.nodes.is_empty() {
             out.push_str("\n\nno originators known");
             return out;

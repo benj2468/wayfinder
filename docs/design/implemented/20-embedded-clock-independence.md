@@ -31,6 +31,15 @@ Owns GitLab #51, subsumes #54, unblocks #53, and imposes a hard constraint on
 - `libs/wayfinder-client`, `bins/wayfinder-ctl` — stamp the time, and refuse to
   when the host cannot vouch for it.
 
+> **`auth.rs` is now `auth/`.** Every `libs/wayfinder/src/auth.rs` path and
+> line number below is as of this design. That file was split one-file-per-
+> exchange during MR !191 — `auth/{mod,ogm,pairwise,revocation,proof,
+> distribution,renewal,paths}.rs` — and `OgmAuth` now builds its own
+> control-plane frames rather than leaving `CentralRouter` to assemble them.
+> The reasoning in this document is unaffected; only the addresses moved. See
+> `libs/wayfinder/CLAUDE.md` for the current map.
+
+
 **Explicitly not touched:**
 
 - **The certificate format, the trust anchor, the OGM signature scheme, the
@@ -39,6 +48,12 @@ Owns GitLab #51, subsumes #54, unblocks #53, and imposes a hard constraint on
   mean, not how many there are.
 - **Host routing behaviour.** A host with a working clock behaves as today.
 - **Cert renewal on embedded.** A board still cannot renew itself.
+
+  > **Note (design 24).** A scope boundary for *this* design, and no longer a
+  > property of the system: a board renews over the mesh now. Design 24 §4.5
+  > leans on §4.2's clock posture below to decide *when* it asks — a floor can
+  > prove an instant is past and never that one is still ahead, so a board
+  > proves it is due and lets the authority judge expiry.
 
 ## 2. Motivation
 

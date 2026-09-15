@@ -165,6 +165,8 @@ impl Default for Mock {
                 // Enrolled online, so the node knows where it renews — the
                 // ordinary state for a node the dashboard enrolled, and the one
                 // whose Security tab has a target to render.
+                renewal_requests_sent: 0,
+                renewal_replies_accepted: 0,
                 renewal_provider: Some(RenewalTargetData {
                     address: "ca.example:7700".into(),
                     node_key: [9u8; 32],
@@ -210,6 +212,8 @@ impl Mock {
                 self_revocation_not_after: 0,
                 // Never enrolled, so nowhere to renew: the credential and the
                 // provider that issued it arrive together or not at all.
+                renewal_requests_sent: 0,
+                renewal_replies_accepted: 0,
                 renewal_provider: None,
             },
             enrollment_token: None,
@@ -1029,6 +1033,14 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
                     }
                     wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(update, reply) => {
                         let _ = reply.send(provider.apply_enrollment_policy(&update));
+                    }
+                    // Unreachable in the mock: a mesh renewal arrives from a
+                    // router loop, and this node has no mesh. Answered rather
+                    // than ignored so nothing can hang on a dropped oneshot.
+                    wayfinder_server::AuthorityCommand::RenewOverMesh { reply, .. } => {
+                        let _ = reply.send(Ok(wayfinder_server::RenewalOutcome::Refused(
+                            "the mock node does not renew over a mesh".into(),
+                        )));
                     }
                 },
                 else => break,

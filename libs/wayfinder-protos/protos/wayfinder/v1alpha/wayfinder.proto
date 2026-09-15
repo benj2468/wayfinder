@@ -205,6 +205,24 @@ message GetSecurityStatusResponse {
   // log, browser and cache on the way; the same reason EnrollmentPolicyStatus
   // stopped reporting the token it used to.
   RenewalProviderStatus renewal_provider = 15;
+
+  // How many membership-certificate renewal requests this node has put on the
+  // **mesh** since boot, and how many re-issued certificates it has accepted.
+  //
+  // Two counters because the **gap between them** is the signal, and neither
+  // number alone carries it.  A node that is asking and never being answered —
+  // partitioned from its authority, or no longer a holder it recognises — looks
+  // identical to a healthy node in the first and identical to a node that has
+  // not started asking in the second.
+  //
+  // Mesh renewal only (design 24), which is the path a node with no IP stack
+  // takes.  A node that renews over this management API against a recorded
+  // provider address leaves both at zero, and reports that renewal through
+  // cert_due_renewal and renewal_provider instead.
+  uint64 renewal_requests_sent = 16;
+
+  // Re-issued certificates accepted and installed; see renewal_requests_sent.
+  uint64 renewal_replies_accepted = 17;
 }
 
 // Where a node renews the membership certificate it currently holds: the
@@ -557,6 +575,16 @@ enum AlarmKind {
   // itself on restart.  Distinct from ALARM_KIND_IDENTITY_CONFLICT, which is
   // two keys claiming one address and is about somebody else.
   ALARM_KIND_CERTIFIED_ADDRESS_MISMATCH = 12;
+
+  // A renewed membership certificate was installed in memory but could not be
+  // written to durable storage, so this node is running under it now and will
+  // come back to the previous one after a reset.
+  //
+  // Distinct from ALARM_KIND_CERT_EXPIRING rather than folded into it: that row
+  // is retired by the poll that finds the node no longer due, which is what a
+  // successful renewal produces — so sharing a kind would have the renewal
+  // delete the report that it was not made durable.
+  ALARM_KIND_CERT_NOT_DURABLE = 13;
 }
 
 // One latched condition the node is holding.

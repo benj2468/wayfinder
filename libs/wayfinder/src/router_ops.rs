@@ -13,6 +13,13 @@
 //! at the point a node picks its profile, via
 //! [`define_profile!`](crate::define_profile) and [`router_for!`](crate::router_for).
 //!
+//! [`RouterAuthOps`] is a **sibling** carrying the four credential verbs —
+//! `poll_challenge`/`next_challenge_after`, `poll_renewal`/`next_renewal_after`.
+//! Nothing on it is a routing decision: they drive exchanges that belong to
+//! [`auth`](crate::auth), which builds their frames and only borrows a
+//! [`Paths`](crate::auth::Paths) view to address them. See its own docs for
+//! what the narrower bound buys.
+//!
 //! # Scope
 //!
 //! Deliberately the *driver* surface, not everything a `CentralRouter` can do.
@@ -194,24 +201,11 @@ pub trait RouterOps {
     /// could not emit. See [`CentralRouter::record_mcast_group_drop`].
     fn record_mcast_group_drop(&mut self, dests: usize);
 
-    /// Produce a next-hop proof challenge for one neighbor awaiting one, with
-    /// the neighbor it is addressed to. `None` when none is due.
-    /// **Implementations must mark the selected candidate as challenged before
-    /// anything can fail**, including on the paths that then return `None`.
-    /// Callers loop until `None` ([`poll_due_challenges`]), so a candidate left
-    /// unmarked is re-selected forever and the driver's event loop hangs.
-    ///
-    /// [`poll_due_challenges`]: ../../wayfinder_driver_core/fn.poll_due_challenges.html
-    fn poll_challenge<'tx>(
-        &mut self,
-        now: Duration,
-        tx_buf: &'tx mut [u8],
-    ) -> Option<(Mac, LinkFrameData<'tx>)>;
-
     /// Produce this node's due reachability probe into `tx_buf`, if one is due.
     ///
     /// **At most one probe per call** — deliberately unlike
-    /// [`poll`](Self::poll) and [`poll_challenge`](Self::poll_challenge), whose
+    /// [`poll`](Self::poll) and [`poll_challenge`](RouterAuthOps::poll_challenge),
+    /// whose
     /// callers loop until `None`. See
     /// [`CentralRouter::poll_ping`](crate::CentralRouter::poll_ping) for why a
     /// driver that slept through several intervals must not wake to a burst.
@@ -226,7 +220,8 @@ pub trait RouterOps {
     ///
     /// A shell that sleeps must fold this into the same `min` as
     /// [`next_broadcast_after`](Self::next_broadcast_after) and its siblings,
-    /// for the same reason [`next_challenge_after`](Self::next_challenge_after)
+    /// for the same reason
+    /// [`next_challenge_after`](RouterAuthOps::next_challenge_after)
     /// documents: a probe left riding the OGM schedule waits up to a full
     /// `i_max` on a settled mesh, by which time it has timed out.
     fn next_ping_after(&self, now: Duration) -> Option<Duration>;
@@ -260,19 +255,6 @@ pub trait RouterOps {
 
     /// Time from `now` until the soonest keep-alive is due.
     fn next_keepalive_after(&self, now: Duration) -> Duration;
-
-    /// Time from `now` until the soonest next-hop proof challenge is due, or
-    /// `None` when there is nothing to challenge.
-    ///
-    /// A shell that sleeps must fold this into the same `min` as
-    /// [`next_broadcast_after`](Self::next_broadcast_after) and
-    /// [`next_keepalive_after`](Self::next_keepalive_after). Proof is not on
-    /// the OGM schedule and must not be left to ride it: a newly discovered
-    /// originator would then wait for the next Trickle deadline before it was
-    /// challenged, which on a settled mesh is a full `i_max` during which it
-    /// can carry no traffic. A shell whose caller drives its own clock
-    /// (`wayfinder-tick-driver`) has no sleep to shorten and can ignore this.
-    fn next_challenge_after(&self, now: Duration) -> Option<Duration>;
 
     /// Record that interface `idx` emitted its OGM at `now`, advancing Trickle.
     fn on_interface_emitted(&mut self, idx: usize, now: Duration);
@@ -333,6 +315,91 @@ pub trait RouterOps {
     /// [`Clocked::Unknown`](wayfinder_auth::Clocked) and the node keeps routing
     /// while judging no validity window (design 20 §4.2).
     fn set_auth_time(&mut self, now: Duration, wall: wayfinder_auth::Clocked);
+}
+
+/// The credential work a shell drives on the router's behalf.
+///
+/// A **sibling of [`RouterOps`], not part of it**, and the split is the point:
+/// nothing here is a routing decision. Renewing a membership certificate and
+/// proving a next hop are the auth module's exchanges — `CentralRouter` only
+/// lends it a view of the routing state needed to address a frame (see
+/// [`auth::Paths`](crate::auth::Paths)), and every method below is a two-line
+/// delegation for that reason.
+///
+/// **What the split actually buys, stated honestly**, because it is a caller-
+/// side property and not an implementor-side one: there is exactly one
+/// implementor of either trait (`CentralRouter`, blanket over every capacity
+/// profile), so no *type* is partitioned. What is partitioned is the **bounds**.
+/// Nine functions in `wayfinder-driver-core` take `R: RouterOps` —
+/// `handle_mesh_frame`, `poll_due_ogms`, `poll_due_keepalives`,
+/// `poll_due_pings`, `handle_link_result`, `plan_dispatch`, `strip_directed`,
+/// `tag_directed_into`, `flush_mcast_groups` — and can now be shown, from their
+/// signatures alone, not to touch credentials. Three (`poll_due_challenges`,
+/// `poll_due_renewal`, `poll_due_all`) take `R: RouterAuthOps`. That is a real
+/// least-privilege line and it is used today; it is worth about what one extra
+/// trait costs, and no more.
+///
+/// The supertrait bound is load-bearing rather than decorative:
+/// `poll_due_challenges` calls `num_interfaces` and `link_may_tx` alongside
+/// `poll_challenge`, so an independent trait would only spell `R: RouterOps +
+/// RouterAuthOps` at three signatures and buy nothing.
+///
+/// Implemented once, blanket, for every [`CentralRouter`] capacity profile,
+/// exactly like `RouterOps`.
+pub trait RouterAuthOps: RouterOps {
+    /// Produce a next-hop proof challenge for one neighbor awaiting one, with
+    /// the neighbor it is addressed to. `None` when none is due.
+    ///
+    /// **Implementations must mark the selected candidate as challenged before
+    /// anything can fail**, including on the paths that then return `None`.
+    /// Callers loop until `None` ([`poll_due_challenges`]), so a candidate left
+    /// unmarked is re-selected forever and the driver's event loop hangs.
+    ///
+    /// [`poll_due_challenges`]: ../../wayfinder_driver_core/fn.poll_due_challenges.html
+    fn poll_challenge<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<(Mac, LinkFrameData<'tx>)>;
+
+    /// Time from `now` until the soonest next-hop proof challenge is due, or
+    /// `None` when there is nothing to challenge.
+    ///
+    /// A shell that sleeps must fold this into the same `min` as
+    /// [`next_broadcast_after`](RouterOps::next_broadcast_after) and
+    /// [`next_keepalive_after`](RouterOps::next_keepalive_after). Proof is not
+    /// on the OGM schedule and must not be left to ride it: a newly discovered
+    /// originator would then wait for the next Trickle deadline before it was
+    /// challenged, which on a settled mesh is a full `i_max` during which it
+    /// can carry no traffic. A shell whose caller drives its own clock
+    /// (`wayfinder-tick-driver`) has no sleep to shorten and can ignore this.
+    fn next_challenge_after(&self, now: Duration) -> Option<Duration>;
+
+    /// Emit this node's due membership-certificate renewal request into
+    /// `tx_buf`, if one is due and there is a path to the authority.
+    ///
+    /// **At most one per call**, like [`poll_ping`](RouterOps::poll_ping) and
+    /// unlike [`poll`](RouterOps::poll): a shell that slept through several
+    /// intervals must not wake and put three copies of the same question on a
+    /// duty-cycled radio.
+    ///
+    /// See [`OgmAuth::poll_renewal`] for what "due" means on a node whose clock
+    /// is a lower bound, and for why the deadline advances even on the paths
+    /// that emit nothing.
+    fn poll_renewal<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>>;
+
+    /// Time from `now` until this node next evaluates whether to renew, or
+    /// `None` when it has nowhere to ask.
+    ///
+    /// The deadline half of [`poll_renewal`](Self::poll_renewal), and a shell
+    /// that sleeps must fold it into the same `min` as its OGM and keep-alive
+    /// deadlines — only a shell that can make the answer *durable* should be
+    /// driving either, which is why `poll_due_all` leaves both out.
+    fn next_renewal_after(&self, now: Duration) -> Option<Duration>;
 }
 
 impl<
@@ -406,14 +473,6 @@ impl<
         CentralRouter::record_mcast_group_drop(self, dests);
     }
 
-    fn poll_challenge<'tx>(
-        &mut self,
-        now: Duration,
-        tx_buf: &'tx mut [u8],
-    ) -> Option<(Mac, LinkFrameData<'tx>)> {
-        Self::poll_challenge(self, now, tx_buf)
-    }
-
     fn poll_ping<'tx>(
         &mut self,
         now: Duration,
@@ -459,10 +518,6 @@ impl<
 
     fn next_keepalive_after(&self, now: Duration) -> Duration {
         Self::next_keepalive_after(self, now)
-    }
-
-    fn next_challenge_after(&self, now: Duration) -> Option<Duration> {
-        Self::next_challenge_after(self, now)
     }
 
     fn on_interface_emitted(&mut self, idx: usize, now: Duration) {
@@ -511,6 +566,58 @@ impl<
 
     fn auth_mut(&mut self) -> Option<&mut Self::Auth> {
         Self::auth_mut(self)
+    }
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> RouterAuthOps
+    for CentralRouter<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
+    fn poll_challenge<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<(Mac, LinkFrameData<'tx>)> {
+        CentralRouter::poll_challenge(self, now, tx_buf)
+    }
+
+    fn next_challenge_after(&self, now: Duration) -> Option<Duration> {
+        CentralRouter::next_challenge_after(self, now)
+    }
+
+    fn poll_renewal<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>> {
+        CentralRouter::poll_renewal(self, now, tx_buf)
+    }
+
+    fn next_renewal_after(&self, now: Duration) -> Option<Duration> {
+        CentralRouter::next_renewal_after(self, now)
     }
 }
 

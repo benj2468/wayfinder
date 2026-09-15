@@ -9,7 +9,7 @@
 //! board-supplied [`DurableStore`] if one was ever written, and otherwise
 //! mints a seed and durably saves it.
 //!
-//! Designed in `docs/design/22-embedded-node-record.md`.
+//! Designed in `docs/design/implemented/22-embedded-node-record.md`.
 //!
 //! # Three things, one blob
 //!
@@ -99,7 +99,11 @@ pub const RECORD_HEADER_LEN: usize = 1 + 1 + Keypair::SEED_LEN + 8;
 pub const MAX_RECORD_LEN: usize = RECORD_HEADER_LEN
     + MembershipCert::SERIALIZED_LEN
     + TrustAnchor::SERIALIZED_LEN
-    + RevocationRecord::SERIALIZED_LEN;
+    + RevocationRecord::SERIALIZED_LEN
+    // The renewal authority's pinned Ed25519 key, which is a public key and so
+    // exactly a seed's width. Named through `Keypair::SEED_LEN` like every
+    // other length here, rather than as a local `32`.
+    + Keypair::SEED_LEN;
 
 /// Read buffer size for loading a record. `DurableStore::load`'s own contract
 /// already forbids overflowing a too-small `out` buffer regardless of size (an
@@ -126,6 +130,11 @@ bitflags::bitflags! {
     /// foreign layout is [`RECORD_VERSION`], which is checked first and fails
     /// closed; a reserved bit set by a future writer of *this* version implies
     /// no trailing blob, so it cannot desynchronise the length check below.
+    ///
+    /// **This byte is now full.** The next optional blob needs a wider flags
+    /// field, and so a [`RECORD_VERSION`] bump — which is the cheap half of the
+    /// change, since `decode` already refuses a version it does not know rather
+    /// than reading a foreign layout as a seed.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct RecordFlags: u8 {
         /// A certificate follows the header.
@@ -145,6 +154,8 @@ bitflags::bitflags! {
         /// The value of `lazy_cert_distribution`, meaningful only alongside
         /// [`LAZY_SET`](Self::LAZY_SET).
         const LAZY = 1 << 6;
+        /// The pinned key of the authority this node renews against follows.
+        const PROVIDER = 1 << 7;
     }
 }
 
@@ -216,6 +227,24 @@ pub struct NodeRecord {
     /// boot, which is why persisting it is safe and why losing it across a
     /// reset — today's behaviour — defeats design 16 entirely.
     pub self_revocation: Option<[u8; RevocationRecord::SERIALIZED_LEN]>,
+    /// The Ed25519 public key of the certificate authority this node renews
+    /// against, as the `SetAuth` that certified it named.
+    ///
+    /// The **key**, not the mesh address it implies: since design 09 §5 the
+    /// address is a function of the key, so storing both would store one fact
+    /// twice with the two able to disagree. `Driver::restore` derives the MAC
+    /// at boot.
+    ///
+    /// Neither the provider's socket address nor its enrollment token is kept.
+    /// Both belong to the client connection a host node opens, and a board has
+    /// no IP stack to open one with — which is exactly why design 24 exists.
+    /// Keeping them would be a durable claim about something this node does
+    /// not do.
+    ///
+    /// `None` for a board whose credential was installed without a provider:
+    /// it renews nowhere, rather than reaching back to an authority it may
+    /// have left.
+    pub renewal_provider_key: Option<[u8; Keypair::SEED_LEN]>,
     /// Whether the node fails closed while it holds no membership cert.
     /// `None` means the operator has never set it, leaving the build's default
     /// authoritative.
@@ -235,6 +264,7 @@ impl NodeRecord {
             cert: None,
             trust_anchor: None,
             self_revocation: None,
+            renewal_provider_key: None,
             require_auth: None,
             lazy_cert_distribution: None,
         }
@@ -273,6 +303,7 @@ impl core::fmt::Debug for NodeRecord {
             .field("cert", &self.cert.is_some())
             .field("trust_anchor", &self.trust_anchor.is_some())
             .field("self_revocation", &self.self_revocation.is_some())
+            .field("renewal_provider", &self.renewal_provider_key.is_some())
             .field("require_auth", &self.require_auth)
             .field("lazy_cert_distribution", &self.lazy_cert_distribution)
             .finish()
@@ -335,6 +366,7 @@ impl Codec<NodeRecord> for RecordCodec {
         flags.set(RecordFlags::CERT, value.cert.is_some());
         flags.set(RecordFlags::ANCHOR, value.trust_anchor.is_some());
         flags.set(RecordFlags::REVOKE, value.self_revocation.is_some());
+        flags.set(RecordFlags::PROVIDER, value.renewal_provider_key.is_some());
         if let Some(require_auth) = value.require_auth {
             flags.insert(RecordFlags::REQUIRE_AUTH_SET);
             flags.set(RecordFlags::REQUIRE_AUTH, require_auth);
@@ -355,6 +387,7 @@ impl Codec<NodeRecord> for RecordCodec {
             value.cert.as_ref().map(|b| &b[..]),
             value.trust_anchor.as_ref().map(|b| &b[..]),
             value.self_revocation.as_ref().map(|b| &b[..]),
+            value.renewal_provider_key.as_ref().map(|b| &b[..]),
         ]
         .into_iter()
         .flatten()
@@ -393,7 +426,8 @@ impl Codec<NodeRecord> for RecordCodec {
         let expected = RECORD_HEADER_LEN
             + blob_len(RecordFlags::CERT, MembershipCert::SERIALIZED_LEN)
             + blob_len(RecordFlags::ANCHOR, TrustAnchor::SERIALIZED_LEN)
-            + blob_len(RecordFlags::REVOKE, RevocationRecord::SERIALIZED_LEN);
+            + blob_len(RecordFlags::REVOKE, RevocationRecord::SERIALIZED_LEN)
+            + blob_len(RecordFlags::PROVIDER, Keypair::SEED_LEN);
         // The flags byte and the total length are two independent statements
         // about the same layout, and a record is only well-formed when they
         // agree. Trusting the flags alone would hand a caller a truncated
@@ -430,6 +464,7 @@ impl Codec<NodeRecord> for RecordCodec {
             flags.contains(RecordFlags::REVOKE),
             RevocationRecord::SERIALIZED_LEN,
         );
+        let provider_at = take(flags.contains(RecordFlags::PROVIDER), Keypair::SEED_LEN);
 
         Ok(NodeRecord {
             seed,
@@ -447,6 +482,11 @@ impl Codec<NodeRecord> for RecordCodec {
             self_revocation: revoke_at.map(|at| {
                 let mut b = [0u8; RevocationRecord::SERIALIZED_LEN];
                 b.copy_from_slice(&bytes[at..at + RevocationRecord::SERIALIZED_LEN]);
+                b
+            }),
+            renewal_provider_key: provider_at.map(|at| {
+                let mut b = [0u8; Keypair::SEED_LEN];
+                b.copy_from_slice(&bytes[at..at + Keypair::SEED_LEN]);
                 b
             }),
             require_auth: flags
@@ -729,16 +769,18 @@ mod tests {
         // And the byte an encode actually writes, so the assertions above are
         // checked against the encoder rather than only against themselves.
         //
-        // Deliberately a *lopsided* record — anchor but no cert, `require_auth`
-        // set to false, `lazy` set to true — because a fully-populated one
-        // writes `0b0111_1111` and would match under every permutation of the
-        // bits, which is the one thing this test exists to catch.
+        // Deliberately a *lopsided* record — anchor but no cert, no provider,
+        // `require_auth` set to false, `lazy` set to true — because a
+        // fully-populated one writes `0b1111_1111` and would match under every
+        // permutation of the bits, which is the one thing this test exists to
+        // catch.
         let record = NodeRecord {
             seed: seed(0x33),
             checkpoint_unix: 0,
             cert: None,
             trust_anchor: Some(anchor_bytes(0xA0)),
             self_revocation: None,
+            renewal_provider_key: None,
             require_auth: Some(false),
             lazy_cert_distribution: Some(true),
         };
@@ -795,6 +837,7 @@ mod tests {
             cert: Some(cert_bytes(0xA1)),
             trust_anchor: Some(anchor_bytes(0xB2)),
             self_revocation: Some(revoke_bytes(0xC3)),
+            renewal_provider_key: Some([0xD4; 32]),
             require_auth: Some(true),
             lazy_cert_distribution: Some(false),
         };
@@ -806,6 +849,7 @@ mod tests {
                 + MembershipCert::SERIALIZED_LEN
                 + TrustAnchor::SERIALIZED_LEN
                 + RevocationRecord::SERIALIZED_LEN
+                + Keypair::SEED_LEN
         );
 
         let decoded = RecordCodec.decode(encoded.as_ref()).unwrap();
@@ -818,13 +862,14 @@ mod tests {
     /// right for one case and wrong for the others.
     #[test]
     fn every_combination_of_optional_blobs_round_trips() {
-        for bits in 0u8..8 {
+        for bits in 0u8..16 {
             let record = NodeRecord {
                 seed: seed(0x44),
                 checkpoint_unix: 42,
                 cert: (bits & 1 != 0).then(|| cert_bytes(1)),
                 trust_anchor: (bits & 2 != 0).then(|| anchor_bytes(2)),
                 self_revocation: (bits & 4 != 0).then(|| revoke_bytes(3)),
+                renewal_provider_key: (bits & 8 != 0).then_some([4u8; 32]),
                 require_auth: None,
                 lazy_cert_distribution: None,
             };

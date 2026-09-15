@@ -210,14 +210,44 @@ trust boundary as a JTAG header.
 > whoever re-wires it, and is recorded in `libs/wayfinder-server/CLAUDE.md`
 > beside the transport it governs.
 
-**Correction (2026-09-07): the wiring returned and the requirement was not
-met.** Both nRF boards bring a CDC-ACM management port up unconditionally
+**Resolved differently (2026-09-11, GitLab #57): the opt-in half of F7 is
+withdrawn. The port stays unconditional, and the physical port is the trust
+boundary.**
+
+The history is worth keeping straight, because F7 was twice described as
+settled and the two settlements disagree. Both nRF boards bring a CDC-ACM
+management port up unconditionally whenever USB init succeeds
 (`libs/wayfinder-nrf/src/node.rs`), and the embedded serve path dispatches
-straight to `handle_router` with no tier check — so `SetAuth` and `SetTime` are
-available to anything that can open `/dev/ttyACM*`. Design 20 made that path
-functional where it had previously rejected every certificate as not-yet-valid,
-which is what turned a dormant gap into a live one. Tracked as **GitLab #57**;
-F7's requirement above is the thing that issue re-opens.
+straight to `handle_router` with no tier check — so `SetAuth` and `SetTime`
+are available to anything that can open `/dev/ttyACM*`. Design 20 made that
+path functional where it had previously rejected every certificate as
+not-yet-valid, and design 22 made its effect durable; between them a dormant
+gap became a live and permanent one, which is what prompted #57.
+
+The decision there was to **accept it and say so**, not to gate it:
+
+- **The threat model is unchanged by a gate.** The port is USB on a board in
+  someone's hand. Whoever can open `/dev/ttyACM*` is standing next to the
+  device, and on these boards that also means an SWD header that reads flash
+  outright. A configuration flag does not move that boundary; it only decides
+  whether the easiest way in is the cable or the debugger.
+- **"Configured to" has no meaning on a board.** A board has no config file, so
+  opt-in resolves to a compile-time feature baked into a shipped image. The
+  operator holding the cable is then the one person who cannot change it, which
+  inverts who the control is for.
+- **A gate would cost the only observability the dongle has.** The dongle has
+  no probe header; the management port is how its logs are read at all
+  (`GetLogs`), and how `libs/wayfinder-hil` reaches any board. Gating the port
+  by default means the fallback console is absent exactly when it is needed.
+
+So the rule for this port is stated positively rather than as a pending
+requirement: **the serial management port is unauthenticated by design, and
+anyone who can reach it is trusted.** That is recorded beside the transport in
+`libs/wayfinder-server/CLAUDE.md` and beside the bring-up in
+`libs/wayfinder-nrf/CLAUDE.md`. What would change the calculus is a management
+transport with no physical precondition — mgmt-over-BLE, or a board that grows
+an IP stack; **neither is in scope here, and either one re-opens F7 rather than
+inheriting this answer.**
 
 ### F8 — Medium. The enrollment token is a bearer secret on a one-second poll.
 

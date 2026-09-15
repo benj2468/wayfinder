@@ -1594,7 +1594,26 @@ fn render_security_header(frame: &mut Frame, app: &App, area: Rect) {
                     None => "not set — renew by hand".to_string(),
                 },
             ),
-        ],
+            // Mesh renewal (design 24), and only shown once this node has
+            // actually asked: a host renews over its management API and leaves
+            // both at zero, where a row reading "0 / 0" would look like a
+            // failure rather than like a path this node does not use.
+            //
+            // Rendered as the pair, because the pair is the signal. A board
+            // asking and never being answered is the failure this exists to
+            // surface, and it is invisible in either number alone.
+        ]
+        .into_iter()
+        .chain((s.renewal_requests_sent > 0).then(|| {
+            field(
+                "Mesh renewals",
+                &format!(
+                    "{} asked / {} answered",
+                    s.renewal_requests_sent, s.renewal_replies_accepted
+                ),
+            )
+        }))
+        .collect(),
     };
 
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });

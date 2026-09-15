@@ -65,6 +65,7 @@ use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::Received;
 use wayfinder::router_ops::OgmAuthOps;
+use wayfinder::router_ops::RouterAuthOps;
 use wayfinder::router_ops::RouterOps;
 use wayfinder_alarm::AlarmKind;
 use wayfinder_alarm::NodeId;
@@ -226,6 +227,17 @@ impl RequiredProof {
 ///   requiring a pairwise tag would make lazy cert distribution unable to
 ///   bootstrap the very keys that tag needs.
 ///
+/// [`RenewReq`](BatmanPacketType::RenewReq) and
+/// [`RenewReply`](BatmanPacketType::RenewReply) are self-authenticating in the
+/// same way and are still **not** exempt, which is the one place that
+/// distinction is worth spelling out. The cert-control exemption is bought by a
+/// circularity — the exchange supplies the keys the tag would need — and
+/// renewal has none: a node renewing is by definition still holding a valid
+/// certificate and routing authenticated (design 24 §2.2), so it already holds
+/// a pairwise key with the neighbour it is handing the frame to. Exempting them
+/// would buy nothing and would let a party with no credential at all put
+/// renewal traffic into the mesh for the authority to spend verification on.
+///
 /// [`Mcast`](BatmanPacketType::Mcast) is the one sub-type with a *choice* of
 /// proof, and the choice is read from its `form` header byte. That byte is
 /// attacker-chosen like every other, which is safe here for a reason worth
@@ -264,7 +276,9 @@ fn required_proof(payload: &[u8]) -> RequiredProof {
             BatmanPacketType::Unicast
             | BatmanPacketType::EchoRequest
             | BatmanPacketType::EchoReply
-            | BatmanPacketType::NextHopChallenge,
+            | BatmanPacketType::NextHopChallenge
+            | BatmanPacketType::RenewReq
+            | BatmanPacketType::RenewReply,
         ) => RequiredProof::Tag,
         // The one sub-type carrying its own freshness. A response answers a
         // nonce its receiver issued and consumes on use, so replaying one
@@ -1025,7 +1039,7 @@ pub fn poll_due_keepalives<R: RouterOps>(
 /// should have kept. Letting the attacker choose where the challenge goes hands
 /// it a denial of service, so the challenge does not ask. A challenge is a
 /// couple of dozen bytes and rare, which is what makes the fan-out affordable.
-pub fn poll_due_challenges<R: RouterOps>(
+pub fn poll_due_challenges<R: RouterAuthOps>(
     router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
@@ -1089,6 +1103,45 @@ pub fn poll_due_pings<R: RouterOps>(
         // Fire-and-forget: a refusal here is the shell's own staging
         // limit, which the shell logs. Only multicast has a fallback to
         // take, and it checks the return value where it matters.
+        let _ = sink.emit(OutgoingFrame {
+            dst: f.dst,
+            protocol: f.protocol,
+            payload: f.payload,
+            egress: Egress::Auto,
+        });
+    }
+}
+
+/// Emit the membership-certificate renewal this node has due at `now`, if any,
+/// letting the router resolve its egress ([`Egress::Auto`]).
+///
+/// **One per call, not a loop**, for the reason [`poll_due_pings`] gives: a
+/// shell that slept through several intervals must not wake and put three
+/// copies of the same question on a duty-cycled radio. The router paces from
+/// `now` and advances its deadline whatever it decides, so this cannot leave a
+/// sleeping shell spinning on a deadline it can never discharge.
+///
+/// [`Egress::Auto`] rather than the per-interface fan-out
+/// [`poll_due_challenges`] uses: the request is addressed to one next hop and
+/// exists to reach one node, so asking the router which link that is, is the
+/// point. `plan_dispatch` then applies the `tx_data` gate on the way out, and
+/// tags the frame — a renewal is a directed sub-type, unlike the cert-control
+/// pair it is otherwise cut from.
+///
+/// **Not every shell calls this.** A host node renews over its management API
+/// against the provider address its enrollment recorded, which is a better
+/// channel where a socket exists; this path is for the node that has none. See
+/// `docs/design/implemented/24-embedded-certificate-renewal.md` §3.
+pub fn poll_due_renewal<R: RouterAuthOps>(
+    router: &mut R,
+    now: Duration,
+    tx_buffer: &mut [u8],
+    sink: &mut impl MeshSink,
+) {
+    if let Some(f) = router.poll_renewal(now, tx_buffer) {
+        trace!(dst = ?f.dst, "emitting a certificate renewal request");
+        // Fire-and-forget: a refusal here is the shell's own staging limit,
+        // which the shell logs.
         let _ = sink.emit(OutgoingFrame {
             dst: f.dst,
             protocol: f.protocol,
@@ -1166,7 +1219,7 @@ pub fn handle_link_result<R: RouterOps>(
 /// keeps no timer of its own — [`poll_due_challenges`] re-derives its candidate
 /// set from current routing and proof state on every call — but it does have a
 /// *deadline*, and a shell that sleeps must fold
-/// [`RouterOps::next_challenge_after`] into the same `min` as the OGM and
+/// [`RouterAuthOps::next_challenge_after`] into the same `min` as the OGM and
 /// keep-alive ones. Leaving it out is what welds proof to the OGM schedule: a
 /// newly discovered originator then waits for the next Trickle deadline, up to
 /// a full `i_max` on a settled mesh, carrying no traffic until it arrives.
@@ -1180,9 +1233,22 @@ pub fn handle_link_result<R: RouterOps>(
 /// which on a settled mesh is minutes, so every probe would time out and a
 /// working path would read as totally lossy.
 ///
-/// [`RouterOps::next_challenge_after`]: wayfinder::router_ops::RouterOps::next_challenge_after
+/// Certificate renewal is **deliberately not here**, and that is a safety
+/// property rather than an omission. A renewal has to be made *durable* by the
+/// shell — the `no_std` core can change the credential it runs under, it cannot
+/// write flash — and a shell that renews without persisting is strictly worse
+/// than one that does not renew: the node installs a certificate, its counters
+/// report success, and it comes back at the next reset on the one that has
+/// lapsed. Bundling renewal in here would arm it for every caller of this
+/// function, including the embedded `run()` loop, which has no store at all.
+///
+/// So [`poll_due_renewal`] is called explicitly, by the shells that can finish
+/// the job, and folding `CentralRouter::next_renewal_after` into the sleep is
+/// their business too.
+///
+/// [`RouterAuthOps::next_challenge_after`]: wayfinder::router_ops::RouterAuthOps::next_challenge_after
 /// [`RouterOps::next_ping_after`]: wayfinder::router_ops::RouterOps::next_ping_after
-pub fn poll_due_all<R: RouterOps>(
+pub fn poll_due_all<R: RouterAuthOps>(
     router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
@@ -2680,6 +2746,42 @@ mod tests {
         );
     }
 
+    /// A due renewal is emitted with [`Egress::Auto`], so the router resolves
+    /// which interface carries it — the same treatment a reachability probe
+    /// gets, and for the same reason: the frame is addressed to one next hop
+    /// and must travel the path the router would actually pick.
+    ///
+    /// One per call and never a burst. This runs from a shell's periodic arm,
+    /// and a board that slept through several intervals must not wake and spend
+    /// a duty-cycled radio's airtime asking the same question three times.
+    #[test]
+    fn poll_due_renewal_emits_the_routers_due_request() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+        // A renewal is a directed frame, so it takes the *proven* next hop —
+        // the same gate a forwarded unicast clears.
+        prove_peer(&mut router, &mut peer);
+        router
+            .auth_mut()
+            .unwrap()
+            .set_renewal_authority(Some(&Keypair::from_seed(&[2; 32]).ed_pubkey()));
+        // `member_auth` certifies to 1000 from 0, so 800 is inside the last
+        // quarter: the only window a renewal is ever attempted from.
+        router.set_auth_time(Duration::ZERO, wayfinder::wayfinder_auth::Clocked::At(800));
+
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        poll_due_renewal(&mut router, Duration::ZERO, &mut tx, &mut sink);
+
+        assert_eq!(sink.mesh.len(), 1, "one request, not a burst");
+        assert_eq!(sink.mesh[0].egress, Egress::Auto);
+        assert_eq!(sink.mesh[0].payload[0], BatmanPacketType::RenewReq.as_u8());
+
+        let mut sink = CaptureSink::default();
+        poll_due_renewal(&mut router, Duration::ZERO, &mut tx, &mut sink);
+        assert!(sink.mesh.is_empty(), "and the poll is paced, not per-wake");
+    }
+
     /// A challenge must not go out a link whose data gate is closed.
     ///
     /// `poll_due_challenges` emits with `Egress::Iface`, and `plan_dispatch`
@@ -2878,6 +2980,17 @@ mod tests {
             BatmanPacketType::EchoRequest,
             BatmanPacketType::EchoReply,
             BatmanPacketType::NextHopChallenge,
+            // Renewal is point-to-point *and* self-authenticating, and unlike
+            // `CertReq` it still requires a tag. The cert-control exemption
+            // exists because lazy distribution is what *supplies* the pairwise
+            // keys a tag needs, so gating it would deadlock bootstrap. A node
+            // renewing is by definition already holding a valid certificate and
+            // routing authenticated (design 24 §2.2), so it has those keys —
+            // which makes the exemption pure cost here: it would let a
+            // credential-less on-link party put renewal traffic into the mesh
+            // for the authority to spend verification on.
+            BatmanPacketType::RenewReq,
+            BatmanPacketType::RenewReply,
         ] {
             assert_eq!(
                 required_proof(&[t.as_u8(), 0xff]),

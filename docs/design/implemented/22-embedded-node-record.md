@@ -1,8 +1,7 @@
 # Design: what a bare-metal node keeps across a reset
 
-**Status:** Proposed — built in this session and awaiting review; §11 records
-what the implementing session decided and where it deviated. Flip to
-`Implemented` and move into `implemented/` when it lands on `main`.
+**Status:** Implemented — landed on `main` in `7e91bb5`. §11 records what the
+implementing session decided and where it deviated.
 
 Owns GitLab #52, resolves #58, discharges design 20 §4.5's constraint, and
 unblocks #53. Two facts in `main` this changes are recorded in §2.
@@ -114,6 +113,12 @@ rewrite interval explicitly handed forward as this design's call.
   certificate; an operator installs one over the management port. #53.
 - **Renewal.** A board cannot renew itself, so the renewal provider is
   deliberately *not* persisted (§4.2).
+
+  > **Note (design 24).** No longer true. A board renews over the *mesh* — it
+  > was never unable to reach its authority, only unable to speak to it, since
+  > every management conversation here is TLS over TCP. The provider's pinned
+  > key is now persisted; see design 24 §2.1, which cites §4.2 below by name as
+  > the behaviour it overturns.
 - **`require_auth` on a board.** What a credential-less board does — route
   unauthenticated or stay inert — is #53's decision. This design persists the
   flag; it does not choose its default.
@@ -170,6 +175,13 @@ seed-rotation path, and §4.4 is what makes it safe.
   stated reason: a board cannot renew its own certificate, that path is the
   host driver's tokio loop. Persisting a target nothing reads would be a
   durable lie about what this node will do.
+
+  > **Note (design 24).** This is the decision design 24 overturns, and it
+  > cites this paragraph by name. The premise — that renewal means opening a
+  > client connection — was the whole of it; a board renews over the mesh
+  > instead, so the target is now read, and `NodeRecord` persists the
+  > provider's pinned key. The reasoning above stands as the record of why it
+  > was right at the time.
 - **The MAC.** It is `Keypair::from_seed(&seed).derived_mac()`. Storing it
   beside the seed is storing the same fact twice, and the two disagreeing is
   precisely the defect #58 reports.

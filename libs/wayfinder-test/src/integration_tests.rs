@@ -4003,3 +4003,215 @@ fn a_silenced_hub_is_evicted_despite_the_stub_echo() {
         "a silenced hub must be evicted, not kept alive by the stub's echo",
     );
 }
+
+/// The instant the mesh-renewal tests run at, and the lifetime the authority
+/// issues for. A short-ish TTL keeps the renewal window inside a virtual clock
+/// a test can step to without overflowing a `Duration` built from it.
+const NOW: u64 = 1_700_000_000;
+/// The certificate lifetime those tests' authority issues.
+const CERT_TTL: u64 = 604_800;
+
+/// Credential a machine for the mesh-renewal tests, with a window around
+/// [`NOW`].
+///
+/// Not [`enable_auth`], whose certificate runs `0..1_000_000` — an instant in
+/// 1970. These tests run at a real unix second and step most of a week forward,
+/// so a fixture certificate from the epoch is expired from the very first
+/// judgement and the two nodes never learn each other at all.
+fn enable_auth_at_now(node: &mut TestRouter, authority: &wayfinder_auth::Authority, index: usize) {
+    let kp = crate::driver::machine_keypair(index);
+    let cert = authority.issue_cert(
+        kp.derived_mac(),
+        kp.ed_pubkey(),
+        kp.x_pubkey(),
+        NOW,
+        NOW + 10 * CERT_TTL,
+    );
+    node.router_mut().set_auth(wayfinder::auth::OgmAuth::new(
+        kp,
+        cert,
+        authority.trust_anchor(),
+    ));
+    node.set_epoch_unix(NOW);
+}
+
+/// A two-node mesh set up for a renewal: `machine1` is the board, credentialed
+/// by a real [`CertAuthority`](wayfinder_server::CertAuthority) so there is a
+/// holder record to renew against, and pointed at `machine2` as its authority.
+///
+/// Returns the authority, the board's current `not_after`, and the instant the
+/// board first asked — reached by stepping the clock rather than jumping it,
+/// because two things have to line up and they are paced differently: the mesh
+/// needs a live route and a current proof to the authority, refreshed every
+/// couple of minutes by the OGM schedule, while the renewal poll runs once a
+/// quarter hour. `converge` also polls *before* it settles, so the board's very
+/// first poll fires with no route yet and spends its interval on a `None` —
+/// correct in production, where a poll that cannot act must still advance its
+/// deadline or a sleeping shell spins, and where the window is forty-two hours
+/// wide.
+fn renewing_pair(harness: &mut TestHarness) -> (wayfinder_server::CertAuthority, u64, Duration) {
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    let mut ca = wayfinder_server::CertAuthority::new(&[1; 32], 0xABCD, CERT_TTL, None, true);
+    ca.set_now_unix(NOW);
+
+    let board_kp = crate::driver::machine_keypair(0);
+    let issued = match wayfinder_server::MeshAuthority::submit_csr(
+        &mut ca,
+        &board_kp.derived_mac().0,
+        &board_kp.ed_pubkey(),
+        &board_kp.x_pubkey(),
+        "",
+    )
+    .expect("the authority is clocked")
+    {
+        wayfinder_protos::service::CsrOutcome::Issued(data) => data,
+        other => panic!("expected an immediate issue, got {other:?}"),
+    };
+    let cert = wayfinder::wayfinder_auth::MembershipCert::from_bytes(&issued.cert).unwrap();
+
+    {
+        let board = harness.get_machine_mut("machine1");
+        board.router_mut().set_auth(wayfinder::auth::OgmAuth::new(
+            crate::driver::machine_keypair(0),
+            cert,
+            authority.trust_anchor(),
+        ));
+        board.set_epoch_unix(NOW);
+        // Where it renews: the authority's pinned key, which is what a `SetAuth`
+        // records and what the board derives its mesh address from (§4.4).
+        board
+            .router_mut()
+            .auth_mut()
+            .unwrap()
+            .set_renewal_authority(Some(&crate::driver::machine_keypair(1).ed_pubkey()));
+    }
+    enable_auth_at_now(harness.get_machine_mut("machine2"), &authority, 1);
+
+    let mut asked = Duration::from_secs(CERT_TTL - CERT_TTL / 8);
+    for _ in 0..64 {
+        converge_at(harness, asked);
+        if harness
+            .get_machine("machine1")
+            .router()
+            .renewal_requests_sent()
+            > 0
+        {
+            break;
+        }
+        asked += Duration::from_secs(20);
+    }
+    assert_eq!(
+        harness
+            .get_machine("machine1")
+            .router()
+            .renewal_requests_sent(),
+        1,
+        "the board asked"
+    );
+    (ca, cert.not_after.get(), asked)
+}
+
+/// **A board renews its membership certificate over the mesh, end to end**
+/// (design 24).
+///
+/// Every other test for this path proves one hop: the body verifies, the relay
+/// decrements a TTL, the authority re-issues, the reply installs. This is the
+/// one that proves they connect — that a request built on one node actually
+/// reaches the other's auth state through the real frame path, carrying a real
+/// pairwise tag, and that the answer comes back the same way.
+///
+/// That is the class of defect the unit tests cannot see. A renewal frame gated
+/// off by a link feature, dropped for want of a proof, or refused because its
+/// sub-type is not in the proof table, fails *here* and nowhere else.
+#[test]
+fn a_board_renews_its_certificate_over_the_mesh() {
+    setup();
+    let mut harness = simple_pair();
+    let (mut ca, first_not_after, asked) = renewing_pair(&mut harness);
+
+    // The provider receives it, verifies it, and answers — the hook a tokio
+    // driver reaches through `poll_mesh_renewals`.
+    //
+    // Its clock is advanced to the same instant the mesh is at. A real provider
+    // reads the host clock, so this is not a nicety: an authority stuck at the
+    // moment it issued would re-issue the *same* window, and the board would
+    // refuse its own renewal for not moving the credential forward.
+    ca.set_now_unix(NOW + asked.as_secs());
+    harness
+        .get_machine_mut("machine2")
+        .serve_mesh_renewals(asked, &mut ca);
+
+    // And the answer travels back the way the request came: through the switch,
+    // which is why this settles the fabric rather than poking the board
+    // directly.
+    harness.settle();
+
+    let board = harness.get_machine("machine1");
+    assert_eq!(
+        board.router().renewal_replies_accepted(),
+        1,
+        "the board was answered"
+    );
+    assert!(
+        board.router().auth().unwrap().own_cert().not_after.get() > first_not_after,
+        "and is running under a certificate that outlives the one it asked with"
+    );
+    // The alarm is still standing at this instant, and that is not a defect:
+    // it is retired by the *poll*, not by the reply, so that the one place
+    // deciding the condition holds is the one deciding it has lifted — which
+    // covers every way a node can leave the window, not only this one.
+    assert!(
+        board
+            .alarms()
+            .iter()
+            .any(|a| a.kind == wayfinder_alarm::AlarmKind::CertExpiring)
+    );
+
+    converge_at(&mut harness, asked + wayfinder::RENEWAL_POLL_INTERVAL);
+    assert!(
+        harness.get_machine("machine1").alarms().is_empty(),
+        "and the next poll retires it: a node that renewed itself has nothing to \
+         report, got {:?}",
+        harness.get_machine("machine1").alarms()
+    );
+}
+
+/// The same exchange, with the board's certificate **already lapsed**: the
+/// authority refuses, nothing comes back, and the board stays where it was
+/// (design 24 §5.2).
+///
+/// The deliberate outcome rather than a limitation. A certificate's lifetime is
+/// the only revocation bound that reaches a member which was offline when the
+/// revocation flooded, and a renewal that rescued an expired credential would
+/// make that bound a formality — on exactly the node an attacker can pocket.
+#[test]
+fn a_lapsed_board_is_not_rescued_by_renewing_over_the_mesh() {
+    setup();
+    let mut harness = simple_pair();
+    let (mut ca, _, asked) = renewing_pair(&mut harness);
+
+    // The authority's clock is past the board's `not_after`, while the board —
+    // whose own clock is a floor that has drifted behind — still believes it is
+    // merely due. Design 24 §4.5's posture case on the wire: the board asks on
+    // the half it can prove, and the authority judges the half it cannot.
+    ca.set_now_unix(NOW + CERT_TTL + 1);
+    harness
+        .get_machine_mut("machine2")
+        .serve_mesh_renewals(asked, &mut ca);
+    harness.settle();
+
+    let board = harness.get_machine("machine1");
+    assert_eq!(board.router().renewal_requests_sent(), 1, "it asked");
+    assert_eq!(
+        board.router().renewal_replies_accepted(),
+        0,
+        "and was refused: recovery is an operator's, over the serial port"
+    );
+    assert!(
+        board
+            .alarms()
+            .iter()
+            .any(|a| a.kind == wayfinder_alarm::AlarmKind::CertExpiring),
+        "and the operator is told, which is the whole point of the alarm"
+    );
+}

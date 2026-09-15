@@ -207,6 +207,39 @@ Three things here fail silently:
 The link is point-to-point and wired, so it gets the tightest Trickle schedule of
 the three interfaces (`node::TRICKLE`) — there is no airtime budget to respect.
 
+## The management port is unauthenticated, and that is the decision
+
+`usb_mgmt::init` brings the CDC-ACM management port up **unconditionally**,
+whenever USB init succeeds. There is no feature flag and no config gate, and
+the embedded serve path dispatches straight to `handle_router` with no tier
+check — so the whole request surface, `SetAuth` and `SetTime` included, is
+available to anything that can open `/dev/ttyACM*`. Since design 22 a board
+supplies a `SettingsStore`, so a credential written over that port is
+*durable*: the cable changes the node's identity permanently, not until the
+next reset.
+
+**This is the accepted posture (GitLab #57, design 06 F7), not a gap to
+re-file.** The port is USB on a board in someone's hand: whoever can reach it
+is standing next to the device, and on these boards that also means an SWD
+header that reads flash outright. A gate would not move that boundary, and it
+would cost the two things this port is for — the dongle has no probe header, so
+`GetLogs` over this port is the only way its logs are read, and
+`libs/wayfinder-hil` reaches every board through it. A board also has no config
+file, so "opt-in" could only mean a compile-time feature baked into the shipped
+image, leaving the operator holding the cable as the one person unable to
+change it.
+
+Two consequences to keep in mind when working here:
+
+- **Do not add a request to the embedded surface on the assumption that
+  something upstream checks who is asking.** Nothing does. The tier model in
+  `wayfinder-protos`'s `rpc.rs` governs the TLS transport; the serial path does
+  not consult it.
+- **A management transport with no physical precondition does not inherit this
+  answer.** Mgmt-over-BLE (the parked plan) or a board with an IP stack must
+  bring its own authentication — there the attacker need not be in the room,
+  which is the entire basis of the decision above.
+
 ## A fault reboots; it does not halt
 
 Both `#[panic_handler]` and the `HardFault` handler print, then reset. They halt

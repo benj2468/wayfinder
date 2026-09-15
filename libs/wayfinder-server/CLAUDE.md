@@ -357,7 +357,7 @@ log ring, through any `{:?}`. The value is a `SharedSecret` (`wayfinder-protos`)
 whose `Debug` redacts and whose reader is named `expose`, so every place it
 escapes is one a search finds.
 
-## The embedded serial port is unauthenticated, and opt-in because of it
+## The embedded serial port is unauthenticated, and the cable is the trust boundary
 
 `embedded.rs`'s `serve` decodes a frame and forwards it to the router. There is
 no `Authenticate` first-frame requirement, no `decide_access` and no `permits`
@@ -369,29 +369,39 @@ which on these boards also means access to an SWD header that reads flash
 outright, and a challenge-response would be a real protocol on a link with no
 connection boundary to hang it off.
 
-What follows is a requirement on whoever wires the port up: **bring it up only
-when a board is configured to, never unconditionally.** Enabling it is an act
-that means "this node's identity and configuration are available over
-`/dev/ttyACM*`", and it should read that way at the call site.
+F7 also asked, at the time, that the port be brought up only when a board is
+configured to. **That half was withdrawn in GitLab #57 (2026-09-11): the port
+is unconditional, and that is the accepted posture, not an unmet requirement.**
+Both nRF boards bring the CDC-ACM port up whenever USB init succeeds
+(`libs/wayfinder-nrf/src/node.rs`'s `usb_mgmt::init`) — no feature flag, no
+config gate — and design 20 then made `SetAuth` over it *work* where it had
+been inert, while design 22 made the effect durable: whoever holds the cable
+changes the node's identity permanently rather than until the next reset.
 
-**That requirement is currently unmet, and this paragraph used to say the
-opposite.** `libs/wayfinder-nrf/src/node.rs`'s `usb_mgmt::init` brings a
-CDC-ACM management port up unconditionally on both nRF boards whenever USB
-init succeeds — no feature flag, no config gate. The text here previously read
-"nothing enables it today", which is what let the requirement read as
-hypothetical while the wiring came back during the USB/802.15.4 work. Design
-20 then made `SetAuth` over that port *work* where it had been inert, so the
-gap went from theoretical to reachable. Design 22 then made it **durable**: a
-board supplies a `SettingsStore` now, so whoever holds the cable changes the
-node's identity permanently rather than until the next reset. That raises the
-stakes of the gap without creating it. Tracked as **GitLab #57**, which carries
-the three options (gate it, authenticate it, or accept it and say so).
+Accepted anyway, for three reasons a gate does not address:
+
+- A board has **no config file**, so "configured to" resolves to a compile-time
+  feature in a shipped image — leaving the operator holding the cable as the
+  one person who cannot change it.
+- The boundary is **physical either way**. Whoever can open `/dev/ttyACM*` is
+  next to the device, which on these boards also means an SWD header that reads
+  flash outright.
+- The dongle has **no probe header**, so this port is the only way its logs are
+  read (`GetLogs`). Gating it by default removes the fallback console precisely
+  when it is wanted.
+
+So state it positively when this comes up again: **the serial management port is
+unauthenticated by design, and anyone who can reach it is trusted.** Do not
+re-file it as a gap. What *would* re-open it is a management transport with no
+physical precondition — mgmt-over-BLE, or a board that grows an IP stack — and
+such a transport must bring its own authentication rather than inheriting this
+one's answer.
 
 `libs/wayfinder-hil`'s hardware tests reach a board through this port and so
 depend on it being open. They drive it through `wayfinder_client::Client`
-rather than a bespoke transport, so authenticating it is a change in that
-harness and not a rewrite of its tests — the rig must not become the reason
-the port stays unauthenticated.
+rather than a bespoke transport, so if a future transport does authenticate,
+that is a change in the harness and not a rewrite of its tests — the rig must
+not become the reason the port stays unauthenticated.
 
 ## The user store (`users.rs`)
 

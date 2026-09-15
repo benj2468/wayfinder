@@ -1,6 +1,9 @@
 # Design: tests that run on real silicon
 
-**Status:** Proposed — approved for implementation in a later session.
+**Status:** Tier B implemented, on `main` in `ee95c92` — `libs/wayfinder-hil`
+and `just hil`, with the first tests in §5 written. **Tier A is not built**: no
+crate uses `embedded-test`, so §4.1 remains a proposal and this doc stays here
+rather than moving into `implemented/`.
 
 Design 20 (`docs/design/implemented/20-embedded-clock-independence.md`) landed
 on `main` in `a2d2cb5`; §2.3 and half of §5 are about verifying its board
@@ -442,9 +445,28 @@ Ordered by what they would have caught. All are Tier B unless marked.
 9. **Fragmentation across payload sizes.** Design 19 §12's hand-made
    16/64/200/400-byte table, re-run as an assertion with a loss ceiling.
 
+**Design 24 on real silicon**
+
+10. **A board inside its renewal window asks, unattended, over the mesh.**
+    Design 24's claim is that a board's problem was never reaching its
+    authority — it routes to one already — but speaking to it, since every
+    management conversation here is TLS over TCP. `libs/wayfinder-hil/tests/
+    renewal.rs` puts the asking half on the part: a real board, free-running on
+    an internal RC oscillator with a credential in its own flash, decides it is
+    due, builds a request, puts it on real RF, and reports what it did.
+
+    The *answering* half is deliberately not here, and the reason is a gap in
+    this rig rather than in the design: it needs a certificate authority on the
+    mesh, which means a host node carrying both a radio and a `CertAuthority` —
+    the `wayfinder-ca` posture with an 802.15.4 link, for which §3 defines no
+    board role. The exchange end to end lives on x86, in `wayfinder-test`,
+    against the same `CertAuthority` a provider runs. What this rig adds is the
+    half x86 cannot have, plus the case a partitioned board actually
+    experiences: asking, not being answered, and saying so.
+
 **Tier A**
 
-10. The five in §4.1.
+11. The five in §4.1.
 
 **Measurement rather than assertion**
 

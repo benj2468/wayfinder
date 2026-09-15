@@ -145,6 +145,10 @@ fn seeded_snapshot() -> NodeSnapshot {
             address: "ca.example:7700".into(),
             node_key: vec![9u8; 32],
         }),
+        // A node that renews over its management API, not over the mesh: both
+        // zero, and so the mesh-renewal row is not rendered at all.
+        renewal_requests_sent: 0,
+        renewal_replies_accepted: 0,
         nodes: vec![
             NodeSecurity {
                 node_id: vec![0, 0, 0, 0, 0, 2],

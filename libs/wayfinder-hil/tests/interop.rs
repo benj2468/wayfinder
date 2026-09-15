@@ -81,8 +81,8 @@ async fn two_boards_on_one_mesh_route_to_each_other() -> anyhow::Result<()> {
     // trust anchor, so each node ends up able to verify the other's OGMs.
     let mesh = TestMesh::mint_now()?;
     let installed_at = host_unix()?;
-    let alpha_mac = mesh.certify(&mut alpha, installed_at).await?;
-    let dongle_mac = mesh.certify(&mut dongle, installed_at).await?;
+    let alpha_mac = mesh.certify(&mut alpha, installed_at, None).await?;
+    let dongle_mac = mesh.certify(&mut dongle, installed_at, None).await?;
 
     anyhow::ensure!(
         alpha_mac != dongle_mac,

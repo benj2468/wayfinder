@@ -10,6 +10,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 use zerocopy::FromBytes;
+use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::BatmanEngine;
@@ -26,6 +27,8 @@ use crate::wire::BatmanCertReqPacket;
 use crate::wire::BatmanEchoPacket;
 use crate::wire::BatmanOgmPacket;
 use crate::wire::BatmanPacketType;
+use crate::wire::BatmanRenewReplyPacket;
+use crate::wire::BatmanRenewReqPacket;
 use crate::wire::BatmanTvlvHdr;
 use crate::wire::BatmanUnicastPacket;
 use crate::wire::ETH_P_BATMAN;
@@ -1907,36 +1910,61 @@ impl<
         }
     }
 
-    /// Route an incoming lazy-cert-distribution fetch request
-    /// (`BatmanPacketType::CertReq`): deliver locally when addressed to us (so the
-    /// router's auth state can answer it), otherwise relay toward the next
-    /// live hop for the requested originator, exactly like
-    /// [`handle_unicast`](Self::handle_unicast). Crypto-free: the engine only
-    /// moves bytes, never inspects the requester's cert/signature body.
-    fn handle_cert_req<'rx, 'tx>(
+    /// Route one of the four credential-control packets — the
+    /// `CertReq`/`CertReply` pair that lazy cert distribution moves, and the
+    /// `RenewReq`/`RenewReply` pair design 24 renews a board with.
+    ///
+    /// All four are structurally one thing: a unicast-shaped header carrying a
+    /// `dest` and a `ttl`, an opaque body, and the same three outcomes —
+    /// deliver locally when `dest` is us (so the router's auth state can act on
+    /// it), drop at `ttl <= 1`, otherwise decrement and relay toward the next
+    /// live hop, exactly like [`handle_unicast`](Self::handle_unicast). They
+    /// share one implementation rather than four copies of the same nine lines
+    /// because the copies are what drift: a fourth arm that forgot its
+    /// decrement is a renewal that circulates forever on a mesh with a
+    /// transient loop, and nothing else here would catch it.
+    ///
+    /// Crypto-free by construction. The engine only moves bytes; every
+    /// signature, certificate and revocation check in these packets belongs to
+    /// the router, which is the layer that holds the keys. That is what keeps
+    /// `libs/batman` linkable on a board that will never be an authority.
+    ///
+    /// `what` names the packet in the drop accounting and the trace line, and
+    /// is a `&'static str` rather than the packet type so the label reads the
+    /// same in both.
+    fn handle_credential_control<'rx, 'tx, H>(
         &mut self,
         now: core::time::Duration,
         frame: &'tx LinkFrame,
         reply: &mut LinkFrameDataMut<'rx>,
-    ) -> RoutingAction {
-        let Ok((hdr, _)) = BatmanCertReqPacket::read_from_prefix(&frame.payload) else {
-            trace!("drop: malformed cert request");
+        what: &'static str,
+    ) -> RoutingAction
+    where
+        H: CredentialControlHeader,
+    {
+        let Ok((hdr, _)) = H::read_from_prefix(&frame.payload) else {
+            trace!(packet = what, "drop: malformed credential-control packet");
             return RoutingAction::Consumed;
         };
-        trace!(cert_req = ?hdr, "rx cert request");
-        let dst = hdr.dest;
+        let dst = hdr.dest();
+        trace!(
+            packet = what,
+            ?dst,
+            ttl = hdr.ttl(),
+            "rx credential control"
+        );
 
         if dst == self.self_ident {
             return RoutingAction::DeliverLocal;
         }
-        if hdr.ttl <= 1 {
+        if hdr.ttl() <= 1 {
             return RoutingAction::Consumed; // Drop packet, expired
         }
         if let Some(next) = self.next_hop(now, dst) {
             let mut updated_hdr = hdr;
-            updated_hdr.ttl -= 1;
+            updated_hdr.decrement_ttl();
 
-            let size = core::mem::size_of::<BatmanCertReqPacket>();
+            let size = core::mem::size_of::<H>();
             let inner = frame.payload.get(size..).unwrap_or(&[]);
             let total = size + inner.len();
 
@@ -1946,51 +1974,7 @@ impl<
                 reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
                 reply.payload[size..total].copy_from_slice(inner);
             } else {
-                self.note_relay_oversize_drop("cert_req_relay", total, reply.payload.len());
-            }
-        }
-
-        RoutingAction::Consumed // Route unknown, drop packet
-    }
-
-    /// Route an incoming lazy-cert-distribution reply (`BatmanPacketType::CertReply`):
-    /// deliver locally when addressed to us, otherwise relay toward the next
-    /// live hop for the original requester. Structurally identical to
-    /// [`handle_cert_req`](Self::handle_cert_req).
-    fn handle_cert_reply<'rx, 'tx>(
-        &mut self,
-        now: core::time::Duration,
-        frame: &'tx LinkFrame,
-        reply: &mut LinkFrameDataMut<'rx>,
-    ) -> RoutingAction {
-        let Ok((hdr, _)) = BatmanCertReplyPacket::read_from_prefix(&frame.payload) else {
-            trace!("drop: malformed cert reply");
-            return RoutingAction::Consumed;
-        };
-        trace!(cert_reply = ?hdr, "rx cert reply");
-        let dst = hdr.dest;
-
-        if dst == self.self_ident {
-            return RoutingAction::DeliverLocal;
-        }
-        if hdr.ttl <= 1 {
-            return RoutingAction::Consumed; // Drop packet, expired
-        }
-        if let Some(next) = self.next_hop(now, dst) {
-            let mut updated_hdr = hdr;
-            updated_hdr.ttl -= 1;
-
-            let size = core::mem::size_of::<BatmanCertReplyPacket>();
-            let inner = frame.payload.get(size..).unwrap_or(&[]);
-            let total = size + inner.len();
-
-            if total <= reply.payload.len() {
-                reply.dst = next;
-                reply.protocol = ETH_P_BATMAN;
-                reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
-                reply.payload[size..total].copy_from_slice(inner);
-            } else {
-                self.note_relay_oversize_drop("cert_reply_relay", total, reply.payload.len());
+                self.note_relay_oversize_drop(what, total, reply.payload.len());
             }
         }
 
@@ -2011,7 +1995,8 @@ impl<
     /// bounds the relay, and it expires long before `hops` could saturate.
     ///
     /// Measurement-free at this layer, in the same spirit as
-    /// [`handle_cert_req`](Self::handle_cert_req) being crypto-free: the engine
+    /// [`handle_credential_control`](Self::handle_credential_control) being
+    /// crypto-free: the engine
     /// counts hops and moves bytes, while what a probe *means* — a session, an
     /// interval, a round-trip time — lives in the router.
     fn handle_echo<'rx, 'tx>(
@@ -2147,8 +2132,34 @@ impl<
                 // and handed to the sink — which copies — one frame at a time.
                 self.handle_mcast(now, frame, out, reply.payload)
             }
-            Some(BatmanPacketType::CertReq) => self.handle_cert_req(now, frame, reply),
-            Some(BatmanPacketType::CertReply) => self.handle_cert_reply(now, frame, reply),
+            Some(BatmanPacketType::CertReq) => self
+                .handle_credential_control::<BatmanCertReqPacket>(
+                    now,
+                    frame,
+                    reply,
+                    "cert_req_relay",
+                ),
+            Some(BatmanPacketType::CertReply) => self
+                .handle_credential_control::<BatmanCertReplyPacket>(
+                    now,
+                    frame,
+                    reply,
+                    "cert_reply_relay",
+                ),
+            Some(BatmanPacketType::RenewReq) => self
+                .handle_credential_control::<BatmanRenewReqPacket>(
+                    now,
+                    frame,
+                    reply,
+                    "renew_req_relay",
+                ),
+            Some(BatmanPacketType::RenewReply) => self
+                .handle_credential_control::<BatmanRenewReplyPacket>(
+                    now,
+                    frame,
+                    reply,
+                    "renew_reply_relay",
+                ),
             Some(BatmanPacketType::Keepalive) => self.handle_keepalive(now, frame),
             Some(BatmanPacketType::EchoRequest) | Some(BatmanPacketType::EchoReply) => {
                 self.handle_echo(now, frame, reply)
@@ -2251,6 +2262,51 @@ impl<
         Some(&tx_buffer[..header_size])
     }
 }
+
+/// The shape every credential-control packet header shares: a `dest` to route
+/// toward and a `ttl` to bound the hops.
+///
+/// A private trait rather than four identical relay arms, so
+/// [`BatmanEngine::handle_credential_control`] can be written once. It exists
+/// only to name the two fields generically — `#[repr(C, packed)]` forbids
+/// taking a reference to a field, so accessors are the way to read them, and
+/// the impls below are the whole of it.
+trait CredentialControlHeader: FromBytes + IntoBytes + Copy + Sized + Immutable {
+    /// The node this packet is routed toward.
+    fn dest(&self) -> Mac;
+    /// The remaining hop budget.
+    fn ttl(&self) -> u8;
+    /// Spend one hop of that budget. Callers check `ttl() > 1` first, so this
+    /// never underflows.
+    fn decrement_ttl(&mut self);
+}
+
+/// Implement [`CredentialControlHeader`] for a header with the standard
+/// `packet_type`/`version`/`ttl`/`dest` layout.
+macro_rules! credential_control_header {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl CredentialControlHeader for $ty {
+                fn dest(&self) -> Mac {
+                    self.dest
+                }
+                fn ttl(&self) -> u8 {
+                    self.ttl
+                }
+                fn decrement_ttl(&mut self) {
+                    self.ttl -= 1;
+                }
+            }
+        )+
+    };
+}
+
+credential_control_header!(
+    BatmanCertReqPacket,
+    BatmanCertReplyPacket,
+    BatmanRenewReqPacket,
+    BatmanRenewReplyPacket,
+);
 
 #[cfg(test)]
 mod tests {
@@ -2579,7 +2635,7 @@ mod tests {
     /// A keep-alive frame truncated shorter than its 2-byte header is
     /// dropped rather than treated as a valid heartbeat — matching every
     /// sibling handler's malformed-input handling (see e.g.
-    /// `handle_cert_req`).
+    /// `handle_credential_control`).
     #[test]
     fn handle_rx_keepalive_drops_truncated_frame() {
         let mut engine = BatmanEngine::<4>::new(mac(1));
@@ -4664,5 +4720,169 @@ mod tests {
             flooded(rx_bcast(&mut engine, t, 2, 2, 1)),
             "a lower seqno is admitted once the old high-water is gone"
         );
+    }
+
+    // ── certificate renewal over the mesh (design 24) ─────────────────────────
+
+    /// A renewal request on the wire: routed toward `dest` like a unicast,
+    /// with a body the engine never looks at.
+    fn renew_req_frame(src: u8, link_dst: u8, dest: u8, ttl: u8) -> Vec<u8> {
+        let pkt = crate::wire::BatmanRenewReqPacket {
+            packet_type: BatmanPacketType::RenewReq.as_u8(),
+            version: BATMAN_VERSION,
+            ttl,
+            dest: mac(dest),
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(link_dst).as_bytes());
+        data.extend_from_slice(mac(src).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(pkt.as_bytes());
+        // A token body, standing in for the requester's cert + signature.
+        data.extend_from_slice(&[0xcd; 16]);
+        data
+    }
+
+    /// The reply half, addressed back toward the requester.
+    fn renew_reply_frame(src: u8, link_dst: u8, dest: u8, ttl: u8) -> Vec<u8> {
+        let pkt = crate::wire::BatmanRenewReplyPacket {
+            packet_type: BatmanPacketType::RenewReply.as_u8(),
+            version: BATMAN_VERSION,
+            ttl,
+            dest: mac(dest),
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(link_dst).as_bytes());
+        data.extend_from_slice(mac(src).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(pkt.as_bytes());
+        data.extend_from_slice(&[0xef; 16]);
+        data
+    }
+
+    /// An engine at `mac(1)` that has learned a route to `mac(2)` from that
+    /// node's own one-hop OGM — the setup every relay assertion below needs,
+    /// since a packet with no next hop is dropped before the TTL is touched.
+    fn engine_with_route_to_two() -> BatmanEngine<4> {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let frame = ogm_frame(2, 1, 1);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut tx = [0u8; 256];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parsed,
+            None,
+            &mut reply,
+            &mut (),
+        );
+        engine
+    }
+
+    /// A `RenewReq` this node is only a waypoint for is forwarded toward the
+    /// next live hop with its TTL decremented — the loop bound design 24 §5.1
+    /// relies on, and the only thing that stops a renewal circulating on a mesh
+    /// with a transient routing loop.
+    #[test]
+    fn a_renew_req_is_relayed_with_a_decremented_ttl() {
+        let mut engine = engine_with_route_to_two();
+        let frame = renew_req_frame(3, 1, 2, 5);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut tx = [0u8; 256];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parsed,
+            None,
+            &mut reply,
+            &mut (),
+        );
+
+        assert!(
+            matches!(action, RoutingAction::Consumed),
+            "a relayed renewal is never delivered to the local node"
+        );
+        assert_eq!(reply.dst, mac(2), "relayed toward the next hop for dest");
+        assert_eq!(reply.protocol, ETH_P_BATMAN);
+        let (hdr, body) =
+            crate::wire::BatmanRenewReqPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(hdr.ttl, 4, "the TTL must be decremented on relay");
+        assert_eq!(hdr.dest, mac(2), "the destination is carried unchanged");
+        assert_eq!(&body[..16], &[0xcd; 16], "the body is relayed verbatim");
+    }
+
+    /// The reply half relays identically. Written out rather than folded into
+    /// the test above because each packet type is a separate *instantiation* of
+    /// `handle_credential_control`, and this is what pins that the dispatch arm
+    /// for the reply reaches it with the right header type. (This rationale
+    /// used to say "separate arms... a copy-paste that forgot one decrement" —
+    /// true when the test was written, and made false by the very commit that
+    /// collapsed the four arms into one generic function.)
+    #[test]
+    fn a_renew_reply_is_relayed_with_a_decremented_ttl() {
+        let mut engine = engine_with_route_to_two();
+        let frame = renew_reply_frame(3, 1, 2, 9);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut tx = [0u8; 256];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parsed,
+            None,
+            &mut reply,
+            &mut (),
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.dst, mac(2));
+        let (hdr, _) = crate::wire::BatmanRenewReplyPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(hdr.ttl, 8);
+    }
+
+    /// A renewal addressed to this node terminates here: it is handed up for
+    /// the router's auth state to verify, never relayed and never put on the
+    /// host device.
+    #[test]
+    fn a_renew_req_addressed_to_us_is_delivered_locally() {
+        let mut engine = engine_with_route_to_two();
+        let frame = renew_req_frame(3, 1, 1, 5);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut tx = [0u8; 256];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parsed,
+            None,
+            &mut reply,
+            &mut (),
+        );
+
+        assert!(matches!(action, RoutingAction::DeliverLocal));
+        assert_eq!(reply.protocol, 0, "nothing is relayed on local delivery");
+    }
+
+    /// At `ttl <= 1` the packet has used its budget and is dropped rather than
+    /// forwarded with a wrapped TTL.
+    #[test]
+    fn a_renew_req_at_ttl_one_is_dropped() {
+        let mut engine = engine_with_route_to_two();
+        let frame = renew_req_frame(3, 1, 2, 1);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut tx = [0u8; 256];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parsed,
+            None,
+            &mut reply,
+            &mut (),
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0, "an expired renewal is not relayed");
     }
 }

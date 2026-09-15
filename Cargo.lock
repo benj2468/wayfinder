@@ -5395,6 +5395,7 @@ dependencies = [
  "interfaces",
  "tracing",
  "wayfinder",
+ "wayfinder-alarm",
  "wayfinder-auth",
  "wayfinder-driver-core",
  "wayfinder-protos",
@@ -5547,6 +5548,8 @@ dependencies = [
  "wayfinder-alarm",
  "wayfinder-auth",
  "wayfinder-driver",
+ "wayfinder-protos",
+ "wayfinder-server",
  "wayfinder-tick-driver",
  "zerocopy",
 ]

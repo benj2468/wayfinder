@@ -42,6 +42,15 @@ and `libs/wayfinder-driver-core`. No change to `LinkT`/`FrameIo` or to
 `MembershipCert`'s layout. (§4 *did* change the routing engine's path
 selection, which the original scope ruled out; see §9's file map.)
 
+> **`auth.rs` is now `auth/`.** Every `libs/wayfinder/src/auth.rs` path and
+> line number below is as of this design. That file was split one-file-per-
+> exchange during MR !191 — `auth/{mod,ogm,pairwise,revocation,proof,
+> distribution,renewal,paths}.rs` — and `OgmAuth` now builds its own
+> control-plane frames rather than leaving `CentralRouter` to assemble them.
+> The reasoning in this document is unaffected; only the addresses moved. See
+> `libs/wayfinder/CLAUDE.md` for the current map.
+
+
 **Threat model, restated up front.** Wayfinder buys *authenticity* and *mesh
 segregation*. It never buys confidentiality — payloads are not encrypted, and a
 listener in radio range reads them whether or not the mesh is authenticated.
