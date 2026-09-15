@@ -22,4 +22,7 @@ build-std = ["core", "alloc"]
 # cable rather than a debug probe: no `probe-rs run --chip ...` like the Cortex-M
 # boards. `--monitor` then stays attached to the same UART the firmware prints
 # on, which is how `cargo run` shows the boot output.
-runner = "espflash flash --monitor --chip esp32"
+# `--partition-table` is not optional: without it espflash generates its own
+# default table, which has no free space after `factory` and so no home for the
+# durable store. `partitions.csv` is this board's `memory.x` — see its header.
+runner = "espflash flash --monitor --chip esp32 --partition-table partitions.csv"

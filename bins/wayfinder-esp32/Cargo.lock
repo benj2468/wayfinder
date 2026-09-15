@@ -959,6 +959,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-storage"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ef0e785f54e316f64a1e14a7a2f061a2ea0b038b284902ca71e1e1f5574cf47"
+dependencies = [
+ "document-features",
+ "embedded-storage",
+ "esp-hal",
+ "esp-hal-procmacros 0.23.0",
+ "esp-metadata-generated 0.5.1",
+ "esp-rom-sys",
+ "esp-sync 0.3.0",
+ "esp32",
+]
+
+[[package]]
 name = "esp-sync"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2257,11 +2273,13 @@ dependencies = [
  "esp-hal",
  "esp-println",
  "esp-rtos",
+ "esp-storage",
  "tracing",
  "wayfinder",
  "wayfinder-embedded-driver",
  "wayfinder-log",
  "wayfinder-server",
+ "wayfinder-storage",
  "wayfinder-version",
 ]
 
@@ -2306,6 +2324,7 @@ dependencies = [
 name = "wayfinder-storage"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "tracing",
 ]
 

@@ -580,6 +580,14 @@ the root workspace" above)
   — the ROM and second-stage bootloaders on every reset, which is why
   `connect_serial` drains before its first frame, and `esp-backtrace` rendering
   a panic.
+
+  Its identity and credential are durable: a seed minted once from the SAR-ADC
+  TRNG (the bare `Rng` on this part is *pseudo*-random without the RF subsystem)
+  and kept in a flash partition. **`partitions.csv` is this board's `memory.x`**
+  — the only statement of where anything lives, since there is no linker script
+  to carve a store out of. `identity.rs` reads that table back at runtime and
+  asks for its partition by label rather than repeating an offset, so the two
+  cannot drift apart.
   Xtensa has no upstream LLVM backend, so this is the one board whose
   compiler the devShell cannot supply — see the `esp-toolchain` section of the
   justfile and `espupWrapped` in `flake.nix`. Flashed over its ROM serial
@@ -591,9 +599,9 @@ the root workspace" above)
   and stack share it, so a `.stack` of ~190 KB in a near-empty image is the
   linker handing out the remainder rather than a cost (194,684 bytes, i.e.
   ~190 KiB — every other DRAM figure here is bytes or KiB, so read it that
-  way). The image uses 82,168
-  bytes of statics in `--release` and leaves 114,440 for stack — 32 KiB of
-  those statics is the heap the management API's framing buffers need.
+  way). The image uses 88,168 bytes of statics in `--release` and leaves
+  108,440 for stack — 32 KiB of those statics is the heap the management API's
+  framing buffers need.
 
   Note there is **no `just stack-budget` for this board**: that gate reads a
   `memory.x`, and `esp-hal` generates `linkall.x` instead. The `.stack` section

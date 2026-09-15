@@ -28,6 +28,7 @@
 #![no_std]
 #![no_main]
 
+mod identity;
 mod link;
 mod mgmt;
 
@@ -38,15 +39,17 @@ use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::Uart;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
-use wayfinder::interfaces::frame::Mac;
+use tracing::warn;
 use wayfinder_embedded_driver::Clock;
 use wayfinder_embedded_driver::Driver;
-use wayfinder_embedded_driver::NullStore;
+use wayfinder_embedded_driver::Restored;
 use wayfinder_embedded_driver::TrickleParams;
 use wayfinder_server::EmbeddedQueryChannel;
 
+use crate::identity::Identity;
 use crate::link::MeshLink;
 
 // The descriptor the ESP-IDF second-stage bootloader reads out of the image
@@ -105,18 +108,6 @@ const MGMT_BAUD: u32 = 115_200;
 /// This board's driver, at the [`esp32`] capacities: one (absent) link driven
 /// by the `embassy-time` clock.
 type BoardDriver = wayfinder_embedded_driver::driver_for!(MeshLink, EspClock, 1, esp32);
-
-/// This node's mesh identity.
-///
-/// A constant, and temporarily so: every board that persists an identity mints
-/// it from hardware and stores it, and this one has neither the flash store nor
-/// the management API to enrol through yet. The eFuse MAC is the natural source
-/// here — it is unique per part, the way the nRF's FICR board id is — and
-/// wiring it is part of making this board persist anything at all.
-///
-/// Locally-administered (`0x02` in the first octet), so it cannot collide with
-/// a real OUI.
-const NODE_MAC: Mac = Mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]);
 
 /// Per-link Trickle schedule. One entry, for the one interface.
 ///
@@ -188,7 +179,6 @@ async fn main(_spawner: Spawner) {
         TimerGroup::new(peripherals.TIMG0).timer0,
         peripherals.FROM_CPU_INTR0,
     );
-
     // After the allocator and before the first event.
     wayfinder_log::init();
 
@@ -243,8 +233,14 @@ async fn main(_spawner: Spawner) {
         }
     };
 
+    // The seed this node routes under, loaded from flash or minted on a part
+    // that has never held one. Before the driver, because the mesh address is
+    // derived from it.
+    let mut identity: Identity =
+        identity::resolve(peripherals.FLASH, peripherals.RNG, peripherals.ADC1);
+    let node_mac = identity.mac();
     let mut driver: BoardDriver = Driver::with_capacities(
-        NODE_MAC,
+        node_mac,
         [MeshLink::Absent],
         EspClock,
         &TRICKLE,
@@ -252,11 +248,36 @@ async fn main(_spawner: Spawner) {
         &NAMES,
     );
 
+    // Come back from what the last run wrote down: the clock checkpoint, then
+    // the credential. Before anything is emitted, so this node's first OGM
+    // already carries its authentication rather than going out unsigned and
+    // being re-flooded that way.
+    //
+    // A board with no durable store has no record and skips this — the same
+    // state as one that has never been enrolled.
+    if let Some(record) = identity.record() {
+        match driver.restore(record) {
+            Restored::Authenticated => info!("restored membership credential from flash"),
+            Restored::Unauthenticated => debug!("no stored credential; routing unauthenticated"),
+            Restored::Refused(reason) => {
+                warn!(
+                    ?reason,
+                    "stored credential refused; routing unauthenticated"
+                );
+            }
+        }
+    }
+
     // Which links came up, not just that the node did — the same line the nRF
     // emits, and for the reason its comment gives: a node routing over nothing
     // is otherwise indistinguishable from a healthy one, and the record saying
     // so has to exist before anyone connects to ask.
-    info!(mac = ?NODE_MAC, espnow = false, "wayfinder started");
+    info!(
+        mac = ?node_mac,
+        espnow = false,
+        durable = identity.record().is_some(),
+        "wayfinder started"
+    );
 
     // The router loop and the management port, concurrently on one task.
     //
@@ -266,17 +287,14 @@ async fn main(_spawner: Spawner) {
     // between frames. That is `run_with_mgmt`'s whole shape, and it is the same
     // arrangement `libs/wayfinder-nrf`'s `node::run` uses.
     //
-    // `NullStore`: nothing this board is told survives a reset yet. A `SetAuth`
-    // over this port applies to the running node and is gone on the next boot,
-    // because the flash-backed store is its own ticket. Deliberately a
-    // `NullStore` rather than a silent no-op — the seam is named, so wiring a
-    // `FlashStore` is a one-line change here.
-    let mut store = NullStore::default();
+    // The store a `SetAuth` over this port writes through, so an enrolment
+    // survives the next reset. `Identity` picks between the flash-backed store
+    // and one that refuses every write with a reason — see `identity`.
     let query_channel = EmbeddedQueryChannel::new();
     let (query_tx, query_rx) = query_channel.split();
 
     let (never, _) = join(
-        driver.run_with_mgmt(&query_rx, &mut store),
+        driver.run_with_mgmt(&query_rx, identity.store_mut()),
         mgmt::serve_forever(&mut uart, &query_tx),
     )
     .await;
