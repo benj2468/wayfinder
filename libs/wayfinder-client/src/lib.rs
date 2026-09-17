@@ -391,6 +391,30 @@ pub fn parse_key32(s: &str) -> anyhow::Result<[u8; 32]> {
         .with_context(|| format!("'{s}' must be a 32-byte key, got {} bytes", bytes.len()))
 }
 
+/// How long one [`Client::request`] waits for its response before giving up.
+///
+/// The deadline is what makes a broken transport *recoverable*, and the serial
+/// link is why it has to exist. A serial port is never closed by the far end,
+/// so there is no EOF: a board that resets mid-request leaves the length codec
+/// holding a partial frame — or a length prefix decoded out of the ROM
+/// bootloader banner a reset injects into the stream — and waiting for bytes
+/// that will never arrive. Without a deadline a caller polling on a timer stops
+/// there permanently, never reaching the reconnect it already knows how to do,
+/// which is exactly how `wayfinder-tui` froze on a board reset. Reconnecting is
+/// the recovery, and it works: `connect_serial` drains the port before its
+/// first frame.
+///
+/// It sits here rather than on either transport because the failure is not the
+/// serial port's alone — a TCP peer that accepts and then goes silent strands a
+/// caller the same way.
+///
+/// Sized for the slowest *legitimate* answer, not the typical one. A `GetLogs`
+/// batch off an embedded ring crosses a 115200-baud line at roughly 11 KB/s, so
+/// a full response is seconds rather than milliseconds; ten leaves room above
+/// that while still bounding a frozen dashboard to something an operator reads
+/// as a stall rather than a hang.
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A connected management-API client over a single transport.
 pub struct Client {
     conn: Conn,
@@ -560,8 +584,9 @@ impl Client {
     /// A well-formed error *response* comes back as a [`ServerError`] inside the
     /// `anyhow::Error`, so a caller can tell the node's considered "no" from the
     /// stream having broken underneath it. Everything else — an I/O failure on
-    /// send or recv, a decode failure, an empty envelope — is an ordinary
-    /// `anyhow` error and means the connection is suspect.
+    /// send or recv, a decode failure, an empty envelope, or the exchange
+    /// outrunning [`RESPONSE_DEADLINE`] — is an ordinary `anyhow` error and
+    /// means the connection is suspect.
     async fn request(&mut self, request: RequestKind) -> anyhow::Result<ResponseKind> {
         let envelope = WayfinderRequest {
             request: Some(request),
@@ -569,8 +594,22 @@ impl Client {
         let mut buf = Vec::new();
         envelope.encode(&mut buf)?;
 
-        self.conn.send(Bytes::from(buf)).await?;
-        let frame = self.conn.recv().await?;
+        // One deadline over the whole exchange rather than one per half: what a
+        // caller needs bounded is "this request will finish or fail", and a send
+        // that never drains strands it exactly as a response that never arrives
+        // does.
+        let exchange = async {
+            self.conn.send(Bytes::from(buf)).await?;
+            self.conn.recv().await
+        };
+        let frame = timeout(RESPONSE_DEADLINE, exchange).await.map_err(|_| {
+            anyhow!(
+                "the node did not answer within {RESPONSE_DEADLINE:?}. This connection \
+                     cannot be recovered in place — reconnect. A board that resets \
+                     mid-request leaves the framing mid-frame, and a serial port has no \
+                     end-of-stream to report it with."
+            )
+        })??;
 
         let response = WayfinderResponse::decode(frame)?;
         match response.response {
