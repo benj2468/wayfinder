@@ -47,7 +47,10 @@ rand = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["derive", "env"], optional = true }
 
 [dev-dependencies]
-tokio.workspace = true
+# `test-util` for `#[tokio::test(start_paused = true)]`: the request-deadline
+# test reaches its deadline by letting the runtime auto-advance a paused clock,
+# rather than by making the suite wait out a real one.
+tokio = { workspace = true, features = ["test-util"] }
 # Test-only: `args.rs` writes an identity seed to a scratch path to exercise
 # endpoint resolution.
 tempfile = "3"

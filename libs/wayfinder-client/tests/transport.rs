@@ -660,3 +660,88 @@ async fn assert_invite_roundtrip(client: &mut Client) {
         .await
         .unwrap();
 }
+
+/// A node that accepts the connection, completes the handshake, and then never
+/// answers must surface as an error rather than hanging the caller forever.
+///
+/// This is the shape a board reset takes on the serial transport, which is
+/// where it was found: a reset mid-stream leaves the length codec holding a
+/// partial frame — or a length prefix decoded out of the ROM bootloader's
+/// banner — and waiting for bytes that will never arrive. There is no EOF on a
+/// serial port to end that wait, so a caller polling on a timer (the TUI) stops
+/// dead and never reaches the reconnect path it already has.
+///
+/// Driven over TLS here because that is the transport a test can stand up
+/// without a board, and the deadline belongs to `Client::request` rather than
+/// to either transport — a TCP peer that accepts and goes silent strands a
+/// caller exactly the same way.
+///
+/// `start_paused` so the deadline is reached by advancing the clock rather than
+/// by waiting out a real one: the runtime auto-advances once every task is
+/// parked, which is precisely the state this test puts it in.
+#[tokio::test(start_paused = true)]
+async fn request_against_a_node_that_never_answers_fails_rather_than_hanging() {
+    use wayfinder_client::Identity;
+
+    let node_seed = [9u8; 32];
+    let ck = wayfinder_tls_mgmt::certified_key_from_seed(&node_seed).unwrap();
+    let node_key = wayfinder_tls_mgmt::raw_ed25519_from_spki(ck.cert[0].as_ref()).unwrap();
+
+    // The service half that never replies: hold every responder so the server
+    // stays connected and silent, rather than dropping them (which would close
+    // the stream and surface as an ordinary "connection closed").
+    let (query_tx, mut query_rx) =
+        mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some((_req, resp_tx)) = query_rx.recv().await {
+            held.push(resp_tx);
+        }
+    });
+
+    let (snapshot_tx, mut snapshot_rx) =
+        mpsc::channel::<oneshot::Sender<wayfinder_server::AuthSnapshot>>(8);
+    tokio::spawn(async move {
+        while let Some(reply) = snapshot_rx.recv().await {
+            let _ = reply.send(wayfinder_server::AuthSnapshot {
+                own_key: Some(node_key),
+                anchor: None,
+                revoked: Vec::new(),
+                own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 9]),
+            });
+        }
+    });
+
+    let listener = wayfinder_server::bind_tcp_server(free_port())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = wayfinder_server::serve_tls_server_with_vpn(
+            listener,
+            node_seed,
+            snapshot_tx,
+            query_tx,
+            wayfinder_server::ServerServices::default(),
+        )
+        .await;
+    });
+
+    let identity = Identity {
+        seed: node_seed,
+        cert: Vec::new(),
+    };
+    let mut client = Client::connect_tls(&addr.into(), &node_key, &identity)
+        .await
+        .unwrap();
+
+    let err = client
+        .node_info()
+        .await
+        .expect_err("a node that never answers must not strand the caller");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("did not answer"),
+        "the error should name the deadline that expired, got: {rendered}"
+    );
+}
