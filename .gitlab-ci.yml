@@ -3,10 +3,53 @@ include:
 variables:
   AST_ENABLE_MR_PIPELINES: true
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  # Line tables only, not full debuginfo, for the dev and test profiles every
+  # MR job compiles: most of a debug build's link time and target size is
+  # debuginfo nobody reads in CI, while line tables keep panic backtraces
+  # pointing at the right line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   CI_REGISTRY_IMAGE: registry.haganah.net
   # CI_REGISTRY_IMAGE_TAG is NOT set here: it's a per-content tag computed by
   # the image-tag job below (see there for why), and every job that needs it
   # pulls it in via that job's dotenv artifact.
+# A newer push to the same MR makes a running pipeline's result moot, and the
+# runners share a host with GitLab itself, so a stale pipeline is not just
+# slow — enough of them starve the server. `interruptible` lets GitLab cancel
+# the superseded one (with "Auto-cancel redundant pipelines" on in the project
+# settings). `deploy` and `mirror:github` opt back out: half a push is worse
+# than a redundant one.
+default:
+  interruptible: true
+# **An MR pipeline aims at under five minutes.** Nothing gates on a lint stage
+# finishing first: every job starts at t=0, and a lint failure still fails the
+# pipeline. Coverage and the full `nix flake check` run on `main` only (a
+# `main` failure is fixed forward). The two longest jobs, `build:web` and
+# `test:run:python`, run everywhere but skip themselves when their exact
+# inputs already passed (`.skip-if-passed`).
+
+# For a long job over one Cargo package: skip it when a run with exactly the
+# same inputs already passed, on any branch. `scripts/ci-input-hash.py` hashes
+# the package, every crate it reaches through path dependencies, the lockfile,
+# this file and the CI image, plus the pathspecs in CI_INPUT_HASH_ARGS. So,
+# unlike a `rules: changes:` list, it cannot miss a dependency.
+#
+# The marker lives in the runners' persistent /sccache volume. before_script
+# and script share one shell, so the `exit 0` ends the job as passed; the
+# marker is written in after_script only when the job really succeeded.
+.skip-if-passed:
+  before_script:
+    - set -f # CI_INPUT_HASH_ARGS carries pathspecs like '*.py' for git, not the shell
+    - CI_PASS_MARK="/sccache/ci-passed/$(echo "$CI_JOB_NAME" | tr ':' '_')/$(python3 scripts/ci-input-hash.py $CI_INPUT_HASH_ARGS)"
+    - set +f
+    - if [ -e "$CI_PASS_MARK" ]; then echo "Inputs unchanged since a passing run ($CI_PASS_MARK); skipping."; exit 0; fi
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = success ]; then
+        set -f
+        mark="/sccache/ci-passed/$(echo "$CI_JOB_NAME" | tr ':' '_')/$(python3 scripts/ci-input-hash.py $CI_INPUT_HASH_ARGS)"
+        mkdir -p "$(dirname "$mark")" && touch "$mark"
+      fi
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_REF_PROTECTED == "true"'
@@ -46,21 +89,26 @@ image-tag:
   artifacts:
     reports:
       dotenv: image.env
-lint:rust:
-  stage: lint
-  image: rustlang/rust:nightly
-  tags:
-    - docker
-  script:
-    - rustup component add rustfmt
-    - cargo fmt
+# Also the repo's formatting gate: `nix flake check` includes treefmt-nix's
+# `treefmt` check, which runs rustfmt (nightly, with `rustfmt.toml`'s unstable
+# options) alongside every other formatter. A separate `lint:rust` job used to
+# run a bare `cargo fmt` — which rewrites instead of checking, so it could never
+# fail — on a ~1.5 GB nightly image pulled every pipeline.
 lint:nix:
   stage: lint
   image: nixos/nix
   tags:
     - docker
   script:
-    - nix --extra-experimental-features "nix-command flakes" flake check
+    # An MR checks formatting only: building the `treefmt` check is the gate
+    # that matters per change. `main` runs the full `flake check`, which also
+    # evaluates every NixOS configuration and minutes of store downloads.
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        nix --extra-experimental-features "nix-command flakes" flake check
+      else
+        nix --extra-experimental-features "nix-command flakes" build --no-link ".#checks.$(nix --extra-experimental-features nix-command eval --impure --raw --expr builtins.currentSystem).treefmt"
+      fi
 lint:mr-title:
   stage: lint
   image:
@@ -78,18 +126,6 @@ secret_detection:
   tags:
     - docker
   needs: []
-lint-done:
-  stage: lint
-  tags:
-    - docker
-  needs:
-    - lint:rust
-    - lint:nix
-    - secret_detection
-    - job: lint:mr-title
-      optional: true
-  script:
-    - echo "done"
 build-image:
   stage: build
   image: docker:latest
@@ -134,7 +170,6 @@ build:
   extends: .base-ci-docker
   stage: build
   needs:
-    - lint-done
     - job: image-tag
       artifacts: true
     - job: build-image
@@ -164,11 +199,15 @@ build:
 # rather than via `-p` from the root. `rylr998`/`at86rf233` aren't part of
 # that binary's graph (they're generic drivers for external radios, not this
 # board's on-board peripheral), so they're still checked directly as libs.
+# Each board below is one `scripts/ci-cached.sh` step with its own input hash
+# (the board's crate, every crate it reaches, its lockfile, `memory.x` and
+# `.cargo/config.toml`), so an MR that touches no board's dependencies skips
+# them all, and one that touches one board rebuilds that board alone. The
+# same holds for build:stack-budget and test:alloc-gate.
 build:embedded:
   extends: .base-ci-docker
   stage: build
   needs:
-    - lint-done
     - job: image-tag
       artifacts: true
     - job: build-image
@@ -188,17 +227,17 @@ build:embedded:
     # on any compile error, and pairing it with a plain build was a full
     # duplicate compile per board (cargo's fingerprinting invalidates the
     # target dir between a plain build and a clippy build of the same crate).
-    - (cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings)
-    - (cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings)
+    - scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings'
+    - scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings'
     # The STM32F411RE (512 KB flash) needs an optimized build to fit the crypto
     # stack, so it's built --release rather than debug like the 1 MB nRF.
-    - (cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings)
+    - scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml -- sh -c 'cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings'
     # Both boards now wire 802.15.4, so the clippy runs above cover
     # `nrf-ieee802154`. What nothing links any more is `blue`'s SoftDevice
     # backend — 802.15.4 and BLE contend for the same RADIO, and the boards
     # took the radio. Cross-compiled explicitly so it cannot rot unnoticed.
     # Keep in step with `clippy-loose-drivers` in the justfile.
-    - cargo clippy --locked -p blue --no-default-features --features hardware,softdevice-log --target "$BARE_METAL_TARGET" -- -D warnings
+    - scripts/ci-cached.sh blue --package blue -- cargo clippy --locked -p blue --no-default-features --features hardware,softdevice-log --target "$BARE_METAL_TARGET" -- -D warnings
     - sccache --show-stats
 # The static stack-budget gate for the board images.
 #
@@ -226,7 +265,6 @@ build:stack-budget:
   extends: .base-ci-docker
   stage: build
   needs:
-    - lint-done
     - job: image-tag
       artifacts: true
     - job: build-image
@@ -247,9 +285,9 @@ build:stack-budget:
     #
     # The nRF boards' 18% share is argued in the `justfile` next to
     # `stack-budget-nrf52840`; keep the two in step.
-    - (cd bins/wayfinder-nrf52840 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x --task-poll-pct 18)
-    - (cd bins/wayfinder-nrf52840-dongle && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x --task-poll-pct 18)
-    - (cd bins/wayfinder-stm32f411 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x)
+    - scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-nrf52840 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x --task-poll-pct 18'
+    - scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x --task-poll-pct 18'
+    - scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-stm32f411 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x'
     - sccache --show-stats
 # `bins/wayfinder-web` needs its own job for two reasons. Its `default` feature
 # set is deliberately empty — so the `build` job's `cargo build --workspace`
@@ -258,10 +296,16 @@ build:stack-budget:
 # (the wasm one is where a misplaced `cfg` hides, since it drops every
 # server-side dependency), then linted and tested against the canned node.
 build:web:
-  extends: .base-ci-docker
+  extends:
+    - .base-ci-docker
+    - .skip-if-passed
   stage: build
+  # Sixteen minutes (release server and wasm builds plus a test build of one
+  # large Leptos crate), so it skips whenever `wayfinder-web` and the 13
+  # in-repo crates it depends on are unchanged since a passing run.
+  variables:
+    CI_INPUT_HASH_ARGS: --package wayfinder-web
   needs:
-    - lint-done
     - job: image-tag
       artifacts: true
     - job: build-image
@@ -276,37 +320,37 @@ build:web:
 test:run:rust:
   extends: .base-ci-docker
   stage: test
+  # Not after `build`: the test build shares nothing with clippy's, so waiting
+  # for it only lengthens the pipeline.
   needs:
-    - build
     - job: image-tag
       artifacts: true
+    - job: build-image
+      optional: true
   # GitLab scrapes this regex against job stdout to populate the coverage badge.
   # The `cargo llvm-cov report` step below prints the TOTAL summary line it matches.
   coverage: '/(?i)total.*?(\d+(?:\.\d+)?%)/'
   script:
-    # Run the suite once and collect coverage without generating a report yet
-    # (--no-report); `cargo llvm-cov report` below then emits both output
-    # formats from that same collected profile data, instead of running the
-    # entire nextest suite a second time just to get a differently-shaped report.
-    - cargo llvm-cov nextest --profile ci --workspace --no-report
-    # `wayfinder-server`'s `embedded` feature is off by default (it is the
-    # `no_std` + `alloc` management transport a board links, and a host build
-    # must not pull `embedded-io-async`/`embassy-sync`), so a plain `--workspace`
-    # run compiles neither the module nor its tests — thirteen of them, covering
-    # the framing and serve loop a node with no debug probe is reached through.
-    # Added to the same profile data rather than as a separate job so its
-    # coverage counts too. See GitLab #22.
-    - cargo llvm-cov nextest --profile ci -p wayfinder-server --features embedded --no-report
-    # Every board builds SHA-512 rolled (`wayfinder-auth/compact-sha512`) while
-    # the host builds it unrolled, so Ed25519 runs through two different hash
-    # implementations on the two sides of every signature. Re-run the auth
-    # suite — RFC 8032 known answers included — on the board's build, so a
-    # board and the CA cannot come to disagree about a signature. See #71.
-    - cargo llvm-cov nextest --profile ci -p wayfinder-auth --features compact-sha512 --no-report
-    # Cobertura file for the MR diff coverage annotations.
-    - cargo llvm-cov report --cobertura --output-path coverage.xml
-    # Text summary to stdout so the `coverage:` regex above can extract the badge number.
-    - cargo llvm-cov report
+    # Coverage on `main` only: instrumentation is a separate, slower build of
+    # the whole workspace. An MR runs the same three suites uninstrumented.
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then RUN="cargo llvm-cov nextest --no-report"; else RUN="cargo nextest run"; fi
+      # The whole workspace.
+      $RUN --profile ci --workspace
+      # `wayfinder-server`'s `embedded` feature is off by default (it is the
+      # `no_std` + `alloc` management transport a board links, and a host
+      # build must not pull `embedded-io-async`/`embassy-sync`), so a plain
+      # `--workspace` run compiles neither the module nor its tests. See #22.
+      $RUN --profile ci -p wayfinder-server --features embedded
+      # Every board builds SHA-512 rolled (`wayfinder-auth/compact-sha512`)
+      # while the host builds it unrolled; re-run the auth suite, RFC 8032
+      # known answers included, on the board's build. See #71.
+      $RUN --profile ci -p wayfinder-auth --features compact-sha512
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        cargo llvm-cov report --cobertura --output-path coverage.xml
+        # Text summary for the `coverage:` regex above.
+        cargo llvm-cov report
+      fi
     - sccache --show-stats
   # `when: always`, so the JUnit report still uploads when the suite is red —
   # the run whose failures GitLab most needs to show on the MR.
@@ -333,11 +377,12 @@ test:alloc-gate:
   extends: .base-ci-docker
   stage: test
   needs:
-    - build
     - job: image-tag
       artifacts: true
+    - job: build-image
+      optional: true
   script:
-    - cargo bench -p wayfinder-bench --features alloc-gate --bench alloc
+    - scripts/ci-cached.sh alloc --package wayfinder-bench -- cargo bench -p wayfinder-bench --features alloc-gate --bench alloc
     - sccache --show-stats
 # The wall-clock packet-path benchmarks.
 #
@@ -371,12 +416,21 @@ bench:
       # the latter is what `critcmp` and any future trend tracking would read.
       - target/criterion/
 test:run:python:
-  extends: .base-ci-docker
+  extends:
+    - .base-ci-docker
+    - .skip-if-passed
   stage: test
   needs:
-    - build
     - job: image-tag
       artifacts: true
+    - job: build-image
+      optional: true
+  # Four minutes (a maturin build plus a ~3-minute suite), so it skips when
+  # the `wayfinder-py` extension's crates and every Python-side input are
+  # unchanged since a passing run.
+  variables:
+    CI_INPUT_HASH_ARGS: >-
+      --package wayfinder-py --manifest-path libs/wayfinder-py/Cargo.toml --extra *.py --extra sim --extra ml --extra scripts --extra libs/wayfinder-shark --extra pyproject.toml --extra uv.lock
   script:
     # `uv sync` builds libs/wayfinder-py from source via maturin (a real cargo
     # invocation), so it's worth the same sccache reuse as the other cargo
@@ -410,11 +464,13 @@ test:run:
     - docker
   needs:
     - test:run:rust
-    - test:run:python
+    - job: test:run:python
+      optional: true
   script:
     - echo "Test Completed"
 deploy:
   stage: deploy
+  interruptible: false
   image: docker:latest
   services:
     - docker:dind
@@ -514,6 +570,7 @@ deploy:
 # stored as the masked CI/CD variable GITHUB_MIRROR_TOKEN.
 mirror:github:
   stage: deploy
+  interruptible: false
   # alpine/git sets ENTRYPOINT ["git"], so the runner's `sh`-based setup script
   # would be invoked as `git sh ...` ("git: 'sh' is not a git command"). Clear
   # the entrypoint so the runner gets a real shell.

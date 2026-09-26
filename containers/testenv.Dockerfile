@@ -9,7 +9,14 @@ RUN apt-get update \
         pkg-config \
         libdbus-1-dev \
         unzip \
+        git \
     && rm -rf /var/lib/apt/lists/*
+
+# `scripts/ci-input-hash.py` reads the checkout with `git ls-files`, so a job
+# can skip when its inputs already passed. The runner's helper container clones
+# the repository, so its owner need not match whoever runs the job, and git
+# refuses such a repository unless it is marked safe.
+RUN git config --system --add safe.directory '*'
 
 # Install the LLVM tools preview required for coverage
 RUN rustup component add llvm-tools-preview
