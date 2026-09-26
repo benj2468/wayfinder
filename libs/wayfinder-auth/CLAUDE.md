@@ -128,6 +128,21 @@ integers). They are parsed straight from received bytes with no allocation — s
 (`CERT_VERSION`, `REVOKE_VERSION`); bump it rather than reinterpreting old
 bytes.
 
+## Two builds of SHA-512
+
+Ed25519 hashes with SHA-512 on every seed expansion, sign and verify. The host
+uses `sha2`'s unrolled round; every board opts into `compact-sha512` (a rolled
+loop — ~10 KiB smaller on Cortex-M, ~43 KiB on the ESP32). Same digest, so the
+only risk is the two builds disagreeing, and that is what the RFC 8032
+known-answer test in `key.rs` rules out — CI runs this crate's suite under both.
+A board opts in on its own `wayfinder-auth` dependency; never enable the feature
+from a shared crate, or the host gets it too.
+
+`blake2` is not a candidate for the same treatment by *replacement*: every
+derived value here — the MAC, cert fingerprints, pairwise keys and tags — is a
+`Blake2s256` output that crosses the wire or is persisted, so swapping hash
+families is a protocol migration, not a size change.
+
 ## Where the CA lives
 
 `Authority` (`authority.rs`, `std` only) holds the mesh root key and issues

@@ -1463,6 +1463,7 @@ dependencies = [
  "blake2",
  "ed25519-dalek",
  "interfaces",
+ "sha2",
  "subtle",
  "x25519-dalek",
  "zerocopy",
@@ -1558,6 +1559,7 @@ dependencies = [
  "embassy-nrf",
  "tracing",
  "wayfinder",
+ "wayfinder-auth",
  "wayfinder-nrf",
 ]
 

@@ -90,6 +90,9 @@ clippy-workspace:
 [doc("Run the root workspace's tests.")]
 test-workspace:
     cargo nextest run --workspace {{ host_workspace_excludes }} --release
+    # The auth suite again on the boards' rolled SHA-512, so a board and the
+    # CA are checked against the same known answers (#71).
+    cargo nextest run -p wayfinder-auth --features compact-sha512 --release
 
 # ---------------------------------------------------------------------------
 # Hardware-in-the-loop (libs/wayfinder-hil)
