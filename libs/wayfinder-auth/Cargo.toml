@@ -15,6 +15,9 @@ x25519-dalek = { version = "2.0", default-features = false, features = [
 blake2 = { version = "0.10", default-features = false }
 subtle = { version = "2.6", default-features = false }
 getrandom = { version = "0.2", optional = true }
+# Named directly only so `compact-sha512` can reach it; `ed25519-dalek` is what
+# actually hashes with it, and cargo unifies the two to one copy.
+sha2 = { version = "0.10", default-features = false, optional = true }
 interfaces.workspace = true
 
 [features]
@@ -23,3 +26,16 @@ default = ["std"]
 # revocation) and OS-RNG keypair generation.  Leave off for `no_std` embedded
 # nodes, which only verify certs and derive pairwise keys.
 std = ["ed25519-dalek/std", "dep:getrandom"]
+# Build SHA-512 — which Ed25519 runs on every seed expansion, sign and verify —
+# as a rolled loop instead of `sha2`'s fully unrolled round (~10 KiB of flash on
+# a Cortex-M4, as one function). Same digest, fewer bytes, more cycles; worth it
+# on a board, where nothing signs or verifies per frame. Off by default: the
+# host has flash to spare and verifies at CA rates.
+#
+# A size choice, so it belongs to the leaf binary (see wayfinder-log's sink
+# features): each board names it on its own dependency. Enabling it here on a
+# shared crate would put it on every build downstream, host included.
+#
+# The known-answer tests in `key.rs` run under both settings in CI, since a
+# board and the CA disagreeing about a signature is the outcome to rule out.
+compact-sha512 = ["dep:sha2", "sha2/force-soft-compact"]

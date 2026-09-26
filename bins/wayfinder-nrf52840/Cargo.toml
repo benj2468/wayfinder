@@ -38,6 +38,13 @@ doc = false
 bench = false
 
 [dependencies]
+# Named only to choose `compact-sha512`: the rolled SHA-512 Ed25519 runs on,
+# ~10 KiB smaller than `sha2`'s unrolled round for the same digest. A size
+# choice, so the leaf binary makes it; the host build keeps the fast path.
+# `default-features = false` because the default is the host's `std`.
+wayfinder-auth = { path = "../../libs/wayfinder-auth", default-features = false, features = [
+    "compact-sha512",
+] }
 # Everything not specific to this board: fault handling, stack measurement,
 # identity, the link enum, the USB management port, the capacity profile and the
 # bring-up sequence. Shared with the dongle firmware.

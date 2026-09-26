@@ -5283,6 +5283,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "interfaces",
+ "sha2",
  "subtle",
  "x25519-dalek",
  "zerocopy",

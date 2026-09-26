@@ -297,6 +297,12 @@ test:run:rust:
     # Added to the same profile data rather than as a separate job so its
     # coverage counts too. See GitLab #22.
     - cargo llvm-cov nextest --profile ci -p wayfinder-server --features embedded --no-report
+    # Every board builds SHA-512 rolled (`wayfinder-auth/compact-sha512`) while
+    # the host builds it unrolled, so Ed25519 runs through two different hash
+    # implementations on the two sides of every signature. Re-run the auth
+    # suite — RFC 8032 known answers included — on the board's build, so a
+    # board and the CA cannot come to disagree about a signature. See #71.
+    - cargo llvm-cov nextest --profile ci -p wayfinder-auth --features compact-sha512 --no-report
     # Cobertura file for the MR diff coverage annotations.
     - cargo llvm-cov report --cobertura --output-path coverage.xml
     # Text summary to stdout so the `coverage:` regex above can extract the badge number.
