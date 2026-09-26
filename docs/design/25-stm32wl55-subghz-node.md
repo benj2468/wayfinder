@@ -5,9 +5,10 @@
 are built; the board **links, fits, and passes `just stack-budget-wl55jc`** as
 a LoRa relay, and §4.1's table carries figures measured from the real image.
 
-**The management port is built but does not fit**, by 28.1 KiB of flash — see
-§4.1's correction, and branch `bjc/wl55jc-mgmt-port`, which carries the working
-port and the measurement. Closing that gap is §9's first open question and the
+**The management port is built but does not fit**: 36,872 bytes over flash on
+current `main`, and 13,960 (13.6 KiB) over once the float-formatting and
+compact-SHA-512 changes land — see §4.1's re-measurement, and branch
+`bjc/wl55jc-mgmt-port`, which carries the working port. Closing that gap is §9's first open question and the
 thing blocking `libs/wayfinder-hil`, enrolment, and observability without a
 debug probe. The durable store (§4.9) and the `fuzz/` target (§10) are also
 unbuilt.
@@ -193,6 +194,29 @@ which is comfortable — but it is the relay, not the finished node. The
 management port is what consumes the remaining headroom (§4.10 budgets 12 KiB
 of heap against the 2 KiB here), so the numbers to re-check are these, after
 that lands.
+
+> **Re-measured on 2026-09-26, after rebasing onto `main`.** Ten commits of
+> `main` landed while this board sat on a branch, including the footprint work
+> in `67682b1` and certificate renewal over the mesh. Same board, same
+> `opt-level="z"` + fat LTO; flash is `.text` + `.data` (so `.rodata`
+> included), statics are `.data` + `.bss`:
+>
+> | image | flash of 262,144 | statics of 65,536 |
+> |---|---|---|
+> | relay, before the rebase | 215,436 | 34,744 |
+> | relay, rebased | 219,532 | 31,692 |
+> | relay, rebased, `ring` off (§4.7) | 219,036 — **43,108 spare** | 27,564 |
+> | + management port, on `main` | 299,016 — **over by 36,872** | 43,984 |
+> | + float fields kept out of `core::fmt` (GitLab #69) and rolled SHA-512 (#71) | 276,104 — **over by 13,960** | 43,984 |
+>
+> So `main` made the relay 4 KB larger in flash and 3 KB smaller in RAM, and
+> the port's shortfall *grew* before the size work began to close it. With the
+> port, 21,552 bytes are left for stack. The two changes in the last row cut
+> 22,912 bytes here; the remaining 13.6 KiB is #70's and #72's to find. The
+> largest single consumers of that image by `cargo bloat --crates`:
+> `embassy_executor` 23.9 KiB (really this board's own task bodies inlined into
+> their polls, #72), `wayfinder_protos` 23.2, `curve25519_dalek` 15.0, `batman`
+> 12.9, `prost` 11.9, `wayfinder_driver_core` 10.0.
 
 For reference, the F411 image the design was planned against had statics of
 ~52 KiB, which on a 64 KiB part would have left ~12 KiB of stack. Two statics
@@ -444,6 +468,14 @@ and 16 records at 160-byte messages remain enough to carry a bring-up sequence.
 
 The ring's own invariants and `GetLogs`'s batch-byte budget are unaffected —
 only the capacity changes, and both are already written against the constant.
+
+**Since then, `main` made the ring itself optional** (the `ring` feature), for
+a board with no management API to serve `GetLogs` from. The two compose rather
+than compete: the feature decides *whether* there is a ring, the variable *how
+big* it is, and with the feature off the variable is inert. The relay takes
+the ring off entirely — nothing on it can read one — which frees the 4,128
+bytes this section budgeted; the management-port build turns it back on at 16
+records.
 
 ### 4.8 Dual core: CM4 only, and the CM0+ is never released
 
@@ -844,7 +876,14 @@ Recorded as the design is built, per `docs/design/README.md`.
   continuation of the abandoned one and the radio reads the first byte as an
   opcode.
 
-- **`stack-budget-wl55jc` runs at `--task-poll-pct 30`, not the 8% default.**
+- **`stack-budget-wl55jc` ran at `--task-poll-pct 30`, not the 8% default; it
+  now runs at 12%.** After the rebase onto `main` the `main` task's poll
+  measures 2,788 bytes, not 6,820, and the stack region 37,968, so the justfile
+  recipe carries the current numbers and a tighter share. The poll is reserved
+  with Thumb-2 `subw`, which `stack-budget.py` read as a zero-byte frame until
+  it was taught the encoding — the gate briefly measured only the radio task.
+  What follows is the original reasoning, kept for the record.
+
   This is the one gate that needed relaxing, so the reasoning is in the
   justfile recipe rather than only here. In short: the default is a *fraction*,
   and this board's stack region is ~30 KB against the nRF52840's ~122 KB — 8%
