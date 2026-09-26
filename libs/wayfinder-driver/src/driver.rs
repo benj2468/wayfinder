@@ -39,6 +39,7 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::router_ops::RouterOps;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
@@ -293,7 +294,17 @@ impl MeshSink for LoopOutput {
 /// `Local` is the host-facing device (a TUN/TAP in production, an observable
 /// channel in tests); the mesh interfaces are type-erased [`LinkT`]s, so simple
 /// point-to-point carriers and self-routing multi-access links can be mixed.
-pub struct Driver<Local: FrameIo> {
+///
+/// Generic over the router type `R: RouterOps`, defaulting to [`CentralRouter`]
+/// at its host capacities — the way `wayfinder-embedded-driver`'s `Driver`
+/// already is (design 26 phase 1 slice 2). The event loop, planning and
+/// dispatch are expressed against `R` alone; the management-API surface
+/// (`router_handle`, `with_router`/`with_router_mut`, `run`/`run_once`/
+/// `process_pending`) stays pinned to the concrete default, because
+/// `wayfinder-server`'s `RouterAdapter` is itself const-generic over
+/// `CentralRouter`'s capacities rather than generic over `RouterOps` —
+/// generalising that is design 26 phase 1 slice 3, not this one.
+pub struct Driver<Local: FrameIo, R: RouterOps = CentralRouter> {
     /// The local host network device.
     local: Local,
     /// The mesh interfaces, indexed by interface index.
@@ -314,7 +325,7 @@ pub struct Driver<Local: FrameIo> {
     /// frames. This loop takes the write guard — in short scopes, never across
     /// a link send — and a connection task reads through a
     /// [`RouterHandle`](wayfinder_server::RouterHandle).
-    shared: Arc<RwLock<SharedRouter>>,
+    shared: Arc<RwLock<SharedRouter<R>>>,
     /// Management-API queries forwarded from the server tasks.
     query_rx: QueryRx,
     /// Requests from the TLS management server for a snapshot of this node's
@@ -424,7 +435,7 @@ pub struct Driver<Local: FrameIo> {
     mesh_renewal_rx: tokio::sync::mpsc::Receiver<(Mac, wayfinder_server::RenewalOutcome)>,
 }
 
-impl<Local: FrameIo> Driver<Local> {
+impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.  `trickle` supplies each
     /// interface's per-link adaptive OGM bounds (`i_min`/`i_max`), `features`
@@ -449,7 +460,7 @@ impl<Local: FrameIo> Driver<Local> {
         // `wayfinder-tap` overrides the policy from config.
         let clock = AuthClock::Host;
         let clock_trust = ClockTrust::default();
-        let mut router = CentralRouter::new(mac);
+        let mut router = R::with_capacities(mac);
         // Install each interface's adaptive OGM schedule and participation
         // features up front so the periodic loop and the egress gates have a
         // per-interface entry to consult from the start.  The Trickle timer is
@@ -733,7 +744,17 @@ impl<Local: FrameIo> Driver<Local> {
             auth_present,
         });
     }
+}
 
+/// The management-API surface: read/mutate the router directly, hand a shared
+/// handle to the TLS server, and run the event loop.
+///
+/// Pinned to the concrete default profile rather than generic over `R:
+/// RouterOps` (design 26 phase 1 slice 3 widens this): `RouterAdapter` and
+/// `RouterHandle` are themselves const-generic over `CentralRouter`'s eleven
+/// table capacities, not generic over the trait, so a query-handling arm built
+/// against them cannot be written for an arbitrary `R` today.
+impl<Local: FrameIo> Driver<Local, CentralRouter> {
     /// Read the router under the shared lock.
     ///
     /// A scoped callback rather than a returned guard, so a caller cannot hold
@@ -1533,7 +1554,12 @@ impl<Local: FrameIo> Driver<Local> {
             ),
         }
     }
+}
 
+/// Back to the generic surface: planning and dispatch, expressible for any
+/// `R: RouterOps` (see the concrete-only block above for why the
+/// management-API methods cannot join them yet).
+impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Inject one host Ethernet frame as if it had arrived from the local
     /// device, wrapping it for the mesh and dispatching the resulting copies
     /// immediately.  Equivalent to the host-device arm of [`run_once`], exposed
@@ -1605,7 +1631,10 @@ impl<Local: FrameIo> Driver<Local> {
         )
         .await
     }
+}
 
+/// Back to the concrete-only management surface (see above).
+impl<Local: FrameIo> Driver<Local, CentralRouter> {
     /// Drain every already-pending event — host frames, mesh frames, management
     /// queries, authorization snapshots and signed revocations — in
     /// non-blocking sweeps until nothing remains.
@@ -1739,7 +1768,11 @@ impl<Local: FrameIo> Driver<Local> {
         self.record_self_revocation().await;
         Ok(())
     }
+}
 
+/// Back to the generic surface for the remaining helpers, which touch only
+/// what [`RouterOps`] already covers.
+impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Persist and alarm on a revocation of *this* node, if the router acted
     /// on one this iteration.
     ///
@@ -1812,8 +1845,8 @@ impl<Local: FrameIo> Driver<Local> {
 /// to that one interface.  Thin `std`-side wrapper that stages the shared
 /// core's [`poll_due_ogms`](wayfinder_driver_core::poll_due_ogms) output into an
 /// owned [`Vec`].
-fn poll_due_ogms(
-    router: &mut CentralRouter,
+fn poll_due_ogms<R: RouterOps>(
+    router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
 ) -> Vec<OutgoingFrame> {
@@ -1827,8 +1860,8 @@ fn poll_due_ogms(
 /// stages the shared core's
 /// [`poll_due_keepalives`](wayfinder_driver_core::poll_due_keepalives) output
 /// into an owned [`Vec`].
-fn poll_due_keepalives(
-    router: &mut CentralRouter,
+fn poll_due_keepalives<R: RouterOps>(
+    router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
 ) -> Vec<OutgoingFrame> {
@@ -2053,9 +2086,9 @@ impl FrameSink for OwnedFrameSink<'_> {
 /// for a multicast group with a known, bounded listener set — an individual
 /// `BatmanPacketType::Mcast` copy per interested node.  IGMP is snooped first so the
 /// groups the host joins/leaves are announced on the next OGM.
-fn plan_host_frame(
+fn plan_host_frame<R: RouterOps>(
     now: Duration,
-    router: &mut CentralRouter,
+    router: &mut R,
     snooper: &mut McastSnooper,
     eth: &[u8],
     tx_buffer: &mut [u8],
@@ -2074,7 +2107,7 @@ fn plan_host_frame(
     let dst = Mac(dst_mac);
 
     // Locally originated frames flood out every interface (no ingress to omit).
-    let flood = |router: &mut CentralRouter, mesh: &mut Vec<OutgoingFrame>, buf: &mut [u8]| {
+    let flood = |router: &mut R, mesh: &mut Vec<OutgoingFrame>, buf: &mut [u8]| {
         if let Ok(f) = router.handle_local(now, Mac::BROADCAST, eth, buf) {
             mesh.push(OutgoingFrame {
                 dst: f.dst,
@@ -2137,10 +2170,10 @@ fn plan_host_frame(
 
 /// Deliver one unit of work: write any inner frame to the host device and
 /// dispatch each outgoing frame onto the mesh via `get_egress_interface`.
-async fn dispatch<Local: FrameIo>(
+async fn dispatch<Local: FrameIo, R: RouterOps>(
     local: &Local,
     interfaces: &mut [Box<DynLinkT<'static>>],
-    shared: &RwLock<SharedRouter>,
+    shared: &RwLock<SharedRouter<R>>,
     mac: Mac,
     now: Duration,
     output: LoopOutput,

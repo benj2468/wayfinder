@@ -52,8 +52,11 @@ use interfaces::link::LinkMetrics;
 
 use crate::CentralRouter;
 use crate::EgressInterface;
+use crate::LocalSendError;
+use crate::McastPlan;
 use crate::RxOutcome;
 use crate::auth::OgmAuth;
+use crate::auth::VerifiedRenewal;
 use crate::features::LinkFeatures;
 use interfaces::engine::FrameSink;
 
@@ -300,6 +303,72 @@ pub trait RouterOps {
 
     /// This router's authentication state, or `None` when auth is off.
     fn auth_mut(&mut self) -> Option<&mut Self::Auth>;
+
+    /// This router's authentication state, or `None` when auth is off.
+    ///
+    /// The shared-borrow sibling of [`auth_mut`](Self::auth_mut), for a driver
+    /// that only needs to ask whether auth is installed (or reach a read-only
+    /// verb on [`OgmAuthOps`]) without excluding a concurrent mutator.
+    fn auth(&self) -> Option<&Self::Auth>;
+
+    // ---- local host egress --------------------------------------------------
+
+    /// Wrap host data destined for `dest` in the appropriate BATMAN packet,
+    /// ready to hand to a link. See [`CentralRouter::handle_local`].
+    fn handle_local<'tx>(
+        &mut self,
+        now: Duration,
+        dest: Mac,
+        payload: &[u8],
+        tx_buf: &'tx mut [u8],
+    ) -> Result<LinkFrameData<'tx>, LocalSendError>;
+
+    /// Wrap host data for a whole set of multicast listeners, emitting one
+    /// frame per next hop into `out`. See [`CentralRouter::handle_local_mcast`].
+    fn handle_local_mcast(
+        &mut self,
+        now: Duration,
+        dests: &[Mac],
+        payload: &[u8],
+        tx_buf: &mut [u8],
+        out: &mut dyn FrameSink,
+    ) -> Result<(), LocalSendError>;
+
+    /// Decide how to deliver a multicast frame for `group`: as individual
+    /// unicasts to each known listener, or by flooding. See
+    /// [`CentralRouter::mcast_plan`].
+    fn mcast_plan(&self, group: Mac) -> McastPlan;
+
+    /// The originators that have announced interest in `group` — the targets
+    /// for [`McastPlan::Unicast`]. See [`CentralRouter::mcast_targets`].
+    fn mcast_targets(&self, group: Mac) -> impl Iterator<Item = Mac> + '_;
+
+    /// Set the multicast groups the local host listens to (typically from IGMP
+    /// snooping). See [`CentralRouter::set_local_mcast_groups`].
+    fn set_local_mcast_groups(&mut self, now: Duration, groups: &[Mac]);
+
+    // ---- revocation and renewal ---------------------------------------------
+
+    /// Ingest a signed revocation (the operator/management-API entry point for
+    /// an emergency purge), returning whether it was newly recorded. See
+    /// [`CentralRouter::ingest_revocation`].
+    fn ingest_revocation(
+        &mut self,
+        record: &wayfinder_auth::RevocationRecord,
+        now: Duration,
+    ) -> bool;
+
+    /// Whether this node has a self-revocation recorded that has not yet been
+    /// taken for persistence. See [`CentralRouter::self_revocation_pending`].
+    fn self_revocation_pending(&self) -> bool;
+
+    /// Take this node's own recorded self-revocation, if any, so a caller can
+    /// persist it. See [`CentralRouter::take_self_revocation`].
+    fn take_self_revocation(&mut self) -> Option<wayfinder_auth::RevocationRecord>;
+
+    /// Take a verified renewal request another node addressed to this one, if
+    /// any is waiting. See [`CentralRouter::take_renewal_request`].
+    fn take_renewal_request(&mut self) -> Option<VerifiedRenewal>;
 
     /// Advance both of the router's clocks and reconcile the engine's next-hop
     /// proofs against the key material behind them.
@@ -566,6 +635,63 @@ impl<
 
     fn auth_mut(&mut self) -> Option<&mut Self::Auth> {
         Self::auth_mut(self)
+    }
+
+    fn auth(&self) -> Option<&Self::Auth> {
+        Self::auth(self)
+    }
+
+    fn handle_local<'tx>(
+        &mut self,
+        now: Duration,
+        dest: Mac,
+        payload: &[u8],
+        tx_buf: &'tx mut [u8],
+    ) -> Result<LinkFrameData<'tx>, LocalSendError> {
+        Self::handle_local(self, now, dest, payload, tx_buf)
+    }
+
+    fn handle_local_mcast(
+        &mut self,
+        now: Duration,
+        dests: &[Mac],
+        payload: &[u8],
+        tx_buf: &mut [u8],
+        out: &mut dyn FrameSink,
+    ) -> Result<(), LocalSendError> {
+        Self::handle_local_mcast(self, now, dests, payload, tx_buf, out)
+    }
+
+    fn mcast_plan(&self, group: Mac) -> McastPlan {
+        Self::mcast_plan(self, group)
+    }
+
+    fn mcast_targets(&self, group: Mac) -> impl Iterator<Item = Mac> + '_ {
+        Self::mcast_targets(self, group)
+    }
+
+    fn set_local_mcast_groups(&mut self, now: Duration, groups: &[Mac]) {
+        Self::set_local_mcast_groups(self, now, groups);
+    }
+
+    fn ingest_revocation(
+        &mut self,
+        record: &wayfinder_auth::RevocationRecord,
+        now: Duration,
+    ) -> bool {
+        Self::ingest_revocation(self, record, now)
+    }
+
+    fn self_revocation_pending(&self) -> bool {
+        Self::self_revocation_pending(self)
+    }
+
+    fn take_self_revocation(&mut self) -> Option<wayfinder_auth::RevocationRecord> {
+        Self::take_self_revocation(self)
+    }
+
+    fn take_renewal_request(&mut self) -> Option<VerifiedRenewal> {
+        Self::take_renewal_request(self)
     }
 }
 
