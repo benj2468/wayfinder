@@ -12,6 +12,9 @@ target = "thumbv7em-none-eabi"
 # general: the crate defaults to 64 records (~16 KiB), which is fine against
 # the nRF52840's 256 KiB of SRAM and a quarter of everything this board has.
 # 16 records still carries a bring-up sequence. Design 25 §4.7.
+#
+# Inert while the `ring` feature is off, as it is on the relay (see
+# `Cargo.toml`): it sizes the ring, it does not create one.
 WAYFINDER_LOG_RING_CAPACITY = "16"
 
 [target.thumbv7em-none-eabi]

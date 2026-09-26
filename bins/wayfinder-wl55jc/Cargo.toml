@@ -40,8 +40,15 @@ wayfinder = { path = "../../libs/wayfinder", default-features = false }
 wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
 # The build identity this firmware logs at bring-up.
 wayfinder-version = { path = "../../libs/wayfinder-version" }
-# The RTT `tracing` subscriber plus the bounded `GetLogs` record ring.
-wayfinder-log = { path = "../../libs/wayfinder-log" }
+# The RTT `tracing` subscriber -- and, deliberately, *not* the `GetLogs` record
+# ring. The relay has no management port, so nothing can ever read the ring;
+# it would still be written on every record and cost a `static` (4,128 bytes at
+# this board's 16 records) on a part with 64 KB of RAM. The STM32F411's
+# posture, for the same reason. The management-port build turns `ring` back on,
+# and `WAYFINDER_LOG_RING_CAPACITY` in `.cargo/config.toml` then sizes it.
+wayfinder-log = { path = "../../libs/wayfinder-log", default-features = false, features = [
+    "sink-rtt",
+] }
 # This board's wire format: framing and fragmentation over a raw LoRa PHY,
 # which is what an on-die SX126x is (unlike the RYLR998 module `rylr998`
 # drives, which does its own addressing).

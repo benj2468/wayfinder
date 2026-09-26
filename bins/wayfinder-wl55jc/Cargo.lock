@@ -1612,6 +1612,7 @@ dependencies = [
  "interfaces",
  "tracing",
  "wayfinder",
+ "wayfinder-alarm",
  "wayfinder-driver-core",
  "wayfinder-protos",
  "wayfinder-server",
