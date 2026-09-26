@@ -86,6 +86,124 @@ impl LineBuf {
     }
 }
 
+/// An `f64` field value rendered as a fixed three-decimal number (`-12.500`)
+/// with integer arithmetic only.
+///
+/// Exists to keep `core`'s float formatter out of a bare-metal image. The bare
+/// subscriber receives fields through `dyn Visit`, so every `record_*` method
+/// is in the vtable and reachable whether or not anything logs a float; the
+/// default `record_f64` formats via `Debug`, which links `flt2dec` (~11 KiB on
+/// a Cortex-M4). Routing the value through this instead links none of it —
+/// and, since it reads the IEEE-754 bits rather than multiplying by `1000.0`,
+/// none of the soft-float builtins either.
+///
+/// Rounds the exact binary value half away from zero. `NaN` and the infinities
+/// render as `NaN`/`inf`/`-inf`; a magnitude too large for three decimals in an
+/// `i64` renders as `<f64>` rather than as a saturated wrong number.
+pub(crate) struct Fixed3(pub(crate) f64);
+
+impl Debug for Fixed3 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let bits = self.0.to_bits();
+        let negative = bits >> 63 == 1;
+        let exp_field = (bits >> 52) & 0x7ff;
+        let fraction = bits & ((1 << 52) - 1);
+
+        if exp_field == 0x7ff {
+            return f.write_str(match (fraction != 0, negative) {
+                (true, _) => "NaN",
+                (false, false) => "inf",
+                (false, true) => "-inf",
+            });
+        }
+
+        // value = mantissa * 2^shift, exactly. Subnormals have no implicit bit
+        // and the minimum exponent.
+        let (mantissa, shift) = if exp_field == 0 {
+            (fraction, -1074)
+        } else {
+            (fraction | (1 << 52), exp_field as i32 - 1075)
+        };
+        // mantissa < 2^53 and 1000 < 2^10, so this cannot overflow.
+        let scaled = mantissa * 1000;
+        let millis = if shift >= 0 {
+            let limit = (i64::MAX as u64) >> shift.min(63);
+            if shift >= 64 || scaled > limit {
+                return f.write_str("<f64>");
+            }
+            scaled << shift
+        } else {
+            let s = shift.unsigned_abs();
+            // scaled < 2^63, so adding the half-unit cannot overflow a u64.
+            if s >= 64 {
+                0
+            } else {
+                (scaled + (1 << (s - 1))) >> s
+            }
+        };
+        if millis > i64::MAX as u64 {
+            return f.write_str("<f64>");
+        }
+
+        let sign = if negative && millis != 0 { "-" } else { "" };
+        write!(f, "{sign}{}.{:03}", millis / 1000, millis % 1000)
+    }
+}
+
+/// A 128-bit integer field value, rendered in full without `u128`'s own
+/// formatter.
+///
+/// The bare subscriber's default `record_u128`/`record_i128` format via
+/// `Debug`, which links `<u128>::_fmt_inner` into every bare-metal image for
+/// fields nothing logs. This splits the magnitude into base-10^19 chunks and
+/// prints each through the `u64` path the image already carries.
+pub(crate) struct Wide128 {
+    /// Whether to print a leading `-`. Never set for zero.
+    negative: bool,
+    /// The absolute value — a `u128` so `i128::MIN`'s magnitude fits.
+    magnitude: u128,
+}
+
+impl From<u128> for Wide128 {
+    fn from(value: u128) -> Self {
+        Self {
+            negative: false,
+            magnitude: value,
+        }
+    }
+}
+
+impl From<i128> for Wide128 {
+    fn from(value: i128) -> Self {
+        Self {
+            negative: value < 0,
+            magnitude: value.unsigned_abs(),
+        }
+    }
+}
+
+impl Debug for Wide128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        /// The largest power of ten that fits a `u64`; `u128::MAX` has 39
+        /// digits, so three chunks always suffice.
+        const CHUNK: u128 = 10_000_000_000_000_000_000;
+        if self.negative {
+            f.write_str("-")?;
+        }
+        let low = (self.magnitude % CHUNK) as u64;
+        let rest = self.magnitude / CHUNK;
+        let mid = (rest % CHUNK) as u64;
+        let high = (rest / CHUNK) as u64;
+        if high != 0 {
+            write!(f, "{high}{mid:019}{low:019}")
+        } else if mid != 0 {
+            write!(f, "{mid}{low:019}")
+        } else {
+            write!(f, "{low}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +307,68 @@ mod tests {
         // `as_str` returning at all proves UTF-8 validity; confirm the tail is a
         // whole char rather than a lone continuation byte.
         assert!(line.as_str().chars().next_back().is_some());
+    }
+
+    /// Render a value through the wrapper's `Debug`, which is how the bare
+    /// visitor hands it to [`LineBuf::push_field`].
+    fn render(value: &dyn Debug) -> String {
+        format!("{value:?}")
+    }
+
+    /// A float renders as a scaled integer with three decimals, rounded half
+    /// away from zero — never through `core`'s float formatter, whose `flt2dec`
+    /// machinery is the ~13 KiB this wrapper exists to keep out of a board image.
+    #[test]
+    fn f64_renders_three_fixed_decimals() {
+        assert_eq!(render(&Fixed3(12.5)), "12.500");
+        assert_eq!(render(&Fixed3(0.0)), "0.000");
+        assert_eq!(render(&Fixed3(0.0005)), "0.001");
+        assert_eq!(render(&Fixed3(-0.0005)), "-0.001");
+        assert_eq!(render(&Fixed3(1234.5678)), "1234.568");
+    }
+
+    /// A negative value whose integer part is zero keeps its sign: splitting on
+    /// `/ 1000` and `% 1000` alone would render `-0.25` as `0.250`.
+    #[test]
+    fn f64_between_minus_one_and_zero_keeps_its_sign() {
+        assert_eq!(render(&Fixed3(-0.25)), "-0.250");
+        assert_eq!(render(&Fixed3(-12.5)), "-12.500");
+    }
+
+    /// Non-finite and out-of-range values render as a marker rather than a
+    /// saturated, plausible-looking wrong number.
+    #[test]
+    fn f64_non_finite_and_out_of_range_render_as_markers() {
+        assert_eq!(render(&Fixed3(f64::NAN)), "NaN");
+        assert_eq!(render(&Fixed3(f64::INFINITY)), "inf");
+        assert_eq!(render(&Fixed3(f64::NEG_INFINITY)), "-inf");
+        assert_eq!(render(&Fixed3(1e300)), "<f64>");
+        assert_eq!(render(&Fixed3(-1e300)), "<f64>");
+    }
+
+    /// 128-bit integers render in full, including middle chunks that need
+    /// zero-padding, without `u128`'s own formatter.
+    #[test]
+    fn u128_renders_every_digit() {
+        for v in [
+            0,
+            42,
+            u128::from(u64::MAX),
+            u128::from(u64::MAX) + 1,
+            5 * 10u128.pow(19) + 7,
+            10u128.pow(38) + 3,
+            u128::MAX,
+        ] {
+            assert_eq!(render(&Wide128::from(v)), v.to_string(), "{v}");
+        }
+    }
+
+    /// Signed 128-bit values, including `i128::MIN`, whose magnitude does not
+    /// fit an `i128`.
+    #[test]
+    fn i128_renders_every_digit_and_its_sign() {
+        for v in [0, -1, 17, i128::from(i64::MIN) - 1, i128::MIN, i128::MAX] {
+            assert_eq!(render(&Wide128::from(v)), v.to_string(), "{v}");
+        }
     }
 }

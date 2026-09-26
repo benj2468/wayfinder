@@ -28,7 +28,9 @@ use tracing_core::span::Record;
 
 use crate::filter;
 use crate::filter::Level;
+use crate::fmt::Fixed3;
 use crate::fmt::LineBuf;
+use crate::fmt::Wide128;
 use crate::ring;
 use crate::sink;
 
@@ -172,8 +174,18 @@ impl Subscriber for BareSubscriber {
 }
 
 /// Appends an event's fields to the line buffer: the reserved `message` field
-/// bare, every other as ` name=value`. The typed `record_*` methods all fall
-/// through to `record_debug`, so implementing it alone covers every type.
+/// bare, every other as ` name=value`. The typed `record_*` methods fall
+/// through to `record_debug`, so it alone covers every type — except the three
+/// overridden below.
+///
+/// Those three exist for flash, not formatting. The dispatcher holds this
+/// visitor as `dyn Visit`, so every trait method is in the vtable and linked
+/// whether or not anything calls it, and the trait's defaults for `f64`,
+/// `i128` and `u128` format through `Debug` — which drags `core`'s float and
+/// 128-bit formatters (~13 KiB, plus the soft-float builtins) into every board
+/// image for fields nothing here logs. See `fmt::Fixed3` and `fmt::Wide128`.
+/// The host layer in `subscriber.rs` keeps the defaults; `std` pays for them
+/// anyway.
 struct FieldVisitor<'a>(&'a mut LineBuf);
 
 impl Visit for FieldVisitor<'_> {
@@ -183,5 +195,17 @@ impl Visit for FieldVisitor<'_> {
         } else {
             self.0.push_field(field.name(), value);
         }
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.record_debug(field, &Fixed3(value));
+    }
+
+    fn record_i128(&mut self, field: &Field, value: i128) {
+        self.record_debug(field, &Wide128::from(value));
+    }
+
+    fn record_u128(&mut self, field: &Field, value: u128) {
+        self.record_debug(field, &Wide128::from(value));
     }
 }
