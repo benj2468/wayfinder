@@ -3498,4 +3498,94 @@ mod tests {
              finished, this test proved nothing and needs a slower authority request"
         );
     }
+
+    // ---- design 26 phase 1 slice 2: the host driver at a non-default profile --
+
+    wayfinder::define_profile! {
+        /// A capacity profile smaller than `host` in every dimension, so a test
+        /// exercising it cannot pass merely because it happens to coincide with
+        /// the router's built-in defaults.
+        pub tiny_cloud {
+            originators: 16,
+            interfaces: 2,
+            mcast_members: 8,
+            local_mcast: 4,
+            ident_table: 16,
+            ident_live: 12,
+            link_quality: 16,
+            neighbor_keys: 8,
+            revoked: 4,
+            in_flight_cert_requests: 2,
+            pending_replies: 2,
+            max_frame_len: 256,
+        }
+    }
+
+    /// The concrete router type for [`tiny_cloud`] — a stand-in for the `cloud`
+    /// profile design 26 itself adds, at a size cheap enough for a unit test.
+    type TinyRouter = wayfinder::router_for!(tiny_cloud);
+
+    /// A mesh interface that only ever captures what is sent on it, so a test
+    /// can observe that the driver's periodic loop actually produced and
+    /// dispatched an OGM rather than merely type-checking.
+    struct CapturingLink(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl LinkT for CapturingLink {
+        async fn send(
+            &mut self,
+            _origin: Mac,
+            data: &LinkFrameData<'_>,
+        ) -> Result<usize, interfaces::link::LinkError> {
+            let payload = data.payload.to_vec();
+            let len = payload.len();
+            #[expect(clippy::unwrap_used, reason = "test harness: an uncontended mutex")]
+            self.0.lock().unwrap().push(payload);
+            Ok(len)
+        }
+
+        async fn recv<'a>(
+            &'a mut self,
+        ) -> Result<wayfinder::link::Received<'a>, interfaces::link::LinkError> {
+            std::future::pending().await
+        }
+    }
+
+    /// The whole point of this slice: the host driver, generic over `R:
+    /// RouterOps`, runs its real event loop — construction, per-interface
+    /// Trickle scheduling, and dispatch — at a capacity profile other than the
+    /// default `host` one, and actually emits an OGM onto a link. Before this
+    /// slice `Driver<Local>` named `CentralRouter` outright, so a router of
+    /// another profile could not be handed to it at all — this test could not
+    /// even be *written*, let alone pass.
+    #[tokio::test]
+    async fn the_host_driver_runs_at_a_non_default_router_profile() {
+        let sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Box<DynLinkT<'static>> = DynLinkT::new_box(CapturingLink(sent.clone()));
+
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        let mut driver: Driver<NeverIo, TinyRouter> = Driver::new(
+            mac(1),
+            NeverIo,
+            vec![link],
+            vec![TrickleConfig::default()],
+            vec![LinkFeatures::default()],
+            Vec::new(),
+            query_rx,
+        );
+
+        // Advance until the one interface's Trickle timer is due — the exact
+        // instant is Trickle's own choice, not this test's, exactly as
+        // `wayfinder::router_ops`'s own `drive_one_ogm` test helper does.
+        let mut now = Duration::ZERO;
+        while sent.lock().expect("uncontended mutex").is_empty() && now < Duration::from_secs(60) {
+            driver.poll_due(now).await.expect("poll_due does not fail");
+            now += Duration::from_millis(100);
+        }
+
+        assert!(
+            !sent.lock().expect("uncontended mutex").is_empty(),
+            "the driver must emit an OGM on its one interface even at a non-default \
+             capacity profile"
+        );
+    }
 }
