@@ -48,12 +48,12 @@ wayfinder-sim = { workspace = true }
 wayfinder-ml = { workspace = true }
 
 [tool.pytest.ini_options]
-# Recurse the crate tree, plus the simulator's own tests (sim/tests/) and the
-# ML pipeline's (ml/tests/). Every one of these resolves its imports from the
-# synced environment — the workspace members are installed editable — so no
-# `pythonpath` entry, `conftest.py` shim or `sys.path` insert is needed to
-# make one directory see another.
-testpaths = ["libs", "sim", "ml"]
+# Recurse the crate tree, plus the simulator's own tests (sim/tests/), the
+# ML pipeline's (ml/tests/) and the build gates' (scripts/tests/). Every one of
+# these resolves its imports from the synced environment — the workspace
+# members are installed editable — so no `pythonpath` entry, `conftest.py` shim
+# or `sys.path` insert is needed to make one directory see another.
+testpaths = ["libs", "sim", "ml", "scripts"]
 # importlib mode means test modules need not have globally-unique filenames, so
 # two crates can each have e.g. tests/test_wire.py without colliding.
 addopts = "-ra --import-mode=importlib"
