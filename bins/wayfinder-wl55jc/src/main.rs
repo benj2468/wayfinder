@@ -1,10 +1,10 @@
 //! NUCLEO-WL55JC1 (STM32WL55JC) firmware: the wayfinder mesh router on bare
 //! metal over the LoRa radio **on the same die**.
 //!
-//! The third silicon family to run the same
-//! [`wayfinder_embedded_driver::Driver`] the nRF boards run, and the first
-//! whose radio is not a separate part: no UART to a module, no second vendor's
-//! firmware in the path, and no AT commands. What that costs is a wire format,
+//! The fourth part (and second STM32) to run the same
+//! [`wayfinder_embedded_driver::Driver`] the other boards run, and the first
+//! whose *LoRa* radio is not a separate part: no UART to a module, no second
+//! vendor's firmware in the path, and no AT commands. What that costs is a wire format,
 //! because a raw SX126x supplies none of the addressing a RYLR998 module does —
 //! see `libs/lora-link`.
 //!
@@ -157,7 +157,7 @@ wayfinder::define_profile! {
 const _: () = assert!(lora_link::MAX_REASSEMBLED_LEN == wl55jc::MAX_FRAME_LEN);
 
 bind_interrupts!(struct Irqs {
-    // The radio's own interrupt. `iv::await_irq` unmasks it and waits on the
+    // The radio's own interrupt. `Stm32wlInterfaceVariant::await_irq` unmasks it and waits on the
     // signal this handler sets; it must not touch the SPI bus.
     SUBGHZ_RADIO => crate::SubghzIrqHandler;
     // `SUBGHZSPI` transfers over DMA, so both channels' completion interrupts
@@ -187,8 +187,8 @@ impl embassy_stm32::interrupt::typelevel::Handler<embassy_stm32::interrupt::type
     unsafe fn on_interrupt() {
         // Mask the line before signalling: the radio's IRQ status is cleared
         // by `lora-phy` over SPI, which cannot happen from here, so leaving it
-        // unmasked would re-enter this handler forever. `iv::await_irq`
-        // unmasks it again before each wait.
+        // unmasked would re-enter this handler forever.
+        // `Stm32wlInterfaceVariant::await_irq` unmasks it again before each wait.
         embassy_stm32::interrupt::SUBGHZ_RADIO.disable();
         iv::IRQ_SIGNAL.signal(());
     }

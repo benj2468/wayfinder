@@ -474,7 +474,7 @@ stack-budget-stm32f411: build-stm32f411
 # from measurements, not a threshold raised to turn a red pipeline green.
 #
 # The default is a *fraction*, and this board's stack region (37,968 bytes,
-# flip-link) is a third of the nRF52840's, so 8% is 3,037 bytes of absolute
+# flip-link) is under a quarter of the nRF52840's 163,000, so 8% is 3,037 bytes of absolute
 # room. The `main` task's poll reserves 2,788 -- it fits, by 249 bytes, which
 # is a gate the next small change trips. 12% (4,556) leaves room for ordinary
 # growth while still catching a regression of the kind that once put this poll
@@ -483,8 +483,8 @@ stack-budget-stm32f411: build-stm32f411
 # That 6,820 was measured before this board was rebased onto the footprint
 # work on main; the same poll now measures 2,788 (which change shrank it was
 # not pinned down). It is reserved with Thumb-2 `subw sp, sp, #0xae4`, so it
-# is only visible to a `stack-budget.py` that counts `subw` -- one that does
-# not reads this poll as zero and passes it at any percentage.
+# is only visible to a `stack-budget.py` that counts `subw` (MR !199) -- one
+# that does not reads this poll as zero and passes it at any percentage.
 #
 # The body chain, checked as the guidance requires: the two task polls reserve
 # 2,788 + 1,220 = 4,008 bytes for the node's life, and the deepest transient

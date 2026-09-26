@@ -57,8 +57,8 @@ and the key is what decides which reassembly a fragment belongs to.
 `ieee802154::short_address_of`'s derivation — deliberately the same, so a
 node's two radios agree on its short identity. This crate does **not** call
 that function or depend on that crate: the adapter passes `src_id` in, the way
-`wayfinder-nrf` already computes its LoRa address
-(`libs/wayfinder-nrf/src/node.rs`). Keep it that way; a LoRa crate depending on
+the STM32F411 board already computes its RYLR998 address inline
+(`bins/wayfinder-stm32f411/src/main.rs`). Keep it that way; a LoRa crate depending on
 an 802.15.4 crate for two lines of arithmetic is worse than the duplication it
 avoids.
 
@@ -137,9 +137,12 @@ and has exactly this latent problem; it has never been exercised only because
 it is unwired.
 
 `send` is under no such constraint — it is awaited to completion by
-`plan_dispatch`'s caller and is not raced — so it may drive the radio directly,
-which is why the owning task generally holds the radio behind a mutex rather
-than being a pure receive loop.
+`plan_dispatch`'s caller and is not raced — **but it still must not take the
+radio through a mutex**. On a half-duplex radio the receive side sits parked
+inside `rx()` holding the radio, so a mutexed `send` waits until a frame happens
+to arrive. Hand transmit to the owning task through a queue instead, and have
+that task race `rx()` against the queue (`bins/wayfinder-wl55jc/src/radio.rs`
+is the shape to copy).
 
 ## Fuzzing
 

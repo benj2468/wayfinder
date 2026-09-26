@@ -330,10 +330,11 @@ pub struct LoraLink {
 }
 
 impl LoraLink {
-    /// Build the link. `src_id` must be
-    /// `ieee802154::short_address_of(node_mac)` — the same short identity
-    /// every other radio on the node uses — and **must differ between
-    /// physical nodes**, or their fragments spoil each other's reassembly.
+    /// Build the link. `src_id` must be the low two bytes of the node's `Mac`,
+    /// big-endian — `ieee802154::short_address_of`'s derivation, which
+    /// `main.rs` repeats rather than depend on that crate — and **must differ
+    /// between physical nodes**, or their fragments spoil each other's
+    /// reassembly.
     pub fn new(net_id: u8, src_id: u16) -> Self {
         Self {
             net_id,

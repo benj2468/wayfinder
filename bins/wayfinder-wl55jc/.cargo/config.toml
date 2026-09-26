@@ -19,9 +19,10 @@ WAYFINDER_LOG_RING_CAPACITY = "16"
 
 [target.thumbv7em-none-eabi]
 # `flip-link` puts the stack *below* the statics, for the reason the nRF boards
-# use it and more urgently: this part has no MPU guard region, so a descending
+# use it and more urgently: with no MPU guard region configured, a descending
 # stack that reaches `.bss` corrupts it silently and the fault surfaces
-# somewhere unrelated. The margin here is a few KB, not tens.
+# somewhere unrelated, and this part's whole stack region is ~38 KB (a peak of
+# ~17.5 KB measured, per `stack-budget-wl55jc` in the justfile).
 linker = "flip-link"
 # `defmt.x` alongside `link.x`: `defmt`'s interning sections must be placed even
 # though this board's logger discards every record. Without it the link fails

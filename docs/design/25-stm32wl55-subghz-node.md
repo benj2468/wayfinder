@@ -831,8 +831,8 @@ Recorded as the design is built, per `docs/design/README.md`.
 
 - **`src_id` is passed in, not derived.** §4.4 says the derivation matches
   `ieee802154::short_address_of`, and the first instinct was to call it. Design
-  19 §11 had already settled where that function lives and why, and
-  `wayfinder-nrf` already calls it *for its LoRa address* — so the board
+  19 §11 had already settled where that function lives and why, and the
+  STM32F411 already derives its RYLR998 address inline — so the board
   computes it and `lora-link` takes a `u16`, rather than a LoRa crate depending
   on an 802.15.4 crate for two lines of arithmetic.
 
@@ -880,9 +880,15 @@ Recorded as the design is built, per `docs/design/README.md`.
   now runs at 12%.** After the rebase onto `main` the `main` task's poll
   measures 2,788 bytes, not 6,820, and the stack region 37,968, so the justfile
   recipe carries the current numbers and a tighter share. The poll is reserved
-  with Thumb-2 `subw`, which `stack-budget.py` read as a zero-byte frame until
-  it was taught the encoding — the gate briefly measured only the radio task.
+  with Thumb-2 `subw`, which `stack-budget.py` reads as a zero-byte frame until
+  MR !199 teaches it the encoding; before that lands, this board's gate
+  measures only the radio task.
   What follows is the original reasoning, kept for the record.
+
+- **Transmit goes through a queue to the radio task, not a `Mutex<LoRa>`** as
+  §4.5 anticipated. A half-duplex radio parked inside `rx()` holds the radio,
+  so a mutexed `send` would wait for a frame to arrive; the task instead races
+  `rx()` against a depth-1 transmit queue (`radio.rs`'s module docs).
 
   This is the one gate that needed relaxing, so the reasoning is in the
   justfile recipe rather than only here. In short: the default is a *fraction*,

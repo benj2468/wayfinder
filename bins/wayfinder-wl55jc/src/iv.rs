@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | reset | NRESET pin | `RCC.CSR.RFRST` |
 //! | busy | BUSY pin | `PWR.SR2.RFBUSYS` |
-//! | chip select | NSS pin | `PWR.SUBGHZSPICR.NSS`, driven by the SPI peripheral |
+//! | chip select | NSS pin | `PWR.SUBGHZSPICR.NSS`, set by `SubghzSpiDevice` |
 //! | IRQ | DIO1 pin | the `SUBGHZ_RADIO` interrupt |
 //!
 //! Keeping it behind `InterfaceVariant` is what stops those registers leaking
@@ -108,11 +108,17 @@ where
 
     /// Wait for the radio's own interrupt.
     ///
-    /// The pending bit is cleared and the line unmasked *before* awaiting, so
-    /// an event that arrives between the caller's last command and this call
-    /// is not lost — the ordering is the whole of the correctness here, and
-    /// getting it backwards produces a receive that hangs until the next
-    /// unrelated event.
+    /// The pending bit is cleared and the line unmasked *before* awaiting.
+    /// Nothing is lost by the clear because the radio's IRQ line is
+    /// **level**-triggered: it stays asserted until `lora-phy` clears the
+    /// radio's IRQ status over SPI, so an event that already happened
+    /// re-pends the moment the line is unmasked. The clear only discards a
+    /// stale NVIC pending bit.
+    ///
+    /// `IRQ_SIGNAL` itself is never reset here, so a signal left set by an
+    /// abandoned `rx` can satisfy one wait spuriously. `lora-phy` rereads the
+    /// radio's IRQ status after every wake and treats "nothing set" as a
+    /// spurious wake, so this costs a loop, not a wrong answer.
     async fn await_irq(&mut self) -> Result<(), RadioError> {
         // Clear then unmask, in that order: a stale pending bit left from the
         // previous operation would otherwise fire this immediately and report

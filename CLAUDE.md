@@ -257,8 +257,8 @@ flood the logs.
 subscribers on every target and feeds two things, *each now a Cargo feature the
 leaf binary chooses*: a text sink (`sink-rtt` over a debug probe,
 `sink-esp-println` over a UART, or none) and a bounded record ring (`ring`) that
-`GetLogs` serves. The STM32F411 takes the ring off — nothing can read it there —
-and the ESP32 takes the sink off, since its one byte stream carries the
+`GetLogs` serves. The STM32F411 and the STM32WL55 relay take the ring off —
+nothing can read it there — and the ESP32 takes the sink off, since its one byte stream carries the
 management API. **Features are additive, so this choice belongs to the binary**:
 naming one on a shared dependency puts it back on every board downstream, which
 is exactly how the STM32's saving was silently undone once already. That
@@ -619,15 +619,16 @@ the root workspace" above)
   size is right there in the ELF, but `scripts/stack-budget.py`'s frame parser
   matches ARM prologues and embassy's `TaskStorage::poll` mangling, so an
   Xtensa backend is the larger half of the job.
-- **bins/wayfinder-wl55jc** — NUCLEO-WL55JC1 (STM32WL55JC), the first board
-  whose **radio is on the same die**: `lora-phy` over the `SUBGHZSPI`
-  peripheral, with `libs/lora-link`'s wire format and no external module. Three
-  things about it differ from every other board here, and each is a silent
-  failure if copied wrong: its Cortex-M4 has **no FPU** (so
-  `thumbv7em-none-eabi`, not `eabihf`), it has **64 KB of SRAM** and gets all
-  of it only because the Cortex-M0+ is never released, and it is the one board
-  that must be built at `opt-level = "z"` with fat LTO to fit 256 KB of flash.
-  See `docs/design/25-stm32wl55-subghz-node.md`.
+- **bins/wayfinder-wl55jc** — NUCLEO-WL55JC1 (STM32WL55JC), a LoRa relay on
+  the **on-die sub-GHz radio**: `lora-phy` over the `SUBGHZSPI` peripheral,
+  with `libs/lora-link`'s wire format and no external module. Two things about
+  it differ from every other board here, and each is a silent failure if copied
+  wrong: its Cortex-M4 has **no FPU** (so `thumbv7em-none-eabi`, not `eabihf`),
+  and it has **64 KB of SRAM** and gets all of it only because the Cortex-M0+
+  is never released. Like the Cortex-M boards it builds at `opt-level = "z"`
+  with fat LTO, and here that is required to fit 256 KB of flash rather than a
+  preference. The relay has no management port and no log ring (it does not fit
+  yet — see `docs/design/25-stm32wl55-subghz-node.md`).
 
 **Deployment targets** — the same `wayfinder-tap` binary, four ways
 - **nix/modules/wayfinder.nix** — the NixOS service module every host
