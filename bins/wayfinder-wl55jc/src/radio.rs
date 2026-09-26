@@ -33,6 +33,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Delay;
+use embassy_time::Duration;
+use embassy_time::Timer;
 use lora_phy::LoRa;
 use lora_phy::RxMode;
 use lora_phy::mod_params::Bandwidth;
@@ -40,6 +42,8 @@ use lora_phy::mod_params::CodingRate;
 use lora_phy::mod_params::SpreadingFactor;
 use lora_phy::sx126x::Stm32wl;
 use lora_phy::sx126x::Sx126x;
+use tracing::debug;
+use tracing::error;
 use tracing::trace;
 use tracing::warn;
 use wayfinder::interfaces::frame::LinkFrameData;
@@ -124,32 +128,35 @@ pub struct RadioConfig {
 pub async fn radio_task(
     spi: SubghzSpiDevice<'static>,
     iv: Stm32wlInterfaceVariant<embassy_stm32::gpio::Output<'static>>,
-    chip: Stm32wl,
     sx_config: lora_phy::sx126x::Config<Stm32wl>,
     config: RadioConfig,
 ) -> ! {
     // Built here rather than in `main` and handed over: a `LoRa` constructed
     // in `main` is a stack temporary in `main`'s poll frame, which is held for
     // the life of the node. `scripts/stack-budget.py` is what catches that.
-    let _ = chip;
     let mut lora = match LoRa::new(Sx126x::new(spi, iv, sx_config), false, Delay).await {
         Ok(lora) => lora,
-        Err(_) => {
-            warn!("radio: bring-up failed; this link is down");
+        Err(e) => {
+            error!(?e, "radio: bring-up failed; this link is down");
             park().await
         }
     };
-    let Ok(modulation) = lora.create_modulation_params(
+    // Nothing this task can do about a rejected parameter set, and returning
+    // is not an option. Park rather than spin, and say why once.
+    let modulation = match lora.create_modulation_params(
         config.spreading_factor,
         config.bandwidth,
         config.coding_rate,
         config.frequency_hz,
-    ) else {
-        // Nothing this task can do about a rejected parameter set, and
-        // returning is not an option. Park rather than spin: the node keeps
-        // running on whatever other links it has, and says why once.
-        warn!("radio: modulation parameters refused; this link is down");
-        park().await
+    ) {
+        Ok(modulation) => modulation,
+        Err(e) => {
+            error!(
+                ?e,
+                "radio: modulation parameters refused; this link is down"
+            );
+            park().await
+        }
     };
 
     // `max_payload_length` is the PHY ceiling, which is also one whole
@@ -163,26 +170,29 @@ pub async fn radio_task(
         &modulation,
     ) {
         Ok(params) => params,
-        Err(_) => {
-            warn!("radio: rx packet parameters refused; this link is down");
+        Err(e) => {
+            error!(?e, "radio: rx packet parameters refused; this link is down");
             park().await
         }
     };
     let mut tx_params =
         match lora.create_tx_packet_params(PREAMBLE_SYMBOLS, false, true, false, &modulation) {
             Ok(params) => params,
-            Err(_) => {
-                warn!("radio: tx packet parameters refused; this link is down");
+            Err(e) => {
+                error!(?e, "radio: tx packet parameters refused; this link is down");
                 park().await
             }
         };
 
-    if lora.init().await.is_err() {
-        warn!("radio: init failed; this link is down");
+    if let Err(e) = lora.init().await {
+        error!(?e, "radio: init failed; this link is down");
         park().await
     }
 
     let mut buf = [0u8; lora_link::MAX_FRAME_LEN];
+    // Consecutive failures to enter receive, for the backoff and so the streak
+    // is reported once rather than per attempt.
+    let mut rx_failures: u32 = 0;
     loop {
         // Re-entered every pass: a transmit leaves the radio in standby, and
         // `rx` refuses to run unless the mode says receive.
@@ -190,8 +200,27 @@ pub async fn radio_task(
             .prepare_for_rx(RxMode::Continuous, &modulation, &rx_params)
             .await
         {
-            trace!(?e, "radio: entering rx failed");
+            // Node-local (an SPI or radio-mode fault, not anything a peer
+            // sends), so `warn!` — once per streak, not per retry.
+            if rx_failures == 0 {
+                warn!(?e, "radio: entering rx failed; retrying with backoff");
+            }
+            rx_failures = rx_failures.saturating_add(1);
+            // Back off, but keep serving transmit while doing it: going
+            // straight back to `prepare_for_rx` never reaches the `select`
+            // below, and every `send` would wait on `TX_DONE` forever — the
+            // whole driver loop with it.
+            let backoff = Duration::from_millis(10 << rx_failures.min(6));
+            if let Either::Second(packet) = select(Timer::after(backoff), TX_QUEUE.receive()).await
+            {
+                let sent = transmit(&mut lora, &modulation, &mut tx_params, &config, &packet).await;
+                TX_DONE.signal(sent);
+            }
             continue;
+        }
+        if rx_failures > 0 {
+            debug!(rx_failures, "radio: entering rx recovered");
+            rx_failures = 0;
         }
 
         // Bound to a `let` so the borrows of `lora` and `buf` end here, before
@@ -264,13 +293,23 @@ async fn transmit(
     }
 }
 
-/// Stop this task forever without returning from it.
+/// Give up on the radio without taking the node down with it.
 ///
-/// For a bring-up failure the node can survive: the radio link is dead, but
-/// the node still answers its management port and routes over any other link,
-/// which is strictly better than halting the whole board.
+/// **Parked still serves the transmit queue**, failing every packet at once.
+/// [`LoraLink::send`] hands each fragment to this task and awaits a verdict,
+/// so a task that simply stopped would hold that `send` — and with it the
+/// whole driver loop, since the driver awaits `send` outside its `select` —
+/// forever. `recv` just stays pending, which is correct for a dead link.
+///
+/// On this board (one interface, no management port) that leaves a node that
+/// is deaf and mute on the mesh while its timers and tables keep running; the
+/// `error!` at each call site is the record of why. A board with another link
+/// or a management port keeps both.
 async fn park() -> ! {
-    core::future::pending().await
+    loop {
+        let _ = TX_QUEUE.receive().await;
+        TX_DONE.signal(false);
+    }
 }
 
 /// The mesh interface over this board's radio.

@@ -487,9 +487,9 @@ stack-budget-stm32f411: build-stm32f411
 # not reads this poll as zero and passes it at any percentage.
 #
 # The body chain, checked as the guidance requires: the two task polls reserve
-# 2,788 + 980 = 3,768 bytes for the node's life, and the deepest transient
+# 2,788 + 1,220 = 4,008 bytes for the node's life, and the deepest transient
 # chain on top is ~13.5 KB (`Driver`'s body 7,388 + `verify_signature` 5,236 +
-# `pairwise_key` 892) -- a peak near 17.3 KB of the 37,968-byte region, so
+# `pairwise_key` 892) -- a peak near 17.5 KB of the 37,968-byte region, so
 # roughly 54% margin.
 [doc("Static stack-budget check for the NUCLEO-WL55JC firmware.")]
 stack-budget-wl55jc: build-wl55jc

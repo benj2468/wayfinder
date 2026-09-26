@@ -12,11 +12,18 @@
 //!
 //! - **NSS is asserted low and deasserted high**, so the bit is *cleared* to
 //!   select the radio. It reads backwards from every GPIO chip-select.
-//! - **The bus is flushed and NSS deasserted even when an operation fails.**
-//!   Returning early on the error would leave the radio selected, and the next
-//!   transaction would then run as a continuation of the abandoned one — the
-//!   radio interprets the first byte as an opcode, so a desynchronised bus does
-//!   not error, it executes something else.
+//! - **NSS is deasserted on every way out of a transaction** — an operation
+//!   failing, and the transaction future being *dropped* mid-transfer. Leaving
+//!   the radio selected means the next transaction runs as a continuation of
+//!   the abandoned one; the radio interprets the first byte as an opcode, so a
+//!   desynchronised bus does not error, it executes something else.
+//!
+//!   The drop case is not hypothetical. `radio_task` races `lora-phy`'s `rx`
+//!   against its transmit queue, and `rx` does SPI work of its own once the
+//!   radio interrupts (IRQ status, payload, packet status). A transmit that
+//!   arrives during those reads wins the race and drops `rx` inside a
+//!   transaction. So the deassert lives in [`NssGuard`]'s `Drop`, not at the
+//!   end of the function.
 
 use embassy_stm32::mode::Async;
 use embassy_stm32::pac;
@@ -29,7 +36,36 @@ use embedded_hal_async::spi::SpiBus;
 use embedded_hal_async::spi::SpiDevice;
 
 /// The `SUBGHZSPI` bus, with the radio's register-backed chip-select.
-pub struct SubghzSpiDevice<'d>(pub Spi<'d, Async, Master>);
+///
+/// The bus is private: the whole point of the type is that every access
+/// selects and deselects the radio around it.
+pub struct SubghzSpiDevice<'d>(Spi<'d, Async, Master>);
+
+impl<'d> SubghzSpiDevice<'d> {
+    /// Wrap the bus `Spi::new_subghz` returns.
+    pub fn new(spi: Spi<'d, Async, Master>) -> Self {
+        Self(spi)
+    }
+}
+
+/// The radio selected for as long as this lives: NSS is asserted (cleared —
+/// it is active low) on construction and deasserted on drop, including the
+/// drop of a transaction future cancelled mid-transfer. See the module docs.
+struct NssGuard;
+
+impl NssGuard {
+    /// Select the radio.
+    fn assert() -> Self {
+        pac::PWR.subghzspicr().modify(|w| w.set_nss(false));
+        Self
+    }
+}
+
+impl Drop for NssGuard {
+    fn drop(&mut self) {
+        pac::PWR.subghzspicr().modify(|w| w.set_nss(true));
+    }
+}
 
 impl ErrorType for SubghzSpiDevice<'_> {
     type Error = SpiError;
@@ -37,8 +73,7 @@ impl ErrorType for SubghzSpiDevice<'_> {
 
 impl SpiDevice<u8> for SubghzSpiDevice<'_> {
     async fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), SpiError> {
-        // Assert: NSS is active low, so this *clears* the bit.
-        pac::PWR.subghzspicr().modify(|w| w.set_nss(false));
+        let nss = NssGuard::assert();
 
         let mut result = Ok(());
         for op in operations {
@@ -59,13 +94,13 @@ impl SpiDevice<u8> for SubghzSpiDevice<'_> {
             }
         }
 
-        // Both of these must happen on the error path too — see the module
-        // docs. A flush that fails does not change what has to be done to NSS.
+        // Flushed on the error path too; a flush that fails does not change
+        // what has to be done to NSS, which the guard does either way.
         // `SpiBus::flush` carries no buffer to infer the word type from, and
         // `Spi` implements the bus for both `u8` and `u16`, so it has to be
         // named explicitly.
         let flushed = SpiBus::<u8>::flush(&mut self.0).await;
-        pac::PWR.subghzspicr().modify(|w| w.set_nss(true));
+        drop(nss);
 
         result.and(flushed)
     }

@@ -90,6 +90,13 @@ const NODE_MAC: Mac = Mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]);
 /// boundary, which is `wayfinder-auth`'s job above `LinkT`.
 const LORA_NET_ID: u8 = 18;
 
+/// Which of the SX126x's two power amplifiers transmit uses. This board brings
+/// out RFO_HP. Named once because two consumers must agree on it: `lora-phy`'s
+/// `Stm32wl` variant (PA configuration) and the antenna switch, whose transmit
+/// truth table inverts FE_CTRL1 by PA — a disagreement transmits into the
+/// wrong path and presents as a radio with no range.
+const USE_HIGH_POWER_PA: bool = true;
+
 /// The radio settings every node on this mesh must agree on.
 ///
 /// 868.1 MHz is in the EU ISM band this board's JC1 (high-band) front end is
@@ -290,24 +297,15 @@ async fn main(spawner: Spawner) {
     // FE_CTRL3 is the switch enable and idles high on this board.
     let fe_ctrl3 = Output::new(p.PC3, Level::High, Speed::High);
 
-    // `SUBGHZSPI` is hardwired to the radio: no pins, and the chip-select is a
-    // `PWR` register bit the peripheral drives.
     // A bare `SpiBus`; `lora-phy` wants a `SpiDevice`, and the chip-select is
     // a `PWR` register bit rather than a pin — hence the wrapper.
-    let spi = SubghzSpiDevice(Spi::new_subghz(p.SUBGHZSPI, p.DMA1_CH1, p.DMA1_CH2, Irqs));
+    let spi = SubghzSpiDevice::new(Spi::new_subghz(p.SUBGHZSPI, p.DMA1_CH1, p.DMA1_CH2, Irqs));
 
-    // `use_high_power_pa: true` — this board brings out RFO_HP, and the
-    // switch's truth table for transmit depends on which PA is selected.
-    let Ok(interface) =
-        Stm32wlInterfaceVariant::new(true, Some(fe_ctrl1), Some(fe_ctrl2), Some(fe_ctrl3))
-    else {
-        error!("radio interface setup failed; halting");
-        halt();
-    };
+    let interface = Stm32wlInterfaceVariant::new(USE_HIGH_POWER_PA, fe_ctrl1, fe_ctrl2, fe_ctrl3);
 
     let sx_config = Sx126xConfig {
         chip: Stm32wl {
-            use_high_power_pa: true,
+            use_high_power_pa: USE_HIGH_POWER_PA,
         },
         // This board *does* have a TCXO, on the radio's DIO3 supply. It is the
         // same 32 MHz reference `config.rcc.hse` bypasses in on, so leaving
@@ -324,15 +322,7 @@ async fn main(spawner: Spawner) {
     // and `scripts/stack-budget.py` gates exactly that.
     //
     // The task pool holds one, so this only fails if it were spawned twice.
-    let Ok(task) = radio::radio_task(
-        spi,
-        interface,
-        Stm32wl {
-            use_high_power_pa: true,
-        },
-        sx_config,
-        RADIO,
-    ) else {
+    let Ok(task) = radio::radio_task(spi, interface, sx_config, RADIO) else {
         error!("could not spawn the radio task; halting");
         halt();
     };

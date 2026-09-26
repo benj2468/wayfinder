@@ -43,9 +43,9 @@ pub static IRQ_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// [`Self::new`].
 pub struct Stm32wlInterfaceVariant<CTRL> {
     use_high_power_pa: bool,
-    rf_switch_rx: Option<CTRL>,
-    rf_switch_tx: Option<CTRL>,
-    rf_switch_en: Option<CTRL>,
+    rf_switch_rx: CTRL,
+    rf_switch_tx: CTRL,
+    rf_switch_en: CTRL,
 }
 
 impl<CTRL> Stm32wlInterfaceVariant<CTRL>
@@ -60,22 +60,23 @@ where
     /// is not supported** (`lora_phy::sx126x::variant::Stm32wl` says so), so
     /// this is fixed at construction.
     ///
-    /// The pins are `Option` because `lora-phy`'s trait allows a board with no
-    /// switch at all; on this board all three are present, and a `None` here
-    /// would leave the antenna disconnected from whichever path it names —
-    /// which presents as a working radio with no range.
+    /// All three pins are required. `lora-phy`'s trait allows a board with no
+    /// switch at all, but this board has all three, and a missing one would
+    /// leave the antenna disconnected from whichever path it names — which
+    /// presents as a working radio with no range. Infallible for the same
+    /// reason: there is nothing left to check once the pins exist.
     pub fn new(
         use_high_power_pa: bool,
-        rf_switch_rx: Option<CTRL>,
-        rf_switch_tx: Option<CTRL>,
-        rf_switch_en: Option<CTRL>,
-    ) -> Result<Self, RadioError> {
-        Ok(Self {
+        rf_switch_rx: CTRL,
+        rf_switch_tx: CTRL,
+        rf_switch_en: CTRL,
+    ) -> Self {
+        Self {
             use_high_power_pa,
             rf_switch_rx,
             rf_switch_tx,
             rf_switch_en,
-        })
+        }
     }
 }
 
@@ -124,15 +125,15 @@ where
 
     /// Receive: FE_CTRL2 low, FE_CTRL1 high, FE_CTRL3 high.
     async fn enable_rf_switch_rx(&mut self) -> Result<(), RadioError> {
-        if let Some(pin) = self.rf_switch_tx.as_mut() {
-            pin.set_low().map_err(|_| RadioError::RfSwitchTx)?;
-        }
-        if let Some(pin) = self.rf_switch_rx.as_mut() {
-            pin.set_high().map_err(|_| RadioError::RfSwitchRx)?;
-        }
-        if let Some(pin) = self.rf_switch_en.as_mut() {
-            pin.set_high().map_err(|_| RadioError::RfSwitchRx)?;
-        }
+        self.rf_switch_tx
+            .set_low()
+            .map_err(|_| RadioError::RfSwitchTx)?;
+        self.rf_switch_rx
+            .set_high()
+            .map_err(|_| RadioError::RfSwitchRx)?;
+        self.rf_switch_en
+            .set_high()
+            .map_err(|_| RadioError::RfSwitchRx)?;
         Ok(())
     }
 
@@ -141,33 +142,32 @@ where
     /// low-power one. That inversion is the switch's truth table, not a
     /// convenience, which is why it reads oddly.
     async fn enable_rf_switch_tx(&mut self) -> Result<(), RadioError> {
-        if let Some(pin) = self.rf_switch_rx.as_mut() {
-            if self.use_high_power_pa {
-                pin.set_low().map_err(|_| RadioError::RfSwitchRx)?;
-            } else {
-                pin.set_high().map_err(|_| RadioError::RfSwitchRx)?;
-            }
+        if self.use_high_power_pa {
+            self.rf_switch_rx.set_low()
+        } else {
+            self.rf_switch_rx.set_high()
         }
-        if let Some(pin) = self.rf_switch_tx.as_mut() {
-            pin.set_high().map_err(|_| RadioError::RfSwitchTx)?;
-        }
-        if let Some(pin) = self.rf_switch_en.as_mut() {
-            pin.set_high().map_err(|_| RadioError::RfSwitchTx)?;
-        }
+        .map_err(|_| RadioError::RfSwitchRx)?;
+        self.rf_switch_tx
+            .set_high()
+            .map_err(|_| RadioError::RfSwitchTx)?;
+        self.rf_switch_en
+            .set_high()
+            .map_err(|_| RadioError::RfSwitchTx)?;
         Ok(())
     }
 
     /// All three low, disconnecting the antenna from both paths.
     async fn disable_rf_switch(&mut self) -> Result<(), RadioError> {
-        if let Some(pin) = self.rf_switch_en.as_mut() {
-            pin.set_low().map_err(|_| RadioError::RfSwitchTx)?;
-        }
-        if let Some(pin) = self.rf_switch_rx.as_mut() {
-            pin.set_low().map_err(|_| RadioError::RfSwitchRx)?;
-        }
-        if let Some(pin) = self.rf_switch_tx.as_mut() {
-            pin.set_low().map_err(|_| RadioError::RfSwitchTx)?;
-        }
+        self.rf_switch_en
+            .set_low()
+            .map_err(|_| RadioError::RfSwitchTx)?;
+        self.rf_switch_rx
+            .set_low()
+            .map_err(|_| RadioError::RfSwitchRx)?;
+        self.rf_switch_tx
+            .set_low()
+            .map_err(|_| RadioError::RfSwitchTx)?;
         Ok(())
     }
 }
