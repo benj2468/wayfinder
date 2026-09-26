@@ -1051,6 +1051,7 @@ impl<
             ogm_refloods_suppressed: self.router.ogm_refloods_suppressed(),
             ogm_echoes_dropped: self.router.ogm_echoes_dropped(),
             ogm_tails_malformed: self.router.ogm_tails_malformed(),
+            broadcast_dedup_evictions: self.router.broadcast_dedup_evictions(),
             proofs_swept: self.router.proofs_swept(),
             unjudged_cert_admissions: self.router.unjudged_cert_admissions(),
         }
@@ -2429,8 +2430,9 @@ mod tests {
                 m.proofs_swept,
                 m.ogm_echoes_dropped,
                 m.ogm_tails_malformed,
+                m.broadcast_dedup_evictions,
             ),
-            (0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
             "an untroubled node reports no faults"
         );
 

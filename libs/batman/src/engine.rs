@@ -756,6 +756,29 @@ impl<
         self.ogm_tails_malformed
     }
 
+    /// How many originators a full broadcast dedup table has evicted to make
+    /// room for a new one.
+    ///
+    /// The companion the dedup occupancy gauge needs: with nothing ageing
+    /// entries out, that gauge saturates on first contact and stays pinned, so
+    /// it reads the same on a healthy busy mesh as under a ghost-originator
+    /// flood. This counter is what tells them apart: it stays at zero while the
+    /// node has heard no more distinct originators than the table holds, and a
+    /// flood of fabricated ones drives it continuously. Nothing ages an entry
+    /// out, so a long-running node on a churning mesh can also climb slowly
+    /// with no attacker involved; it is the *rate* of climb that separates the
+    /// two. Each eviction also costs at
+    /// worst one duplicate re-flood of the victim's next broadcast, so a steady
+    /// climb is airtime being spent as well as a signal.
+    ///
+    /// A count rather than a rate, for the same reason as
+    /// [`ogm_tails_malformed`](Self::ogm_tails_malformed): on a healthy mesh
+    /// it is zero, and "how many so far" is what an operator compares across
+    /// polls.
+    pub fn broadcast_dedup_evictions(&self) -> u32 {
+        self.broadcast_dedup_evictions
+    }
+
     /// How many next-hop proofs this node has dropped because the key behind
     /// them was no longer usable — see [`proofs_swept`](Self::proofs_swept).
     pub fn proofs_swept(&self) -> u32 {
@@ -1716,6 +1739,7 @@ impl<
             {
                 trace!(orig = ?evicted, "broadcast dedup table full, evicting least-recently-updated");
                 self.broadcast_seqno.remove(&evicted);
+                self.broadcast_dedup_evictions = self.broadcast_dedup_evictions.saturating_add(1);
             }
             // Infallible: the eviction above guarantees a free slot, and
             // `MAX_ORIGINATORS` is a non-zero power of two (a `heapless` map
@@ -4594,6 +4618,42 @@ mod tests {
             "the least-recently-updated entry must be the one evicted"
         );
         assert_eq!(bcast_high_water(&engine, 20), Some(1));
+    }
+
+    /// Issue #36: the dedup table's occupancy gauge saturates on first contact
+    /// and stays pinned, so the only signal that separates a busy mesh from a
+    /// ghost-originator flood is how often a full table has to evict. Filling
+    /// the table and re-hearing a known originator must not count; each new
+    /// originator admitted into a full table counts exactly once.
+    #[test]
+    fn broadcast_dedup_evictions_counts_each_full_table_eviction() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        assert_eq!(engine.broadcast_dedup_evictions(), 0);
+
+        for (i, orig) in (10..14).enumerate() {
+            rx_bcast(
+                &mut engine,
+                core::time::Duration::from_secs(i as u64),
+                orig,
+                9,
+                1,
+            );
+        }
+        assert_eq!(
+            engine.broadcast_dedup_evictions(),
+            0,
+            "filling the table up to capacity evicts nothing"
+        );
+
+        // A known originator advancing its seqno updates in place.
+        rx_bcast(&mut engine, core::time::Duration::from_secs(10), 13, 9, 2);
+        assert_eq!(engine.broadcast_dedup_evictions(), 0);
+
+        rx_bcast(&mut engine, core::time::Duration::from_secs(20), 20, 9, 1);
+        assert_eq!(engine.broadcast_dedup_evictions(), 1);
+        rx_bcast(&mut engine, core::time::Duration::from_secs(21), 21, 9, 1);
+        assert_eq!(engine.broadcast_dedup_evictions(), 2);
+        assert_eq!(engine.broadcast_seqno.len(), 4, "table stays at capacity");
     }
 
     /// A stream of non-advancing frames must not keep a poisoned entry pinned
