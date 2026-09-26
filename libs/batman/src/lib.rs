@@ -838,6 +838,9 @@ pub struct BatmanEngine<
     /// sender supplied could not be parsed — see
     /// [`BatmanEngine::ogm_tails_malformed`].
     pub(crate) ogm_tails_malformed: u32,
+    /// How many originators a full broadcast dedup table has had to evict to
+    /// admit a new one — see [`BatmanEngine::broadcast_dedup_evictions`].
+    pub(crate) broadcast_dedup_evictions: u32,
     /// How many next-hop proofs this node has dropped because the pairwise key
     /// they were answered with is no longer usable.
     ///
@@ -930,6 +933,7 @@ impl<
             proven: FnvIndexMap::new(),
             seqno_resyncs: 0,
             ogm_refloods_suppressed: 0,
+            broadcast_dedup_evictions: 0,
             ogm_echoes_dropped: 0,
             ogm_tails_malformed: 0,
             proofs_swept: 0,

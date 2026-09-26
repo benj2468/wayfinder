@@ -2107,6 +2107,20 @@ message NodeMetrics {
   // while a malformed tail is a peer's problem that no buffer size will fix.
   uint32 ogm_tails_malformed = 25;
 
+  // Count of originators the broadcast dedup table evicted because it was full
+  // when a new originator's broadcast arrived.
+  //
+  // The companion broadcast_dedup needs: nothing ages a dedup entry out, so
+  // that gauge saturates on first contact and stays pinned, reading the same
+  // on a healthy busy mesh as under a flood of fabricated originators. This is
+  // what tells them apart: zero while the node has heard no more distinct
+  // originators than the table holds, driven continuously by a
+  // ghost-originator flood. Nothing ages an entry out, so a long-running node
+  // on a churning mesh can also climb slowly with no attacker; the rate of
+  // climb is what separates the two. Each eviction can also cost one duplicate re-flood of the
+  // victim's next broadcast, so a steady climb is spent airtime too.
+  uint32 broadcast_dedup_evictions = 26;
+
   // Count of next-hop proofs dropped because the pairwise key they were
   // answered with stopped being usable — a neighbor's certificate lapsing, a
   // revocation, or its entry being pushed out of a full key cache.

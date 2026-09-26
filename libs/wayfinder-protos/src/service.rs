@@ -481,6 +481,12 @@ pub struct NodeMetricsData {
     /// parsed. Any steady rate is a fault: a peer is emitting frames no node
     /// can relay.
     pub ogm_tails_malformed: u32,
+    /// Count of originators a full broadcast dedup table evicted to admit a
+    /// new one. Zero while the node has heard no more distinct originators
+    /// than the table holds; a steady climb is
+    /// churn — most sharply, a flood of fabricated originators — that the
+    /// saturated `broadcast_dedup` gauge cannot show.
+    pub broadcast_dedup_evictions: u32,
     /// Count of next-hop proofs dropped because the pairwise key they were
     /// answered with stopped being usable. Zero when auth is disabled.
     pub proofs_swept: u32,
@@ -2133,6 +2139,7 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 ogm_refloods_suppressed: m.ogm_refloods_suppressed,
                 ogm_echoes_dropped: m.ogm_echoes_dropped,
                 ogm_tails_malformed: m.ogm_tails_malformed,
+                broadcast_dedup_evictions: m.broadcast_dedup_evictions,
                 proofs_swept: m.proofs_swept,
                 unjudged_cert_admissions: m.unjudged_cert_admissions,
             })
@@ -4408,6 +4415,7 @@ mod tests {
                 ogm_refloods_suppressed: 11,
                 ogm_echoes_dropped: 12,
                 ogm_tails_malformed: 13,
+                broadcast_dedup_evictions: 14,
                 proofs_swept: 3,
                 unjudged_cert_admissions: 0,
             },
@@ -4438,6 +4446,7 @@ mod tests {
                 assert_eq!(m.ogm_refloods_suppressed, 11);
                 assert_eq!(m.ogm_echoes_dropped, 12);
                 assert_eq!(m.ogm_tails_malformed, 13);
+                assert_eq!(m.broadcast_dedup_evictions, 14);
                 assert_eq!(m.proofs_swept, 3);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),

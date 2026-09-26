@@ -1805,6 +1805,14 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                 // nothing in the mesh can relay.
                 field("OGM echoes dropped", &m.ogm_echoes_dropped.to_string()),
                 field("OGM tails malformed", &m.ogm_tails_malformed.to_string()),
+                // The churn the saturated "Broadcast dedup" occupancy above
+                // cannot show: zero until the node has heard more distinct
+                // originators than the table holds, a steady climb under a
+                // flood of fabricated ones.
+                field(
+                    "Bcast dedup evictions",
+                    &m.broadcast_dedup_evictions.to_string(),
+                ),
                 field("Proofs swept", &m.proofs_swept.to_string()),
                 // Nonzero means this node has been routing on credentials it
                 // could not date. It sits beside the counts rather than the
@@ -2406,6 +2414,7 @@ mod tests {
             ogm_refloods_suppressed: 0,
             ogm_echoes_dropped: 0,
             ogm_tails_malformed: 0,
+            broadcast_dedup_evictions: 0,
             proofs_swept: 0,
             ..Default::default()
         });

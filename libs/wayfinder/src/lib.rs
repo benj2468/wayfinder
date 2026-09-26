@@ -957,6 +957,14 @@ impl<
         self.batman.ogm_tails_malformed()
     }
 
+    /// How many originators a full broadcast dedup table has evicted to admit
+    /// a new one — the churn signal the saturating `broadcast_dedup` occupancy
+    /// gauge cannot give. See
+    /// [`batman::BatmanEngine::broadcast_dedup_evictions`].
+    pub fn broadcast_dedup_evictions(&self) -> u32 {
+        self.batman.broadcast_dedup_evictions()
+    }
+
     /// How many next-hop proofs this node has dropped because the pairwise key
     /// they were answered with stopped being usable.
     ///
