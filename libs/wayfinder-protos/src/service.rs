@@ -2698,6 +2698,35 @@ pub fn handle_unowned(request: WayfinderRequest) -> WayfinderResponse {
     }
 }
 
+/// The fallback for a node that runs no certificate authority, after its router
+/// dispatcher has declined `request`: an authority or VPN request gets
+/// [`NOT_A_PROVIDER`], as it would on a router-only host, and anything else goes
+/// to [`handle_unowned`].
+///
+/// Embedded nodes need this rather than `handle_unowned` alone. Sending the
+/// authority requests there answered them "request has no handler on this
+/// node", which clients do not read as "not a provider", so a dashboard polling
+/// a board failed its whole snapshot on the first CA table it asked for.
+///
+/// Decided from the request's declared owner ([`request_facet`]) rather than by
+/// running [`handle_authority`] over an empty provider: the answer is the same,
+/// and a board does not link the whole authority dispatcher to produce one
+/// error string.
+pub fn handle_without_authority(request: WayfinderRequest) -> WayfinderResponse {
+    match &request.request {
+        Some(kind) if request_facet(kind) == RequestFacet::Authority => not_a_provider_response(),
+        // VPN coordination is a provider's service too: the tunnel control
+        // plane runs beside the CA. On a host the transport answers these; a
+        // node with no provider has nothing to coordinate.
+        Some(
+            RequestKind::GetVpnEnrollment(_)
+            | RequestKind::ListVpnPeers(_)
+            | RequestKind::RevokeVpnPeer(_),
+        ) => not_a_provider_response(),
+        _ => handle_unowned(request),
+    }
+}
+
 /// Stateful handler that maps [`WayfinderRequest`] → [`WayfinderResponse`].
 ///
 /// `P` is any type implementing [`WayfinderDataProvider`]; pass a reference
@@ -2747,6 +2776,7 @@ mod tests {
     use crate::wayfinder::v1alpha::GetSecurityStatusRequest;
     use crate::wayfinder::v1alpha::GetThroughputRequest;
     use crate::wayfinder::v1alpha::GetTrustAnchorRequest;
+    use crate::wayfinder::v1alpha::ListPendingCsrsRequest;
     use crate::wayfinder::v1alpha::ListUsersRequest;
     use crate::wayfinder::v1alpha::ListVpnPeersRequest;
     use crate::wayfinder::v1alpha::ResolveRouteRequest;
@@ -5060,5 +5090,57 @@ mod tests {
             )),
             "CompleteUserRegistration"
         );
+    }
+
+    /// The error message a whole-request fallback answered with.
+    fn fallback_message(req: Option<RequestKind>) -> String {
+        match handle_without_authority(WayfinderRequest { request: req }).response {
+            Some(ResponseKind::Error(ErrorResponse { message })) => message,
+            other => panic!("expected an error response, got {other:?}"),
+        }
+    }
+
+    /// A node with no certificate authority answers an authority request the
+    /// way a router-only host does: `NOT_A_PROVIDER`, which clients recognise
+    /// and render as "not a provider" instead of failing their whole poll.
+    /// Embedded nodes used to answer "request has no handler on this node",
+    /// which took the web dashboard's snapshot down for every board.
+    #[test]
+    fn without_authority_an_authority_request_is_not_a_provider() {
+        assert_eq!(
+            fallback_message(Some(RequestKind::ListPendingCsrs(
+                ListPendingCsrsRequest {}
+            ))),
+            NOT_A_PROVIDER
+        );
+    }
+
+    /// The transport-owned answers are kept: a repeated `Authenticate` is a
+    /// client protocol error, and "not a provider" would point its author at
+    /// the wrong subsystem.
+    #[test]
+    fn without_authority_a_repeated_authenticate_is_still_a_protocol_error() {
+        let message = fallback_message(Some(RequestKind::Authenticate(
+            AuthenticateRequest::default(),
+        )));
+        assert!(message.contains("unexpected Authenticate"), "{message}");
+    }
+
+    /// VPN coordination is a provider's service (the tunnel control plane runs
+    /// beside the CA), so a node without one says it is not a provider, which
+    /// clients already treat as "no VPN here". The transport-level "not served
+    /// on this transport" answer made the dashboard fail its whole poll on a
+    /// board.
+    #[test]
+    fn without_authority_a_vpn_request_is_not_a_provider() {
+        assert_eq!(
+            fallback_message(Some(RequestKind::ListVpnPeers(Default::default()))),
+            NOT_A_PROVIDER
+        );
+    }
+
+    #[test]
+    fn without_authority_an_empty_request_is_still_empty() {
+        assert_eq!(fallback_message(None), "empty request");
     }
 }
