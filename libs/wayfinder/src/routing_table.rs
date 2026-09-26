@@ -567,4 +567,36 @@ mod tests {
         assert_eq!(table.map.len(), 100);
         table.assert_invariants();
     }
+
+    /// A distinct `Mac` per `n`, for tables larger than `u8` keys can fill.
+    fn mac(n: u16) -> interfaces::frame::Mac {
+        let [hi, lo] = n.to_be_bytes();
+        interfaces::frame::Mac([0x02, 0, 0, 0, hi, lo])
+    }
+
+    /// A profile can hold more than 254 live identities: a cloud node's table
+    /// is sized to the mesh, and the slot index used to be a `u8`, which
+    /// capped every profile at 254 whatever its `CAP`.
+    #[test]
+    fn more_than_254_live_entries() {
+        let mut table = std::boxed::Box::new(IdentTable::<interfaces::frame::Mac, 512, 400>::new());
+        for n in 0..400u16 {
+            table.add_record(usize::from(n % 8), mac(n));
+        }
+        table.assert_invariants();
+        for n in 0..400u16 {
+            assert_eq!(
+                table.peek_egress_interface(mac(n)),
+                Some(usize::from(n % 8))
+            );
+        }
+
+        // Full: the next insert evicts the least recently used, which is the
+        // first one added.
+        table.add_record(0, mac(400));
+        assert_eq!(table.peek_egress_interface(mac(0)), None);
+        assert_eq!(table.peek_egress_interface(mac(400)), Some(0));
+        assert_eq!(table.map.len(), 400);
+        table.assert_invariants();
+    }
 }
