@@ -193,3 +193,15 @@ leptos_meta = "0.8"
 leptos_axum = "0.8"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
+
+# Argon2id at the store's real parameters (64 MiB, 3 passes) is one of the few
+# things a test does that is compute-bound, and unoptimised it is slow enough
+# to matter: under CI's coverage instrumentation and a loaded runner a single
+# `user add` took past the client's 10 s response deadline, so the RPC tests
+# failed on time rather than on behaviour. Optimising just the hash keeps the
+# test suite honest about the parameters without paying for a release build.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
