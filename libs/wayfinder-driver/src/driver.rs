@@ -3621,4 +3621,61 @@ mod tests {
              capacity profile"
         );
     }
+
+    /// This is the red checkpoint for design 26 phase 1 slice 3 ("a cloud
+    /// capacity profile" — the management path). Slice 2 made the *event
+    /// loop* generic over `R: RouterOps`, so a `Driver<NeverIo, TinyRouter>`
+    /// can be built and driven — the test above pins that. But
+    /// `router_handle` (and the rest of the management-API surface:
+    /// `with_router`/`with_router_mut`, `run`/`run_once`/`process_pending`)
+    /// still lives only in `impl<Local: FrameIo> Driver<Local, CentralRouter>`
+    /// — pinned to the bare, default-profile `CentralRouter` — so calling it
+    /// on a `TinyRouter`-backed driver does not even compile today:
+    ///
+    ///     error[E0599]: no method named `router_handle` found for struct
+    ///     `Driver<NeverIo, TinyRouter>` in the current scope
+    ///
+    /// Making that surface const-generic over `CentralRouter`'s eleven table
+    /// capacities — matching `RouterAdapter`/`RouterHandle`, which already are
+    /// — is what turns this green: a management *read* becomes reachable at
+    /// any capacity profile, not only `host`.
+    #[tokio::test]
+    async fn a_non_default_router_profile_serves_a_management_read() {
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        let driver: Driver<NeverIo, TinyRouter> = Driver::new(
+            mac(9),
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+
+        let handle = driver.router_handle();
+        let response = handle
+            .serve_read(wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+                request: Some(
+                    wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::GetNodeInfo(
+                        wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest {},
+                    ),
+                ),
+            })
+            .await
+            .expect("GetNodeInfo is a router read");
+
+        match response.response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::NodeInfo(
+                info,
+            )) => {
+                assert_eq!(
+                    info.node_id,
+                    mac(9).0.to_vec(),
+                    "a management read on a non-default router profile must answer from \
+                     that same router, not a default-profile stand-in"
+                );
+            }
+            other => panic!("expected NodeInfo, got {other:?}"),
+        }
+    }
 }
