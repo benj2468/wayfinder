@@ -4,8 +4,9 @@ pub use interfaces;
 use interfaces::frame::MeshIdentifier;
 
 /// Sentinel value meaning "no node" in the LRU linked list.
-/// Valid slot indices are 0..IDENT_TABLE_MAX (at most 99), so 255 is safe.
-const NONE_IDX: u8 = u8::MAX;
+/// The null slot index. Valid indices are below `CAP`, which the invariants
+/// keep under this, so it never names a real slot.
+const NONE_IDX: u16 = u16::MAX;
 /// `heapless::FnvIndexMap` requires a power-of-two capacity.
 pub(crate) const IDENT_TABLE_CAP: usize = 128;
 /// Actual maximum live entries before LRU eviction kicks in.
@@ -19,8 +20,8 @@ pub(crate) const IDENT_TABLE_MAX: usize = 100;
 struct LruNode<Ident> {
     key: Ident,
     iface_idx: usize,
-    prev: u8,
-    next: u8,
+    prev: u16,
+    next: u16,
 }
 
 /// Maps mesh identifiers to egress interfaces with **O(1)** insert, lookup,
@@ -45,24 +46,25 @@ pub struct IdentTable<
     /// Flat node pool; slots whose index is in `free_stack` are unoccupied.
     nodes: [Option<LruNode<Ident>>; CAP],
     /// Key → slot index in `nodes`.
-    map: FnvIndexMap<Ident, u8, CAP>,
+    map: FnvIndexMap<Ident, u16, CAP>,
     /// Index of the most-recently-used node; `NONE_IDX` when the table is empty.
-    head: u8,
+    head: u16,
     /// Index of the least-recently-used node; `NONE_IDX` when the table is empty.
-    tail: u8,
+    tail: u16,
     /// Stack of available slot indices.
-    free_stack: [u8; CAP],
+    free_stack: [u16; CAP],
     /// Number of entries in `free_stack`.
-    free_len: u8,
+    free_len: u16,
 }
 
 impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     IdentTable<Ident, CAP, MAX_LIVE>
 {
-    /// Slot indices are held as `u8` with 255 reserved as the null sentinel, and
-    /// the backing map is a `FnvIndexMap`, so a profile must keep `CAP` a power
-    /// of two under 255 and leave headroom above `MAX_LIVE` for the map's load
-    /// factor.
+    /// Slot indices are held as `u16` with `u16::MAX` reserved as the null
+    /// sentinel, and the backing map is a `FnvIndexMap`, so a profile must keep
+    /// `CAP` a power of two below that and leave headroom above `MAX_LIVE` for
+    /// the map's load factor. (It was a `u8`, which capped every profile at 254
+    /// live entries: fine for a board, not for a cloud node sized to its mesh.)
     const _INVARIANTS: () = {
         assert!(
             CAP.is_power_of_two(),
@@ -70,7 +72,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
         );
         assert!(
             CAP < NONE_IDX as usize,
-            "IdentTable CAP must fit in a u8 index"
+            "IdentTable CAP must fit in a u16 index"
         );
         assert!(MAX_LIVE <= CAP, "IdentTable MAX_LIVE cannot exceed CAP");
     };
@@ -78,9 +80,9 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     /// An empty table at this profile's capacities.
     pub fn new() -> Self {
         let () = Self::_INVARIANTS;
-        let mut free_stack = [0u8; CAP];
+        let mut free_stack = [0u16; CAP];
         for (i, slot) in free_stack.iter_mut().enumerate() {
-            *slot = i as u8;
+            *slot = i as u16;
         }
         Self {
             nodes: core::array::from_fn(|_| None),
@@ -91,7 +93,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
             // Only vend the first MAX_LIVE slots; the remaining CAP - MAX_LIVE
             // slots act as unused padding required by the power-of-two heapless
             // capacity.
-            free_len: MAX_LIVE as u8,
+            free_len: MAX_LIVE as u16,
         }
     }
 
@@ -105,7 +107,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     // ── linked-list helpers ──────────────────────────────────────────────────
 
     /// Remove node `idx` from the doubly-linked list.  O(1).
-    fn unlink(&mut self, idx: u8) {
+    fn unlink(&mut self, idx: u16) {
         // `LruNode` is `Copy`, so `.expect()` gives us a value, not a reference,
         // keeping the borrow of `self.nodes` trivially short.
         #[expect(
@@ -142,7 +144,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     /// Insert node `idx` at the MRU head of the list.  O(1).
     ///
     /// The slot must already be populated in `self.nodes` but not yet linked.
-    fn link_at_head(&mut self, idx: u8) {
+    fn link_at_head(&mut self, idx: u16) {
         let old_head = self.head;
 
         // Update the new head's own pointers (copy-modify-store).
@@ -173,7 +175,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     }
 
     /// Move an already-linked node to the MRU head.  O(1).
-    fn move_to_front(&mut self, idx: u8) {
+    fn move_to_front(&mut self, idx: u16) {
         if self.head == idx {
             return;
         }
@@ -280,7 +282,7 @@ mod tests {
         /// consistency.  Panics on any violation — call this liberally in tests.
         fn assert_invariants(&self) {
             // Forward walk: head → tail
-            let mut forward: std::vec::Vec<u8> = std::vec::Vec::new();
+            let mut forward: std::vec::Vec<u16> = std::vec::Vec::new();
             let mut cur = self.head;
             let mut expected_prev = NONE_IDX;
             while cur != NONE_IDX {
@@ -302,7 +304,7 @@ mod tests {
             );
 
             // Backward walk: tail → head
-            let mut backward: std::vec::Vec<u8> = std::vec::Vec::new();
+            let mut backward: std::vec::Vec<u16> = std::vec::Vec::new();
             let mut cur = self.tail;
             let mut expected_next = NONE_IDX;
             while cur != NONE_IDX {
@@ -372,7 +374,7 @@ mod tests {
         assert_eq!(table.get_egress_interface(42), None);
         assert_eq!(table.head, NONE_IDX);
         assert_eq!(table.tail, NONE_IDX);
-        assert_eq!(table.free_len, IDENT_TABLE_MAX as u8);
+        assert_eq!(table.free_len, IDENT_TABLE_MAX as u16);
         table.assert_invariants();
     }
 
