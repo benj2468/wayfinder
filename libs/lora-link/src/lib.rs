@@ -70,6 +70,12 @@ pub const MAX_REASSEMBLIES: usize = 4;
 /// [`MAX_REASSEMBLED_LEN`] minus the [`LinkFrame`] header.
 pub const MAX_PAYLOAD_LEN: usize = MAX_REASSEMBLED_LEN - LINK_HEADER_LEN;
 
+/// The most fragments one reassembled frame can need: 3 at this crate's
+/// sizes. The wire's 4-bit count allows up to `MAX_FRAGMENTS` (15), so a
+/// larger claim can only come from a sender that is not following this
+/// format, and [`decode_fragment`] refuses it.
+pub const MAX_FRAGMENTS_PER_FRAME: usize = MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD);
+
 /// `HEADER_LEN` must match the fields it claims to cover. Not tautological:
 /// the constant is written as a literal (it is quoted in the wire-format
 /// documentation), so a field added to the header without updating it would
@@ -180,6 +186,11 @@ pub fn build_fragment(
     if !(1..=MAX_FRAGMENTS).contains(&spec.count) || spec.index >= spec.count {
         return Err(LinkError::InvalidPacket);
     }
+    // The count has to be *this frame's*: a smaller one sends a prefix the
+    // receiver completes as a whole frame, a larger one an empty tail.
+    if spec.count != fragment_count(frame.len())? {
+        return Err(LinkError::InvalidPacket);
+    }
     let start = spec.index * FRAG_PAYLOAD;
     if start > frame.len() {
         return Err(LinkError::BufferFull);
@@ -207,7 +218,11 @@ pub fn build_fragment(
 ///
 /// Returns [`LinkError::InvalidPacket`] if it is too short, carries a
 /// different `net_id` than `net_id`, or has a fragment header that could not
-/// describe a real fragment.
+/// describe a real fragment of *this* format: a `count` above
+/// [`MAX_FRAGMENTS_PER_FRAME`], or a non-final fragment whose body is not
+/// exactly [`FRAG_PAYLOAD`]. [`build_fragment`] produces neither, and each
+/// would otherwise reach the table — the first opening a slot that can never
+/// complete, the second a frame of plausible length with a zero-filled hole.
 ///
 /// **The `net_id` check happens before anything touches the reassembly
 /// table**, which is the whole point of the field: another mesh on the same
@@ -224,6 +239,13 @@ pub fn decode_fragment(net_id: u8, buf: &[u8]) -> Result<(u16, FragHeader, &[u8]
     let src_id = u16::from_be_bytes([buf[1], buf[2]]);
     let (hdr, body) =
         wayfinder_link_utils::parse_fragment(&buf[HEADER_LEN..]).ok_or(LinkError::InvalidPacket)?;
+    let (index, count) = (usize::from(hdr.index), usize::from(hdr.count));
+    if count > MAX_FRAGMENTS_PER_FRAME {
+        return Err(LinkError::InvalidPacket);
+    }
+    if index + 1 < count && body.len() != FRAG_PAYLOAD {
+        return Err(LinkError::InvalidPacket);
+    }
     Ok((src_id, hdr, body))
 }
 
