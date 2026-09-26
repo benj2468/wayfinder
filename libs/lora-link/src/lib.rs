@@ -724,4 +724,144 @@ mod tests {
             );
         }
     }
+
+    /// A hand-built packet: `count`/`index` as given and a body of `body_len`
+    /// bytes, for the headers a well-behaved sender never produces.
+    fn raw_packet(net_id: u8, src_id: u16, index: usize, count: usize, body_len: usize) -> Vec<u8> {
+        let mut buf = vec![net_id];
+        buf.extend_from_slice(&src_id.to_be_bytes());
+        buf.extend_from_slice(&pack_header(0, index, count));
+        buf.extend(core::iter::repeat_n(0xAB, body_len));
+        buf
+    }
+
+    /// `build_fragment` refuses a `count` that does not match the frame, in
+    /// either direction. Too small a count is the dangerous one: `count: 1` on
+    /// a two-fragment frame sends a single fragment the receiver completes —
+    /// a truncated frame that parses, which is exactly what `assemble_frame`'s
+    /// docs promise never happens.
+    #[test]
+    fn build_fragment_refuses_a_count_that_does_not_match_the_frame() {
+        let payload: Vec<u8> = (0..(FRAG_PAYLOAD + 10) as u16).map(|i| i as u8).collect();
+        let (frame, n) = frame_of(mac(1), &payload);
+        assert_eq!(fragment_count(n).unwrap(), 2);
+        let mut out = [0u8; MAX_FRAME_LEN];
+
+        for count in [1, 3] {
+            let spec = FragmentSpec {
+                msg_id: 0,
+                index: 0,
+                count,
+            };
+            assert!(
+                matches!(
+                    build_fragment(NET, 1, &frame[..n], spec, &mut out),
+                    Err(LinkError::InvalidPacket)
+                ),
+                "count {count} on a two-fragment frame should be refused"
+            );
+        }
+    }
+
+    /// **Foreign fragments never occupy a reassembly slot**, checked through
+    /// the table rather than through `decode_fragment` alone: with our own
+    /// message half-received, a full table's worth of other-mesh first
+    /// fragments must not evict it. A refactor that checked `net_id` only on
+    /// completion would still never *return* a foreign frame, and would fail
+    /// only here.
+    #[test]
+    fn foreign_fragments_never_occupy_a_reassembly_slot() {
+        let payload: Vec<u8> = (0..(FRAG_PAYLOAD + 10) as u16).map(|i| i as u8).collect();
+        let (frame, n) = frame_of(mac(1), &payload);
+        let ours = fragments_of(NET, 0x0001, 5, &frame[..n]);
+        assert_eq!(ours.len(), 2);
+
+        let mut reassembler = LoraReassembler::new();
+        let mut out = [0u8; MAX_REASSEMBLED_LEN];
+        assert!(
+            accept_fragment(
+                &mut reassembler,
+                NET,
+                &ours[0],
+                LinkMetrics::default(),
+                &mut out
+            )
+            .is_none()
+        );
+
+        for src_id in 0..MAX_REASSEMBLIES as u16 {
+            let theirs = fragments_of(OTHER_NET, 0x1000 + src_id, 5, &frame[..n]);
+            assert!(
+                accept_fragment(
+                    &mut reassembler,
+                    NET,
+                    &theirs[0],
+                    LinkMetrics::default(),
+                    &mut out
+                )
+                .is_none()
+            );
+        }
+
+        let (len, _) = accept_fragment(
+            &mut reassembler,
+            NET,
+            &ours[1],
+            LinkMetrics::default(),
+            &mut out,
+        )
+        .expect("our message survived a table's worth of foreign traffic");
+        assert_eq!(&out[..len], &frame[..n]);
+    }
+
+    /// A header claiming more fragments than a reassembled frame can hold is
+    /// refused at decode. The wire's 4-bit count allows 15, but only
+    /// `fragment_count(MAX_REASSEMBLED_LEN)` (3) fit: a larger count opens a
+    /// slot that can never complete, which is a free eviction for anyone in
+    /// radio range.
+    #[test]
+    fn a_count_no_frame_could_need_is_refused() {
+        let most = fragment_count(MAX_REASSEMBLED_LEN).unwrap();
+        assert!(decode_fragment(NET, &raw_packet(NET, 1, 0, most, FRAG_PAYLOAD)).is_ok());
+        assert!(matches!(
+            decode_fragment(NET, &raw_packet(NET, 1, 0, most + 1, FRAG_PAYLOAD)),
+            Err(LinkError::InvalidPacket)
+        ));
+    }
+
+    /// Every fragment but the last carries exactly `FRAG_PAYLOAD` bytes —
+    /// `build_fragment` cannot produce anything else — so a short non-final
+    /// fragment is refused rather than leaving a zero-filled gap in a frame
+    /// of plausible length.
+    #[test]
+    fn a_short_non_final_fragment_is_refused() {
+        assert!(decode_fragment(NET, &raw_packet(NET, 1, 0, 2, FRAG_PAYLOAD)).is_ok());
+        assert!(matches!(
+            decode_fragment(NET, &raw_packet(NET, 1, 0, 2, FRAG_PAYLOAD - 1)),
+            Err(LinkError::InvalidPacket)
+        ));
+        // The last fragment is the one that may be short.
+        assert!(decode_fragment(NET, &raw_packet(NET, 1, 1, 2, 1)).is_ok());
+    }
+
+    /// `fragment_count` at every boundary its doc calls out.
+    #[test]
+    fn fragment_count_boundaries() {
+        for (len, want) in [
+            (0, 1),
+            (1, 1),
+            (FRAG_PAYLOAD, 1),
+            (FRAG_PAYLOAD + 1, 2),
+            (2 * FRAG_PAYLOAD, 2),
+            (2 * FRAG_PAYLOAD + 1, 3),
+            (MAX_REASSEMBLED_LEN, 3),
+            (MAX_FRAGMENTS * FRAG_PAYLOAD, MAX_FRAGMENTS),
+        ] {
+            assert_eq!(fragment_count(len).unwrap(), want, "len {len}");
+        }
+        assert!(matches!(
+            fragment_count(MAX_FRAGMENTS * FRAG_PAYLOAD + 1),
+            Err(LinkError::BufferFull)
+        ));
+    }
 }
