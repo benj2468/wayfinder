@@ -67,6 +67,18 @@ use zerocopy::IntoBytes;
 
 use crate::tap::TapDevice;
 
+/// The capacity profile this binary's router runs at.
+///
+/// One name, so choosing a different profile — the `cloud` one design 26
+/// phase 1 adds for the certificate authority and other server-class nodes —
+/// is a one-line change here rather than a search for every place this binary
+/// names its router. `wayfinder-embedded-driver`'s boards do the same with
+/// their own per-board profile; this is the host equivalent now that
+/// `wayfinder-driver`'s management-API surface is const-generic over
+/// `CentralRouter`'s table capacities (design 26 phase 1 slice 3) instead of
+/// pinned to the default profile.
+type TapRouter = wayfinder::router_for!(wayfinder::host);
+
 /// Command-line arguments.
 #[derive(clap::Parser, Debug)]
 // `--version` reports the build this node is running, which is the same answer
@@ -785,7 +797,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut driver = Driver::new(
+    let mut driver: Driver<Box<dyn FrameIo>, TapRouter> = Driver::new(
         Mac(mac_addr),
         local,
         interfaces,

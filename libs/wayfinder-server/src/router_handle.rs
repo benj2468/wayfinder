@@ -69,11 +69,7 @@ use crate::authority_task::EnrollmentPolicyRx;
 ///
 /// Generic over the router type, defaulting to [`CentralRouter`] at its host
 /// capacities, so `wayfinder-driver`'s `Driver<Local, R>` can hold one at any
-/// `R: RouterOps` (design 26 phase 1 slice 2). [`RouterHandle`] and
-/// [`RouterView`](crate::adapter::RouterView) stay unparameterized — they name
-/// `SharedRouter`/`CentralRouter` outright — so a management read is only
-/// reachable at the default capacity profile until they are generalised too
-/// (design 26 phase 1 slice 3).
+/// `R: RouterOps` (design 26 phase 1 slice 2).
 pub struct SharedRouter<R = CentralRouter> {
     /// The routing engine. `&mut` only ever through the driver's write guard.
     pub router: R,
@@ -112,9 +108,46 @@ impl<R> SharedRouter<R> {
 /// no method here that takes a write lock, which is what makes "reads are
 /// served from this, mutations from the loop" a property of the type rather
 /// than a rule to remember.
+///
+/// Const-generic over [`CentralRouter`]'s eleven table capacities, matching
+/// [`RouterAdapter`](crate::RouterAdapter)/[`RouterView`](crate::adapter::RouterView)
+/// exactly — same names, same order, same `wayfinder::host` defaults — so a
+/// management read is reachable at any capacity profile, not only the default
+/// one (design 26 phase 1 slice 3). `wayfinder-driver`'s `Driver<Local, R>`
+/// builds one at whichever profile its own `R` names.
 #[derive(Clone)]
-pub struct RouterHandle {
-    inner: Arc<RwLock<SharedRouter>>,
+pub struct RouterHandle<
+    const ORIGINATORS: usize = { wayfinder::host::ORIGINATORS },
+    const INTERFACES: usize = { wayfinder::host::INTERFACES },
+    const MCAST_MEMBERS: usize = { wayfinder::host::MCAST_MEMBERS },
+    const LOCAL_MCAST: usize = { wayfinder::host::LOCAL_MCAST },
+    const IDENT_TABLE: usize = { wayfinder::host::IDENT_TABLE },
+    const IDENT_LIVE: usize = { wayfinder::host::IDENT_LIVE },
+    const LINK_QUALITY: usize = { wayfinder::host::LINK_QUALITY },
+    const NEIGHBOR_KEYS: usize = { wayfinder::host::NEIGHBOR_KEYS },
+    const REVOKED: usize = { wayfinder::host::REVOKED },
+    const IN_FLIGHT_CERT_REQUESTS: usize = { wayfinder::host::IN_FLIGHT_CERT_REQUESTS },
+    const PENDING_REPLIES: usize = { wayfinder::host::PENDING_REPLIES },
+> {
+    inner: Arc<
+        RwLock<
+            SharedRouter<
+                CentralRouter<
+                    ORIGINATORS,
+                    INTERFACES,
+                    MCAST_MEMBERS,
+                    LOCAL_MCAST,
+                    IDENT_TABLE,
+                    IDENT_LIVE,
+                    LINK_QUALITY,
+                    NEIGHBOR_KEYS,
+                    REVOKED,
+                    IN_FLIGHT_CERT_REQUESTS,
+                    PENDING_REPLIES,
+                >,
+            >,
+        >,
+    >,
     /// Reference instant for the router's monotonic clock — the same `start`
     /// the driver measures `now` from.
     ///
@@ -148,10 +181,57 @@ pub struct RouterHandle {
     clock_trusted: Option<watch::Receiver<bool>>,
 }
 
-impl RouterHandle {
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    RouterHandle<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
     /// Build a handle over `inner`, whose router's monotonic clock is measured
     /// from `start`.
-    pub fn new(inner: Arc<RwLock<SharedRouter>>, start: std::time::Instant) -> Self {
+    pub fn new(
+        inner: Arc<
+            RwLock<
+                SharedRouter<
+                    CentralRouter<
+                        ORIGINATORS,
+                        INTERFACES,
+                        MCAST_MEMBERS,
+                        LOCAL_MCAST,
+                        IDENT_TABLE,
+                        IDENT_LIVE,
+                        LINK_QUALITY,
+                        NEIGHBOR_KEYS,
+                        REVOKED,
+                        IN_FLIGHT_CERT_REQUESTS,
+                        PENDING_REPLIES,
+                    >,
+                >,
+            >,
+        >,
+        start: std::time::Instant,
+    ) -> Self {
         Self {
             inner,
             start,
@@ -191,7 +271,27 @@ impl RouterHandle {
     /// is the property this type exists to hold. A `pub` accessor here would be
     /// the one crack in it.
     #[cfg(test)]
-    fn shared(&self) -> Arc<RwLock<SharedRouter>> {
+    fn shared(
+        &self,
+    ) -> Arc<
+        RwLock<
+            SharedRouter<
+                CentralRouter<
+                    ORIGINATORS,
+                    INTERFACES,
+                    MCAST_MEMBERS,
+                    LOCAL_MCAST,
+                    IDENT_TABLE,
+                    IDENT_LIVE,
+                    LINK_QUALITY,
+                    NEIGHBOR_KEYS,
+                    REVOKED,
+                    IN_FLIGHT_CERT_REQUESTS,
+                    PENDING_REPLIES,
+                >,
+            >,
+        >,
+    > {
         Arc::clone(&self.inner)
     }
 

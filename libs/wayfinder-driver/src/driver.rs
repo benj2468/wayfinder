@@ -300,10 +300,13 @@ impl MeshSink for LoopOutput {
 /// already is (design 26 phase 1 slice 2). The event loop, planning and
 /// dispatch are expressed against `R` alone; the management-API surface
 /// (`router_handle`, `with_router`/`with_router_mut`, `run`/`run_once`/
-/// `process_pending`) stays pinned to the concrete default, because
-/// `wayfinder-server`'s `RouterAdapter` is itself const-generic over
-/// `CentralRouter`'s capacities rather than generic over `RouterOps` —
-/// generalising that is design 26 phase 1 slice 3, not this one.
+/// `process_pending`) is expressed against a concrete `CentralRouter`
+/// const-generic over its eleven table capacities instead — matching
+/// `wayfinder-server`'s `RouterAdapter`/`RouterHandle`, which are themselves
+/// const-generic over those capacities rather than generic over `RouterOps`
+/// (design 26 phase 1 slice 3). So that surface reaches every capacity
+/// *profile* `CentralRouter` is built at, but — like `RouterAdapter` — not an
+/// arbitrary `R: RouterOps` implementor.
 pub struct Driver<Local: FrameIo, R: RouterOps = CentralRouter> {
     /// The local host network device.
     local: Local,
@@ -749,19 +752,70 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
 /// The management-API surface: read/mutate the router directly, hand a shared
 /// handle to the TLS server, and run the event loop.
 ///
-/// Pinned to the concrete default profile rather than generic over `R:
-/// RouterOps` (design 26 phase 1 slice 3 widens this): `RouterAdapter` and
-/// `RouterHandle` are themselves const-generic over `CentralRouter`'s eleven
-/// table capacities, not generic over the trait, so a query-handling arm built
-/// against them cannot be written for an arbitrary `R` today.
-impl<Local: FrameIo> Driver<Local, CentralRouter> {
+/// Const-generic over `CentralRouter`'s eleven table capacities rather than
+/// generic over `R: RouterOps` (design 26 phase 1 slice 3): `RouterAdapter`
+/// and `RouterHandle` are themselves const-generic over those same eleven
+/// capacities — same names, same order, same `wayfinder::host` defaults — not
+/// generic over the trait, so a query-handling arm built against them still
+/// cannot be written for an arbitrary `R` today. What this buys is every
+/// *capacity profile* of `CentralRouter`, not only the default one: a driver
+/// built at `wayfinder::router_for!(cloud)` gets a working management API
+/// exactly as a `host`-profile one does.
+impl<
+    Local: FrameIo,
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    Driver<
+        Local,
+        CentralRouter<
+            ORIGINATORS,
+            INTERFACES,
+            MCAST_MEMBERS,
+            LOCAL_MCAST,
+            IDENT_TABLE,
+            IDENT_LIVE,
+            LINK_QUALITY,
+            NEIGHBOR_KEYS,
+            REVOKED,
+            IN_FLIGHT_CERT_REQUESTS,
+            PENDING_REPLIES,
+        >,
+    >
+{
     /// Read the router under the shared lock.
     ///
     /// A scoped callback rather than a returned guard, so a caller cannot hold
     /// the lock across an `await` it did not think about — which on this type
     /// means stalling the mesh, since the event loop needs the write half for
     /// every frame it forwards.
-    pub async fn with_router<R>(&self, f: impl FnOnce(&CentralRouter) -> R) -> R {
+    pub async fn with_router<T>(
+        &self,
+        f: impl FnOnce(
+            &CentralRouter<
+                ORIGINATORS,
+                INTERFACES,
+                MCAST_MEMBERS,
+                LOCAL_MCAST,
+                IDENT_TABLE,
+                IDENT_LIVE,
+                LINK_QUALITY,
+                NEIGHBOR_KEYS,
+                REVOKED,
+                IN_FLIGHT_CERT_REQUESTS,
+                PENDING_REPLIES,
+            >,
+        ) -> T,
+    ) -> T {
         f(&self.shared.read().await.router)
     }
 
@@ -771,7 +825,24 @@ impl<Local: FrameIo> Driver<Local, CentralRouter> {
     ///
     /// Scoped for the same reason as [`with_router`](Self::with_router), and
     /// more so: this takes the write half, which excludes every reader.
-    pub async fn with_router_mut<R>(&self, f: impl FnOnce(&mut CentralRouter) -> R) -> R {
+    pub async fn with_router_mut<T>(
+        &self,
+        f: impl FnOnce(
+            &mut CentralRouter<
+                ORIGINATORS,
+                INTERFACES,
+                MCAST_MEMBERS,
+                LOCAL_MCAST,
+                IDENT_TABLE,
+                IDENT_LIVE,
+                LINK_QUALITY,
+                NEIGHBOR_KEYS,
+                REVOKED,
+                IN_FLIGHT_CERT_REQUESTS,
+                PENDING_REPLIES,
+            >,
+        ) -> T,
+    ) -> T {
         f(&mut self.shared.write().await.router)
     }
 
@@ -781,7 +852,21 @@ impl<Local: FrameIo> Driver<Local, CentralRouter> {
     /// Read-only by construction: [`RouterHandle`](wayfinder_server::RouterHandle)
     /// exposes no way to take the write guard, so wiring one up cannot move a
     /// mutation off this loop by accident.
-    pub fn router_handle(&self) -> wayfinder_server::RouterHandle {
+    pub fn router_handle(
+        &self,
+    ) -> wayfinder_server::RouterHandle<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    > {
         wayfinder_server::RouterHandle::new(Arc::clone(&self.shared), self.start)
             .with_enrollment_policy(Some(self.authority.enrollment_policy_rx()))
             .with_clock_trust(Some(self.clock_trusted_tx.subscribe()))
@@ -1634,7 +1719,37 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
 }
 
 /// Back to the concrete-only management surface (see above).
-impl<Local: FrameIo> Driver<Local, CentralRouter> {
+impl<
+    Local: FrameIo,
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    Driver<
+        Local,
+        CentralRouter<
+            ORIGINATORS,
+            INTERFACES,
+            MCAST_MEMBERS,
+            LOCAL_MCAST,
+            IDENT_TABLE,
+            IDENT_LIVE,
+            LINK_QUALITY,
+            NEIGHBOR_KEYS,
+            REVOKED,
+            IN_FLIGHT_CERT_REQUESTS,
+            PENDING_REPLIES,
+        >,
+    >
+{
     /// Drain every already-pending event — host frames, mesh frames, management
     /// queries, authorization snapshots and signed revocations — in
     /// non-blocking sweeps until nothing remains.
@@ -1881,8 +1996,32 @@ fn poll_due_keepalives<R: RouterOps>(
 /// process, so "the authority produced something this loop cannot parse" was
 /// never a condition that could arise — only one the receiver had to invent an
 /// answer for.
-fn ingest_signed_revocation(
-    router: &mut CentralRouter,
+fn ingest_signed_revocation<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>(
+    router: &mut CentralRouter<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >,
     record: &wayfinder::wayfinder_auth::RevocationRecord,
     now: Duration,
     now_unix: u64,
@@ -1946,8 +2085,32 @@ fn ingest_signed_revocation(
 /// certificate authority says "revoked" while the mesh was never told. That is
 /// the precise divergence this hop exists to surface, so the log lives on this
 /// side of the channel too.
-fn ingest_and_report(
-    router: &mut CentralRouter,
+fn ingest_and_report<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>(
+    router: &mut CentralRouter<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >,
     record: &wayfinder::wayfinder_auth::RevocationRecord,
     now: Duration,
     now_unix: u64,
@@ -2030,7 +2193,34 @@ fn read_enrollment_policy(
 /// TLS listener, and nothing configures a TLS listener without an identity
 /// seed), so reaching it still warns: it silently disables the bootstrap grant
 /// for this node.
-fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
+fn build_auth_snapshot<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>(
+    router: &CentralRouter<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >,
+    identity_seed: Option<[u8; 32]>,
+) -> AuthSnapshot {
     let own_key = identity_seed.map(|seed| Keypair::from_seed(&seed).ed_pubkey());
     if own_key.is_none() {
         warn!(
@@ -2838,7 +3028,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -2921,7 +3111,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -3131,7 +3321,7 @@ mod tests {
         // The node: running under that first certificate, and told where it
         // came from.
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -3230,7 +3420,7 @@ mod tests {
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -3463,7 +3653,7 @@ mod tests {
         ca.set_now_unix(1_700_000_000);
 
         let (query_tx, query_rx) = tokio::sync::mpsc::channel(4);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac(1),
             NeverIo,
             Vec::new(),
