@@ -84,7 +84,13 @@ import shutil
 import subprocess
 import sys
 
-FRAME_RE = re.compile(r"\bsub(?:\.w)?\s+sp, (?:sp, )?#(0x[0-9a-f]+|\d+)\b")
+# A stack reservation: `sub sp, #n`, `sub.w sp, sp, #n`, and Thumb-2's `subw
+# sp, sp, #n` -- the 12-bit-immediate encoding the compiler picks when `n` is
+# not expressible as a modified immediate (0xae4 is not; 0x3d4 is). Missing a
+# form is not a harmless blind spot: that frame reads as zero bytes and passes
+# any budget, which is how a 2,788-byte and two 3,388-byte task polls went
+# unmeasured. `scripts/tests/test_stack_budget.py` pins each form.
+FRAME_RE = re.compile(r"\bsubw?(?:\.w)?\s+sp, (?:sp, )?#(0x[0-9a-f]+|\d+)\b")
 SYMBOL_RE = re.compile(r"^[0-9a-f]+ <(.+)>:$")
 ORIGIN_RE = re.compile(r"^\s*RAM\s*:\s*ORIGIN\s*=\s*([^,]+),\s*LENGTH", re.MULTILINE)
 
@@ -182,8 +188,14 @@ def frames(objdump, elf):
     is therefore counted too, which over-states rather than under-states — the
     safe direction for a gate.
     """
+    return parse_frames(run_tool(objdump, "-d", "--no-show-raw-insn", elf))
+
+
+def parse_frames(disassembly):
+    """`frames` on an `objdump -d --no-show-raw-insn` listing already in hand,
+    so the parser is testable without an ELF or a toolchain."""
     found, symbol = {}, "<unknown>"
-    for line in run_tool(objdump, "-d", "--no-show-raw-insn", elf).splitlines():
+    for line in disassembly.splitlines():
         sym = SYMBOL_RE.match(line)
         if sym:
             symbol = sym.group(1)
