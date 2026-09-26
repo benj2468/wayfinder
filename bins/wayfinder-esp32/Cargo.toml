@@ -15,14 +15,23 @@ members = ["."]
 
 # Matching the other boards. `panic = "abort"` is the load-bearing one: a
 # bare-metal image has no use for unwinding machinery.
+#
+# `opt-level = "z"`, as on every Cortex-M board, and it matters more here: on
+# `"s"` (the `esp-generate` template's default, which this board carried until
+# it was measured) the release image was 553,317 flash-resident bytes; on
+# `"z"` it is 463,670 (-89,647, all of it `.text`), and the IRAM-resident
+# `.rwtext` shrinks too (-1,432). Xtensa has no carry flag, no shifted-operand
+# ALU ops and no machine outliner, so code the compiler chooses to expand costs
+# far more bytes here than on Thumb-2 — `sha2`'s unrolled SHA-512 round alone
+# was 44 KiB on this target and 10 KiB on a Cortex-M4.
 [profile.dev]
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 
 [profile.release]
 codegen-units = 1
 lto = "fat"
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 
 # `#[no_std]`/`#[no_main]` can't build the host `test` harness.
