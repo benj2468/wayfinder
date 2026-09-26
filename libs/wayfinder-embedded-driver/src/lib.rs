@@ -1035,12 +1035,12 @@ impl<
                         .with_settings(store),
                     request,
                 )
-                // `handle_unowned`, not the not-a-provider message: an
-                // embedded node genuinely is not a provider, but a repeated
-                // `Authenticate` is a client protocol error and saying
-                // "not a certificate-authority provider" points its author
-                // at the wrong thing entirely.
-                .unwrap_or_else(wayfinder_protos::service::handle_unowned);
+                // An embedded node runs no certificate authority, so an
+                // authority request gets the same "not a certificate-authority
+                // provider" a router-only host gives, which clients render as
+                // such. Anything else (a repeated `Authenticate`, an empty
+                // request) keeps its own protocol-error answer.
+                .unwrap_or_else(wayfinder_protos::service::handle_without_authority);
                 mgmt.reply(response).await;
             }
         }
