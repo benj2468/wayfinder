@@ -4077,4 +4077,78 @@ mod tests {
             "the credential must actually be installed"
         );
     }
+
+    /// A certificate authority that restarts re-floods the revocations it
+    /// still has on file (design 26 phase 2): a revocation reaches only the
+    /// peers online when it is issued, so one the CA stopped announcing at a
+    /// restart would stop spreading. They go through the same checks as a
+    /// revocation signed live — one this node's anchor does not verify is
+    /// refused, not flooded.
+    #[tokio::test]
+    async fn a_restarted_authority_refloods_its_revocations() {
+        use wayfinder_server::MeshAuthority;
+        const NOW: u64 = 1_700_000_000;
+
+        let seed = [3u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let mac_addr = kp.derived_mac();
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(NOW);
+        let cert = match ca
+            .submit_csr(
+                zerocopy::IntoBytes::as_bytes(&mac_addr),
+                &kp.ed_pubkey(),
+                &kp.x_pubkey(),
+                "",
+            )
+            .unwrap()
+        {
+            wayfinder_protos::service::CsrOutcome::Issued(issued) => issued.cert,
+            other => panic!("expected the CSR to be issued outright, got {other:?}"),
+        };
+        let anchor =
+            wayfinder::wayfinder_auth::TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        let revoked = ca.revoke(&[0x02, 0, 0, 0, 0, 7]).unwrap();
+        let foreign = CertAuthority::new(&[8u8; 32], 0xABCD, 10_000, None, true);
+        let mut foreign = foreign;
+        foreign.set_now_unix(NOW);
+        let unverifiable = foreign.revoke(&[0x02, 0, 0, 0, 0, 8]).unwrap();
+
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let driver: Driver<NeverIo> = Driver::new(
+            mac_addr,
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+        driver
+            .with_router_mut(|r| {
+                r.set_auth(wayfinder::auth::OgmAuth::new(
+                    kp,
+                    wayfinder::wayfinder_auth::MembershipCert::from_bytes(&cert).unwrap(),
+                    anchor,
+                ));
+                r.set_auth_time(Duration::ZERO, wayfinder::wayfinder_auth::Clocked::At(NOW));
+            })
+            .await;
+        driver.set_epoch_unix(Duration::from_secs(NOW));
+
+        let accepted = driver.reflood_revocations(&[revoked, unverifiable]).await;
+
+        assert_eq!(
+            accepted, 1,
+            "only the record this node's anchor verifies is flooded"
+        );
+        let held = driver
+            .with_router(|r| {
+                r.auth()
+                    .map(|a| a.revocations().map(|r| r.node_mac).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .await;
+        assert_eq!(held, vec![revoked.node_mac]);
+    }
 }
