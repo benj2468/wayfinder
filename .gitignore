@@ -101,3 +101,6 @@ containers/gantz.yml
 # membership certificate is presented on every connection), but per-bench and
 # regenerable from the board at any time.
 .local-enroll/
+
+# Pass markers GitHub Actions restores into the checkout (scripts/ci-cached.sh).
+.ci-passed/

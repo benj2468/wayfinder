@@ -1,0 +1,18 @@
+# gitleaks configuration: the default rules, plus the known non-secrets they
+# flag in this repository. CI's `secret-scan` job runs it over the whole
+# history (`.github/workflows/ci.yml`).
+#
+# Add an entry here only for a value that is public by design, with the reason
+# next to it. A real secret that was committed gets rotated first, not allowed.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+The certificate authority's Ed25519 *public* key, which every client pins
+(`--node-key`). `generic-api-key` matches it by shape; it is meant to be
+published.
+"""
+regexTarget = "match"
+regexes = ['''21eca19792e0c231a790d86b0353e7625560f9139d32fff062a091be5fa49707''']
