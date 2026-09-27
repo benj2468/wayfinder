@@ -163,7 +163,7 @@ where
                     .accept(key, &hdr, body, metrics, &mut self.rx_frame)
             {
                 let frame = LinkFrame::ref_from_bytes(&self.rx_frame[..len])
-                    .map_err(|_| LinkError::InvalidPacket)?;
+                    .map_err(|_| LinkError::MalformedFrame)?;
                 return Ok(Received { frame, metrics });
             }
         }
@@ -239,10 +239,13 @@ fn push_base64<const N: usize>(
 /// number of bytes written (0 for an empty `s`). Errors if the length isn't a
 /// multiple of 4, on a non-alphabet/misplaced-padding character, or if `out`
 /// is too small.
+///
+/// Its only input is a received packet's data field — a peer's bytes — so bad
+/// encoding is [`LinkError::MalformedFrame`], not a local fault.
 fn decode_base64(s: &str, out: &mut [u8]) -> Result<usize, LinkError> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(4) {
-        return Err(LinkError::InvalidPacket);
+        return Err(LinkError::MalformedFrame);
     }
 
     let mut n = 0;
@@ -253,7 +256,7 @@ fn decode_base64(s: &str, out: &mut [u8]) -> Result<usize, LinkError> {
         if pad2 && !pad3 {
             // '=' in position 2 without position 3 also padded is not a
             // valid encoding of any byte length.
-            return Err(LinkError::InvalidPacket);
+            return Err(LinkError::MalformedFrame);
         }
 
         let s0 = sextet(chunk[0])?;
@@ -285,7 +288,7 @@ fn sextet(c: u8) -> Result<u8, LinkError> {
         b'0'..=b'9' => Ok(c - b'0' + 52),
         b'-' => Ok(62),
         b'_' => Ok(63),
-        _ => Err(LinkError::InvalidPacket),
+        _ => Err(LinkError::MalformedFrame),
     }
 }
 
@@ -628,12 +631,12 @@ mod tests {
         let mut out = [0u8; 8];
         assert!(matches!(
             decode_base64("YW,5IA==", &mut out),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
         // Length not a multiple of 4.
         assert!(matches!(
             decode_base64("YW5", &mut out),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 }

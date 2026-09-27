@@ -160,7 +160,9 @@ impl<Io: FrameIo> LinkT for Link<Io> {
             tracing::warn!(error = ?e, "link recv failed");
             LinkError::Io
         })?;
-        let frame = LinkFrame::ref_from_bytes(&self.buffer[..n]).map_err(|_| LinkError::Io)?;
+        // A peer's bytes that are not a frame: its fault, not the socket's.
+        let frame =
+            LinkFrame::ref_from_bytes(&self.buffer[..n]).map_err(|_| LinkError::MalformedFrame)?;
         // A bare byte pipe carries no signal information.
         Ok(Received {
             frame,

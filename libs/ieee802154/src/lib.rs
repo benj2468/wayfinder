@@ -317,7 +317,7 @@ pub fn build_fragment(
 /// Parse one received fragment (with the FCS already stripped by the radio)
 /// into the sender's short address, its fragment header, and its body.
 ///
-/// Returns [`LinkError::InvalidPacket`] if `buf` is too short to hold an
+/// Returns [`LinkError::MalformedFrame`] if `buf` is too short to hold an
 /// [`Ieee802154Header`] plus a fragment header, if the header is not exactly
 /// the one [`build_fragment`] writes, or if the fragment header is malformed.
 /// Fail-closed throughout: a frame this crate cannot make sense of is dropped,
@@ -337,19 +337,20 @@ pub fn build_fragment(
 /// makes this crate the only thing its own reassembler will accept.
 pub fn decode_fragment(buf: &[u8]) -> Result<(u16, FragHeader, &[u8]), LinkError> {
     if buf.len() < HEADER_LEN + FRAG_HDR_LEN {
-        return Err(LinkError::InvalidPacket);
+        return Err(LinkError::MalformedFrame);
     }
 
     let (header, rest) =
-        Ieee802154Header::ref_from_prefix(buf).map_err(|_| LinkError::InvalidPacket)?;
+        Ieee802154Header::ref_from_prefix(buf).map_err(|_| LinkError::MalformedFrame)?;
     if header.frame_control.get() != FRAME_CONTROL
         || header.dest_pan_id.get() != BROADCAST_ADDR
         || header.dest_addr.get() != BROADCAST_ADDR
     {
-        return Err(LinkError::InvalidPacket);
+        return Err(LinkError::MalformedFrame);
     }
 
-    let (hdr, body) = wayfinder_link_utils::parse_fragment(rest).ok_or(LinkError::InvalidPacket)?;
+    let (hdr, body) =
+        wayfinder_link_utils::parse_fragment(rest).ok_or(LinkError::MalformedFrame)?;
     Ok((header.src_addr.get(), hdr, body))
 }
 
@@ -387,11 +388,11 @@ pub fn accept_fragment(
 
 /// Reinterpret reassembled bytes as a [`LinkFrame`].
 ///
-/// Returns [`LinkError::InvalidPacket`] if they are too short to hold a
+/// Returns [`LinkError::MalformedFrame`] if they are too short to hold a
 /// [`LinkFrame`] header — which a corrupted reassembly (see the module docs
 /// on colliding short addresses) can produce.
 pub fn decode_frame(bytes: &[u8]) -> Result<&LinkFrame, LinkError> {
-    LinkFrame::ref_from_bytes(bytes).map_err(|_| LinkError::InvalidPacket)
+    LinkFrame::ref_from_bytes(bytes).map_err(|_| LinkError::MalformedFrame)
 }
 
 #[cfg(test)]
@@ -731,7 +732,7 @@ mod tests {
         air[0] = 0b010; // Ack
         assert!(matches!(
             decode_fragment(&air[..HEADER_LEN + FRAG_HDR_LEN + 1]),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 
@@ -758,7 +759,7 @@ mod tests {
         air[HEADER_LEN + 1] = 0x01;
         assert!(matches!(
             decode_fragment(&air[..HEADER_LEN + FRAG_HDR_LEN + 4]),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 
@@ -786,7 +787,7 @@ mod tests {
         air[3] = 0x22;
         assert!(matches!(
             decode_fragment(&air[..n]),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
 
         // The destination address (bytes 5..7) is no longer broadcast.
@@ -794,7 +795,7 @@ mod tests {
         air[5] = 0x22;
         assert!(matches!(
             decode_fragment(&air[..n]),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 
@@ -848,7 +849,19 @@ mod tests {
         let air = [0u8; HEADER_LEN + FRAG_HDR_LEN - 1];
         assert!(matches!(
             decode_fragment(&air),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
+        ));
+    }
+
+    /// Reassembled bytes too short for a `LinkFrame` header are a *peer's*
+    /// fault — a corrupted reassembly, or a stranger's frame — so they must
+    /// surface as [`LinkError::MalformedFrame`], which the driver drops without
+    /// raising the interface's `LinkErrors` alarm (#75).
+    #[test]
+    fn decode_frame_reports_a_short_buffer_as_malformed() {
+        assert!(matches!(
+            decode_frame(&[0u8; 3]),
+            Err(LinkError::MalformedFrame)
         ));
     }
 
@@ -876,7 +889,7 @@ mod tests {
         air[HEADER_LEN + 1] = 0x21;
         assert!(matches!(
             decode_fragment(&air[..n]),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 

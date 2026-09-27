@@ -238,7 +238,9 @@ impl LinkT for UdpMultiLink {
                 tracing::warn!(error = ?e, "udp-multi recv failed");
                 LinkError::Io
             })?;
-        let frame = LinkFrame::ref_from_bytes(&self.wire_buf[..n]).map_err(|_| LinkError::Io)?;
+        // A peer's bytes that are not a frame: its fault, not the socket's.
+        let frame = LinkFrame::ref_from_bytes(&self.wire_buf[..n])
+            .map_err(|_| LinkError::MalformedFrame)?;
         self.peers.learn(frame.src, peer_addr, Instant::now());
         // A UDP datagram carries no physical-layer signal information.
         Ok(Received {
@@ -1106,6 +1108,29 @@ mod tests {
                     .unwrap();
             assert!(recvd > 0);
         }
+    }
+
+    /// A datagram too short to be a frame is the sender's fault, and on a UDP
+    /// carrier the sender is anyone who can reach the port. It must surface as
+    /// [`LinkError::MalformedFrame`] — which the driver drops without raising
+    /// `LinkErrors` — not as `Io`, which would let that stranger keep the
+    /// interface's alarm latched (#75). Nor may it teach the hub a peer.
+    #[tokio::test]
+    async fn a_runt_datagram_is_a_malformed_frame() {
+        let mut hub_link = hub(addr(0)).await;
+        let hub_addr = hub_link.socket.local_addr().unwrap();
+        let stranger = UdpSocket::bind(addr(0)).await.unwrap();
+
+        stranger.send_to(&[0u8; 3], hub_addr).await.unwrap();
+
+        assert!(matches!(
+            hub_link.recv().await,
+            Err(LinkError::MalformedFrame)
+        ));
+        assert!(
+            hub_link.peers.peers.is_empty(),
+            "a runt must not be learned"
+        );
     }
 
     #[tokio::test]

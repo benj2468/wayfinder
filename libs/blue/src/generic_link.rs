@@ -334,7 +334,7 @@ impl<A: BleAdvertiser> LinkT for BleLink<A> {
                 // arrive in" is the observation bring-up needs.
                 trace!(?format, ?origin, len, "rx frame");
                 let frame = LinkFrame::ref_from_bytes(&self.rx_frame[..len])
-                    .map_err(|_| LinkError::InvalidPacket)?;
+                    .map_err(|_| LinkError::MalformedFrame)?;
                 return Ok(Received { frame, metrics });
             }
         }
