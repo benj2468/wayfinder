@@ -377,7 +377,7 @@ pub struct Driver<
     L,
     C,
     const N: usize,
-    const FRAME_LEN: usize = { wayfinder::host::MAX_FRAME_LEN },
+    const FRAME_LEN: usize = { wayfinder::default::MAX_FRAME_LEN },
     R = CentralRouter,
 > {
     router: R,
@@ -427,7 +427,7 @@ pub struct Driver<
     fan_out: [Option<NonZeroU8>; N],
 }
 
-/// Constructor at the default (host) capacities.
+/// Constructor at the default capacities.
 ///
 /// Kept on the fully-defaulted type rather than the generic impl below: a
 /// struct's default const parameters do not drive inference in expression
@@ -1531,7 +1531,7 @@ mod capacity_tests {
     fn staged_frame_capacity_follows_the_profile() {
         assert_eq!(Staged::<256>::payload_capacity(), 256);
         assert_eq!(
-            Staged::<{ wayfinder::host::MAX_FRAME_LEN }>::payload_capacity(),
+            Staged::<{ wayfinder::default::MAX_FRAME_LEN }>::payload_capacity(),
             2048
         );
     }

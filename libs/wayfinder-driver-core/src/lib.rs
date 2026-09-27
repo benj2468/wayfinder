@@ -1472,7 +1472,7 @@ mod tests {
     use super::*;
     use wayfinder::batman::wire::BATMAN_VERSION;
     // The planning functions are generic over `RouterOps` now; the tests still
-    // instantiate a concrete host-profile router to drive them.
+    // instantiate a concrete default-profile router to drive them.
     use wayfinder::CentralRouter;
     use wayfinder::auth::DIRECTED_TRAILER_LEN;
     use wayfinder::auth::OgmAuth;

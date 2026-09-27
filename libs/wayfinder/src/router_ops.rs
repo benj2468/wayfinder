@@ -846,7 +846,7 @@ mod tests {
     }
 
     /// The contract, stated once: the same generic function drives the default
-    /// (host) profile and a constrained profile, and both originate the *same*
+    /// (default) profile and a constrained profile, and both originate the *same*
     /// OGM. Capacity is a memory decision, never a behavioural one — so if this
     /// diverges, the trait is leaking capacity into behaviour.
     #[test]

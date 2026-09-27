@@ -1,17 +1,17 @@
-//! The per-frame paths at the `cloud` capacity profile (design 26 phase 1).
+//! The per-frame paths at the `host` capacity profile (design 26 phase 1).
 //!
-//! `wayfinder-tap` runs a router whose tables are up to 32x the `host`
+//! `wayfinder-tap` runs a router whose tables are up to 32x the `default`
 //! profile's. Most of them are hashed maps, which should not notice; several
 //! are `heapless::Vec`s searched linearly, which would. This suite exists to
 //! say which, with numbers, before any table is converted: every group sweeps
 //! occupancy, and a curve that tracks it is the scan.
 //!
-//! - `cloud/ogm_ingest`, `cloud/unicast_forward` — the routing core against an
+//! - `host/ogm_ingest`, `host/unicast_forward` — the routing core against an
 //!   originator table from one entry to full.
-//! - `cloud/hub_poll` — the periodic tick on a hub whose every peer is a direct
+//! - `host/hub_poll` — the periodic tick on a hub whose every peer is a direct
 //!   neighbour: the work a node does between frames, which scales with the
 //!   neighbourhood rather than the traffic.
-//! - `cloud/directed_verify` — verifying a directed frame against a neighbour
+//! - `host/directed_verify` — verifying a directed frame against a neighbour
 //!   key table from one entry to full, from the neighbour stored *last*, since
 //!   that is the worst case a linear search can have.
 #![allow(
@@ -37,33 +37,33 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder_auth::Authority;
 use wayfinder_auth::Clocked;
 use wayfinder_auth::Keypair;
-use wayfinder_bench::CLOUD_ORIGINATOR_COUNTS;
 use wayfinder_bench::CountingSink;
+use wayfinder_bench::HOST_ORIGINATOR_COUNTS;
 use wayfinder_bench::NO_FAN_OUT;
 use wayfinder_bench::PEER_MAC;
-use wayfinder_bench::WarmCloudRouter;
+use wayfinder_bench::WarmHostRouter;
 use wayfinder_bench::ogm_frame;
 use wayfinder_bench::ogm_payload;
 use wayfinder_bench::unicast_frame;
-use wayfinder_bench::warm_cloud_hub;
-use wayfinder_bench::warm_cloud_router;
+use wayfinder_bench::warm_host_hub;
+use wayfinder_bench::warm_host_router;
 use wayfinder_bench::wide_mac;
 use wayfinder_driver_core::handle_mesh_frame;
 use wayfinder_driver_core::poll_due_all;
 use wayfinder_test::driver::mac;
 use zerocopy::FromBytes;
 
-/// Neighbour-key occupancies the directed-verify sweep covers: one, the `host`
-/// profile's whole table, and the `cloud` profile's.
+/// Neighbour-key occupancies the directed-verify sweep covers: one, the `default`
+/// profile's whole table, and the `host` profile's.
 const NEIGHBOR_COUNTS: [usize; 3] = [1, 64, 1024];
 
-/// Hub sizes: `host`'s neighbour-key capacity, the `cloud` one, and a full
+/// Hub sizes: `default`'s neighbour-key capacity, the `host` one, and a full
 /// originator table of direct neighbours.
 const HUB_SIZES: [usize; 3] = [64, 1024, 4096];
 
 /// Run one measured receive of `raw` against `warm`, parse included, exactly
 /// as `packet_path`'s `recv` does.
-fn recv(warm: &mut WarmCloudRouter, raw: &[u8], sink: &mut CountingSink) {
+fn recv(warm: &mut WarmHostRouter, raw: &[u8], sink: &mut CountingSink) {
     let frame = LinkFrame::ref_from_bytes(black_box(raw)).unwrap();
     handle_mesh_frame(
         warm.now,
@@ -77,12 +77,12 @@ fn recv(warm: &mut WarmCloudRouter, raw: &[u8], sink: &mut CountingSink) {
     );
 }
 
-/// OGM ingest against a cloud-sized originator table, one entry to full.
+/// OGM ingest against a host-sized originator table, one entry to full.
 fn ogm_ingest(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cloud/ogm_ingest");
+    let mut group = c.benchmark_group("host/ogm_ingest");
     group.throughput(Throughput::Elements(1));
-    for n in CLOUD_ORIGINATOR_COUNTS {
-        let mut warm = warm_cloud_router(n);
+    for n in HOST_ORIGINATOR_COUNTS {
+        let mut warm = warm_host_router(n);
         warm.assert_originators(n + 1);
         let raw = ogm_frame(mac(PEER_MAC), mac(PEER_MAC), 5_000, 50, 255);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -97,10 +97,10 @@ fn ogm_ingest(c: &mut Criterion) {
 /// Forwarding a unicast to the far-side originator learned last, against a
 /// table one entry to full.
 fn unicast_forward(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cloud/unicast_forward");
+    let mut group = c.benchmark_group("host/unicast_forward");
     group.throughput(Throughput::Elements(1));
-    for n in CLOUD_ORIGINATOR_COUNTS {
-        let mut warm = warm_cloud_router(n);
+    for n in HOST_ORIGINATOR_COUNTS {
+        let mut warm = warm_host_router(n);
         let dest = wide_mac(n - 1);
         warm.assert_route_to(dest);
         let raw = unicast_frame(mac(PEER_MAC), mac(wayfinder_bench::SELF_MAC), dest, 512);
@@ -109,7 +109,7 @@ fn unicast_forward(c: &mut Criterion) {
         recv(&mut warm, &raw, &mut probe);
         assert_eq!(
             probe.emitted, 1,
-            "cloud fixture must forward toward {dest:?}"
+            "host fixture must forward toward {dest:?}"
         );
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             let mut sink = CountingSink::default();
@@ -124,10 +124,10 @@ fn unicast_forward(c: &mut Criterion) {
 /// nothing due: what the node pays on every timer wake-up just to find that
 /// out. The first call (outside the timing) emits the OGM that *was* due.
 fn hub_poll(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cloud/hub_poll");
+    let mut group = c.benchmark_group("host/hub_poll");
     group.throughput(Throughput::Elements(1));
     for n in HUB_SIZES {
-        let mut warm = warm_cloud_hub(n);
+        let mut warm = warm_host_hub(n);
         assert_eq!(
             warm.router.originator_table().count(),
             n,
@@ -152,19 +152,19 @@ fn hub_poll(c: &mut Criterion) {
     group.finish();
 }
 
-/// The `cloud` profile's auth state: 1024 neighbour keys, 1024 revocations.
-type CloudAuth = OgmAuth<
-    { wayfinder::cloud::NEIGHBOR_KEYS },
-    { wayfinder::cloud::REVOKED },
-    { wayfinder::cloud::IN_FLIGHT_CERT_REQUESTS },
-    { wayfinder::cloud::PENDING_REPLIES },
+/// The `host` profile's auth state: 1024 neighbour keys, 1024 revocations.
+type HostProfileAuth = OgmAuth<
+    { wayfinder::host::NEIGHBOR_KEYS },
+    { wayfinder::host::REVOKED },
+    { wayfinder::host::IN_FLIGHT_CERT_REQUESTS },
+    { wayfinder::host::PENDING_REPLIES },
 >;
 
-/// A cloud-profile node holding `n` neighbours' keys, and the neighbour it
+/// A host-profile node holding `n` neighbours' keys, and the neighbour it
 /// learned last, holding the node's keys in turn — so the last neighbour can
 /// tag frames the node verifies.
 struct Neighbourhood {
-    node: Box<CloudAuth>,
+    node: Box<HostProfileAuth>,
     node_mac: Mac,
     last: OgmAuth,
     last_mac: Mac,
@@ -210,7 +210,7 @@ fn neighbourhood(n: usize) -> Neighbourhood {
         0,
         1_000_000,
     );
-    let mut node = Box::new(CloudAuth::with_capacities(
+    let mut node = Box::new(HostProfileAuth::with_capacities(
         node_kp,
         node_cert,
         authority.trust_anchor(),
@@ -253,7 +253,7 @@ fn neighbourhood(n: usize) -> Neighbourhood {
 /// table one entry to full. Fresh replay counter per iteration, tagged in the
 /// untimed setup, for the reason `auth.rs`'s `directed_verify` spells out.
 fn directed_verify(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cloud/directed_verify");
+    let mut group = c.benchmark_group("host/directed_verify");
     group.throughput(Throughput::Elements(1));
     let frame = vec![0xa5u8; 512];
     for n in NEIGHBOR_COUNTS {

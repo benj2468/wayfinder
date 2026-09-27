@@ -65,7 +65,7 @@ crate::define_profile! {
     /// named — sized for a Linux gateway. Downstream crates whose own defaults
     /// must match the router's name this rather than repeating the literals;
     /// `router_defaults_preserve_todays_capacities` pins the two together.
-    pub host {
+    pub default {
         originators: 128,
         interfaces: 8,
         mcast_members: 64,
@@ -85,13 +85,13 @@ crate::define_profile! {
     /// Capacities for a node with a server's memory: the certificate authority,
     /// a VPN hub, any `wayfinder-tap` in a data centre (design 26). Sized so no
     /// mesh we run gets near them — on a VPN hub every peer is a direct
-    /// neighbour, which is what fills `host`'s 64 neighbour keys first.
+    /// neighbour, which is what fills `default`'s 64 neighbour keys first.
     ///
     /// A router at these sizes is about 1.8 MB, so it cannot be built on a
     /// default thread's stack: `wayfinder-driver` builds it on a short-lived
     /// thread with room for it and keeps only the `Arc` it is moved into.
-    /// `the_cloud_profile_pins_design_26s_capacities` pins every number.
-    pub cloud {
+    /// `the_host_profile_pins_design_26s_capacities` pins every number.
+    pub host {
         originators: 4096,
         interfaces: 8,
         mcast_members: 1024,
@@ -694,7 +694,7 @@ pub struct CentralRouter<
 }
 
 impl CentralRouter {
-    /// A router at the default (host) capacities.
+    /// A router at the default capacities.
     ///
     /// Kept on the fully-defaulted type rather than the generic impl below: a
     /// struct's default const parameters do not drive inference in expression

@@ -67,14 +67,14 @@ use zerocopy::IntoBytes;
 
 use crate::tap::TapDevice;
 
-/// The capacity profile this binary's router runs at: `cloud` (design 26),
+/// The capacity profile this binary's router runs at: `host` (design 26),
 /// since this binary is what the certificate authority, VPN hubs and container
 /// nodes all run.
 ///
 /// One name, so the profile is a one-line choice rather than a search for every
 /// place this binary names its router — the host equivalent of a board's
 /// per-board profile.
-type TapRouter = wayfinder::router_for!(wayfinder::cloud);
+type TapRouter = wayfinder::router_for!(wayfinder::host);
 
 /// Command-line arguments.
 #[derive(clap::Parser, Debug)]
@@ -1286,7 +1286,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::trace!("Failed to notify systemd: {}", err);
     }
 
-    // Awaited here, on the main thread, and not `tokio::spawn`ed: at the `cloud`
+    // Awaited here, on the main thread, and not `tokio::spawn`ed: at the `host`
     // profile, installing a credential moves a ~548 KB `OgmAuth` by value, and
     // an unoptimised build needs ~2.1 MB of stack for it — more than a 2 MiB
     // tokio worker has, well inside the main thread's 8 MiB. Moving the loop
@@ -1324,7 +1324,7 @@ mod tests {
     const NODE_SEED: [u8; 32] = [9u8; 32];
 
     /// Every `wayfinder-tap` node runs with a hub-sized neighbour table
-    /// (design 26 §3 step 5): `host`'s 64 neighbour keys is the limit a VPN
+    /// (design 26 §3 step 5): `default`'s 64 neighbour keys is the limit a VPN
     /// hub hits first, and each peer past it displaces a member's keys. Read
     /// off the router's own auth type, so reverting `TapRouter` to a smaller
     /// profile fails here rather than on a hub.
@@ -1335,7 +1335,7 @@ mod tests {
         type HostAuth = <wayfinder::CentralRouter as RouterOps>::Auth;
         assert!(
             size_of::<TapAuth>() > 8 * size_of::<HostAuth>(),
-            "TapRouter's auth state is sized for host's neighbour table, not a hub's"
+            "TapRouter's auth state is sized for default's neighbour table, not a hub's"
         );
     }
 

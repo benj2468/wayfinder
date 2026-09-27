@@ -455,12 +455,12 @@ fn links_beyond_capacity<R: RouterOps>(n: usize) -> bool {
 /// For constructing a router at a large capacity profile. A `no_std` router
 /// has no way to be built in place, so construction returns it by value, and
 /// an unoptimized build keeps several copies of that value live on the stack
-/// at once — for a `cloud` router, more than a whole default thread's worth.
+/// at once — for a `host` router, more than a whole default thread's worth.
 /// The fix is to build somewhere with room and hand back something small (an
 /// `Arc`), not to raise every thread's stack in the process: the router is
 /// constructed once, and nothing after that moves it.
 ///
-/// The stack is sixteen times the value. Measured at the `cloud` profile, a
+/// The stack is sixteen times the value. Measured at the `host` profile, a
 /// debug build needs more than six times and no more than eight; a release
 /// build needs a fraction of one, so the margin is for the build that is
 /// slowest to notice. It is reserved address space, committed only as far as
@@ -516,8 +516,8 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
         // participation (a `set_link_features` past the cap no-ops), so a link
         // configured as a read-only tap would still transmit. Warn rather than
         // ship that misconfiguration mutely. Checked against this router's own
-        // capacity, not the fixed `host`-profile constant: a smaller profile
-        // (`tiny_cloud`'s 2, say) must be flagged well below that constant, and
+        // capacity, not the fixed `default`-profile constant: a smaller profile
+        // (`tiny_host`'s 2, say) must be flagged well below that constant, and
         // a larger one must not be flagged below it either.
         if links_beyond_capacity::<R>(link_count) {
             warn!(
@@ -527,7 +527,7 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
             );
         }
         // Built — and configured — on a thread whose stack fits the router,
-        // then handed back already behind its `Arc`. At the `cloud` profile a
+        // then handed back already behind its `Arc`. At the `host` profile a
         // router is ~1.8 MB, and a debug build copies it through
         // `with_capacities` and each wrapper on the way into the lock: done
         // here, on a 2 MiB tokio worker or test thread, that overflows the
@@ -816,12 +816,12 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
 /// Const-generic over `CentralRouter`'s eleven table capacities rather than
 /// generic over `R: RouterOps` (design 26 phase 1 slice 3): `RouterAdapter`
 /// and `RouterHandle` are themselves const-generic over those same eleven
-/// capacities — same names, same order, same `wayfinder::host` defaults — not
+/// capacities — same names, same order, same `wayfinder::default` defaults — not
 /// generic over the trait, so a query-handling arm built against them still
 /// cannot be written for an arbitrary `R` today. What this buys is every
 /// *capacity profile* of `CentralRouter`, not only the default one: a driver
-/// built at `wayfinder::router_for!(cloud)` gets a working management API
-/// exactly as a `host`-profile one does.
+/// built at `wayfinder::router_for!(host)` gets a working management API
+/// exactly as a `default`-profile one does.
 impl<
     Local: FrameIo,
     const ORIGINATORS: usize,
@@ -3711,10 +3711,10 @@ mod tests {
     // ---- design 26 phase 1 slice 2: the host driver at a non-default profile --
 
     wayfinder::define_profile! {
-        /// A capacity profile smaller than `host` in every dimension, so a test
+        /// A capacity profile smaller than `default` in every dimension, so a test
         /// exercising it cannot pass merely because it happens to coincide with
         /// the router's built-in defaults.
-        pub tiny_cloud {
+        pub tiny_host {
             originators: 16,
             interfaces: 2,
             mcast_members: 8,
@@ -3730,9 +3730,9 @@ mod tests {
         }
     }
 
-    /// The concrete router type for [`tiny_cloud`] — a stand-in for the `cloud`
+    /// The concrete router type for [`tiny_host`] — a stand-in for the `host`
     /// profile design 26 itself adds, at a size cheap enough for a unit test.
-    type TinyRouter = wayfinder::router_for!(tiny_cloud);
+    type TinyRouter = wayfinder::router_for!(tiny_host);
 
     /// A mesh interface that only ever captures what is sent on it, so a test
     /// can observe that the driver's periodic loop actually produced and
@@ -3763,9 +3763,9 @@ mod tests {
     /// capacity, not past a fixed host constant.
     ///
     /// `wayfinder::MAX_INTERFACES` is `batman::MAX_INTERFACES` (8) — the
-    /// `host` profile's own interface count, but not every profile's.
-    /// `tiny_cloud` has only 2, so 3 links must be flagged there even though
-    /// 3 is nowhere near the fixed constant. Conversely the `host` profile's
+    /// `default` profile's own interface count, but not every profile's.
+    /// `tiny_host` has only 2, so 3 links must be flagged there even though
+    /// 3 is nowhere near the fixed constant. Conversely the `default` profile's
     /// 8 links is exactly at its own capacity, not past it, and must not be
     /// flagged. Checked through the pure helper rather than `Driver::new`
     /// itself so the assertion does not need to capture a `warn!` line.
@@ -3773,11 +3773,11 @@ mod tests {
     fn links_beyond_capacity_checks_the_routers_own_interface_bound() {
         assert!(
             links_beyond_capacity::<TinyRouter>(3),
-            "tiny_cloud has only 2 interfaces, so 3 links is past its capacity"
+            "tiny_host has only 2 interfaces, so 3 links is past its capacity"
         );
         assert!(
             !links_beyond_capacity::<CentralRouter>(8),
-            "the host profile's own capacity is 8, so 8 links is at capacity, not past it"
+            "the default profile's own capacity is 8, so 8 links is at capacity, not past it"
         );
         // And the other side of each boundary, so an off-by-one fails.
         assert!(!links_beyond_capacity::<TinyRouter>(2));
@@ -3787,7 +3787,7 @@ mod tests {
     /// The whole point of this slice: the host driver, generic over `R:
     /// RouterOps`, runs its real event loop — construction, per-interface
     /// Trickle scheduling, and dispatch — at a capacity profile other than the
-    /// default `host` one, and actually emits an OGM onto a link. Before this
+    /// `default` one, and actually emits an OGM onto a link. Before this
     /// slice `Driver<Local>` named `CentralRouter` outright, so a router of
     /// another profile could not be handed to it at all — this test could not
     /// even be *written*, let alone pass.
@@ -3825,7 +3825,7 @@ mod tests {
 
     /// The management-API surface (`router_handle`, `with_router*`,
     /// `run`/`run_once`/`process_pending`) reaches every capacity profile, not
-    /// only `host`: it is const-generic over `CentralRouter`'s eleven table
+    /// only `default`: it is const-generic over `CentralRouter`'s eleven table
     /// capacities, as `RouterAdapter`/`RouterHandle` are. When it lived only on
     /// the default-profile `CentralRouter`, calling `router_handle` on a
     /// `TinyRouter`-backed driver did not compile.
@@ -3869,12 +3869,12 @@ mod tests {
         }
     }
 
-    // ---- design 26 phase 1: the `cloud` profile itself --------------------
+    // ---- design 26 phase 1: the `host` profile itself --------------------
 
-    /// The router type `wayfinder-tap` runs a cloud node at.
-    type CloudRouter = wayfinder::router_for!(wayfinder::cloud);
+    /// The router type `wayfinder-tap` runs every node at.
+    type HostRouter = wayfinder::router_for!(wayfinder::host);
 
-    /// A `cloud` router is about 1.8 MB, well past a 2 MiB thread's stack once
+    /// A `host` router is about 1.8 MB, well past a 2 MiB thread's stack once
     /// a debug build has copied it through a constructor or two — which is how
     /// every host path used to build one. `Driver::new` must therefore put it
     /// on the heap without ever holding it by value on the caller's stack: this
@@ -3883,7 +3883,7 @@ mod tests {
     #[tokio::test]
     async fn a_cloud_profile_driver_builds_on_an_ordinary_thread() {
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(1);
-        let driver: Driver<NeverIo, CloudRouter> = Driver::new(
+        let driver: Driver<NeverIo, HostRouter> = Driver::new(
             mac(1),
             NeverIo,
             Vec::new(),
@@ -3896,14 +3896,14 @@ mod tests {
         let occupancy = driver.with_router(|r| r.originator_occupancy()).await;
         assert_eq!(
             occupancy,
-            (0, wayfinder::cloud::ORIGINATORS),
-            "the driver must be running the cloud profile it was asked for"
+            (0, wayfinder::host::ORIGINATORS),
+            "the driver must be running the host profile it was asked for"
         );
     }
 
     /// Installing a credential is the other place auth state crosses the stack
     /// by value: `SetAuth` builds an `OgmAuth` and hands it to the router, and
-    /// at the `cloud` profile's 1024 neighbour keys and 1024 revocations that
+    /// at the `host` profile's 1024 neighbour keys and 1024 revocations that
     /// value alone is ~548 KB. A `no_std` value cannot be built in place, so
     /// an unoptimized build holds a few copies across `RouterAdapter::set_auth`
     /// and `CentralRouter::set_auth` — about 2.1 MB, measured, just past a
@@ -3951,7 +3951,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
-        let mut driver: Driver<NeverIo, CloudRouter> = Driver::new(
+        let mut driver: Driver<NeverIo, HostRouter> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -3982,7 +3982,7 @@ mod tests {
 
         match resp_rx.await.unwrap().response {
             Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::Empty(_)) => {}
-            other => panic!("expected SetAuth to install on a cloud router, got {other:?}"),
+            other => panic!("expected SetAuth to install on a host router, got {other:?}"),
         }
         assert!(
             driver.with_router(|r| r.auth().is_some()).await,

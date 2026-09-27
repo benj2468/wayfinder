@@ -114,23 +114,23 @@ impl<R> SharedRouter<R> {
 ///
 /// Const-generic over [`CentralRouter`]'s eleven table capacities, matching
 /// [`RouterAdapter`](crate::RouterAdapter)/[`RouterView`](crate::adapter::RouterView)
-/// exactly — same names, same order, same `wayfinder::host` defaults — so a
+/// exactly — same names, same order, same `wayfinder::default` defaults — so a
 /// management read is reachable at any capacity profile, not only the default
 /// one (design 26 phase 1 slice 3). `wayfinder-driver`'s `Driver<Local, R>`
 /// builds one at whichever profile its own `R` names.
 #[derive(Clone)]
 pub struct RouterHandle<
-    const ORIGINATORS: usize = { wayfinder::host::ORIGINATORS },
-    const INTERFACES: usize = { wayfinder::host::INTERFACES },
-    const MCAST_MEMBERS: usize = { wayfinder::host::MCAST_MEMBERS },
-    const LOCAL_MCAST: usize = { wayfinder::host::LOCAL_MCAST },
-    const IDENT_TABLE: usize = { wayfinder::host::IDENT_TABLE },
-    const IDENT_LIVE: usize = { wayfinder::host::IDENT_LIVE },
-    const LINK_QUALITY: usize = { wayfinder::host::LINK_QUALITY },
-    const NEIGHBOR_KEYS: usize = { wayfinder::host::NEIGHBOR_KEYS },
-    const REVOKED: usize = { wayfinder::host::REVOKED },
-    const IN_FLIGHT_CERT_REQUESTS: usize = { wayfinder::host::IN_FLIGHT_CERT_REQUESTS },
-    const PENDING_REPLIES: usize = { wayfinder::host::PENDING_REPLIES },
+    const ORIGINATORS: usize = { wayfinder::default::ORIGINATORS },
+    const INTERFACES: usize = { wayfinder::default::INTERFACES },
+    const MCAST_MEMBERS: usize = { wayfinder::default::MCAST_MEMBERS },
+    const LOCAL_MCAST: usize = { wayfinder::default::LOCAL_MCAST },
+    const IDENT_TABLE: usize = { wayfinder::default::IDENT_TABLE },
+    const IDENT_LIVE: usize = { wayfinder::default::IDENT_LIVE },
+    const LINK_QUALITY: usize = { wayfinder::default::LINK_QUALITY },
+    const NEIGHBOR_KEYS: usize = { wayfinder::default::NEIGHBOR_KEYS },
+    const REVOKED: usize = { wayfinder::default::REVOKED },
+    const IN_FLIGHT_CERT_REQUESTS: usize = { wayfinder::default::IN_FLIGHT_CERT_REQUESTS },
+    const PENDING_REPLIES: usize = { wayfinder::default::PENDING_REPLIES },
 > {
     inner: Arc<
         RwLock<

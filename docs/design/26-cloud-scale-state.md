@@ -1,10 +1,10 @@
-# Design: cloud-scale state — a cloud capacity profile, and the CA on SQLite
+# Design: cloud-scale state — a host capacity profile, and the CA on SQLite
 
 **Status:** Phase 1 implemented (see §3.1); phase 2 not started. Numbered 26 because 25 is taken by the WL55 design on `bjc/wl55jc-relay`.
 
 **Scope:**
 - `libs/interfaces` (`define_profile!`) and `libs/wayfinder` (`router_for!`, a
-  new `cloud` profile, the identity table's slot index).
+  new `host` profile, the identity table's slot index).
 - `libs/wayfinder-driver`, `libs/wayfinder-server` (`RouterAdapter`) and
   `bins/wayfinder-tap`: letting a host node choose a profile.
 - `libs/wayfinder-server` (`persistence.rs`, `authority.rs`): the CA's durable
@@ -20,11 +20,11 @@ A cloud node (the certificate authority, a VPN hub, any `wayfinder-tap` on a
 server) has effectively unlimited memory and disk, but it is held to the same
 kind of fixed limits as a board. It runs out in two places.
 
-**The router's tables.** `wayfinder-tap` and the CA always run the `host`
+**The router's tables.** `wayfinder-tap` and the CA always run the `default`
 profile, because `wayfinder-driver` and `RouterAdapter` name `CentralRouter`
 with its defaults and no host node can choose another:
 
-| Table | `host` capacity | When full |
+| Table | `default` capacity | When full |
 |---|---|---|
 | originators (also sizes broadcast dedup, keepalive, proofs) | 128 | evicts the least recently heard |
 | identity table | 128 (100 live) | evicts; slot index is a `u8`, so no profile can exceed a 128-slot table |
@@ -51,7 +51,7 @@ CSRs, enrollment policy, users and invites in one JSON document,
 ## 2. Goals and non-goals
 
 **Goals**
-- A host node chooses its capacity profile, and a `cloud` profile exists with
+- A host node chooses its capacity profile, and a `host` profile exists with
   limits no realistic mesh reaches.
 - The CA's state lives in a store with transactions, per-record writes, schema
   migrations and no size cliff, starting as one SQLite file on the CA's disk.
@@ -73,7 +73,7 @@ CSRs, enrollment policy, users and invites in one JSON document,
 - PostgreSQL in this design.
 - Unbounded routing tables in phases 1 and 2. §6 sketches them as phase 3.
 
-## 3. Phase 1: a cloud capacity profile
+## 3. Phase 1: a host capacity profile
 
 1. **Host nodes choose a profile, in the binary.** Make `wayfinder-driver::Driver`
    generic over its router, `R: RouterOps = CentralRouter`, exactly as the
@@ -81,12 +81,12 @@ CSRs, enrollment policy, users and invites in one JSON document,
    management adapter. `RouterOps` covers 9 of the 19 router methods the host
    driver calls today; the other 10 join the trait (it is capacity-erased, so
    every profile implements it for free). `wayfinder-tap` then chooses by naming
-   `router_for!(cloud)`.
+   `router_for!(host)`.
 
    **Not a Cargo feature on `wayfinder-driver`.** That was the obvious route
    and is the wrong one: features unify across a workspace build, so a
    `cargo test --workspace` that also builds `wayfinder-tap` would silently run
-   every driver test at cloud sizes, and tests pinned to the host capacities
+   every driver test at host sizes, and tests pinned to the `default` capacities
    would pass or fail depending on what else was built. The profile belongs to
    the binary, the same rule `CLAUDE.md` gives for the log sinks.
 2. **Widen the identity table's slot index** from `u8` to `u16`, so a profile
@@ -96,7 +96,7 @@ CSRs, enrollment policy, users and invites in one JSON document,
 3. **Add the profile**, sized so no mesh we run gets near it (capacities that
    back an `FnvIndexMap` must be powers of two):
 
-   | Parameter | `host` | `cloud` |
+   | Parameter | `default` | `host` |
    |---|---|---|
    | originators | 128 | 4096 |
    | identity table (live) | 128 (100) | 4096 (3500) |
@@ -115,26 +115,32 @@ CSRs, enrollment policy, users and invites in one JSON document,
    1024 entries that is a measurable per-frame cost. Phase 1 measures it with
    `wayfinder-bench` at the new sizes; any table that shows up converts to an
    indexed map within phase 1, keeping the same eviction policy.
-5. The `cloud` build becomes the CA's and the containers' default. The
+5. The `host` build becomes the CA's and the containers' default. The
    saturation alarm and `TableOccupancy` gauges keep working unchanged.
 
 ### 3.1 Phase 1 as built
 
+- **Naming.** The profile was proposed as `cloud` and shipped as `host`:
+  `wayfinder-tap` runs on Linux gateways and laptops as well as in the cloud,
+  and all of them get it (§3.1's measurements are why that costs nothing
+  worth a second build). The previous `host` profile, `CentralRouter`'s
+  default capacities, is now `default`; it stays small because tests, the
+  simulator and the tick driver build routers on ordinary thread stacks.
 - **Profile choice.** `Driver` is generic over `R: RouterOps`; its management
   path and `RouterHandle` are const-generic over `CentralRouter`'s eleven
-  capacities, as `RouterAdapter` already was; `wayfinder-tap` names `router_for!(wayfinder::cloud)`
+  capacities, as `RouterAdapter` already was; `wayfinder-tap` names `router_for!(wayfinder::host)`
   once (`TapRouter`). The TLS transport, which only ever serves reads, holds an
   `Arc<dyn ServeRouterRead>` so its types do not depend on the profile.
-- **Heap placement.** A cloud router is 1.77 MB and its `OgmAuth` 548 KB. A
+- **Heap placement.** A host router is 1.77 MB and its `OgmAuth` 548 KB. A
   `no_std` value cannot be built in place, and a debug build needs 6-8x the
   router's size in stack to construct one (measured), so `Driver::new` builds
   and configures it on a short-lived thread sized from the type and gets back
   only the `Arc`. Installing a credential needs ~2.1 MB of stack in a debug
   build; the tap's loop runs on the main thread (8 MiB), which has it. Release
   builds need a fraction of either.
-- **Measurements** (`wayfinder-bench`'s `cloud` suite, aarch64, release):
+- **Measurements** (`wayfinder-bench`'s `host` suite, aarch64, release):
 
-  | Path | `host` | `cloud`, 1 entry | `cloud`, full |
+  | Path | `default` | `host`, 1 entry | `host`, full |
   |---|---|---|---|
   | OGM ingest | 78 ns | 77 ns | 87 ns (4095) |
   | unicast forward, 512 B | — | 105 ns | 113 ns (4095) |
@@ -255,8 +261,8 @@ set first persists.
 ## 7. Test plan
 
 - **Phase 1:**
-  - A test that a `cloud`-profile router builds and runs on the heap.
-  - The existing capacity-profile pinning tests extended to `cloud`.
+  - A test that a `host`-profile router builds and runs on the heap.
+  - The existing capacity-profile pinning tests extended to `host`.
   - Identity-table tests past what a `u8` index can address.
   - `wayfinder-bench` runs at the new sizes, compared against `main` for the
     per-frame paths.

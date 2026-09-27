@@ -397,18 +397,18 @@ fn feed_at<R: RouterOps>(
     );
 }
 
-// ── the cloud-profile fixtures (design 26) ──────────────────────────────────
+// ── the host-profile fixtures (design 26) ──────────────────────────────────
 
-/// The router at the `cloud` capacity profile, which `wayfinder-tap` runs.
-pub type CloudRouter = wayfinder::router_for!(wayfinder::cloud);
+/// The router at the `host` capacity profile, which `wayfinder-tap` runs.
+pub type HostRouter = wayfinder::router_for!(wayfinder::host);
 
-/// Originator-table occupancies the cloud sweep covers: one, a quarter of the
+/// Originator-table occupancies the host sweep covers: one, a quarter of the
 /// table, and full (4095 far-side originators plus the relaying neighbour).
 ///
 /// The same question as [`ORIGINATOR_COUNTS`], asked where it matters: at 4096
-/// entries a per-frame linear scan is 32x the work it is at `host`'s 128, so
+/// entries a per-frame linear scan is 32x the work it is at `default`'s 128, so
 /// a cost that was noise there is the whole number here.
-pub const CLOUD_ORIGINATOR_COUNTS: [usize; 3] = [1, 1024, 4095];
+pub const HOST_ORIGINATOR_COUNTS: [usize; 3] = [1, 1024, 4095];
 
 /// The address of far-side node `i`, for sweeps wider than a `u8` can name.
 ///
@@ -422,17 +422,17 @@ pub fn wide_mac(i: usize) -> Mac {
     Mac([0x02, 0, 0, 0x10, hi, lo])
 }
 
-/// A converged router at the `cloud` profile: the [`WarmRouter`] counterpart,
+/// A converged router at the `host` profile: the [`WarmRouter`] counterpart,
 /// boxed because the router is ~1.8 MB.
 ///
-/// Built with `Box::new(CloudRouter::with_capacities(..))`, which is fine in a
+/// Built with `Box::new(HostRouter::with_capacities(..))`, which is fine in a
 /// benchmark: `cargo bench` builds with optimisations, where construction
 /// needs a fraction of the stack an unoptimised build does. Do not build one of
 /// these from a debug-profile unit test — see `wayfinder-driver`'s
 /// `build_off_stack` for why.
-pub struct WarmCloudRouter {
+pub struct WarmHostRouter {
     /// The router under measurement.
-    pub router: Box<CloudRouter>,
+    pub router: Box<HostRouter>,
     /// The transmit scratchpad.
     pub tx: Vec<u8>,
     /// The virtual instant every measured call is made at, fixed for the
@@ -440,7 +440,7 @@ pub struct WarmCloudRouter {
     pub now: Duration,
 }
 
-impl WarmCloudRouter {
+impl WarmHostRouter {
     /// Panic unless the router resolves a route to `dst` at [`now`](Self::now).
     /// See [`WarmRouter::assert_route_to`] for why every forwarding benchmark
     /// calls this first.
@@ -448,28 +448,28 @@ impl WarmCloudRouter {
         let now = self.now;
         assert!(
             self.router.get_egress_interface(now, dst).is_some(),
-            "cloud fixture is not converged: no route to {dst:?} at {now:?}"
+            "host fixture is not converged: no route to {dst:?} at {now:?}"
         );
     }
 
     /// Panic unless the originator table holds exactly `n` entries.
     pub fn assert_originators(&self, n: usize) {
         let got = self.router.originator_table().count();
-        assert_eq!(got, n, "cloud fixture has {got} originators, wanted {n}");
+        assert_eq!(got, n, "host fixture has {got} originators, wanted {n}");
     }
 }
 
-/// A `cloud` router converged so that `n_originators` far-side nodes
+/// A `host` router converged so that `n_originators` far-side nodes
 /// ([`wide_mac`]`(0..n)`) are reachable via neighbour [`PEER_MAC`] — the
-/// [`warm_router`] topology, at cloud scale. Fed through the real receive path
+/// [`warm_router`] topology, at host scale. Fed through the real receive path
 /// on the same one-second round, for the reasons given there.
-pub fn warm_cloud_router(n_originators: usize) -> WarmCloudRouter {
+pub fn warm_host_router(n_originators: usize) -> WarmHostRouter {
     assert!(
-        n_originators < wayfinder::cloud::ORIGINATORS,
+        n_originators < wayfinder::host::ORIGINATORS,
         "n_originators must leave a table slot for the relaying neighbour"
     );
     const ROUND: Duration = Duration::from_secs(1);
-    let mut router = Box::new(CloudRouter::with_capacities(mac(SELF_MAC)));
+    let mut router = Box::new(HostRouter::with_capacities(mac(SELF_MAC)));
     router.configure_interface_ogm(
         0,
         Duration::from_secs(1),
@@ -494,26 +494,26 @@ pub fn warm_cloud_router(n_originators: usize) -> WarmCloudRouter {
     }
 
     sink.black_box_counts();
-    WarmCloudRouter {
+    WarmHostRouter {
         router,
         tx,
         now: now + Duration::from_millis(100),
     }
 }
 
-/// A `cloud` router at the centre of a hub: `n_neighbours` nodes
+/// A `host` router at the centre of a hub: `n_neighbours` nodes
 /// ([`wide_mac`]`(0..n)`), every one a *direct* neighbour announcing itself.
 ///
 /// The VPN hub's shape, and the one that fills the per-neighbour tables rather
-/// than only the originator table: [`warm_cloud_router`] has one neighbour
+/// than only the originator table: [`warm_host_router`] has one neighbour
 /// relaying everything, which a scan over neighbours would never notice.
-pub fn warm_cloud_hub(n_neighbours: usize) -> WarmCloudRouter {
+pub fn warm_host_hub(n_neighbours: usize) -> WarmHostRouter {
     assert!(
-        n_neighbours <= wayfinder::cloud::ORIGINATORS,
+        n_neighbours <= wayfinder::host::ORIGINATORS,
         "a hub cannot have more neighbours than originator slots"
     );
     const ROUND: Duration = Duration::from_secs(1);
-    let mut router = Box::new(CloudRouter::with_capacities(mac(SELF_MAC)));
+    let mut router = Box::new(HostRouter::with_capacities(mac(SELF_MAC)));
     router.configure_interface_ogm(
         0,
         Duration::from_secs(1),
@@ -533,7 +533,7 @@ pub fn warm_cloud_hub(n_neighbours: usize) -> WarmCloudRouter {
     }
 
     sink.black_box_counts();
-    WarmCloudRouter {
+    WarmHostRouter {
         router,
         tx,
         now: now + Duration::from_millis(100),

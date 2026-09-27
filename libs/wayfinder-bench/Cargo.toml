@@ -65,7 +65,7 @@ name = "auth"
 harness = false
 
 [[bench]]
-name = "cloud"
+name = "host"
 harness = false
 
 [[bench]]
