@@ -1266,4 +1266,234 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── the SQLite-backed log (design 26 phase 2) ─────────────────────────
+
+    use crate::ca_store::CaStore;
+    use crate::ca_store::ChangeSet;
+    use crate::ca_store::Loaded;
+    use crate::ca_store::SqliteStore;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// A store that records every change set it is asked to commit, so a test
+    /// can see exactly which rows a mutation wrote.
+    struct RecordingStore {
+        inner: SqliteStore,
+        commits: Arc<Mutex<Vec<ChangeSet>>>,
+    }
+
+    impl CaStore for RecordingStore {
+        fn load(&mut self) -> Result<Loaded, String> {
+            self.inner.load()
+        }
+
+        fn commit(&mut self, change: &ChangeSet) -> Result<Vec<i64>, String> {
+            self.commits.lock().unwrap().push(change.clone());
+            self.inner.commit(change)
+        }
+    }
+
+    fn recording_log() -> (CaLog, Arc<Mutex<Vec<ChangeSet>>>) {
+        let commits = Arc::new(Mutex::new(Vec::new()));
+        let store = RecordingStore {
+            inner: SqliteStore::open_in_memory().unwrap(),
+            commits: Arc::clone(&commits),
+        };
+        let log = CaLog::with_store(Box::new(store), None).unwrap();
+        commits.lock().unwrap().clear();
+        (log, commits)
+    }
+
+    fn user(name: &str) -> UserRecord {
+        UserRecord::new(name, "correct horse", crate::users::UserRole::Admin, 900).unwrap()
+    }
+
+    /// The problem the store exists to solve: a login rewrote the whole CA.
+    /// Now changing one account writes that account's row and nothing else —
+    /// not the other accounts, and not the issued log beside them.
+    #[test]
+    fn a_mutation_writes_only_the_rows_it_changed() {
+        let (mut log, commits) = recording_log();
+        let (_, r) = log.mutate_users(|users| {
+            users.push(user("a"));
+            users.push(user("b"));
+            users.push(user("c"));
+        });
+        r.unwrap();
+        assert_eq!(commits.lock().unwrap().last().unwrap().inserts().len(), 3);
+
+        let (_, r) = log.mutate_users(|users| users[1].failed_attempts += 1);
+        r.unwrap();
+        let commits = commits.lock().unwrap();
+        let change = commits.last().unwrap();
+        assert_eq!(
+            change.inserts().len(),
+            1,
+            "only the changed account is written"
+        );
+        assert_eq!(change.deletes().len(), 1, "and only its old row is removed");
+    }
+
+    /// A mutation that changes nothing writes nothing — the common case for a
+    /// read-modify-write that finds nothing to modify.
+    #[test]
+    fn a_mutation_that_changes_nothing_writes_nothing() {
+        let (mut log, commits) = recording_log();
+        let (_, r) = log.mutate_users(|users| users.push(user("a")));
+        r.unwrap();
+        let before = commits.lock().unwrap().len();
+
+        let (_, r) = log.mutate_users(|_| {});
+        r.unwrap();
+        let commits = commits.lock().unwrap();
+        assert!(
+            commits.len() == before || commits.last().unwrap().is_empty(),
+            "an unchanged collection must not be rewritten"
+        );
+    }
+
+    /// Everything a CA holds comes back after a restart, through the database.
+    #[test]
+    fn state_survives_a_restart_through_the_database() {
+        let dir = unique_dir("sqlite-restart");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ca.sqlite3");
+        {
+            let mut log = CaLog::open(&db, None).unwrap();
+            log.mutate_users(|users| users.push(user("ops"))).1.unwrap();
+            log.mutate_policy(|p| p.auto_approve = Some(true))
+                .1
+                .unwrap();
+        }
+        let log = CaLog::open(&db, None).unwrap();
+        assert_eq!(log.users().len(), 1);
+        assert_eq!(log.users()[0].username, "ops");
+        assert_eq!(log.policy().auto_approve, Some(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A commit that fails rolls every collection the mutation touched back,
+    /// in memory as well as on disk.
+    #[test]
+    fn a_failed_commit_rolls_back_every_collection_touched() {
+        let (mut log, _) = recording_log();
+        log.mutate_users(|users| users.push(user("kept")))
+            .1
+            .unwrap();
+        log.fail_commits();
+
+        let (_, r) = log.mutate_users_and_invites(|users, invites| {
+            users.clear();
+            invites.clear();
+        });
+        assert!(r.is_err());
+        assert_eq!(log.users().len(), 1, "the in-memory users rolled back");
+        assert_eq!(log.users()[0].username, "kept");
+    }
+
+    /// On its first start against an empty database, a CA takes its state from
+    /// the `ca-state.json` it ran on before, commits it, and moves the file
+    /// aside — so the import happens once, and the file is kept rather than
+    /// deleted.
+    #[test]
+    fn a_legacy_snapshot_is_imported_once_and_moved_aside() {
+        let dir = unique_dir("import");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+
+        let log = CaLog::open(&db, Some(&json)).unwrap();
+        assert_eq!(log.issued().len(), 1);
+        assert_eq!(log.held().len(), 1);
+        assert!(!json.exists(), "the snapshot is moved aside once imported");
+        assert!(dir.join("ca-state.json.imported").exists());
+        drop(log);
+
+        let log = CaLog::open(&db, Some(&json)).unwrap();
+        assert_eq!(
+            log.issued().len(),
+            1,
+            "the imported state is in the database"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The import runs through the versioned loader, so a snapshot from any
+    /// schema version upgrades on the way in — here a v1, which had no held
+    /// CSRs at all.
+    #[test]
+    fn an_old_schema_snapshot_upgrades_on_import() {
+        let dir = unique_dir("import-v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let key = [0u8; 32];
+        std::fs::write(
+            &json,
+            serde_json::json!({
+                "version": 1,
+                "issued": [{
+                    "node_mac": [0, 0, 0, 0, 0, 1],
+                    "ed_pubkey": key,
+                    "not_before": 0,
+                    "not_after": 1,
+                    "revoked": true,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let log = CaLog::open(&dir.join("ca.sqlite3"), Some(&json)).unwrap();
+        assert_eq!(log.issued().len(), 1);
+        assert!(log.issued()[0].revoked);
+        assert!(log.held().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A snapshot still sitting beside a database that already holds a CA is
+    /// either the leftover of an import that committed but crashed before the
+    /// rename — same contents, so finish the rename — or two different CAs, and
+    /// then neither can be picked without losing the other's revocations.
+    #[test]
+    fn a_snapshot_beside_a_database_that_disagrees_fails_closed() {
+        let dir = unique_dir("import-conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        {
+            let mut log = CaLog::open(&db, None).unwrap();
+            log.mutate_users(|users| users.push(user("someone-else")))
+                .1
+                .unwrap();
+        }
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+
+        let err = CaLog::open(&db, Some(&json))
+            .err()
+            .expect("must fail closed");
+        assert!(
+            err.contains("ca-state.json"),
+            "the error names the file: {err}"
+        );
+        assert!(json.exists(), "nothing is moved aside when refusing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_snapshot_beside_a_database_that_agrees_finishes_the_import() {
+        let dir = unique_dir("import-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+        drop(CaLog::open(&db, Some(&json)).unwrap());
+        // Put the file back as though the rename had never happened.
+        std::fs::rename(dir.join("ca-state.json.imported"), &json).unwrap();
+
+        let log = CaLog::open(&db, Some(&json)).unwrap();
+        assert_eq!(log.issued().len(), 1, "imported once, not twice");
+        assert!(!json.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
