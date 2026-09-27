@@ -1,6 +1,6 @@
 # Design: cloud-scale state — a cloud capacity profile, and the CA on SQLite
 
-**Status:** Proposed: awaiting review before phase 1 starts. Numbered 26 because 25 is taken by the WL55 design on `bjc/wl55jc-relay`.
+**Status:** Phase 1 implemented (see §3.1); phase 2 not started. Numbered 26 because 25 is taken by the WL55 design on `bjc/wl55jc-relay`.
 
 **Scope:**
 - `libs/interfaces` (`define_profile!`) and `libs/wayfinder` (`router_for!`, a
@@ -117,6 +117,42 @@ CSRs, enrollment policy, users and invites in one JSON document,
    indexed map within phase 1, keeping the same eviction policy.
 5. The `cloud` build becomes the CA's and the containers' default. The
    saturation alarm and `TableOccupancy` gauges keep working unchanged.
+
+### 3.1 Phase 1 as built
+
+- **Profile choice.** `Driver`, `RouterHandle` and the management path are
+  generic over the router; `wayfinder-tap` names `router_for!(wayfinder::cloud)`
+  once (`TapRouter`). The TLS transport, which only ever serves reads, holds an
+  `Arc<dyn ServeRouterRead>` so its types do not depend on the profile.
+- **Heap placement.** A cloud router is 1.77 MB and its `OgmAuth` 548 KB. A
+  `no_std` value cannot be built in place, and a debug build needs 6-8x the
+  router's size in stack to construct one (measured), so `Driver::new` builds
+  and configures it on a short-lived thread sized from the type and gets back
+  only the `Arc`. Installing a credential needs ~2.1 MB of stack in a debug
+  build; the tap's loop runs on the main thread (8 MiB), which has it. Release
+  builds need a fraction of either.
+- **Measurements** (`wayfinder-bench`'s `cloud` suite, aarch64, release):
+
+  | Path | `host` | `cloud`, 1 entry | `cloud`, full |
+  |---|---|---|---|
+  | OGM ingest | 78 ns | 77 ns | 87 ns (4095) |
+  | unicast forward, 512 B | — | 105 ns | 113 ns (4095) |
+  | directed verify, 512 B | — | 1.04 µs | 1.63 µs (1024 keys) |
+  | idle periodic tick, hub | — | 86 ns (64) | 4.9 µs (4096) |
+
+  The first run had ingest and forward at ~2.5 µs at *every* occupancy: a cost
+  tracking capacity, not occupancy. `IdentTable::clear` assigned
+  `Self::new()`, a >100 KB temporary that inlined into
+  `apply_self_revocation` — called on every frame — so that function
+  stack-probed a frame that size per call. It now clears in place.
+- **Deferred: the neighbour-key scan.** `OgmAuth`'s `neighbors` and
+  `recv_counters` are searched linearly, adding ~0.6 µs per directed frame at
+  1024 keys. Not converted: an index map would add RAM on every board (this
+  design's one hard constraint), and the cost only appears on a hub with
+  hundreds of *authenticated* neighbours, on a path where each OGM already
+  pays tens of µs for Ed25519. Revisit with phase 3's per-profile tables.
+- The idle tick is linear in the neighbourhood (~1.2 ns per neighbour), paid per
+  timer wake-up rather than per frame.
 
 ## 4. Phase 2: the CA on SQLite
 
