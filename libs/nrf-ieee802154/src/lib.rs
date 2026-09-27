@@ -289,14 +289,16 @@ impl Ieee802154Link {
 /// Map an `embassy-nrf` radio error to a [`LinkError`].
 ///
 /// [`RadioError::CrcFailed`] (a corrupted received frame, from
-/// [`Radio::receive`]) maps to [`LinkError::ReceiveFailed`], and
+/// [`Radio::receive`]) maps to [`LinkError::MalformedFrame`] — noise, a
+/// collision, or anyone on the channel can produce one, so it must not raise
+/// the interface's `LinkErrors` alarm — and
 /// [`RadioError::ChannelInUse`] (clear-channel assessment found the channel
 /// busy, from [`Radio::try_send`]) maps to [`LinkError::TransmitFailed`]. All
 /// other variants — including any added later, since [`RadioError`] is
 /// `#[non_exhaustive]` — map to [`LinkError::Io`].
 fn map_err(err: RadioError) -> LinkError {
     match err {
-        RadioError::CrcFailed(_) => LinkError::ReceiveFailed,
+        RadioError::CrcFailed(_) => LinkError::MalformedFrame,
         RadioError::ChannelInUse => LinkError::TransmitFailed,
         _ => LinkError::Io,
     }
@@ -607,11 +609,15 @@ mod tests {
     /// `ChannelInUse` from [`Radio::try_send`]) and falls back to
     /// [`LinkError::Io`] for everything else, including future
     /// `#[non_exhaustive]` variants.
+    ///
+    /// A CRC failure is off-air corruption — noise, a collision, or anyone on
+    /// the channel transmitting garbage — so it is `MalformedFrame`, which does
+    /// not latch the interface's `LinkErrors` alarm (#75).
     #[test]
     fn map_err_distinguishes_known_variants() {
         assert!(matches!(
             map_err(RadioError::CrcFailed(0)),
-            LinkError::ReceiveFailed
+            LinkError::MalformedFrame
         ));
         assert!(matches!(
             map_err(RadioError::ChannelInUse),

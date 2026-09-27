@@ -1186,6 +1186,12 @@ pub fn handle_link_result<R: RouterOps>(
                 sink,
             );
         }
+        // The sender's fault, and the sender can be anyone in range — see
+        // `LinkError::MalformedFrame`. No alarm, or a stranger could keep
+        // this interface's `LinkErrors` row latched indefinitely.
+        Err(LinkError::MalformedFrame) => {
+            trace!(iface = idx, "drop: malformed frame");
+        }
         Err(e) => {
             trace!(iface = idx, error = ?e, "drop: link recv error");
             // One row per interface, however many errors it produces. `Info`
@@ -2354,6 +2360,37 @@ mod tests {
         assert_eq!(raised.kind, AlarmKind::LinkErrors);
         assert_eq!(raised.subject, Subject::Interface(1));
         assert_eq!(raised.count, 3);
+    }
+
+    /// A frame that arrived but did not parse is the *sender's* fault, and the
+    /// sender can be anyone in radio range. Alarming on it would let a stranger
+    /// keep an interface's `LinkErrors` row permanently latched and hide a real
+    /// link fault behind it (#75), so it is dropped at `trace!` like any other
+    /// malformed peer input — and plans nothing, as every recv error does.
+    #[test]
+    fn a_malformed_frame_raises_no_alarm() {
+        let mut router = router_with_interfaces(2);
+        let mut tx = [0u8; 256];
+        let mut sink = CaptureSink::default();
+
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            handle_link_result(
+                Duration::from_secs(1),
+                &mut router,
+                1,
+                Err(interfaces::link::LinkError::MalformedFrame),
+                &mut tx,
+                &[],
+                &mut sink,
+            );
+        });
+
+        assert!(sink.mesh.is_empty() && sink.local.is_empty());
+        assert!(
+            board.snapshot().alarms.is_empty(),
+            "a peer's malformed frame is not a link fault"
+        );
     }
 
     /// The periodic arm drives both schedules in one call: an interface due an

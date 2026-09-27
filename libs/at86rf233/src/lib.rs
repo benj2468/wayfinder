@@ -266,8 +266,10 @@ where
     /// returning the PSDU length with the trailing [`FCS_LEN`]-byte FCS
     /// stripped, and the trailing LQI byte.
     ///
-    /// Returns [`LinkError::InvalidPacket`] if the reported PHY header length
-    /// is shorter than [`FCS_LEN`] or longer than [`MAX_PSDU_LEN`].
+    /// Returns [`LinkError::MalformedFrame`] if the reported PHY header length
+    /// is shorter than [`FCS_LEN`] or longer than [`MAX_PSDU_LEN`] — the PHR
+    /// is the length byte the sender put on the air, so a bad one is the
+    /// sender's fault (or noise), not this radio's.
     async fn read_frame_buffer(&mut self) -> Result<(usize, u8), LinkError> {
         let mut buf = [0u8; 1 + FRAME_BUFFER_READ_LEN];
         buf[0] = CMD_FRAME_READ;
@@ -278,7 +280,7 @@ where
 
         let phr = buf[1] as usize;
         if !(FCS_LEN..=MAX_PSDU_LEN).contains(&phr) {
-            return Err(LinkError::InvalidPacket);
+            return Err(LinkError::MalformedFrame);
         }
         let psdu_len = phr - FCS_LEN;
         self.rx_buf[..psdu_len].copy_from_slice(&buf[2..2 + psdu_len]);
@@ -802,6 +804,6 @@ mod tests {
 
         chip.lock().unwrap().rx_frames.push_back(vec![1]); // phr = 1 < FCS_LEN
 
-        assert!(matches!(radio.recv().await, Err(LinkError::InvalidPacket)));
+        assert!(matches!(radio.recv().await, Err(LinkError::MalformedFrame)));
     }
 }

@@ -414,14 +414,14 @@ mod tokio_impl {
                     LinkError::Io
                 })?;
             if n < ETH_HEADER_LEN {
-                return Err(LinkError::InvalidPacket);
+                return Err(LinkError::MalformedFrame);
             }
             // The wire EtherType is a transport label; retag it to this link's
             // mesh protocol so the bytes reinterpret as a `LinkFrame` the router
             // can demux — in place, no copy.
             retag_ethertype(&mut self.wire_buf, self.mesh_protocol);
             let frame = LinkFrame::ref_from_bytes(&self.wire_buf[..n])
-                .map_err(|_| LinkError::InvalidPacket)?;
+                .map_err(|_| LinkError::MalformedFrame)?;
             // AF_PACKET carries no physical-layer signal information.
             Ok(Received {
                 frame,

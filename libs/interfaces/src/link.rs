@@ -25,9 +25,27 @@ pub enum LinkError {
     /// The supplied buffer was too small to hold the frame.
     #[error("buffer full")]
     BufferFull,
-    /// The received bytes did not parse as a valid frame.
+    /// Bytes this node produced or was handed locally did not form a valid
+    /// frame — a malformed reply from an attached module, or a transmit spec
+    /// that could not describe one. A fault on this side of the link.
+    ///
+    /// Not for bytes that arrived off the medium: those are
+    /// [`Self::MalformedFrame`].
     #[error("invalid packet")]
     InvalidPacket,
+    /// A frame arrived off the medium and did not parse — too short, a
+    /// foreign format sharing the channel, a corrupted reassembly, a failed
+    /// CRC.
+    ///
+    /// Distinct from every other variant because the fault is the
+    /// *sender's*, and the sender can be anyone in range: a stranger who
+    /// knows a LoRa `net_id` can produce one at will. So the driver drops it
+    /// at `trace!` and does **not** raise the interface's `LinkErrors`
+    /// alarm, which would otherwise stay latched for as long as someone
+    /// cared to transmit garbage, hiding a real fault behind it. Every other
+    /// `recv` error therefore means something wrong on this side of the link.
+    #[error("malformed frame")]
+    MalformedFrame,
 }
 
 /// Per-frame physical-layer measurements reported by the radio.
