@@ -438,6 +438,16 @@ pub struct Driver<Local: FrameIo, R: RouterOps = CentralRouter> {
     mesh_renewal_rx: tokio::sync::mpsc::Receiver<(Mac, wayfinder_server::RenewalOutcome)>,
 }
 
+/// Whether `n` configured mesh links exceed router type `R`'s own interface
+/// capacity ([`RouterOps::INTERFACES`]), not a fixed host constant.
+///
+/// Pulled out of [`Driver::new`] as a pure function so the bound it checks —
+/// which varies by capacity profile — is assertable directly, rather than
+/// only observable by capturing the `warn!` line it gates.
+fn links_beyond_capacity<R: RouterOps>(n: usize) -> bool {
+    n > R::INTERFACES
+}
+
 impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.  `trickle` supplies each
@@ -470,15 +480,18 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
         // armed on every interface regardless of `tx_ogm`; a `tx_ogm`-off link
         // simply has its emission suppressed at poll time, which keeps the
         // features runtime-toggleable without arming/disarming timers.
-        // The router only tracks `MAX_INTERFACES` interfaces; links past that cap
+        // The router only tracks `R::INTERFACES` interfaces; links past that cap
         // are silently never OGM-scheduled *and* silently revert to full
         // participation (a `set_link_features` past the cap no-ops), so a link
         // configured as a read-only tap would still transmit. Warn rather than
-        // ship that misconfiguration mutely.
-        if interfaces.len() > wayfinder::MAX_INTERFACES {
+        // ship that misconfiguration mutely. Checked against this router's own
+        // capacity, not the fixed `host`-profile constant: a smaller profile
+        // (`tiny_cloud`'s 2, say) must be flagged well below that constant, and
+        // a larger one must not be flagged below it either.
+        if links_beyond_capacity::<R>(interfaces.len()) {
             warn!(
                 configured = interfaces.len(),
-                max = wayfinder::MAX_INTERFACES,
+                max = R::INTERFACES,
                 "more mesh links than the router supports; links past the cap are unscheduled and ungated"
             );
         }
