@@ -65,6 +65,10 @@ name = "auth"
 harness = false
 
 [[bench]]
+name = "cloud"
+harness = false
+
+[[bench]]
 name = "throughput"
 harness = false
 
