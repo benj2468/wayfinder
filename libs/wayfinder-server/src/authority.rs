@@ -4816,6 +4816,91 @@ mod tests {
         std::fs::remove_dir_all(&path).ok();
     }
 
+    /// The signed revocation itself survives a restart, not only the flag on
+    /// the issued entry — so a restarted CA can flood it again (design 26
+    /// phase 2, closing design 03's CA-restart gap). Byte for byte: it is the
+    /// record the mesh already verified, not a re-signing.
+    #[test]
+    fn a_signed_revocation_survives_a_restart() {
+        use zerocopy::IntoBytes;
+        let path = unique_state_path("revocation-restart");
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let record = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            issued_cert(&mut ca, &mac, &ed, &x, "");
+            ca.revoke(&mac).unwrap()
+        };
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(200);
+        let live = ca.live_revocations();
+        assert_eq!(live.len(), 1, "the revocation is on file after the restart");
+        assert_eq!(live[0].as_bytes(), record.as_bytes());
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        assert!(anchor.verify_revocation(&live[0], ca.now_unix()).is_ok());
+    }
+
+    /// Only revocations still in force are handed back to flood: one past its
+    /// `not_after` cancels nothing a peer would still accept.
+    #[test]
+    fn an_expired_revocation_is_not_handed_back() {
+        let path = unique_state_path("revocation-expired");
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let not_after = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            issued_cert(&mut ca, &mac, &ed, &x, "");
+            ca.revoke(&mac).unwrap().not_after.get()
+        };
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(not_after + 1);
+        assert!(ca.live_revocations().is_empty());
+    }
+
+    /// The revocations a removal signs for an account's sessions are kept too,
+    /// in the same write that marks the certificates revoked.
+    #[test]
+    fn session_revocations_from_a_removal_survive_a_restart() {
+        let path = unique_state_path("session-revocations");
+        let records = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap();
+            let secret = user.totp_secret.clone().unwrap();
+            ca.add_user(user).unwrap();
+            sign_in(&mut ca, "ops", &secret, 2);
+            ca.remove_user_revoking_sessions("ops").unwrap()
+        };
+        assert_eq!(records.len(), 1);
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(200);
+        let live = ca.live_revocations();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].node_mac, records[0].node_mac);
+    }
+
+    /// A revocation whose write fails is not kept either: the CA reports the
+    /// failure, and a restart must not flood a revocation the operator was
+    /// told did not happen.
+    #[test]
+    fn a_revocation_that_cannot_be_written_is_not_kept() {
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let mut ca =
+            CertAuthority::from_config(&[1; 32], &persisted_cfg(&unique_state_path("rev-doom")))
+                .unwrap();
+        ca.set_now_unix(100);
+        issued_cert(&mut ca, &mac, &ed, &x, "");
+        ca.log.fail_commits();
+        assert!(ca.revoke(&mac).is_err());
+        assert!(ca.live_revocations().is_empty());
+    }
+
     #[test]
     fn issued_certs_persist_across_a_restart() {
         let path = unique_state_path("restart");
