@@ -841,6 +841,10 @@ pub struct BatmanEngine<
     /// How many originators a full broadcast dedup table has had to evict to
     /// admit a new one — see [`BatmanEngine::broadcast_dedup_evictions`].
     pub(crate) broadcast_dedup_evictions: u32,
+    /// How many flooded broadcasts this node refused because their seqno was
+    /// out of band against the originator's dedup high-water — see
+    /// [`BatmanEngine::broadcast_seqno_refusals`].
+    pub(crate) broadcast_seqno_refusals: u32,
     /// How many next-hop proofs this node has dropped because the pairwise key
     /// they were answered with is no longer usable.
     ///
@@ -934,6 +938,7 @@ impl<
             seqno_resyncs: 0,
             ogm_refloods_suppressed: 0,
             broadcast_dedup_evictions: 0,
+            broadcast_seqno_refusals: 0,
             ogm_echoes_dropped: 0,
             ogm_tails_malformed: 0,
             proofs_swept: 0,

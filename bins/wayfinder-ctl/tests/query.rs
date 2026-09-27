@@ -139,6 +139,7 @@ impl RouterReads for Mock {
             ogm_echoes_dropped: 13,
             ogm_tails_malformed: 5,
             broadcast_dedup_evictions: 17,
+            broadcast_seqno_refusals: 19,
             proofs_swept: 3,
             unjudged_cert_admissions: 0,
         }
@@ -581,6 +582,7 @@ async fn metrics_query_renders_json_from_server() {
     assert_eq!(parsed["ogm_echoes_dropped"], 13);
     assert_eq!(parsed["ogm_tails_malformed"], 5);
     assert_eq!(parsed["broadcast_dedup_evictions"], 17);
+    assert_eq!(parsed["broadcast_seqno_refusals"], 19);
     assert_eq!(parsed["proofs_swept"], 3);
 }
 
@@ -600,6 +602,7 @@ async fn metrics_query_renders_human_from_server() {
     assert!(out.contains("ogm_echoes_dropped: 13"), "got: {out}");
     assert!(out.contains("ogm_tails_malformed: 5"), "got: {out}");
     assert!(out.contains("broadcast_dedup_evictions: 17"), "got: {out}");
+    assert!(out.contains("broadcast_seqno_refusals: 19"), "got: {out}");
     assert!(out.contains("untaggable_drop_rate: 2.25"), "got: {out}");
     assert!(out.contains("seqno_resyncs: 7"), "got: {out}");
     assert!(out.contains("ogm_refloods_suppressed: 11"), "got: {out}");

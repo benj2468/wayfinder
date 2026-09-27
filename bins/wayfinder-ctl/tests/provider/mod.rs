@@ -160,6 +160,7 @@ impl RouterReads for ProviderMock {
             ogm_echoes_dropped: 0,
             ogm_tails_malformed: 0,
             broadcast_dedup_evictions: 0,
+            broadcast_seqno_refusals: 0,
             proofs_swept: 0,
             unjudged_cert_admissions: 0,
         }

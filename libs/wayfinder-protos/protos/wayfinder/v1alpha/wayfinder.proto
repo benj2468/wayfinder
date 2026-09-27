@@ -2121,6 +2121,19 @@ message NodeMetrics {
   // victim's next broadcast, so a steady climb is spent airtime too.
   uint32 broadcast_dedup_evictions = 26;
 
+  // Count of flooded broadcasts refused because their seqno was out of band
+  // against the originator's dedup high-water: a resync watch opening or
+  // continuing, or a completed resync that still did not admit the frame.
+  //
+  // The signal of a suppressed member. Once an originator's high-water has
+  // been pushed out of band — most sharply by one forged frame with a
+  // far-ahead seqno — every honest broadcast it sends is refused here until
+  // the 30-second resync protection passes. Exact duplicates and in-tolerance
+  // stragglers (the same flood by a second path) are not counted, so this is
+  // zero on a healthy mesh; an originator rebooting with a reset counter is the
+  // one benign way to move it.
+  uint32 broadcast_seqno_refusals = 27;
+
   // Count of next-hop proofs dropped because the pairwise key they were
   // answered with stopped being usable — a neighbor's certificate lapsing, a
   // revocation, or its entry being pushed out of a full key cache.
