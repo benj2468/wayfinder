@@ -208,6 +208,34 @@ catch-up parts stay design 03's own.
 - **Tooling:** the "one writer" rule in `CLAUDE.md` still holds. Operators
   change state over RPC, never by opening the database beside the running CA.
 
+### 4.1 Phase 2 as built
+
+- **`rusqlite`, not `sqlx`.** `CertAuthority` is synchronous; an async driver
+  meant making it async end to end or blocking a tokio worker per write. The
+  `CaStore` trait (load everything; commit one change set atomically) is still
+  the seam a PostgreSQL backend plugs into.
+- **Rows keyed by content.** None of the collections has a unique natural key
+  (the issued log keeps every certificate a MAC was given), and `authority.rs`
+  mutates whole `Vec`s through `CaLog`'s sealed `mutate_*` closures. So a row is
+  `(id, collection, body)`, and a mutation re-encodes only the collections it
+  touched, diffs them against an index of stored bodies, and commits the
+  deleted and inserted rows in one transaction. `authority.rs` is unchanged
+  apart from construction, and a login writes one row.
+- **Where the database lives.** Beside `state_path`, with its extension
+  replaced (`ca-state.json` → `ca-state.sqlite3`), so an upgrade needs no
+  config change. Created `0600` before SQLite opens it; WAL,
+  `synchronous=FULL`; table layout versioned in `user_version`.
+- **Import** as §4 describes. A CA whose database cannot be created now
+  refuses to start, where it used to start and fail every write.
+- **Revocations** are a collection of the signed records' own bytes, written
+  in the same transaction that marks the certificate revoked, and pruned once
+  past `not_after`. At provider startup `wayfinder-tap` re-floods the live ones
+  through `Driver::reflood_revocations`, which applies a live revocation's
+  trust-anchor check.
+- **Not yet:** the complete revocation index of §5. The CA's router still
+  checks revocations against its bounded table (1024 at `cloud`), so a CA with
+  more live revocations than that re-floods the newest it can hold.
+
 ## 5. Tiering: which state gets a cache in front of a store
 
 A tiered (multi-level) cache keeps a small fast tier of hot entries in memory
