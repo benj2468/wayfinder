@@ -779,6 +779,29 @@ impl<
         self.broadcast_dedup_evictions
     }
 
+    /// How many flooded broadcasts this node refused because their seqno sat
+    /// out of band against the originator's dedup high-water — a resync watch
+    /// opening or continuing, or a completed resync that still did not admit
+    /// the frame.
+    ///
+    /// This is the refusal that suppresses a member: once a high-water has been
+    /// pushed out of band (most sharply by an outsider forging one frame with
+    /// a far-ahead seqno), every honest broadcast from that originator lands
+    /// here until [`BROADCAST_SEQNO_RESET_PROTECTION`](crate::BROADCAST_SEQNO_RESET_PROTECTION)
+    /// has passed. An exact duplicate or an in-tolerance straggler is *not*
+    /// counted: those are the same flood arriving by a second path, the
+    /// ordinary cost of a redundant mesh, and would bury the signal. So on a
+    /// healthy mesh this stays at zero, and an originator that reboots and
+    /// restarts its counter is the one benign way to move it.
+    ///
+    /// A count rather than a rate for the same reason as
+    /// [`seqno_resyncs`](Self::seqno_resyncs): broadcasts are sparse,
+    /// application-driven traffic, so a five-second rate would read zero at
+    /// most polls even while a suppression is under way.
+    pub fn broadcast_seqno_refusals(&self) -> u32 {
+        self.broadcast_seqno_refusals
+    }
+
     /// How many next-hop proofs this node has dropped because the key behind
     /// them was no longer usable — see [`proofs_swept`](Self::proofs_swept).
     pub fn proofs_swept(&self) -> u32 {
@@ -1714,6 +1737,9 @@ impl<
                 self.seqno_resyncs = self.seqno_resyncs.saturating_add(1);
             }
             if !admission.advanced() {
+                if !matches!(admission, crate::SeqnoAdmission::Duplicate { .. }) {
+                    self.broadcast_seqno_refusals = self.broadcast_seqno_refusals.saturating_add(1);
+                }
                 trace!(?orig_ident, incoming_seqno, "drop: broadcast not admitted");
                 return RoutingAction::Consumed;
             }
@@ -4654,6 +4680,62 @@ mod tests {
         rx_bcast(&mut engine, core::time::Duration::from_secs(21), 21, 9, 1);
         assert_eq!(engine.broadcast_dedup_evictions(), 2);
         assert_eq!(engine.broadcast_seqno.len(), 4, "table stays at capacity");
+    }
+
+    /// Issue #36: a member whose broadcasts are being suppressed — its dedup
+    /// high-water pushed out of band, so every honest frame it sends is refused
+    /// until the resync watch completes — must be countable without trace
+    /// logging. Only the out-of-band refusals count: an exact duplicate (the
+    /// same flood by a second path) and an in-tolerance straggler are the
+    /// ordinary cost of flooding a redundant mesh, and counting them would bury
+    /// the signal under every healthy node's second-path arrivals.
+    #[test]
+    fn broadcast_seqno_refusals_count_only_out_of_band_frames() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+        assert_eq!(engine.broadcast_seqno_refusals(), 0);
+
+        assert!(flooded(rx_bcast(&mut engine, secs(0), 2, 3, 1_000)));
+        assert!(!flooded(rx_bcast(&mut engine, secs(0), 2, 4, 1_000)));
+        assert!(!flooded(rx_bcast(
+            &mut engine,
+            secs(0),
+            2,
+            4,
+            1_000 - TOLERANCE
+        )));
+        assert!(flooded(rx_bcast(&mut engine, secs(0), 2, 3, 1_001)));
+        assert_eq!(
+            engine.broadcast_seqno_refusals(),
+            0,
+            "duplicates and stragglers are benign and must not count"
+        );
+
+        // Out of band ahead: opens a resync watch, refused.
+        let opening = 1_001 + WINDOW + 1;
+        assert!(!flooded(rx_bcast(&mut engine, secs(1), 2, 3, opening)));
+        assert_eq!(engine.broadcast_seqno_refusals(), 1);
+        // Out of band behind: the watch continues, refused.
+        assert!(!flooded(rx_bcast(
+            &mut engine,
+            secs(2),
+            2,
+            3,
+            1_001 - TOLERANCE - 1
+        )));
+        assert_eq!(engine.broadcast_seqno_refusals(), 2);
+
+        // The watch completes and the tripping frame advances past the rewound
+        // high-water: admitted, so not a refusal.
+        assert!(flooded(rx_bcast(
+            &mut engine,
+            secs(1) + PROTECTION,
+            2,
+            3,
+            opening + 1
+        )));
+        assert_eq!(engine.seqno_resyncs(), 1);
+        assert_eq!(engine.broadcast_seqno_refusals(), 2);
     }
 
     /// A stream of non-advancing frames must not keep a poisoned entry pinned

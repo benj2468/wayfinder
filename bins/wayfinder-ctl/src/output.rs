@@ -351,7 +351,8 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
              untaggable_drop_rate: {:.2}\n\
              seqno_resyncs: {}\nogm_refloods_suppressed: {}\n\
              ogm_echoes_dropped: {}\nogm_tails_malformed: {}\n\
-             broadcast_dedup_evictions: {}\nproofs_swept: {}",
+             broadcast_dedup_evictions: {}\nbroadcast_seqno_refusals: {}\n\
+             proofs_swept: {}",
             v.uptime_secs,
             v.neighbor_count,
             occ(&v.originators),
@@ -376,6 +377,7 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
             v.ogm_echoes_dropped,
             v.ogm_tails_malformed,
             v.broadcast_dedup_evictions,
+            v.broadcast_seqno_refusals,
             v.proofs_swept,
         )
     })

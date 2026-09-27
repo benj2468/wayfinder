@@ -487,6 +487,11 @@ pub struct NodeMetricsData {
     /// churn — most sharply, a flood of fabricated originators — that the
     /// saturated `broadcast_dedup` gauge cannot show.
     pub broadcast_dedup_evictions: u32,
+    /// Count of flooded broadcasts refused as out of band against the
+    /// originator's dedup high-water. Zero on a healthy mesh — duplicates and
+    /// stragglers do not count — so a climb means some member's broadcasts
+    /// are being suppressed (or it rebooted with a reset counter).
+    pub broadcast_seqno_refusals: u32,
     /// Count of next-hop proofs dropped because the pairwise key they were
     /// answered with stopped being usable. Zero when auth is disabled.
     pub proofs_swept: u32,
@@ -2140,6 +2145,7 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 ogm_echoes_dropped: m.ogm_echoes_dropped,
                 ogm_tails_malformed: m.ogm_tails_malformed,
                 broadcast_dedup_evictions: m.broadcast_dedup_evictions,
+                broadcast_seqno_refusals: m.broadcast_seqno_refusals,
                 proofs_swept: m.proofs_swept,
                 unjudged_cert_admissions: m.unjudged_cert_admissions,
             })
@@ -4416,6 +4422,7 @@ mod tests {
                 ogm_echoes_dropped: 12,
                 ogm_tails_malformed: 13,
                 broadcast_dedup_evictions: 14,
+                broadcast_seqno_refusals: 15,
                 proofs_swept: 3,
                 unjudged_cert_admissions: 0,
             },
@@ -4447,6 +4454,7 @@ mod tests {
                 assert_eq!(m.ogm_echoes_dropped, 12);
                 assert_eq!(m.ogm_tails_malformed, 13);
                 assert_eq!(m.broadcast_dedup_evictions, 14);
+                assert_eq!(m.broadcast_seqno_refusals, 15);
                 assert_eq!(m.proofs_swept, 3);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),

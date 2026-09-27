@@ -1813,6 +1813,13 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                     "Bcast dedup evictions",
                     &m.broadcast_dedup_evictions.to_string(),
                 ),
+                // Zero on a healthy mesh: duplicates don't count, only frames
+                // refused against a high-water pushed out of band — a member
+                // whose broadcasts are being suppressed.
+                field(
+                    "Bcast seqno refusals",
+                    &m.broadcast_seqno_refusals.to_string(),
+                ),
                 field("Proofs swept", &m.proofs_swept.to_string()),
                 // Nonzero means this node has been routing on credentials it
                 // could not date. It sits beside the counts rather than the
@@ -2415,6 +2422,7 @@ mod tests {
             ogm_echoes_dropped: 0,
             ogm_tails_malformed: 0,
             broadcast_dedup_evictions: 0,
+            broadcast_seqno_refusals: 0,
             proofs_swept: 0,
             ..Default::default()
         });

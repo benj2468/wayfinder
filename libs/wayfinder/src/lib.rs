@@ -965,6 +965,14 @@ impl<
         self.batman.broadcast_dedup_evictions()
     }
 
+    /// How many flooded broadcasts this node refused as out of band against
+    /// the originator's dedup high-water — the signal of a member whose
+    /// broadcasts are being suppressed, which duplicates never move. See
+    /// [`batman::BatmanEngine::broadcast_seqno_refusals`].
+    pub fn broadcast_seqno_refusals(&self) -> u32 {
+        self.batman.broadcast_seqno_refusals()
+    }
+
     /// How many next-hop proofs this node has dropped because the pairwise key
     /// they were answered with stopped being usable.
     ///
