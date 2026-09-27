@@ -947,6 +947,37 @@ impl<
         self.start.elapsed()
     }
 
+    /// Flood again the revocations a restarted certificate authority still has
+    /// on file ([`CertAuthority::live_revocations`](wayfinder_server::CertAuthority::live_revocations)),
+    /// returning how many this node accepted.
+    ///
+    /// A revocation reaches only the peers online when it is issued. Before
+    /// the CA kept its signed records, a restart ended its announcement, and a
+    /// node that came back online afterwards never learned it (design 03's
+    /// CA-restart gap). Each record takes the path a live one does: one this
+    /// node's trust anchor does not verify is refused and logged, never
+    /// flooded.
+    pub async fn reflood_revocations(
+        &self,
+        records: &[wayfinder::wayfinder_auth::RevocationRecord],
+    ) -> usize {
+        let now = self.start.elapsed();
+        let now_unix = self.clock.now_unix(now);
+        let mut guard = self.shared.write().await;
+        let mut accepted = 0;
+        for record in records {
+            match ingest_signed_revocation(&mut guard.router, record, now, now_unix) {
+                Ok(()) => accepted += 1,
+                Err(reason) => warn!(
+                    reason,
+                    node_mac = ?record.node_mac,
+                    "a revocation on file could not be flooded after the restart"
+                ),
+            }
+        }
+        accepted
+    }
+
     /// Run the event loop forever.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         loop {
@@ -4109,13 +4140,12 @@ mod tests {
         let anchor =
             wayfinder::wayfinder_auth::TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         let revoked = ca.revoke(&[0x02, 0, 0, 0, 0, 7]).unwrap();
-        let foreign = CertAuthority::new(&[8u8; 32], 0xABCD, 10_000, None, true);
-        let mut foreign = foreign;
+        let mut foreign = CertAuthority::new(&[8u8; 32], 0xABCD, 10_000, None, true);
         foreign.set_now_unix(NOW);
         let unverifiable = foreign.revoke(&[0x02, 0, 0, 0, 0, 8]).unwrap();
 
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(1);
-        let driver: Driver<NeverIo> = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),

@@ -1188,6 +1188,19 @@ async fn main() -> anyhow::Result<()> {
                  refuse until it does"
             );
         }
+        // Announce again every revocation still in force. The node's own
+        // credential is installed above, so its router can verify and carry
+        // them; without this, a revocation stopped spreading the moment the CA
+        // restarted, and a node offline at the time never heard it.
+        let on_file = ca.live_revocations();
+        if !on_file.is_empty() {
+            let flooded = driver.reflood_revocations(&on_file).await;
+            tracing::info!(
+                on_file = on_file.len(),
+                flooded,
+                "re-flooding the revocations this authority has on file"
+            );
+        }
         let policy = ca.enrollment_policy();
         tracing::info!(
             auto_approve = policy.auto_approve,
