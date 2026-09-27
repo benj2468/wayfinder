@@ -233,7 +233,7 @@ catch-up parts stay design 03's own.
   through `Driver::reflood_revocations`, which applies a live revocation's
   trust-anchor check.
 - **Not yet:** the complete revocation index of §5. The CA's router still
-  checks revocations against its bounded table (1024 at `cloud`), so a CA with
+  checks revocations against its bounded table (32 at `host`, 1024 at `cloud`), so a CA with
   more live revocations than that re-floods the newest it can hold.
 
 ## 5. Tiering: which state gets a cache in front of a store
