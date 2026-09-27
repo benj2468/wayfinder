@@ -1320,6 +1320,17 @@ mod tests {
     const ROOT_SEED: [u8; 32] = [7u8; 32];
     const NODE_SEED: [u8; 32] = [9u8; 32];
 
+    /// Every `wayfinder-tap` node runs the `cloud` profile (design 26 §3 step
+    /// 5): this binary is what the certificate authority, VPN hub and container
+    /// nodes all run, and `host`'s 64 neighbour keys is the limit a hub hits
+    /// first. Checked as a type rather than by building one and reading a
+    /// capacity, since a cloud router cannot be built on a test thread's stack.
+    #[test]
+    fn this_binary_runs_the_cloud_profile() {
+        let _: core::marker::PhantomData<TapRouter> =
+            core::marker::PhantomData::<wayfinder::router_for!(wayfinder::cloud)>;
+    }
+
     /// The trust anchor a provider derives is the one its root seed defines —
     /// the same 36 bytes `wayfinderctl cert init-ca --out-anchor` would have
     /// written, which is why the file is redundant on a node holding the root.
