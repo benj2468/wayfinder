@@ -77,7 +77,7 @@ use crate::tap::TapDevice;
 /// `wayfinder-driver`'s management-API surface is const-generic over
 /// `CentralRouter`'s table capacities (design 26 phase 1 slice 3) instead of
 /// pinned to the default profile.
-type TapRouter = wayfinder::router_for!(wayfinder::host);
+type TapRouter = wayfinder::router_for!(wayfinder::cloud);
 
 /// Command-line arguments.
 #[derive(clap::Parser, Debug)]
@@ -1131,7 +1131,7 @@ async fn main() -> anyhow::Result<()> {
                 .await;
         } else {
             driver
-                .with_router_mut(|r| r.set_auth(OgmAuth::new(keypair, cert, anchor)))
+                .with_router_mut(|r| r.set_auth(OgmAuth::with_capacities(keypair, cert, anchor)))
                 .await;
             tracing::info!("mesh authentication enabled (mesh_id = {:#x})", mesh_id);
         }
@@ -1278,7 +1278,7 @@ async fn main() -> anyhow::Result<()> {
                 wayfinder_server::ServerServices {
                     vpn,
                     authority_tx: authority,
-                    router: Some(router_handle),
+                    router: Some(std::sync::Arc::new(router_handle)),
                 },
             )
             .await

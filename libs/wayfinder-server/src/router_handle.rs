@@ -43,7 +43,10 @@
 //! lock to recover, and an `RwLock` there would be ceremony bought with flash.
 //! The `no_std` half of this crate is unchanged.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
 use core::time::Duration;
 
 use tokio::sync::RwLock;
@@ -338,6 +341,60 @@ impl<
     /// `true` where no publisher was wired — see the field's doc comment.
     fn clock_trusted(&self) -> bool {
         self.clock_trusted.as_ref().is_none_or(|rx| *rx.borrow())
+    }
+}
+
+/// A [`RouterHandle`] with its capacity profile erased, for the management
+/// transport to hold.
+///
+/// The TLS server only ever asks a handle to [`serve_read`](RouterHandle::serve_read),
+/// and threading `CentralRouter`'s eleven capacities through every connection
+/// type to do that would make the transport's types depend on which profile the
+/// binary chose (design 26). A node holds one handle for its lifetime, and a
+/// read already allocates its response, so the boxed future costs nothing that
+/// matters.
+pub trait ServeRouterRead: Send + Sync {
+    /// See [`RouterHandle::serve_read`]: answers a router read, or hands the
+    /// request back unconsumed when this half does not own it.
+    fn serve_read(
+        &self,
+        request: WayfinderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<WayfinderResponse, WayfinderRequest>> + Send + '_>>;
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> ServeRouterRead
+    for RouterHandle<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
+    fn serve_read(
+        &self,
+        request: WayfinderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<WayfinderResponse, WayfinderRequest>> + Send + '_>>
+    {
+        Box::pin(RouterHandle::serve_read(self, request))
     }
 }
 

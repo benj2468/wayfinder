@@ -532,7 +532,7 @@ async fn serve_by_facet(
     request: &WayfinderRequest,
     query_tx: &QueryTx,
     authority_tx: Option<&crate::AuthorityTx>,
-    router: Option<&crate::RouterHandle>,
+    router: Option<&alloc::sync::Arc<dyn crate::ServeRouterRead>>,
 ) -> anyhow::Result<WayfinderResponse> {
     // Audited here and nowhere else on this path. The host no longer goes
     // through `WayfinderService::handle`, which is where the audit record used
@@ -809,7 +809,7 @@ pub(crate) struct ServeContext {
     /// Serves the router *reads* under a shared borrow, on the connection's own
     /// task. `None` falls every read back onto `query_tx`, which is what the
     /// in-process channel server and the stream-level tests do.
-    pub(crate) router: Option<crate::RouterHandle>,
+    pub(crate) router: Option<alloc::sync::Arc<dyn crate::ServeRouterRead>>,
 }
 
 /// The optional collaborators a management listener serves its connections
@@ -845,7 +845,7 @@ pub struct ServerServices {
     /// `None` sends every read down the query channel as before — correct, just
     /// serialised behind the loop — which is what a test driving a listener
     /// with no driver behind it does.
-    pub router: Option<crate::RouterHandle>,
+    pub router: Option<alloc::sync::Arc<dyn crate::ServeRouterRead>>,
 }
 
 /// The grant does not stand for the life of the connection: `gate` re-decides
@@ -2193,7 +2193,7 @@ mod tests {
                 query_tx,
                 vpn: None,
                 authority_tx: None,
-                router: Some(handle),
+                router: Some(std::sync::Arc::new(handle)),
             },
         ));
         let mut client = LengthDelimitedCodec::builder().new_framed(client_io);
