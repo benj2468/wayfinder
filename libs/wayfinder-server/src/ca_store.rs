@@ -110,8 +110,15 @@ impl ChangeSet {
 
     /// The rows this change inserts, in the order [`CaStore::commit`] assigns
     /// their ids.
+    #[cfg(test)]
     pub(crate) fn inserts(&self) -> &[(Collection, Vec<u8>)] {
         &self.inserts
+    }
+
+    /// The rows this change deletes.
+    #[cfg(test)]
+    pub(crate) fn deletes(&self) -> &[(Collection, i64)] {
+        &self.deletes
     }
 
     /// Whether this change writes nothing.

@@ -472,7 +472,14 @@ impl CertAuthority {
     /// fail-closed behaviour of an authority that has none.
     pub fn from_config(root_seed: &[u8; 32], cfg: &ProviderConfig) -> Result<Self, String> {
         check_cert_ttl(cfg.cert_ttl_secs, cfg.allow_unbounded_cert_ttl)?;
-        let log = CaLog::load(cfg.state_path.as_ref().map(PathBuf::from))?;
+        let log = match cfg.state_path.as_ref().map(PathBuf::from) {
+            // The database lives beside the snapshot `state_path` names, which
+            // is imported into it on the first start and moved aside (design 26
+            // phase 2) — so an existing deployment migrates with no config
+            // change.
+            Some(json) => CaLog::open(&json.with_extension("sqlite3"), Some(&json))?,
+            None => CaLog::empty(),
+        };
         let mut ca = Self {
             pending_ttl_secs: cfg.pending_ttl_secs,
             allow_unbounded_cert_ttl: cfg.allow_unbounded_cert_ttl,
@@ -4850,16 +4857,19 @@ mod tests {
         // Build a real v7 snapshot through the ordinary path, then age it back
         // to v6 by hand. Hand-writing the v6 file directly would mean
         // hand-writing an Argon2id hash and a TOTP secret to sign in against.
-        let secret = {
-            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        // Built against a scratch path and exported, so the aged snapshot
+        // lands at `path` with no database beside it yet — as an upgrade
+        // from a pre-database CA finds it.
+        let (secret, current) = {
+            let scratch = unique_state_path("pre-id-scratch");
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&scratch)).unwrap();
             ca.set_now_unix(100);
             let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap();
             let secret = user.totp_secret.clone().unwrap();
             ca.add_user(user).unwrap();
-            secret
+            (secret, ca.log.snapshot_json())
         };
-        let mut snapshot: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_slice(&current).unwrap();
         snapshot["version"] = serde_json::json!(6);
         for user in snapshot["users"].as_array_mut().unwrap() {
             user.as_object_mut().unwrap().remove("id");
@@ -4882,6 +4892,29 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A CA whose database cannot be created refuses to start.
+    ///
+    /// It used to start and fail every write instead — serving from memory,
+    /// forgetting every issuance and revocation at the next restart, and
+    /// saying so only in a warning per mutation. For the mesh's root of trust
+    /// the earlier, louder failure is the right one.
+    #[test]
+    fn a_state_path_in_a_missing_directory_fails_at_startup() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "wayfinder-server-test-{}-no-such-dir",
+                std::process::id()
+            ))
+            .join("state.json");
+        let err = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path))
+            .err()
+            .expect("a CA with nowhere to persist must not start");
+        assert!(
+            err.contains("database"),
+            "the error says what failed: {err}"
+        );
     }
 
     #[test]
@@ -5015,19 +5048,19 @@ mod tests {
         // empty rather than erroring.
         assert!(ca.list_pending().is_empty());
 
-        // A subsequent mutation rewrites the file under the current version,
-        // with a `held` section now present.
+        // The snapshot was imported into the database and moved aside, and a
+        // held CSR submitted afterwards survives a restart beside the
+        // migrated certificate.
+        assert!(
+            !path.exists(),
+            "the v1 snapshot is moved aside once imported"
+        );
         let (ed2, x2) = node_keys(3);
         ca.submit_csr(&node_mac(3), &ed2, &x2, "").unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            on_disk["version"],
-            crate::persistence::CURRENT_STATE_VERSION
-        );
-        assert!(on_disk["held"].is_array());
-
-        std::fs::remove_file(&path).ok();
+        drop(ca);
+        let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        // `persisted_cfg` auto-approves, so the new CSR was issued outright.
+        assert_eq!(ca.list_certs().len(), 2);
     }
 
     #[test]
@@ -5114,18 +5147,11 @@ mod tests {
 
     #[test]
     fn failed_persist_rolls_back_the_in_memory_mutation_but_caller_is_told() {
-        // state_path under a directory that doesn't exist, so every write
-        // attempt fails; a missing *file* is a normal fresh-install case
-        // (`Ok(None)`), but a missing *directory* dooms every persist.
-        let path = std::env::temp_dir()
-            .join(format!(
-                "wayfinder-server-test-{}-nonexistent-dir",
-                std::process::id()
-            ))
-            .join("state.json");
-
+        let path = unique_state_path("doomed");
         let cfg = persisted_cfg(&path);
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        // Every write fails from here on, as a full disk would make it.
+        ca.log.fail_commits();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
         let mac = node_mac(2);
@@ -5192,7 +5218,7 @@ mod tests {
         ));
 
         // Now doom every subsequent write.
-        std::fs::remove_dir_all(&dir).ok();
+        ca.log.fail_commits();
 
         let err = ca.approve_csr(&mac, None).unwrap_err();
         assert!(
@@ -5226,7 +5252,7 @@ mod tests {
         // again, a subsequent deny succeeds against the (correctly
         // still-Pending) entry, and there is no already-issued certificate
         // left behind for it to have failed to revoke.
-        std::fs::create_dir_all(&dir).unwrap();
+        ca.log.restore_commits();
         ca.deny_csr(&mac)
             .expect("deny succeeds against the rolled-back entry");
         assert_eq!(ca.list_certs().len(), 0);
@@ -5262,7 +5288,7 @@ mod tests {
         ));
 
         // Now doom the deny's write.
-        std::fs::remove_dir_all(&dir).ok();
+        ca.log.fail_commits();
 
         let err = ca.deny_csr(&mac).unwrap_err();
         assert!(
@@ -5281,7 +5307,7 @@ mod tests {
 
         // Once storage is available again, denying still works normally
         // against the rolled-back (still-Pending) entry.
-        std::fs::create_dir_all(&dir).unwrap();
+        ca.log.restore_commits();
         ca.deny_csr(&mac)
             .expect("deny succeeds once storage recovers");
         assert!(ca.list_pending().is_empty());
@@ -5564,9 +5590,10 @@ mod tests {
             "wayfinder-server-test-{}-policy-nodir",
             std::process::id()
         ));
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
         let cfg = persisted_cfg(&dir.join("state.json"));
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.log.fail_commits();
 
         let result = ca.set_enrollment_policy(&EnrollmentPolicyData {
             auto_approve: Some(false),
@@ -6536,7 +6563,7 @@ mod tests {
         let live = ca.live_session_macs("ops");
         assert_eq!(live.len(), 1, "the account holds one session to revoke");
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        ca.log.fail_commits();
 
         let err = ca
             .set_user_role_revoking_sessions("ops", UserRole::Viewer)
