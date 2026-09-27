@@ -99,6 +99,13 @@ pub trait OgmAuthOps {
     /// Verify a fan-out multicast trailer from neighbour `src`.
     /// See [`OgmAuth::verify_fanout`].
     fn verify_fanout(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool;
+
+    /// This node's own trust anchor. See [`OgmAuth::anchor`].
+    fn anchor(&self) -> &wayfinder_auth::TrustAnchor;
+
+    /// The revocation records this node currently holds. See
+    /// [`OgmAuth::revocations`].
+    fn revocations(&self) -> impl Iterator<Item = &wayfinder_auth::RevocationRecord> + '_;
 }
 
 impl<
@@ -126,6 +133,14 @@ impl<
 
     fn verify_fanout(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
         OgmAuth::verify_fanout(self, src, frame, trailer)
+    }
+
+    fn anchor(&self) -> &wayfinder_auth::TrustAnchor {
+        OgmAuth::anchor(self)
+    }
+
+    fn revocations(&self) -> impl Iterator<Item = &wayfinder_auth::RevocationRecord> + '_ {
+        OgmAuth::revocations(self)
     }
 }
 

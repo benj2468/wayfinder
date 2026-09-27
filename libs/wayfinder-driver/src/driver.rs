@@ -39,6 +39,7 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::router_ops::OgmAuthOps;
 use wayfinder::router_ops::RouterOps;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver_core::Egress;
@@ -2009,32 +2010,8 @@ fn poll_due_keepalives<R: RouterOps>(
 /// process, so "the authority produced something this loop cannot parse" was
 /// never a condition that could arise — only one the receiver had to invent an
 /// answer for.
-fn ingest_signed_revocation<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+fn ingest_signed_revocation<R: RouterOps>(
+    router: &mut R,
     record: &wayfinder::wayfinder_auth::RevocationRecord,
     now: Duration,
     now_unix: u64,
@@ -2098,32 +2075,8 @@ fn ingest_signed_revocation<
 /// certificate authority says "revoked" while the mesh was never told. That is
 /// the precise divergence this hop exists to surface, so the log lives on this
 /// side of the channel too.
-fn ingest_and_report<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+fn ingest_and_report<R: RouterOps>(
+    router: &mut R,
     record: &wayfinder::wayfinder_auth::RevocationRecord,
     now: Duration,
     now_unix: u64,
@@ -2206,34 +2159,7 @@ fn read_enrollment_policy(
 /// TLS listener, and nothing configures a TLS listener without an identity
 /// seed), so reaching it still warns: it silently disables the bootstrap grant
 /// for this node.
-fn build_auth_snapshot<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
-    identity_seed: Option<[u8; 32]>,
-) -> AuthSnapshot {
+fn build_auth_snapshot<R: RouterOps>(router: &R, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
     let own_key = identity_seed.map(|seed| Keypair::from_seed(&seed).ed_pubkey());
     if own_key.is_none() {
         warn!(
