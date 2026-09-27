@@ -3773,6 +3773,28 @@ mod tests {
         }
     }
 
+    /// `Driver::new` must warn about a link count past the router's own
+    /// capacity, not past a fixed host constant.
+    ///
+    /// `wayfinder::MAX_INTERFACES` is `batman::MAX_INTERFACES` (8) — the
+    /// `host` profile's own interface count, but not every profile's.
+    /// `tiny_cloud` has only 2, so 3 links must be flagged there even though
+    /// 3 is nowhere near the fixed constant. Conversely the `host` profile's
+    /// 8 links is exactly at its own capacity, not past it, and must not be
+    /// flagged. Checked through the pure helper rather than `Driver::new`
+    /// itself so the assertion does not need to capture a `warn!` line.
+    #[test]
+    fn links_beyond_capacity_checks_the_routers_own_interface_bound() {
+        assert!(
+            links_beyond_capacity::<TinyRouter>(3),
+            "tiny_cloud has only 2 interfaces, so 3 links is past its capacity"
+        );
+        assert!(
+            !links_beyond_capacity::<CentralRouter>(8),
+            "the host profile's own capacity is 8, so 8 links is at capacity, not past it"
+        );
+    }
+
     /// The whole point of this slice: the host driver, generic over `R:
     /// RouterOps`, runs its real event loop — construction, per-interface
     /// Trickle scheduling, and dispatch — at a capacity profile other than the
