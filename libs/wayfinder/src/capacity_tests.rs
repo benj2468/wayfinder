@@ -244,3 +244,59 @@ fn a_host_router_still_reports_the_crate_capacities() {
     assert_eq!(host.local_mcast_occupancy(), (0, 16));
     assert_eq!(host.mcast_member_occupancy(), (0, 64));
 }
+
+/// The `cloud` profile is sized so no mesh we run gets near it (design 26 §3).
+/// Pinned number by number so a change to any of them is a deliberate edit
+/// here rather than a drift nobody reviews.
+#[test]
+fn the_cloud_profile_pins_design_26s_capacities() {
+    use crate::cloud;
+
+    assert_eq!(cloud::ORIGINATORS, 4096);
+    assert_eq!(cloud::INTERFACES, 8);
+    assert_eq!(cloud::MCAST_MEMBERS, 1024);
+    assert_eq!(cloud::LOCAL_MCAST, 64);
+    assert_eq!(cloud::IDENT_TABLE, 4096);
+    assert_eq!(cloud::IDENT_LIVE, 3500);
+    assert_eq!(cloud::LINK_QUALITY, 1024);
+    assert_eq!(cloud::NEIGHBOR_KEYS, 1024);
+    assert_eq!(cloud::REVOKED, 1024);
+    assert_eq!(cloud::IN_FLIGHT_CERT_REQUESTS, 256);
+    assert_eq!(cloud::PENDING_REPLIES, 256);
+    assert_eq!(cloud::MAX_FRAME_LEN, crate::host::MAX_FRAME_LEN);
+}
+
+/// Every `cloud` table must be at least the `host` one: a cloud node is the
+/// same gateway with more memory, never a narrower one in some dimension.
+#[test]
+fn the_cloud_profile_is_no_smaller_than_host_in_any_table() {
+    use crate::cloud;
+    use crate::host;
+
+    for (name, cloud, host) in [
+        ("originators", cloud::ORIGINATORS, host::ORIGINATORS),
+        ("interfaces", cloud::INTERFACES, host::INTERFACES),
+        ("mcast_members", cloud::MCAST_MEMBERS, host::MCAST_MEMBERS),
+        ("local_mcast", cloud::LOCAL_MCAST, host::LOCAL_MCAST),
+        ("ident_table", cloud::IDENT_TABLE, host::IDENT_TABLE),
+        ("ident_live", cloud::IDENT_LIVE, host::IDENT_LIVE),
+        ("link_quality", cloud::LINK_QUALITY, host::LINK_QUALITY),
+        ("neighbor_keys", cloud::NEIGHBOR_KEYS, host::NEIGHBOR_KEYS),
+        ("revoked", cloud::REVOKED, host::REVOKED),
+        (
+            "in_flight",
+            cloud::IN_FLIGHT_CERT_REQUESTS,
+            host::IN_FLIGHT_CERT_REQUESTS,
+        ),
+        (
+            "pending_replies",
+            cloud::PENDING_REPLIES,
+            host::PENDING_REPLIES,
+        ),
+    ] {
+        assert!(
+            cloud >= host,
+            "cloud {name} ({cloud}) is below host ({host})"
+        );
+    }
+}

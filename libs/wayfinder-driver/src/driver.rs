@@ -3829,4 +3829,103 @@ mod tests {
             other => panic!("expected NodeInfo, got {other:?}"),
         }
     }
+
+    // ---- design 26 phase 1: the `cloud` profile itself --------------------
+
+    /// The router type `wayfinder-tap` runs a cloud node at.
+    type CloudRouter = wayfinder::router_for!(wayfinder::cloud);
+
+    /// A `cloud` router is about 1.8 MB, well past a 2 MiB thread's stack once
+    /// a debug build has copied it through a constructor or two — which is how
+    /// every host path used to build one. `Driver::new` must therefore put it
+    /// on the heap without ever holding it by value on the caller's stack: this
+    /// test runs on an ordinary test thread, so building the router inline
+    /// aborts the process with a stack overflow rather than failing an assert.
+    #[tokio::test]
+    async fn a_cloud_profile_driver_builds_on_an_ordinary_thread() {
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let driver: Driver<NeverIo, CloudRouter> = Driver::new(
+            mac(1),
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+
+        let occupancy = driver.with_router(|r| r.originator_occupancy()).await;
+        assert_eq!(
+            occupancy,
+            (0, wayfinder::cloud::ORIGINATORS),
+            "the driver must be running the cloud profile it was asked for"
+        );
+    }
+
+    /// Installing a credential is the other place the auth state crosses the
+    /// stack by value: `SetAuth` builds an `OgmAuth` and hands it to the router,
+    /// and at the `cloud` profile's 1024 neighbour keys and 1024 revocations
+    /// that value alone is over half a megabyte. It must still install on an
+    /// ordinary thread.
+    #[tokio::test]
+    async fn a_cloud_profile_driver_installs_a_credential_over_set_auth() {
+        let seed = [3u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let mac_addr = kp.derived_mac();
+
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_700_000_000);
+        let cert = match ca
+            .submit_csr(
+                zerocopy::IntoBytes::as_bytes(&mac_addr),
+                &kp.ed_pubkey(),
+                &kp.x_pubkey(),
+                "",
+            )
+            .unwrap()
+        {
+            wayfinder_protos::service::CsrOutcome::Issued(issued) => issued.cert,
+            other => panic!("expected the CSR to be issued outright, got {other:?}"),
+        };
+        let anchor = ca.trust_anchor_bytes();
+
+        let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let mut driver: Driver<NeverIo, CloudRouter> = Driver::new(
+            mac_addr,
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+        driver.set_identity_seed(seed).await;
+        driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
+
+        let request = wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+            request: Some(
+                wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::SetAuth(
+                    wayfinder_protos::wayfinder::v1alpha::SetAuthRequest {
+                        seed: Vec::new(),
+                        cert,
+                        trust_anchor: anchor,
+                        provider: None,
+                        installer_unix: 0,
+                    },
+                ),
+            ),
+        };
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        query_tx.send((request, resp_tx)).await.unwrap();
+        driver.process_pending().await.unwrap();
+
+        match resp_rx.await.unwrap().response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::Empty(_)) => {}
+            other => panic!("expected SetAuth to install on a cloud router, got {other:?}"),
+        }
+        assert!(
+            driver.with_router(|r| r.auth().is_some()).await,
+            "the credential must actually be installed"
+        );
+    }
 }
