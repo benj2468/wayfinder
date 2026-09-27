@@ -449,6 +449,39 @@ fn links_beyond_capacity<R: RouterOps>(n: usize) -> bool {
     n > R::INTERFACES
 }
 
+/// Run `build` to completion on a short-lived thread whose stack is sized for a
+/// value of `value_bytes`, and return what it produced.
+///
+/// For constructing a router at a large capacity profile. A `no_std` router
+/// has no way to be built in place, so construction returns it by value, and
+/// an unoptimized build keeps several copies of that value live on the stack
+/// at once — for a `cloud` router, more than a whole default thread's worth.
+/// The fix is to build somewhere with room and hand back something small (an
+/// `Arc`), not to raise every thread's stack in the process: the router is
+/// constructed once, and nothing after that moves it.
+///
+/// The stack is sixteen times the value. Measured at the `cloud` profile, a
+/// debug build needs more than six times and no more than eight; a release
+/// build needs a fraction of one, so the margin is for the build that is
+/// slowest to notice. It is reserved address space, committed only as far as
+/// construction actually reaches. A thread that cannot be spawned at all is a
+/// node that cannot start, so that panics.
+fn build_off_stack<T: Send>(value_bytes: usize, build: impl FnOnce() -> T + Send) -> T {
+    const MIN_STACK: usize = 2 << 20;
+    let stack = value_bytes.saturating_mul(16).max(MIN_STACK);
+    std::thread::scope(|scope| {
+        let builder = std::thread::Builder::new()
+            .name("router-build".into())
+            .stack_size(stack);
+        match builder.spawn_scoped(scope, build) {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(e) => panic!("cannot spawn a {stack}-byte thread to build the router: {e}"),
+        }
+    })
+}
+
 impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.  `trickle` supplies each
@@ -467,20 +500,17 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
         features: Vec<LinkFeatures>,
         names: Vec<String>,
         query_rx: QueryRx,
-    ) -> Self {
+    ) -> Self
+    where
+        R: Send + Sync,
+    {
         // Gated on the host's NTP verdict by default: a node whose clock
         // nothing is disciplining reports zero rather than a plausible wrong
         // time, and every certificate-validity check refuses on that sentinel.
         // `wayfinder-tap` overrides the policy from config.
         let clock = AuthClock::Host;
         let clock_trust = ClockTrust::default();
-        let mut router = R::with_capacities(mac);
-        // Install each interface's adaptive OGM schedule and participation
-        // features up front so the periodic loop and the egress gates have a
-        // per-interface entry to consult from the start.  The Trickle timer is
-        // armed on every interface regardless of `tx_ogm`; a `tx_ogm`-off link
-        // simply has its emission suppressed at poll time, which keeps the
-        // features runtime-toggleable without arming/disarming timers.
+        let link_count = interfaces.len();
         // The router only tracks `R::INTERFACES` interfaces; links past that cap
         // are silently never OGM-scheduled *and* silently revert to full
         // participation (a `set_link_features` past the cap no-ops), so a link
@@ -489,30 +519,47 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
         // capacity, not the fixed `host`-profile constant: a smaller profile
         // (`tiny_cloud`'s 2, say) must be flagged well below that constant, and
         // a larger one must not be flagged below it either.
-        if links_beyond_capacity::<R>(interfaces.len()) {
+        if links_beyond_capacity::<R>(link_count) {
             warn!(
-                configured = interfaces.len(),
+                configured = link_count,
                 max = R::INTERFACES,
                 "more mesh links than the router supports; links past the cap are unscheduled and ungated"
             );
         }
-        for idx in 0..interfaces.len() {
-            let cfg = trickle.get(idx).copied().unwrap_or_default();
-            router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
-            let link_features = features.get(idx).copied().unwrap_or_default();
-            router.set_link_features(idx, link_features);
-            if let Some(name) = names.get(idx) {
-                router.set_interface_name(idx, name);
+        // Built — and configured — on a thread whose stack fits the router,
+        // then handed back already behind its `Arc`. At the `cloud` profile a
+        // router is ~1.8 MB, and a debug build copies it through
+        // `with_capacities` and each wrapper on the way into the lock: done
+        // here, on a 2 MiB tokio worker or test thread, that overflows the
+        // stack. What comes back is a pointer, so nothing on this side ever
+        // holds the router by value.
+        let shared = build_off_stack(size_of::<SharedRouter<R>>(), move || {
+            let mut router = R::with_capacities(mac);
+            // Install each interface's adaptive OGM schedule and participation
+            // features up front so the periodic loop and the egress gates have a
+            // per-interface entry to consult from the start.  The Trickle timer is
+            // armed on every interface regardless of `tx_ogm`; a `tx_ogm`-off link
+            // simply has its emission suppressed at poll time, which keeps the
+            // features runtime-toggleable without arming/disarming timers.
+            for idx in 0..link_count {
+                let cfg = trickle.get(idx).copied().unwrap_or_default();
+                router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
+                let link_features = features.get(idx).copied().unwrap_or_default();
+                router.set_link_features(idx, link_features);
+                if let Some(name) = names.get(idx) {
+                    router.set_interface_name(idx, name);
+                }
+                // Keep-alive rides on the same per-link `features` entry (no
+                // separate constructor vector) — its `tx_keepalive` supplies the
+                // schedule, `None` leaving that interface's timer unarmed.
+                router.configure_interface_keepalive(
+                    idx,
+                    link_features.tx_keepalive.map(|c| c.interval()),
+                    Duration::ZERO,
+                );
             }
-            // Keep-alive rides on the same per-link `features` entry (no
-            // separate constructor vector) — its `tx_keepalive` supplies the
-            // schedule, `None` leaving that interface's timer unarmed.
-            router.configure_interface_keepalive(
-                idx,
-                link_features.tx_keepalive.map(|c| c.interval()),
-                Duration::ZERO,
-            );
-        }
+            Arc::new(RwLock::new(SharedRouter::new(router)))
+        });
         let fan_out = interfaces.iter().map(|i| i.fan_out()).collect();
         // Depth one: at most one renewal attempt is ever outstanding, so a
         // second result cannot exist to be queued behind the first.
@@ -527,7 +574,7 @@ impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
             local,
             interfaces,
             fan_out,
-            shared: Arc::new(RwLock::new(SharedRouter::new(router))),
+            shared,
             query_rx,
             mac,
             snooper: McastSnooper::new(),
@@ -3862,13 +3909,35 @@ mod tests {
         );
     }
 
-    /// Installing a credential is the other place the auth state crosses the
-    /// stack by value: `SetAuth` builds an `OgmAuth` and hands it to the router,
-    /// and at the `cloud` profile's 1024 neighbour keys and 1024 revocations
-    /// that value alone is over half a megabyte. It must still install on an
-    /// ordinary thread.
-    #[tokio::test]
-    async fn a_cloud_profile_driver_installs_a_credential_over_set_auth() {
+    /// Installing a credential is the other place auth state crosses the stack
+    /// by value: `SetAuth` builds an `OgmAuth` and hands it to the router, and
+    /// at the `cloud` profile's 1024 neighbour keys and 1024 revocations that
+    /// value alone is ~548 KB. A `no_std` value cannot be built in place, so
+    /// an unoptimized build holds a few copies across `RouterAdapter::set_auth`
+    /// and `CentralRouter::set_auth` — about 2.1 MB, measured, just past a
+    /// 2 MiB test thread (a release build fits in a fraction of that).
+    ///
+    /// So this pins the install on the thread `wayfinder-tap` actually runs
+    /// its loop on: `driver.run()` is awaited on the main thread, which gets
+    /// the platform's 8 MiB default rather than a spawned thread's 2 MiB.
+    #[test]
+    fn a_cloud_profile_driver_installs_a_credential_over_set_auth() {
+        const MAIN_THREAD_STACK: usize = 8 << 20;
+        std::thread::Builder::new()
+            .stack_size(MAIN_THREAD_STACK)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(install_a_credential_on_a_cloud_driver());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn install_a_credential_on_a_cloud_driver() {
         let seed = [3u8; 32];
         let kp = Keypair::from_seed(&seed);
         let mac_addr = kp.derived_mac();

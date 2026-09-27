@@ -81,6 +81,31 @@ crate::define_profile! {
     }
 }
 
+crate::define_profile! {
+    /// Capacities for a node with a server's memory: the certificate authority,
+    /// a VPN hub, any `wayfinder-tap` in a data centre (design 26). Sized so no
+    /// mesh we run gets near them — on a VPN hub every peer is a direct
+    /// neighbour, which is what fills `host`'s 64 neighbour keys first.
+    ///
+    /// A router at these sizes is about 1.8 MB, so it cannot be built on a
+    /// thread's stack: `wayfinder-driver` constructs it straight onto the heap.
+    /// `the_cloud_profile_pins_design_26s_capacities` pins every number.
+    pub cloud {
+        originators: 4096,
+        interfaces: 8,
+        mcast_members: 1024,
+        local_mcast: 64,
+        ident_table: 4096,
+        ident_live: 3500,
+        link_quality: 1024,
+        neighbor_keys: 1024,
+        revoked: 1024,
+        in_flight_cert_requests: 256,
+        pending_replies: 256,
+        max_frame_len: 2048,
+    }
+}
+
 /// Re-exported so a profile can be declared as `wayfinder::define_profile!`
 /// alongside the [`router_for!`] that consumes it.
 pub use interfaces::define_profile;
