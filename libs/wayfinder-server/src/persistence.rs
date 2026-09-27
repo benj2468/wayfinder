@@ -36,6 +36,7 @@ use crate::authority::HeldCsr;
 use wayfinder_auth::CERT_FLAG_ADMIN;
 use wayfinder_auth::CERT_FLAG_USER;
 use wayfinder_auth::CERT_FLAG_VIEWER;
+use wayfinder_auth::RevocationRecord;
 
 use crate::users::AccountId;
 use crate::users::UserInvite;
@@ -501,11 +502,8 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
     }
 }
 
-/// The in-memory value a [`CaLog`] wraps in the store: everything
-/// `authority.rs` can mutate. Cheap to `Clone` at the scale this is meant for
-/// (see one commit's own doc on why that bound exists) — needed so
-/// a failed persist can roll the in-memory value back to its pre-mutation
-/// snapshot.
+/// Everything `authority.rs` can mutate, as [`CaLog`] holds it in memory.
+/// `Clone` so a failed commit can roll it back to its pre-mutation snapshot.
 #[derive(Clone)]
 struct CaLogState {
     issued: Vec<IssuedCertData>,
@@ -513,6 +511,9 @@ struct CaLogState {
     policy: PolicyOverrides,
     users: Vec<UserRecord>,
     invites: Vec<UserInvite>,
+    /// Signed revocations still in force when last written. Not in the legacy
+    /// JSON snapshot, which never kept them.
+    revocations: Vec<RevocationRecord>,
 }
 
 impl CaLogState {
@@ -524,6 +525,7 @@ impl CaLogState {
             policy: PolicyOverrides::default(),
             users: Vec::new(),
             invites: Vec::new(),
+            revocations: Vec::new(),
         }
     }
 }
@@ -575,6 +577,7 @@ impl Codec<CaLogState> for CaStateCodec {
             policy: state.policy,
             users: state.users,
             invites: state.invites,
+            revocations: Vec::new(),
         })
     }
 }
@@ -779,6 +782,29 @@ impl CaLog {
         &self.state.policy
     }
 
+    /// The signed revocations on file, including any that have expired since
+    /// they were last written (they are pruned on the next revocation).
+    pub(crate) fn revocations(&self) -> &[RevocationRecord] {
+        &self.state.revocations
+    }
+
+    /// [`Self::mutate_issued`], also recording the signed `records` in the
+    /// same transaction — so a revocation is on file exactly when the issued
+    /// log says the certificate is revoked. Revocations past their
+    /// `not_after` at `now_unix` are dropped on the way, which keeps the
+    /// collection to the ones still in force.
+    pub(crate) fn mutate_issued_recording<R>(
+        &mut self,
+        records: &[RevocationRecord],
+        now_unix: u64,
+        f: impl FnOnce(&mut Vec<IssuedCertData>) -> R,
+    ) -> (R, Result<(), String>) {
+        self.mutate(&[Collection::Issued, Collection::Revocations], |state| {
+            record_revocations(&mut state.revocations, records, now_unix);
+            f(&mut state.issued)
+        })
+    }
+
     /// Read-only view of the certificate authority's user accounts.
     pub(crate) fn users(&self) -> &[UserRecord] {
         &self.state.users
@@ -833,7 +859,7 @@ impl CaLog {
     /// is told their registration failed. If the deletion lands first and the
     /// account write fails, the invite is gone and the person holding the handle
     /// has nothing left to redeem and no way to ask for another. One
-    /// one commit closes both: either the account exists and the
+    /// commit closes both: either the account exists and the
     /// invite is gone, or neither happened.
     pub(crate) fn mutate_users_and_invites<R>(
         &mut self,
@@ -858,16 +884,29 @@ impl CaLog {
     /// end, reintroduced in the window where it is hardest to notice. If the
     /// revocations land and the deletion rolls back, the account survives with
     /// its sessions cut and can simply sign in again for a fresh one. One
-    /// one commit closes both: either the account is gone and its
+    /// commit closes both: either the account is gone and its
     /// sessions are revoked, or neither happened.
+    ///
+    /// Every caller is revoking, so `records` — the revocations signed for the
+    /// certificates `f` marks — are recorded in the same write, as
+    /// [`Self::mutate_issued_recording`] does.
     pub(crate) fn mutate_users_and_issued<R>(
         &mut self,
+        records: &[RevocationRecord],
+        now_unix: u64,
         f: impl FnOnce(&mut Vec<UserRecord>, &mut Vec<IssuedCertData>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self.mutate(&[Collection::Users, Collection::Issued], |state| {
-            f(&mut state.users, &mut state.issued)
-        });
-        (result, persisted)
+        self.mutate(
+            &[
+                Collection::Users,
+                Collection::Issued,
+                Collection::Revocations,
+            ],
+            |state| {
+                record_revocations(&mut state.revocations, records, now_unix);
+                f(&mut state.users, &mut state.issued)
+            },
+        )
     }
 
     /// Run `f` against the enrollment-policy overrides, then attempt to
@@ -934,7 +973,7 @@ impl CaLog {
     /// denial that never touches `issued`, silently leaving an
     /// already-issued, still-valid certificate un-revocable through the
     /// normal held-CSR flow. Running both mutations inside one
-    /// one commit call closes that gap: either both land
+    /// commit closes that gap: either both land
     /// durably, or the commit's rollback undoes both together.
     pub(crate) fn mutate_issued_and_held<R>(
         &mut self,
@@ -1053,6 +1092,16 @@ impl Backing {
     }
 }
 
+/// Drop the revocations that expired by `now_unix` and append `records`.
+fn record_revocations(
+    on_file: &mut Vec<RevocationRecord>,
+    records: &[RevocationRecord],
+    now_unix: u64,
+) {
+    on_file.retain(|r| r.not_after.get() > now_unix);
+    on_file.extend_from_slice(records);
+}
+
 /// Every record of `collection` in `state`, serialised as the store holds it.
 ///
 /// Issued certificates go through [`IssuedRecord`], the on-disk mirror of the
@@ -1082,6 +1131,13 @@ fn encode_collection(state: &CaLogState, collection: Collection) -> Result<Vec<V
         Collection::Policy => Ok(vec![json(&state.policy)?]),
         Collection::Users => state.users.iter().map(json).collect(),
         Collection::Invites => state.invites.iter().map(json).collect(),
+        // The signed record's own bytes: it is flooded exactly as it was
+        // signed, so there is no serialised form to prefer over it.
+        Collection::Revocations => Ok(state
+            .revocations
+            .iter()
+            .map(|r| zerocopy::IntoBytes::as_bytes(r).to_vec())
+            .collect()),
     }
 }
 
@@ -1105,6 +1161,13 @@ fn decode_rows(loaded: &Loaded) -> Result<CaLogState, String> {
             }
             Collection::Users => state.users.push(json(row)?),
             Collection::Invites => state.invites.push(json(row)?),
+            Collection::Revocations => {
+                let record = <RevocationRecord as zerocopy::FromBytes>::read_from_bytes(&row.body)
+                    .map_err(|_| {
+                        format!("CA database row {} is not a revocation record", row.id)
+                    })?;
+                state.revocations.push(record);
+            }
         }
     }
     if policies > 1 {
@@ -1341,7 +1404,7 @@ mod tests {
         // Doom every subsequent write, as a full disk would.
         log.fail_commits();
 
-        let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        let (_, persisted) = log.mutate_users_and_issued(&[], 0, |users, issued| {
             users[0].role = crate::users::UserRole::Viewer;
             issued[0].revoked = true;
         });

@@ -37,16 +37,19 @@ pub(crate) enum Collection {
     Users,
     /// Pending account invitations.
     Invites,
+    /// Signed revocation records, kept so a restarted CA can flood them again.
+    Revocations,
 }
 
 impl Collection {
     /// Every collection, in the order a snapshot lists them.
-    pub(crate) const ALL: [Collection; 5] = [
+    pub(crate) const ALL: [Collection; 6] = [
         Collection::Issued,
         Collection::Held,
         Collection::Policy,
         Collection::Users,
         Collection::Invites,
+        Collection::Revocations,
     ];
 
     /// The name this collection is stored under. Part of the on-disk format:
@@ -58,6 +61,7 @@ impl Collection {
             Collection::Policy => "policy",
             Collection::Users => "users",
             Collection::Invites => "invites",
+            Collection::Revocations => "revocations",
         }
     }
 

@@ -1057,8 +1057,9 @@ impl CertAuthority {
     ) -> Result<Vec<RevocationRecord>, String> {
         let account = self.account_id_of(username)?;
         let sessions = self.live_sessions_of(account);
-        self.revoke_sessions(username, &sessions, |log, revoked| {
-            let (_, persisted) = log.mutate_issued(|issued| mark_revoked(issued, revoked));
+        self.revoke_sessions(username, &sessions, |log, revoked, records, now| {
+            let (_, persisted) =
+                log.mutate_issued_recording(records, now, |issued| mark_revoked(issued, revoked));
             persisted
         })
     }
@@ -1088,8 +1089,8 @@ impl CertAuthority {
         let account = self.account_id_of(username)?;
         let sessions = self.live_sessions_of(account);
         let name = username.to_string();
-        self.revoke_sessions(username, &sessions, move |log, revoked| {
-            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        self.revoke_sessions(username, &sessions, move |log, revoked, records, now| {
+            let (_, persisted) = log.mutate_users_and_issued(records, now, |users, issued| {
                 users.retain(|u| u.username != name);
                 mark_revoked(issued, revoked);
             });
@@ -1143,8 +1144,8 @@ impl CertAuthority {
             UserRole::Admin => Vec::new(),
         };
         let name = username.to_string();
-        self.revoke_sessions(username, &sessions, move |log, revoked| {
-            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        self.revoke_sessions(username, &sessions, move |log, revoked, records, now| {
+            let (_, persisted) = log.mutate_users_and_issued(records, now, |users, issued| {
                 if let Some(user) = users.iter_mut().find(|u| u.username == name) {
                     user.role = role;
                 }
@@ -1201,8 +1202,8 @@ impl CertAuthority {
             self.live_sessions_of(account)
         };
         let name = username.to_string();
-        self.revoke_sessions(username, &sessions, move |log, revoked| {
-            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        self.revoke_sessions(username, &sessions, move |log, revoked, records, now| {
+            let (_, persisted) = log.mutate_users_and_issued(records, now, |users, issued| {
                 if let Some(user) = users.iter_mut().find(|u| u.username == name) {
                     user.disabled = !enabled;
                     if enabled {
@@ -1316,7 +1317,7 @@ impl CertAuthority {
         &mut self,
         username: &str,
         sessions: &[(Mac, u64)],
-        commit: impl FnOnce(&mut CaLog, &[Mac]) -> Result<(), String>,
+        commit: impl FnOnce(&mut CaLog, &[Mac], &[RevocationRecord], u64) -> Result<(), String>,
     ) -> Result<Vec<RevocationRecord>, String> {
         // Only when there is something to sign. An account with no live
         // sessions is removable on a node whose clock was never set, exactly as
@@ -1336,7 +1337,8 @@ impl CertAuthority {
             .map(|(mac, not_after)| self.authority.revoke(*mac, self.now_unix(), *not_after))
             .collect();
         let macs: Vec<Mac> = sessions.iter().map(|(mac, _)| *mac).collect();
-        commit(&mut self.log, &macs)?;
+        let now = self.now_unix();
+        commit(&mut self.log, &macs, &records, now)?;
         // Logged even at zero: "revoked nothing" is the answer to a question an
         // operator asked, and its absence reads as a failure.
         tracing::info!(
@@ -1345,6 +1347,19 @@ impl CertAuthority {
             "revoked an account's session certificates"
         );
         Ok(records)
+    }
+
+    /// The signed revocations still in force, for a restarted node to flood
+    /// again: a revocation that reached only the peers online when it was
+    /// issued would otherwise stop spreading the moment the CA restarted.
+    pub fn live_revocations(&self) -> Vec<RevocationRecord> {
+        let now = self.now_unix();
+        self.log
+            .revocations()
+            .iter()
+            .filter(|r| r.not_after.get() > now)
+            .copied()
+            .collect()
     }
 
     /// Whether `username` holds at least one session certificate that revoking
@@ -2592,8 +2607,11 @@ impl MeshAuthority for CertAuthority {
         let not_after = self.now_unix().saturating_add(self.cert_ttl_secs);
         let record = self.authority.revoke(mac, self.now_unix(), not_after);
 
-        // Mark the issued entry revoked (retained for ListCerts observability).
-        let (_, persisted) = self.log.mutate_issued(|issued| {
+        // Mark the issued entry revoked (retained for ListCerts observability),
+        // and keep the signed record in the same write, so a restarted CA can
+        // flood it again.
+        let now = self.now_unix();
+        let (_, persisted) = self.log.mutate_issued_recording(&[record], now, |issued| {
             if let Some(entry) = issued.iter_mut().find(|c| c.node_mac == mac.0) {
                 entry.revoked = true;
             }
