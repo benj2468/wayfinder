@@ -88,7 +88,8 @@ crate::define_profile! {
     /// neighbour, which is what fills `host`'s 64 neighbour keys first.
     ///
     /// A router at these sizes is about 1.8 MB, so it cannot be built on a
-    /// thread's stack: `wayfinder-driver` constructs it straight onto the heap.
+    /// default thread's stack: `wayfinder-driver` builds it on a short-lived
+    /// thread with room for it and keeps only the `Arc` it is moved into.
     /// `the_cloud_profile_pins_design_26s_capacities` pins every number.
     pub cloud {
         originators: 4096,

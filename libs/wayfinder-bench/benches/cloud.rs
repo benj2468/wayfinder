@@ -136,6 +136,13 @@ fn hub_poll(c: &mut Criterion) {
         let now = warm.now;
         let mut sink = CountingSink::default();
         poll_due_all(&mut *warm.router, now, &mut warm.tx, &mut sink);
+        // The timed polls must find nothing due, or they measure emission.
+        let mut probe = CountingSink::default();
+        poll_due_all(&mut *warm.router, now, &mut warm.tx, &mut probe);
+        assert_eq!(
+            probe.emitted, 0,
+            "hub fixture still has work due at {now:?}"
+        );
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             let mut sink = CountingSink::default();
             b.iter(|| poll_due_all(&mut *warm.router, now, &mut warm.tx, &mut sink));
@@ -223,6 +230,11 @@ fn neighbourhood(n: usize) -> Neighbourhood {
         );
         last = Some((peer, id));
     }
+    assert_eq!(
+        node.cert_store_occupancy().0,
+        n,
+        "the node must hold every neighbour's keys, or the lookup is shorter than claimed"
+    );
     let (mut last, last_mac) = last.expect("at least one neighbour");
     let node_ogm = signed_ogm(&mut *node, node_mac, 1);
     assert!(

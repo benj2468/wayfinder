@@ -67,16 +67,13 @@ use zerocopy::IntoBytes;
 
 use crate::tap::TapDevice;
 
-/// The capacity profile this binary's router runs at.
+/// The capacity profile this binary's router runs at: `cloud` (design 26),
+/// since this binary is what the certificate authority, VPN hubs and container
+/// nodes all run.
 ///
-/// One name, so choosing a different profile — the `cloud` one design 26
-/// phase 1 adds for the certificate authority and other server-class nodes —
-/// is a one-line change here rather than a search for every place this binary
-/// names its router. `wayfinder-embedded-driver`'s boards do the same with
-/// their own per-board profile; this is the host equivalent now that
-/// `wayfinder-driver`'s management-API surface is const-generic over
-/// `CentralRouter`'s table capacities (design 26 phase 1 slice 3) instead of
-/// pinned to the default profile.
+/// One name, so the profile is a one-line choice rather than a search for every
+/// place this binary names its router — the host equivalent of a board's
+/// per-board profile.
 type TapRouter = wayfinder::router_for!(wayfinder::cloud);
 
 /// Command-line arguments.
@@ -1289,6 +1286,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::trace!("Failed to notify systemd: {}", err);
     }
 
+    // Awaited here, on the main thread, and not `tokio::spawn`ed: at the `cloud`
+    // profile, installing a credential moves a ~548 KB `OgmAuth` by value, and
+    // an unoptimised build needs ~2.1 MB of stack for it — more than a 2 MiB
+    // tokio worker has, well inside the main thread's 8 MiB. Moving the loop
+    // onto a worker would abort a debug build's first `SetAuth`.
+    //
     // Not `driver.run().await`: every listener and carrier spawned above lives
     // in `join_set`, and awaiting only the driver let one of them die leaving
     // the node routing perfectly with no management API and nothing said about
@@ -1320,15 +1323,20 @@ mod tests {
     const ROOT_SEED: [u8; 32] = [7u8; 32];
     const NODE_SEED: [u8; 32] = [9u8; 32];
 
-    /// Every `wayfinder-tap` node runs the `cloud` profile (design 26 §3 step
-    /// 5): this binary is what the certificate authority, VPN hub and container
-    /// nodes all run, and `host`'s 64 neighbour keys is the limit a hub hits
-    /// first. Checked as a type rather than by building one and reading a
-    /// capacity, since a cloud router cannot be built on a test thread's stack.
+    /// Every `wayfinder-tap` node runs with a hub-sized neighbour table
+    /// (design 26 §3 step 5): `host`'s 64 neighbour keys is the limit a VPN
+    /// hub hits first, and each peer past it displaces a member's keys. Read
+    /// off the router's own auth type, so reverting `TapRouter` to a smaller
+    /// profile fails here rather than on a hub.
     #[test]
-    fn this_binary_runs_the_cloud_profile() {
-        let _: core::marker::PhantomData<TapRouter> =
-            core::marker::PhantomData::<wayfinder::router_for!(wayfinder::cloud)>;
+    fn this_binary_holds_a_hub_sized_neighbour_table() {
+        use wayfinder::router_ops::RouterOps;
+        type TapAuth = <TapRouter as RouterOps>::Auth;
+        type HostAuth = <wayfinder::CentralRouter as RouterOps>::Auth;
+        assert!(
+            size_of::<TapAuth>() > 8 * size_of::<HostAuth>(),
+            "TapRouter's auth state is sized for host's neighbour table, not a hub's"
+        );
     }
 
     /// The trust anchor a provider derives is the one its root seed defines —

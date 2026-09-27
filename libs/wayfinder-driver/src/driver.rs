@@ -3779,6 +3779,9 @@ mod tests {
             !links_beyond_capacity::<CentralRouter>(8),
             "the host profile's own capacity is 8, so 8 links is at capacity, not past it"
         );
+        // And the other side of each boundary, so an off-by-one fails.
+        assert!(!links_beyond_capacity::<TinyRouter>(2));
+        assert!(links_beyond_capacity::<CentralRouter>(9));
     }
 
     /// The whole point of this slice: the host driver, generic over `R:
@@ -3820,23 +3823,12 @@ mod tests {
         );
     }
 
-    /// This is the red checkpoint for design 26 phase 1 slice 3 ("a cloud
-    /// capacity profile" — the management path). Slice 2 made the *event
-    /// loop* generic over `R: RouterOps`, so a `Driver<NeverIo, TinyRouter>`
-    /// can be built and driven — the test above pins that. But
-    /// `router_handle` (and the rest of the management-API surface:
-    /// `with_router`/`with_router_mut`, `run`/`run_once`/`process_pending`)
-    /// still lives only in `impl<Local: FrameIo> Driver<Local, CentralRouter>`
-    /// — pinned to the bare, default-profile `CentralRouter` — so calling it
-    /// on a `TinyRouter`-backed driver does not even compile today:
-    ///
-    ///     error[E0599]: no method named `router_handle` found for struct
-    ///     `Driver<NeverIo, TinyRouter>` in the current scope
-    ///
-    /// Making that surface const-generic over `CentralRouter`'s eleven table
-    /// capacities — matching `RouterAdapter`/`RouterHandle`, which already are
-    /// — is what turns this green: a management *read* becomes reachable at
-    /// any capacity profile, not only `host`.
+    /// The management-API surface (`router_handle`, `with_router*`,
+    /// `run`/`run_once`/`process_pending`) reaches every capacity profile, not
+    /// only `host`: it is const-generic over `CentralRouter`'s eleven table
+    /// capacities, as `RouterAdapter`/`RouterHandle` are. When it lived only on
+    /// the default-profile `CentralRouter`, calling `router_handle` on a
+    /// `TinyRouter`-backed driver did not compile.
     #[tokio::test]
     async fn a_non_default_router_profile_serves_a_management_read() {
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);

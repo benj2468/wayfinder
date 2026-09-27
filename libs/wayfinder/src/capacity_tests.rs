@@ -300,3 +300,20 @@ fn the_cloud_profile_is_no_smaller_than_host_in_any_table() {
         );
     }
 }
+
+/// A board-sized router's footprint, pinned so growth is a deliberate edit.
+///
+/// Measured on the host target, where pointers are wider than a Cortex-M's, so
+/// the number is a proxy rather than a board's own — but every byte a table
+/// adds shows up here too. Design 26 widened the identity table's slot index to
+/// `u16` for every profile, which a board pays for (§3.1); anything more should
+/// be a decision someone makes, not a drift.
+#[test]
+fn embedded_router_size_is_pinned() {
+    let size = size_of::<TinyRouter>();
+    assert!(
+        size <= 12_240,
+        "a board-sized router is {size} B, up from 12,240 B; if that growth is \
+         intended, raise this bound and say why in the commit"
+    );
+}

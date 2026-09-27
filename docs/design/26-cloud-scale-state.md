@@ -27,7 +27,7 @@ with its defaults and no host node can choose another:
 | Table | `host` capacity | When full |
 |---|---|---|
 | originators (also sizes broadcast dedup, keepalive, proofs) | 128 | evicts the least recently heard |
-| identity table | 128 (100 live) | evicts; slot index is a `u8`, so no profile can exceed 254 |
+| identity table | 128 (100 live) | evicts; slot index is a `u8`, so no profile can exceed a 128-slot table |
 | neighbour keys (also sizes the cert-request and renewal rate limiters) | 64 | overwrites the first slot, which can be a live member (deliberate trade-off, #50) |
 | multicast members | 64 | silently drops the rest |
 | revocations | 32 | evicts the live entry with the lowest flood budget |
@@ -90,7 +90,7 @@ CSRs, enrollment policy, users and invites in one JSON document,
    would pass or fail depending on what else was built. The profile belongs to
    the binary, the same rule `CLAUDE.md` gives for the log sinks.
 2. **Widen the identity table's slot index** from `u8` to `u16`, so a profile
-   can exceed 254 entries. Boards keep their memory use: the index width is
+   can exceed a 128-slot table. Boards keep their memory use: the index width is
    the only change, and it moves with the profile through a const-generic
    helper or a per-profile type.
 3. **Add the profile**, sized so no mesh we run gets near it (capacities that
@@ -120,8 +120,9 @@ CSRs, enrollment policy, users and invites in one JSON document,
 
 ### 3.1 Phase 1 as built
 
-- **Profile choice.** `Driver`, `RouterHandle` and the management path are
-  generic over the router; `wayfinder-tap` names `router_for!(wayfinder::cloud)`
+- **Profile choice.** `Driver` is generic over `R: RouterOps`; its management
+  path and `RouterHandle` are const-generic over `CentralRouter`'s eleven
+  capacities, as `RouterAdapter` already was; `wayfinder-tap` names `router_for!(wayfinder::cloud)`
   once (`TapRouter`). The TLS transport, which only ever serves reads, holds an
   `Arc<dyn ServeRouterRead>` so its types do not depend on the profile.
 - **Heap placement.** A cloud router is 1.77 MB and its `OgmAuth` 548 KB. A
@@ -145,6 +146,14 @@ CSRs, enrollment policy, users and invites in one JSON document,
   `Self::new()`, a >100 KB temporary that inlined into
   `apply_self_revocation` — called on every frame — so that function
   stack-probed a frame that size per call. It now clears in place.
+- **Boards do grow, slightly.** Step 2 promised the slot index would move with
+  the profile; it does not. It is `u16` for every profile, which costs a board
+  about 5 bytes per identity-table slot — ~164 B at the nRF52840 and ESP32
+  profiles' 32 slots, ~84 B at the STM32's 16. Choosing the width per profile
+  needs either a twelfth parameter on `CentralRouter` or a `where` bound on
+  every generic impl of it, the viral shape rejected for capacity profiles
+  once already. `embedded_router_size_is_pinned` now pins a board-sized
+  router so any further growth is a deliberate edit.
 - **Deferred: the neighbour-key scan.** `OgmAuth`'s `neighbors` and
   `recv_counters` are searched linearly, adding ~0.6 µs per directed frame at
   1024 keys. Not converted: an index map would add RAM on every board (this
@@ -248,7 +257,7 @@ set first persists.
 - **Phase 1:**
   - A test that a `cloud`-profile router builds and runs on the heap.
   - The existing capacity-profile pinning tests extended to `cloud`.
-  - Identity-table tests at more than 254 entries.
+  - Identity-table tests past what a `u8` index can address.
   - `wayfinder-bench` runs at the new sizes, compared against `main` for the
     per-frame paths.
 - **Phase 2:**

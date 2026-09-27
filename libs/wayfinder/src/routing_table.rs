@@ -63,7 +63,8 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     /// Slot indices are held as `u16` with `u16::MAX` reserved as the null
     /// sentinel, and the backing map is a `FnvIndexMap`, so a profile must keep
     /// `CAP` a power of two below that and leave headroom above `MAX_LIVE` for
-    /// the map's load factor. (It was a `u8`, which capped every profile at 254
+    /// the map's load factor. (It was a `u8`, which — `CAP` being a power of two
+    /// below the `u8::MAX` sentinel — capped every profile at 128
     /// live entries: fine for a board, not for a cloud node sized to its mesh.)
     const _INVARIANTS: () = {
         assert!(
@@ -106,7 +107,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     /// and at the `cloud` profile that is >100 KB: every function this inlines
     /// into — `CentralRouter::apply_self_revocation`, which runs on every frame
     /// — then reserves a stack frame that size and probes it page by page on
-    /// each call, whether or not it ever clears anything. Measured as 2.4 µs
+    /// each call, whether or not it ever clears anything. Measured as ~2.5 µs
     /// on every frame at `cloud` (design 26 phase 1).
     pub fn clear(&mut self) {
         self.map.clear();
@@ -623,9 +624,9 @@ mod tests {
         interfaces::frame::Mac([0x02, 0, 0, 0, hi, lo])
     }
 
-    /// A profile can hold more than 254 live identities: a cloud node's table
-    /// is sized to the mesh, and the slot index used to be a `u8`, which
-    /// capped every profile at 254 whatever its `CAP`.
+    /// A profile can hold more than a `u8` can index: a cloud node's table is
+    /// sized to the mesh, and the slot index used to be a `u8`, which capped
+    /// every profile at a 128-slot table.
     #[test]
     fn more_than_254_live_entries() {
         let mut table = std::boxed::Box::new(IdentTable::<interfaces::frame::Mac, 512, 400>::new());
