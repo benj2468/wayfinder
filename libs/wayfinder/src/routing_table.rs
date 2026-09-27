@@ -100,8 +100,23 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     /// Drop every learned `(dest → interface)` mapping, restoring an empty
     /// table (including the LRU list and free-slot stack).  Used when routing
     /// state is invalidated wholesale, e.g. on a runtime authentication change.
+    ///
+    /// Resets each field in place rather than assigning `Self::new()`. The
+    /// assignment reads the same, but it builds a whole table as a temporary,
+    /// and at the `cloud` profile that is >100 KB: every function this inlines
+    /// into — `CentralRouter::apply_self_revocation`, which runs on every frame
+    /// — then reserves a stack frame that size and probes it page by page on
+    /// each call, whether or not it ever clears anything. Measured as 2.4 µs
+    /// on every frame at `cloud` (design 26 phase 1).
     pub fn clear(&mut self) {
-        *self = Self::new();
+        self.map.clear();
+        self.nodes.iter_mut().for_each(|node| *node = None);
+        for (i, slot) in self.free_stack.iter_mut().enumerate() {
+            *slot = i as u16;
+        }
+        self.head = NONE_IDX;
+        self.tail = NONE_IDX;
+        self.free_len = MAX_LIVE as u16;
     }
 
     // ── linked-list helpers ──────────────────────────────────────────────────
