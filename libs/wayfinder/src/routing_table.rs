@@ -273,6 +273,38 @@ mod tests {
 
     // `u8` implements `MeshIdentifier`, so it's the natural choice for tests.
 
+    /// `clear` must leave the table indistinguishable from a new one: every
+    /// mapping gone, the LRU list empty, and all `MAX_LIVE` slots vendable
+    /// again. Exercised from a table that has already evicted, so the free
+    /// stack and the list have both been churned before the reset.
+    #[test]
+    fn clear_restores_an_empty_table_with_its_full_capacity() {
+        let mut table: IdentTable<u8, 16, 12> = IdentTable::new();
+        for n in 0..20u8 {
+            table.add_record(usize::from(n % 3), n);
+        }
+        table.assert_invariants();
+
+        table.clear();
+        table.assert_invariants();
+        for n in 0..20u8 {
+            assert_eq!(table.peek_egress_interface(n), None, "{n} survived clear");
+        }
+
+        // Every live slot is usable again: twelve fit without evicting.
+        for n in 100..112u8 {
+            table.add_record(1, n);
+            table.assert_invariants();
+        }
+        for n in 100..112u8 {
+            assert_eq!(
+                table.peek_egress_interface(n),
+                Some(1),
+                "{n} was evicted early"
+            );
+        }
+    }
+
     // ── invariant checker ────────────────────────────────────────────────────
 
     impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
