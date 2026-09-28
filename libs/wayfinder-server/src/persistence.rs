@@ -1698,10 +1698,39 @@ mod tests {
 
         let (_, r) = log.mutate_users(|_| {});
         r.unwrap();
-        let commits = commits.lock().unwrap();
-        assert!(
-            commits.len() == before || commits.last().unwrap().is_empty(),
+        assert_eq!(
+            commits.lock().unwrap().len(),
+            before,
             "an unchanged collection must not be rewritten"
+        );
+    }
+
+    /// A record that cannot be stored fails the mutation, which leaves the log
+    /// as it was. The JSON snapshot used to drop such a record with a warning
+    /// and report success, so the caller was told a change was durable that a
+    /// restart would lose — a revoked flag among it.
+    #[test]
+    fn a_record_that_cannot_be_stored_fails_the_mutation() {
+        let (mut log, _commits) = recording_log();
+        // Three bytes where a MAC is six: nothing on disk can mirror it.
+        let malformed = IssuedCertData {
+            node_mac: alloc::vec![1, 2, 3],
+            ed_pubkey: alloc::vec![0; 32],
+            not_before: 0,
+            not_after: 1,
+            revoked: true,
+            user: false,
+            admin: false,
+            viewer: false,
+            account_id: Vec::new(),
+        };
+
+        let (_, r) = log.mutate_issued(|issued| issued.push(malformed));
+
+        assert!(r.is_err(), "a record the store cannot hold is not durable");
+        assert!(
+            log.issued().is_empty(),
+            "the failed mutation is rolled back"
         );
     }
 

@@ -4860,6 +4860,77 @@ mod tests {
         assert!(anchor.verify_revocation(&live[0], ca.now_unix()).is_ok());
     }
 
+    /// Editing a record that is not the last one survives a restart with every
+    /// lookup unchanged.
+    ///
+    /// The store keeps rows, not positions: an edit deletes a record's row and
+    /// inserts a new one, so after a restart the edited record comes back at
+    /// the end of its list. That is harmless only because each MAC has at most
+    /// one issued record (every write replaces by MAC), so a first-match
+    /// lookup by MAC cannot find a different record than it did before. This
+    /// pins both halves: the order may change, the answers may not.
+    #[test]
+    fn editing_an_earlier_record_survives_a_restart_with_lookups_unchanged() {
+        let path = unique_state_path("edit-earlier-record");
+        let macs = [node_mac(2), node_mac(3), node_mac(4)];
+        {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            for (i, mac) in macs.iter().enumerate() {
+                let (ed, x) = node_keys(2 + i as u8);
+                issued_cert(&mut ca, mac, &ed, &x, "");
+            }
+            // The first record, not the last: its row is replaced.
+            ca.revoke(&macs[0]).unwrap();
+        }
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(200);
+        let issued = ca.log.issued();
+        assert_eq!(
+            issued.len(),
+            macs.len(),
+            "one record per MAC, none duplicated"
+        );
+        for (i, mac) in macs.iter().enumerate() {
+            let matching: Vec<_> = issued.iter().filter(|c| c.node_mac == mac).collect();
+            assert_eq!(matching.len(), 1, "exactly one issued record for each MAC");
+            assert_eq!(
+                matching[0].revoked,
+                i == 0,
+                "only the edited record is revoked, wherever it now sits"
+            );
+        }
+    }
+
+    /// A certificate revoked before the CA kept signed records has nothing on
+    /// file to flood after a restart. Those are named, so a startup warning
+    /// can tell the operator which nodes to revoke again; revoking again signs
+    /// a fresh record and clears the entry.
+    #[test]
+    fn revoked_certs_without_a_signed_record_are_named_until_revoked_again() {
+        let path = unique_state_path("revoked-without-record");
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(100);
+        issued_cert(&mut ca, &mac, &ed, &x, "");
+        assert!(ca.revoked_without_a_signed_record().is_empty());
+
+        // As an import from a snapshot that predates signed records leaves it.
+        ca.log
+            .mutate_issued(|issued| issued[0].revoked = true)
+            .1
+            .unwrap();
+        assert_eq!(
+            ca.revoked_without_a_signed_record(),
+            alloc::vec![mac.to_vec()]
+        );
+
+        ca.revoke(&mac).unwrap();
+        assert!(ca.revoked_without_a_signed_record().is_empty());
+    }
+
     /// Only revocations still in force are handed back to flood: one past its
     /// `not_after` cancels nothing a peer would still accept.
     #[test]
