@@ -34,7 +34,7 @@ binary is a behaviour the other silently lacks.
    is not automatically `0x20000000`** — a board that boots through Nordic's
    MBR must leave its first 8 bytes alone (see "Board differences").
 3. Fix the LED pin and the `.cargo/config.toml` runner.
-4. Add the build and clippy lines to `.gitlab-ci.yml`'s `build:embedded`.
+4. Add the build and clippy lines to `.github/workflows/ci.yml`'s `build-embedded`.
 
 Nothing else should need touching. If it does, that is a sign the thing you are
 reaching for should move into this crate first.

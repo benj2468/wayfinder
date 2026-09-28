@@ -69,4 +69,4 @@ Not every section applies to every doc, but this is the shape to start from:
 A design doc is not a spec that has to be followed to the letter — if
 implementation surfaces a better approach, take it, and note the deviation
 either in the doc's own "open decisions" section (if not yet implemented) or
-in the MR description (if it does).
+in the PR description (if it does).

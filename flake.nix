@@ -323,7 +323,7 @@
 
           # Python interpreter with the integration-test deps (pytest). Used by
           # both the default dev shell and the lightweight `pytest` shell that
-          # CI runs — see tests/README.md and .gitlab-ci.yml.
+          # CI runs — see tests/README.md and .github/workflows/ci.yml.
           pytestEnv = pkgs.python3.withPackages (ps: with ps; [ pytest ]);
 
           nixpkgs = nixpkgsForSystem system;
@@ -505,7 +505,7 @@
                 protobuf
                 buf
                 tshark
-                glab
+                gh
                 just
                 stdenv.cc.cc.lib
                 # Cloud deployment (`infra/oracle/`, `nix/machines/wayfinder-ca`):

@@ -2,7 +2,7 @@
 """Print a hash of everything a CI job for one Cargo package reads.
 
 A job can then skip itself when a run with the same hash already passed
-(see `.gitlab-ci.yml`'s `.skip-if-passed`). That replaces hand-written
+(see `scripts/ci-cached.sh`). That replaces hand-written
 `rules: changes:` path lists, which go stale the moment a crate gains a
 dependency: this walks the real dependency graph instead.
 
@@ -13,9 +13,8 @@ What goes in:
   dependencies affect tests and build scripts too), across workspaces;
 - each touched workspace's root `Cargo.toml`, `Cargo.lock`, and
   `.cargo/config.toml`;
-- `.gitlab-ci.yml`, `.github/workflows/ci.yml` and
-  `containers/testenv.Dockerfile`, the job definitions and the image (and
-  so the toolchain) they run in;
+- `.github/workflows/ci.yml` and `containers/testenv.Dockerfile`, the job
+  definitions and the image (and so the toolchain) they run in;
 - any extra git pathspecs the job names, for inputs that aren't Rust crates.
 
 Registry dependencies need no walking: `Cargo.lock` pins them. The graph comes
@@ -33,11 +32,7 @@ import sys
 from pathlib import Path
 
 # Always part of the hash, relative to the repository root, if tracked.
-GLOBAL_INPUTS = [
-    ".gitlab-ci.yml",
-    ".github/workflows/ci.yml",
-    "containers/testenv.Dockerfile",
-]
+GLOBAL_INPUTS = [".github/workflows/ci.yml", "containers/testenv.Dockerfile"]
 
 
 def cargo_metadata(manifest):

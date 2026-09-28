@@ -84,7 +84,7 @@ in the **root** `Cargo.toml`:
 **`default` is deliberately empty.** A plain `cargo build --workspace` then
 compiles a stub (`main` is `#[cfg(feature = "ssr")]`-gated) rather than failing,
 which keeps the root workspace green. The corollary is that a workspace build
-proves nothing about this crate — hence the `build:web` CI job.
+proves nothing about this crate — hence the `build-web` CI job.
 
 Anything server-side must be behind `#[cfg(feature = "ssr")]` (`conn`, `server`,
 `mock`, and `build_snapshot`). The wasm build is the check that this holds:

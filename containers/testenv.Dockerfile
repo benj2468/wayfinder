@@ -22,8 +22,8 @@ RUN git config --system --add safe.directory '*'
 RUN rustup component add llvm-tools-preview
 RUN rustup component add clippy
 
-# Bare-metal target for the embedded (`no_std`) crates (see build:embedded in
-# .gitlab-ci.yml) — Tier 2 with prebuilt core/alloc, so no nightly required.
+# Bare-metal target for the embedded (`no_std`) crates (see build-embedded in
+# .github/workflows/ci.yml) — Tier 2 with prebuilt core/alloc, so no nightly required.
 RUN rustup target add thumbv7em-none-eabihf
 
 # Browser target for `bins/wayfinder-web`: cargo-leptos builds that crate twice,
@@ -38,7 +38,7 @@ RUN cargo binstall -y cargo-nextest
 RUN cargo binstall -y cargo-llvm-cov
 RUN cargo binstall -y sccache
 # Builds/installs the libs/wayfinder-py extension module before the pytest job
-# imports it (see test:run:python in .gitlab-ci.yml).
+# imports it (see test-python in .github/workflows/ci.yml).
 RUN cargo binstall -y maturin
 RUN cargo binstall -y cargo-ndk
 RUN cargo binstall -y flip-link

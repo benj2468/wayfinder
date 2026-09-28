@@ -55,7 +55,7 @@ runs:
           echo "post-build-hook = $hook"
           # A runner that cannot sandbox should fail at once, not build
           # unsandboxed for half an hour and fail at the first derivation
-          # that needs it (see the nixos tests on the GitLab side).
+          # that needs it (see `test-nixos` in .github/workflows/ci.yml).
           echo "sandbox-fallback = false"
           if [ -n "$CACHE_URL" ] && [ -n "$PUBLIC_KEY" ]; then
             echo "extra-substituters = $CACHE_URL"

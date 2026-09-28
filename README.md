@@ -171,7 +171,7 @@ cargo nextest run --workspace                 # test
 cd libs/wayfinder-protos && buf lint   # proto docs + style
 ```
 
-Contributions ship through GitLab merge requests with
+Contributions ship through GitHub pull requests with
 [Conventional Commits](https://www.conventionalcommits.org/) titles
 (`type(scope): summary`). See [`CLAUDE.md`](./CLAUDE.md) for the full
 architecture, conventions, and contributor guide.
