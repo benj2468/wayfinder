@@ -51,8 +51,12 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# `packages: read` is what lets a container job pull the rust-ci image from
+# ghcr with the job's own token; without it every pull is `denied`, even
+# though the `image` job (which asks for `packages: write`) pushed it fine.
 permissions:
   contents: read
+  packages: read
 env:
   # See `.gitlab-ci.yml`: line tables keep backtraces useful without the link
   # time and target size of full debuginfo.
