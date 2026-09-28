@@ -1822,4 +1822,70 @@ mod tests {
         assert!(!json.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// The leftover of an import is recognised by the file it was, not by
+    /// re-reading it and comparing states. A snapshot from before accounts had
+    /// ids mints a fresh random id per account on every parse, so a re-read v6
+    /// file never compares equal to what its own import committed — and a CA
+    /// that crashed between the commit and the rename would refuse to start.
+    #[test]
+    fn a_leftover_v6_snapshot_with_accounts_finishes_the_import() {
+        let dir = unique_dir("import-resume-v6");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        let hash = "$argon2id$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaGhhc2g";
+        std::fs::write(
+            &json,
+            serde_json::json!({
+                "version": 6,
+                "issued": [],
+                "held": [],
+                "invites": [],
+                "users": [{
+                    "username": "ops",
+                    "password_hash": hash,
+                    "totp_secret": null,
+                    "session_ttl_secs": 3600,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        drop(CaLog::open(&db, Some(&json)).unwrap());
+        // Put the file back as though the rename had never happened.
+        std::fs::rename(dir.join("ca-state.json.imported"), &json).unwrap();
+
+        let log = CaLog::open(&db, Some(&json)).expect("the leftover is the imported file");
+        assert_eq!(log.users().len(), 1, "imported once, not twice");
+        assert!(!json.exists(), "the rename is finished");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rename that failed (or a power loss that undid it) leaves the
+    /// imported file in place while the CA carries on: logins, issuance and
+    /// revocations all change the database after it. The file is still the one
+    /// that was imported, so the next start finishes the rename rather than
+    /// refusing because the database has since moved on.
+    #[test]
+    fn a_leftover_snapshot_finishes_the_import_after_later_changes() {
+        let dir = unique_dir("import-resume-later");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+        {
+            let mut log = CaLog::open(&db, Some(&json)).unwrap();
+            std::fs::rename(dir.join("ca-state.json.imported"), &json).unwrap();
+            log.mutate_users(|users| users.push(user("added-after-import")))
+                .1
+                .unwrap();
+        }
+
+        let log = CaLog::open(&db, Some(&json)).expect("the leftover is the imported file");
+        assert_eq!(log.issued().len(), 1, "imported once, not twice");
+        assert_eq!(log.users().len(), 1, "the later change is kept");
+        assert!(!json.exists(), "the rename is finished");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
