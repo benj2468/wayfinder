@@ -33,6 +33,10 @@ inputs:
     description: R2 API token secret, for reading the bucket.
     required: false
     default: ""
+  extra-config:
+    description: More nix.conf lines, e.g. the sandbox features the NixOS tests need.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -42,6 +46,7 @@ runs:
       env:
         CACHE_URL: ${{ inputs.cache-url }}
         PUBLIC_KEY: ${{ inputs.public-key }}
+        EXTRA_CONFIG: ${{ inputs.extra-config }}
       run: |
         hook="$RUNNER_TEMP/nix-post-build-hook"
         printf '#!/bin/sh\necho $OUT_PATHS >> %s/nix-built-paths\n' "$RUNNER_TEMP" > "$hook"
@@ -56,6 +61,7 @@ runs:
             echo "extra-substituters = $CACHE_URL"
             echo "extra-trusted-public-keys = $PUBLIC_KEY"
           fi
+          printf '%s\n' "$EXTRA_CONFIG"
         } > "$RUNNER_TEMP/nix.conf.extra"
         {
           echo 'config<<EOF'

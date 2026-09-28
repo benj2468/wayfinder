@@ -42,6 +42,10 @@ on:
         description: Run the wall-clock benchmarks and upload the report
         type: boolean
         default: false
+      nixos:
+        description: Run the NixOS integration tests (nix/tests)
+        type: boolean
+        default: false
 # A newer push to the same PR makes a running pipeline moot. `main` and tags
 # are never cancelled: half a deploy is worse than a redundant one.
 concurrency:
@@ -329,6 +333,41 @@ jobs:
         with:
           path: .ci-passed
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  # The NixOS integration tests (nix/tests), on `main` or on demand, as on
+  # GitLab. They are systemd-nspawn container tests, so they need a real build
+  # sandbox with `uid-range` — which a hosted runner, being a full VM, gives
+  # where GitLab's docker runner could not (that needed the `privileged` one).
+  # See `.gitlab-ci.yml`'s `test:nixos` for each setting's reason.
+  test-nixos:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.nixos)
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [simple, ethernet-egress, ca-provider, vpn-data-plane]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          public-key: ${{ vars.NIX_CACHE_PUBLIC_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          extra-config: |
+            experimental-features = nix-command flakes auto-allocate-uids cgroups
+            sandbox = true
+            auto-allocate-uids = true
+            system-features = kvm nixos-test uid-range big-parallel benchmark
+            extra-sandbox-paths = /dev/net/tun
+      - run: nix build --print-build-logs --no-link ".#wayfinder-${{ matrix.test }}"
+      - uses: ./.github/actions/nix-cache-push
+        if: always()
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   # Wall-clock benchmarks never gate (see CLAUDE.md); on demand only.
   bench:
     if: github.event_name == 'workflow_dispatch' && inputs.bench
