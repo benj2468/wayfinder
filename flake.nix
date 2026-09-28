@@ -87,24 +87,44 @@
         in
         if rev == null then null else builtins.substring 0 7 rev;
 
-      overlay = final: prev: {
-        craneLib = inputs.crane.mkLib prev;
+      # The overlay, parameterised on the build identity it stamps into the
+      # binaries. See `overlay` and `unstampedOverlay` below for the two uses.
+      mkOverlay =
+        { buildVersion, buildCommit }:
+        final: prev: {
+          craneLib = inputs.crane.mkLib prev;
 
-        cudaPackages = final.cudaPackages_13_0;
+          cudaPackages = final.cudaPackages_13_0;
 
-        inherit
-          (prev.callPackage ./nix {
-            src = prev.lib.cleanSource ./.;
-            inherit buildVersion buildCommit;
-          })
-          wayfinder-tap
-          wayfinder-tui
-          wayfinder-ctl
-          wayfinder-web
-          wayfinder-shark
-          wayfinder-tshark
-          wayfinder-termshark
-          ;
+          inherit
+            (prev.callPackage ./nix {
+              src = prev.lib.cleanSource ./.;
+              inherit buildVersion buildCommit;
+            })
+            wayfinder-tap
+            wayfinder-tui
+            wayfinder-ctl
+            wayfinder-web
+            wayfinder-shark
+            wayfinder-tshark
+            wayfinder-termshark
+            ;
+        };
+
+      # What every deployment and every published package is built with: the
+      # commit baked in, so a running node can say which build it is.
+      overlay = mkOverlay { inherit buildVersion buildCommit; };
+
+      # The same packages with no build identity, for what CI builds: the NixOS
+      # tests. The stamp is an env var on each binary's final derivation, so it
+      # changes the Rust packages' hashes on *every* commit — a change to
+      # nothing but a test script still recompiled wayfinder-tap, -ctl and -tui,
+      # minutes a job, and never came from the cache. Without it the test
+      # closure changes only when the filtered Rust/proto/web source does. No
+      # test asserts on the version; the binaries report "unknown".
+      unstampedOverlay = mkOverlay {
+        buildVersion = null;
+        buildCommit = null;
       };
 
       nixpkgsForSystem =
@@ -307,6 +327,11 @@
           pytestEnv = pkgs.python3.withPackages (ps: with ps; [ pytest ]);
 
           nixpkgs = nixpkgsForSystem system;
+
+          # See `unstampedOverlay`. Applied on top rather than as a second
+          # import, so it reuses this nixpkgs' config and only re-binds the
+          # wayfinder packages.
+          nixpkgsUnstamped = nixpkgs.extend unstampedOverlay;
 
           # nrfutil's package-generation extension (nrfutil-nrf5sdk-tools —
           # needed to build a DFU package for the nRF52840 dongle's probe-less
@@ -614,17 +639,17 @@
               wayfinder-tshark
               wayfinder-termshark
               ;
-            wayfinder-simple = nixpkgs.callPackage ./nix/tests/simple.nix { };
-            wayfinder-ethernet-egress = nixpkgs.callPackage ./nix/tests/ethernet-egress.nix { };
+            wayfinder-simple = nixpkgsUnstamped.callPackage ./nix/tests/simple.nix { };
+            wayfinder-ethernet-egress = nixpkgsUnstamped.callPackage ./nix/tests/ethernet-egress.nix { };
             # The cloud certificate-authority posture: no local egress, no
             # links, provider mode, unprivileged. Covers what
             # `nix/machines/wayfinder-ca` deploys, without a cloud account.
-            wayfinder-ca-provider = nixpkgs.callPackage ./nix/tests/ca-provider.nix { };
+            wayfinder-ca-provider = nixpkgsUnstamped.callPackage ./nix/tests/ca-provider.nix { };
             # The VPN data plane: real mesh traffic over a real Tailscale
             # tunnel between two nodes with no other path to each other. See
             # docs/design/implemented/08-internet-links-headscale-vpn.md's own
             # stated gap.
-            wayfinder-vpn-data-plane = nixpkgs.callPackage ./nix/tests/vpn-data-plane.nix { };
+            wayfinder-vpn-data-plane = nixpkgsUnstamped.callPackage ./nix/tests/vpn-data-plane.nix { };
           };
 
           treefmt = {
