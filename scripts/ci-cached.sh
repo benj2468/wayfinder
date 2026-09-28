@@ -3,13 +3,14 @@
 #
 #   ci-cached.sh <step> <ci-input-hash.py args...> -- <command...>
 #
-# The finer-grained sibling of `.skip-if-passed` in .gitlab-ci.yml, for a job
+# CI's skip-if-unchanged gate (see `.github/workflows/ci.yml`), for a job
 # that does several independent things, like one build per board: each step
 # gets its own input hash, so touching one board rebuilds that board alone.
 #
-# A pass marker is written under $CI_PASS_DIR (default /sccache/ci-passed, the
-# runners' persistent volume) only after <command> succeeds, and a failing
-# command's exit status is passed through, so a failure is never cached.
+# A pass marker is written under $CI_PASS_DIR only after <command> succeeds,
+# and a failing command's exit status is passed through, so a failure is never
+# cached. CI points $CI_PASS_DIR at a directory `actions/cache` restores and
+# saves around the job; the default suits a runner with a persistent volume.
 set -euo pipefail
 
 step="$1"

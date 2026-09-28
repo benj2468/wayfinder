@@ -1,32 +1,40 @@
-# GitHub Actions port of `.gitlab-ci.yml`, for moving the forge off rabin.
+# The pipeline: lint, build, test and (on `main` and tags) deploy.
 #
-# Job for job the same pipeline, and the comments there still carry the *why*
-# of each job; this file only explains what is different on GitHub. While both
-# forges run, keep the two in step: `scripts/ci-input-hash.py` hashes both files
-# into every pass marker, so an edit to either invalidates the skips.
+# **A PR's pipeline aims to be short.** Nothing waits on a lint stage finishing
+# first: every job starts at once, and a lint failure still fails the run. The
+# full `nix flake check`, coverage, the NixOS tests and the image deploy run on
+# `main` only (a `main` failure is fixed forward). The long jobs skip
+# themselves when their exact inputs already passed (`scripts/ci-cached.sh`).
 #
-# What changed in the move:
+# **Everything builds debug except what ships or what measures a shipped
+# image.** A release build is minutes per job that shares nothing with the
+# debug clippy and test builds beside it, and release is already covered on
+# `main` by the Nix packages the NixOS tests boot and by `deploy`. The
+# exceptions are argued at each one: `build-stack-budget` (it measures the
+# flashed firmware), `test-python` (its simulations run inside the extension),
+# `bench` and `deploy`.
 #
-# - **Runners.** Every job takes `runs-on` from the `CI_RUNNER` repository
-#   variable, defaulting to GitHub's hosted `ubuntu-latest`. Pointing it at a
-#   self-hosted runner's label moves the whole pipeline in one setting, which
-#   is the lever for a private repository, where hosted minutes are billed.
-# - **Images.** The rust-ci image goes to ghcr.io instead of
-#   registry.haganah.net, under the same content-hash tag. ghcr is served over
-#   TLS, so the insecure-registry buildkitd config is gone.
-# - **sccache** uses an R2 bucket instead of a volume on the runner host, since
-#   a hosted runner keeps nothing between jobs, falling back to the Actions
-#   cache for a run with no secrets (see `.github/actions/sccache`).
-# - **Pass markers** (`scripts/ci-cached.sh`) move from `/sccache/ci-passed` to
-#   an `actions/cache` entry per job. A marker lost to cache eviction or a race
-#   between two branches only means a step runs again; a marker is still only
-#   ever written after its step passed.
-# - **Nix** substitutes from, and pushes to, an R2 bucket instead of Attic —
-#   see `.github/actions/nix`. Nothing on rabin is needed, so step-ca and the
-#   `NIX_SSL_CERT_FILE` workaround go with it.
-# - **Secret scanning** runs gitleaks over the whole history rather than
-#   GitLab's template, since the history is what goes public with the repo.
-# - **The mirror job is gone**: GitHub is the destination.
+# Shared machinery, each explained where it lives:
+#
+# - **Runners.** `runs-on` comes from the `CI_RUNNER` repository variable,
+#   defaulting to GitHub's hosted `ubuntu-latest`, so moving the pipeline to a
+#   self-hosted runner is one setting. If one is ever used on a public
+#   repository, route fork PRs to hosted runners first: a fork's PR is
+#   arbitrary code on that machine.
+# - **The rust-ci image** (`containers/testenv.Dockerfile`), on ghcr.io under
+#   a tag that is a hash of its content (the `image` job).
+# - **sccache** keeps compiler outputs in an R2 bucket every branch shares,
+#   falling back to the Actions cache for a run with no secrets
+#   (`.github/actions/sccache`).
+# - **Pass markers** (`scripts/ci-cached.sh`) live in an `actions/cache` entry
+#   per job. A marker lost to eviction or a race between branches only means a
+#   step runs again; a marker is only ever written after its step passed.
+# - **Nix** substitutes from, and pushes to, an R2 binary cache
+#   (`.github/actions/nix`, `.github/actions/nix-cache-push`).
+#
+# The R2 buckets, their tokens and the Nix cache's signing key are managed
+# outside this repository; the variables and secrets named below are what
+# they hand to it.
 name: ci
 on:
   pull_request:
@@ -59,8 +67,10 @@ permissions:
   contents: read
   packages: read
 env:
-  # See `.gitlab-ci.yml`: line tables keep backtraces useful without the link
-  # time and target size of full debuginfo.
+  # Line tables only, not full debuginfo, for the dev and test profiles every
+  # PR job compiles: most of a debug build's link time and target size is
+  # debuginfo nobody reads in CI, while line tables keep panic backtraces
+  # pointing at the right line.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # sccache cannot cache incrementally-compiled crates, and a fresh runner has
@@ -69,8 +79,20 @@ env:
   # Which store it uses is `.github/actions/sccache`'s choice, per job.
   RUSTC_WRAPPER: sccache
 jobs:
-  # The rust-ci image tag: a hash of containers/testenv.Dockerfile's content.
-  # Built and pushed only when that exact content is not in ghcr yet.
+  # The tag every container job resolves the rust-ci image by: a hash of
+  # containers/testenv.Dockerfile's own content, not a shared mutable
+  # "latest". Two branches editing the Dockerfile differently get two tags, so
+  # neither can overwrite the other's image; two that end up byte-identical
+  # get the same tag and the second skips the build.
+  #
+  # The job always runs rather than being gated on the Dockerfile changing: a
+  # diff is neither necessary nor sufficient for "this tag needs building"
+  # (the image can be missing for reasons a diff cannot see — a new hash's
+  # first run, a registry cleanup), and a skipped build would leave every
+  # downstream job pulling an image that was never pushed. The manifest check
+  # is the real, self-healing gate. `rust-ci:cache` is a floating pointer used
+  # only as a `--cache-from` source, never resolved by a job, so branches
+  # racing to update it only race for each other's cache hit rate.
   image:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     permissions:
@@ -103,7 +125,11 @@ jobs:
           docker build -f containers/testenv.Dockerfile --cache-from "$CACHE_IMAGE" -t "$TAG" -t "$CACHE_IMAGE" .
           docker push "$TAG"
           docker push "$CACHE_IMAGE"
-  # Formatting on a PR, the full `nix flake check` on `main`.
+  # Also the repository's formatting gate: `nix flake check` includes
+  # treefmt-nix's `treefmt` check, which runs rustfmt (nightly, with
+  # `rustfmt.toml`'s unstable options) alongside every other formatter. A PR
+  # builds only that check; `main` runs the full `flake check`, which also
+  # evaluates every NixOS configuration.
   lint-nix:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
@@ -128,7 +154,7 @@ jobs:
           aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   # The PR title becomes the squash-merge commit, so it is the one that must
-  # follow Conventional Commits (commitlint.config.ts).
+  # follow Conventional Commits (commitlint.config.ts), not each commit.
   lint-pr-title:
     if: github.event_name == 'pull_request'
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -139,9 +165,9 @@ jobs:
       - env:
           TITLE: ${{ github.event.pull_request.title }}
         run: printf '%s\n' "$TITLE" | docker run -i --rm -v "$PWD:/app" -w /app commitlint/commitlint
-  # Every commit reachable from this ref, not only the tree: once the
-  # repository is public, a secret anywhere in history is published.
-  # `.gitleaks.toml` holds the allowlist for known non-secrets.
+  # Every commit reachable from this ref, not only the tree: in a public
+  # repository, a secret anywhere in history is published. `.gitleaks.toml`
+  # holds the allowlist for known non-secrets.
   secret-scan:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
@@ -150,6 +176,11 @@ jobs:
           fetch-depth: 0
       # As the runner user, so git does not refuse a checkout it does not own.
       - run: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1 git --no-banner --redact --exit-code 1 .
+  # clippy fully subsumes a plain `cargo build` (it still fails on any compile
+  # error) and also covers tests/examples/benches through --all-targets.
+  # Running both was a full duplicate compile of the workspace for no extra
+  # signal: cargo's fingerprinting invalidates the target dir between a plain
+  # build and a clippy build of the same crate.
   build:
     needs: image
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -168,6 +199,26 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: sccache --show-stats
+  # Cross-compiles the `no_std` stack for a real bare-metal target instead of
+  # relying on `#![no_std]` type-checking under the host's target, which lets
+  # a stray `std`-only dependency (a workspace default feature, say) slip
+  # through. `thumbv7em-none-eabihf` is Tier 2 with prebuilt `core`/`alloc`,
+  # so no nightly `-Z build-std`.
+  #
+  # Each board is its own Cargo workspace (linker script, panic handler, HAL),
+  # so it is linted from its own directory rather than through `-p`. They share
+  # a target but not a vendor HAL (Nordic vs ST): linting all of them proves
+  # the shared driver is portable, and both nRF boards proves
+  # `libs/wayfinder-nrf` serves both. `blue`'s SoftDevice backend is linted
+  # explicitly because no board links it any more (802.15.4 took the RADIO);
+  # keep that line in step with `clippy-loose-drivers` in the justfile.
+  #
+  # Only clippy, never clippy plus a plain build (see `build`), and debug
+  # throughout: clippy never links, so the STM32F411RE's 512 KB flash — the
+  # reason it is *flashed* `--release` — does not constrain a lint. The linked
+  # release images are `build-stack-budget`'s to check. Each board is one
+  # `ci-cached.sh` step with its own input hash, so a PR that touches one
+  # board's dependencies rebuilds that board alone.
   build-embedded:
     needs: image
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -177,6 +228,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
+      # Kept in step with the `rustup target add` in containers/testenv.Dockerfile.
       BARE_METAL_TARGET: thumbv7em-none-eabihf
       CI_JOB_NAME: build-embedded
     steps:
@@ -202,6 +254,28 @@ jobs:
         with:
           path: .ci-passed
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  # The static stack-budget gate for the board images: no
+  # `TaskStorage::<F>::poll` frame may reserve more than a small share of the
+  # stack the linker actually left. That frame is live for its task's whole
+  # body, so a large one is stack no other frame can use — which is how the
+  # nRF52840 DK overflowed into the SoftDevice's reserved RAM in Sep 2026: an
+  # `#[task]` wrapper `.await`ing `node::run` paid 62,720 bytes to copy its
+  # future through the stack. It was live on `main` for months, invisible to
+  # the host suite (the types are nRF-only) and to clippy.
+  #
+  # **`--release`, and it must stay so.** That is the profile each board is
+  # flashed at, and no Nix build covers the firmware. The boards used to be
+  # checked at `debug`, and the two profiles did not merely differ by a margin
+  # but disagreed about *which symbol carries the frame*: at `debug` rustc
+  # emitted `node::run`'s body as its own symbol and left a 932-byte
+  # trampoline for the gate to find, while at `--release` the body inlined
+  # into the poll and carried 72,908 bytes. The gate had passed, for as long
+  # as it had existed, on an image nobody flashes.
+  #
+  # A separate job from `build-embedded` because it needs the linked ELF, which
+  # clippy never produces. See `scripts/stack-budget.py` for why the gate is on
+  # task polls and not frame size in general (a blanket cap fails the healthy
+  # image).
   build-stack-budget:
     needs: image
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -236,6 +310,19 @@ jobs:
         with:
           path: .ci-passed
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  # `bins/wayfinder-web` needs its own job: its `default` feature set is empty
+  # on purpose (so `build`'s workspace clippy compiles a stub that proves
+  # nothing), and its tests sit behind `mock-node`, so the workspace test run
+  # never sees them. `cargo leptos build` is the real path — both halves,
+  # wasm-bindgen and the site bundle — where a misplaced `cfg` hides, since the
+  # wasm half drops every server-side dependency.
+  #
+  # Debug, not `--release`: the optimised server and wasm builds were ten of
+  # this job's sixteen minutes and shared nothing with the debug clippy/nextest
+  # builds after them. The job was also the pipeline's most expensive by a
+  # distance (4,500 runner-minutes in a month on the previous forge), so it
+  # skips whenever wayfinder-web and every crate it reaches are unchanged since
+  # a passing run.
   build-web:
     needs: image
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -260,11 +347,6 @@ jobs:
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ci-passed-${{ github.job }}-
       - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
-      # The largest job on GitLab by a distance (4,500 runner-minutes in the
-      # 30 days before the move), so it skips whenever wayfinder-web and every
-      # crate it reaches are unchanged since a passing run. Debug throughout:
-      # the release leptos build was ten of its sixteen minutes, and `main`'s
-      # Nix build already covers release (see `.gitlab-ci.yml`'s `build:web`).
       - run: >-
           scripts/ci-cached.sh web --package wayfinder-web -- sh -c 'cargo leptos build && cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings && cargo nextest run -p wayfinder-web --features mock-node'
       - run: sccache --show-stats
@@ -272,6 +354,16 @@ jobs:
         with:
           path: .ci-passed
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  # Three suites. The workspace; `wayfinder-server`'s `embedded` feature, off
+  # by default because a host build must not pull `embedded-io-async`/
+  # `embassy-sync`, so `--workspace` compiles neither the module nor its tests
+  # (#22); and `wayfinder-auth` with `compact-sha512`, since every board builds
+  # SHA-512 rolled while the host builds it unrolled, so the RFC 8032 known
+  # answers are re-run on the board's build (#71).
+  #
+  # Coverage on `main` only: instrumentation is a separate, slower build of the
+  # whole workspace. The reports upload even from a red run — that is the run
+  # whose failures most need reading.
   test-rust:
     needs: image
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -288,7 +380,6 @@ jobs:
           endpoint: ${{ vars.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
           secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
-      # Coverage on `main` only, as on GitLab.
       - run: |
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then RUN="cargo llvm-cov nextest --no-report"; else RUN="cargo nextest run"; fi
           $RUN --profile ci --workspace
@@ -307,6 +398,15 @@ jobs:
             target/nextest/ci/junit.xml
             coverage.xml
           if-no-files-found: ignore
+  # The allocation gate from libs/wayfinder-bench: planning a received frame
+  # and planning a transmit must allocate exactly zero times. Its own job
+  # because a failure here means something specific — the `no_std` core
+  # stopped being allocation-free, which breaks the boards and nothing else.
+  #
+  # The only benchmark-derived job that can fail: an allocation count is
+  # deterministic, so it means the same on a busy runner as on a laptop. And
+  # `--profile dev` rather than the bench profile's release build, because the
+  # count is the code's semantics, not its optimisation.
   test-alloc-gate:
     needs: image
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -337,6 +437,19 @@ jobs:
         with:
           path: .ci-passed
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  # The Python side: `uv sync` resolves and builds everything from the root
+  # pyproject.toml/uv.lock, including `libs/wayfinder-py` (a uv workspace
+  # member built from source by maturin) — nothing else builds it, since that
+  # crate is its own Cargo workspace. `uv run`, not a bare `python3 -m pytest`,
+  # so the suite resolves against the `.venv` that sync built.
+  #
+  # tshark will not load the Lua dissector as root, so the suite runs as the
+  # image's unprivileged `ci` user, with its JUnit directory created for it up
+  # front (the checkout is root-owned).
+  #
+  # The one cargo build here left at release (maturin's default), besides the
+  # stack-budget gate: the suite's simulations run inside the extension, so a
+  # debug build made the job slower overall (3 minutes to 8+), not faster.
   test-python:
     needs: image
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -361,8 +474,6 @@ jobs:
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ci-passed-${{ github.job }}-
       - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
-      # tshark will not load the Lua dissector as root, so the suite runs as
-      # the image's unprivileged `ci` user (see `.gitlab-ci.yml`).
       - run: >-
           scripts/ci-cached.sh python --package wayfinder-py --manifest-path libs/wayfinder-py/Cargo.toml --extra '*.py' --extra sim --extra ml --extra scripts --extra libs/wayfinder-shark --extra pyproject.toml --extra uv.lock -- sh -c 'uv sync --locked && install -d -o ci target/pytest && runuser -u ci -- uv run pytest --junitxml=target/pytest/junit.xml'
       - uses: actions/upload-artifact@v4
@@ -380,7 +491,7 @@ jobs:
   # packages included — so building all four drivers here, in one job, builds
   # every package they share exactly once and pushes it to the R2 cache. The
   # test jobs below then substitute their driver instead of each compiling the
-  # same workspace in parallel.
+  # same workspace in parallel (about 30 minutes each, before this job).
   build-nixos-tests:
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.nixos)
@@ -403,11 +514,20 @@ jobs:
           signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
           aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  # The NixOS integration tests (nix/tests), on `main` or on demand, as on
-  # GitLab. They are systemd-nspawn container tests, so they need a real build
-  # sandbox with `uid-range` — which a hosted runner, being a full VM, gives
-  # where GitLab's docker runner could not (that needed the `privileged` one).
-  # See `.gitlab-ci.yml`'s `test:nixos` for each setting's reason.
+  # The NixOS integration tests (nix/tests), on `main` or on demand. They are
+  # systemd-nspawn container tests, not QEMU VMs: no /dev/kvm is used, but the
+  # test derivation requires `kvm nixos-test uid-range`, and `uid-range` needs a
+  # real build sandbox — which a hosted runner, being a full VM, can give where
+  # a docker-executor runner cannot (no namespaces inside its job container).
+  #
+  # The settings, each for a reason:
+  # - `sandbox-fallback = false` (in `.github/actions/nix`): Nix otherwise
+  #   builds unsandboxed when it cannot create the namespaces, and only the
+  #   final test derivation (which needs `uid-range`) fails — half an hour in.
+  # - `auto-allocate-uids` and `cgroups`: what `uid-range` is built on.
+  # - `extra-sandbox-paths = /dev/net/tun`: the node under test opens it for
+  #   its TAP egress, and a build sandbox starts with a minimal /dev. No `?`
+  #   suffix, so a runner without the device fails here, at once.
   test-nixos:
     needs: build-nixos-tests
     if: >-
@@ -439,7 +559,13 @@ jobs:
           signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
           aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  # Wall-clock benchmarks never gate (see CLAUDE.md); on demand only.
+  # The wall-clock packet-path benchmarks, on demand only (the `bench` input).
+  # A full criterion pass is minutes for numbers nothing compares
+  # automatically, and timings from a shared runner are too noisy to gate on
+  # (see CLAUDE.md). This exists so a run can produce a shareable report —
+  # the `criterion` artifact — without anyone setting up the toolchain; for a
+  # before/after comparison, `just bench-save`/`just bench-cmp` locally is the
+  # better loop.
   bench:
     if: github.event_name == 'workflow_dispatch' && inputs.bench
     needs: image
@@ -485,9 +611,25 @@ jobs:
       - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
       - run: echo "all required jobs passed"
-  # Multi-arch images for each runnable binary, to ghcr.io. Automatic for a
-  # release tag or a push to main; on demand elsewhere. See `.gitlab-ci.yml`'s
-  # `deploy` for the tagging scheme, which is unchanged.
+  # One multi-platform (linux/amd64 + linux/arm64) image per runnable binary,
+  # to ghcr.io: automatically for a release tag or a push to `main`, on demand
+  # elsewhere (the `deploy` input). A tag is a release and its images carry
+  # the git tag (`wayfinder-tap:v1.2.3`); any other commit is a dev build,
+  # `dev-<short sha>`, and `main`'s also gets the moving `nightly` tag. Both
+  # tags name one manifest, so the nightly tag costs no second build.
+  #
+  # The binaries report their build (over `GetNodeInfo` and `--version`) as
+  # exactly the image tag, so "which build is this node running?" and "which
+  # image is deployed here?" have one answer. The Dockerfile never copies
+  # `.git`, so passing them in is the only way the binaries can know, and the
+  # commit separately because a tag carries no hash. An empty version means
+  # this script broke, and is refused rather than shipped.
+  #
+  # containers/Dockerfile cross-compiles natively for each target arch rather
+  # than emulating the build under QEMU, so no binfmt setup is needed. Its
+  # cargo builds run through sccache against the same R2 bucket as the jobs
+  # above when handed the `sccache` build secret (containers/with-sccache.sh);
+  # a secret, not a build arg, so the credentials are in no image layer.
   deploy:
     if: >-
       startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deploy)
@@ -507,6 +649,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v3
+      - name: Write the sccache build secret
+        env:
+          BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
+          KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          SECRET: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+        run: |
+          secret="$RUNNER_TEMP/sccache.env"
+          : > "$secret"
+          chmod 600 "$secret"
+          if [ -n "$BUCKET" ] && [ -n "$KEY_ID" ]; then
+            {
+              echo "SCCACHE_BUCKET=$BUCKET"
+              echo "SCCACHE_ENDPOINT=$ENDPOINT"
+              echo "SCCACHE_REGION=auto"
+              echo "AWS_ACCESS_KEY_ID=$KEY_ID"
+              echo "AWS_SECRET_ACCESS_KEY=$SECRET"
+            } >> "$secret"
+          fi
+          echo "SCCACHE_SECRET_FILE=$secret" >> "$GITHUB_ENV"
       - run: |
           registry=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           short_sha=$(git rev-parse --short HEAD)
@@ -534,6 +696,7 @@ jobs:
               --platform linux/amd64,linux/arm64 \
               -f containers/Dockerfile \
               --target "$app" \
+              --secret "id=sccache,src=$SCCACHE_SECRET_FILE" \
               --build-arg "WAYFINDER_BUILD_VERSION=$IMAGE_TAG" \
               --build-arg "WAYFINDER_BUILD_COMMIT=$short_sha" \
               -t "$image" \
@@ -541,3 +704,5 @@ jobs:
               --push \
               .
           done
+      - if: always()
+        run: rm -f "$SCCACHE_SECRET_FILE"

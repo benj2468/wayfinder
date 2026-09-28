@@ -59,11 +59,12 @@ just bench-smoke            # run each bench once; checks fixtures still converg
 
 Two rules about them, both easy to get wrong:
 
-- **Wall-clock benchmarks are never a CI gate.** A shared docker runner varies by
+- **Wall-clock benchmarks are never a CI gate.** A shared runner varies by
   more than most real regressions, so a threshold there fires constantly or
-  catches nothing. The `bench` job is `when: manual` and uploads criterion's HTML
-  report as an artifact; comparing baselines locally is the real workflow.
-  `test:alloc-gate` is the one benchmark-derived job that fails, because an
+  catches nothing. The `bench` job only runs on a manual `workflow_dispatch`
+  (the `bench` input) and uploads criterion's HTML report as the `criterion`
+  artifact; comparing baselines locally is the real workflow. `test-alloc-gate`
+  is the one benchmark-derived job that fails on every run, because an
   *allocation count* is deterministic where a timing is not.
 - **A benchmark's fixture must assert the state it claims to measure.** Every path
   worth timing is reachable only from a converged router, and an unconverged one
@@ -90,13 +91,13 @@ invocation from its own directory:
 
 - `libs/wayfinder-py` — a separate `[workspace]` (needs a linkable libpython;
   must not leak into the main host build). Host-testable: `cd libs/wayfinder-py
-  && cargo nextest run`. Wired into CI's `test:run:python` job, alongside pytest.
+  && cargo nextest run`. Wired into CI's `test-python` job, alongside pytest.
 - `bins/wayfinder-nrf52840`, `bins/wayfinder-nrf52840-dongle`,
   `bins/wayfinder-stm32f411`, `bins/wayfinder-esp32` — separate `[workspace]`s,
   `no_std`/`no_main` firmware binaries with `test = false`; a host test harness
   can't link against them at all. Their logic is exercised indirectly through
   the `libs/*` crates they wire together (tested in the root workspace) plus
-  CI's `build:embedded` job (cross-compile + clippy for the real target).
+  CI's `build-embedded` job (cross-compile + clippy for the real target).
   Behaviour beyond that needs hardware-in-the-loop: `libs/wayfinder-hil` (`just
   hil`) drives a real board over its management API, `#[ignore]`d so it
   compiles everywhere and runs only where boards are attached — see
@@ -110,7 +111,7 @@ invocation from its own directory:
 
   But not every board-only property needs a board. Anything
   decidable from the linked image is gatable without a board, and
-  `build:stack-budget` (`just stack-budget`) is the one that exists: it reads
+  `build-stack-budget` (`just stack-budget`) is the one that exists: it reads
   each board's ELF and fails if a task's poll frame reserves more of the stack
   than `memory.x` can spare. That class of bug is invisible here otherwise — it
   reproduces identically in `--release`, draws no clippy diagnostic, and the
@@ -121,7 +122,7 @@ invocation from its own directory:
   share. Not a workspace member (it depends on `nrf-softdevice`, which only
   links for a real embedded target) and not its own `[workspace]` either — a
   root-level `exclude`, pulled in by path from each board. Covered by the same
-  `build:embedded` job, through the boards that consume it.
+  `build-embedded` job, through the boards that consume it.
 - `libs/*/fuzz` (`wayfinder`, `batman`, `wayfinder-auth`, `ieee802154`) —
   `cargo-fuzz` targets, not unit tests; run explicitly with `cargo fuzz run`,
   not part of any `nextest` invocation.
@@ -130,7 +131,7 @@ invocation from its own directory:
 workspace build or test run**, for a different reason: its `default` feature set
 is empty on purpose (so `cargo build --workspace` compiles a stub instead of
 failing), and its tests sit behind the `mock-node` feature. It needs its own
-invocations, which CI's `build:web` job runs:
+invocations, which CI's `build-web` job runs:
 
 ```bash
 cargo build -p wayfinder-web --features ssr
@@ -338,17 +339,17 @@ account existing.
 The test to apply: *would this command still work against a node with no
 filesystem?* If not, the state it produces belongs in an RPC.
 
-### Merge requests
+### Pull requests
 
-Ships through GitLab MRs (`git.haganah.net`), not direct pushes to `main`. The
-**MR title must follow Conventional Commits** (`type(scope): summary`, lowercase
-imperative summary ≤100 chars) — the `lint:mr-title` CI job enforces it on the
-title. **Invoke the `mr` skill** to run the checks, draft the title/description,
-and create it with `glab`; **`mr-review`** for the second-opinion review a
-complex MR needs.
+Ships through GitHub pull requests (`github.com/benj2468/wayfinder`), not
+direct pushes to `main`. The **PR title must follow Conventional Commits**
+(`type(scope): summary`, lowercase imperative summary ≤100 chars) — the
+`lint-pr-title` CI job runs commitlint on the PR title. **Invoke the `mr`
+skill** to run the checks, draft the title/description, and create it with
+`gh`; **`mr-review`** for the second-opinion review a complex PR needs.
 
-**Keep MR descriptions concise.** A short Summary plus what changed and why is
-usually enough — most MRs don't need every section of the description
+**Keep PR descriptions concise.** A short Summary plus what changed and why is
+usually enough — most PRs don't need every section of the description
 template filled in. Reach for the fuller template (key design decisions,
 deferred/follow-ups, detailed testing notes) only when the change is complex
 or risky enough that a reviewer would actually need it.

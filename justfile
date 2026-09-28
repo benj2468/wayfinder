@@ -10,9 +10,9 @@
 #
 # The practical consequence is that "did I break anything?" takes a dozen
 # separate commands, each run from the right directory with the right features.
-# Every recipe here mirrors the corresponding `.gitlab-ci.yml` job, so a green
-# `just ci` locally covers the same set of checks the pipeline runs (plus a
-# couple of things CI doesn't gate on yet, like `buf lint`).
+# Every recipe here mirrors the corresponding `.github/workflows/ci.yml` job, so
+# a green `just ci` locally covers the same set of checks the pipeline runs
+# (plus a couple of things CI doesn't gate on yet, like `buf lint`).
 #
 # Start with `just` (lists everything), `just ci` (the full gate), or one of the
 # per-area aggregates: `just build`, `just clippy`, `just test`.
@@ -105,7 +105,8 @@ test-workspace:
 #
 # Never a CI gate on the shared runner: it has no boards, by the same argument
 # that keeps the wall-clock benchmarks manual. A self-hosted runner with parts
-# attached would take these as a `tags: [hardware]`, `when: manual` job.
+# attached would take these as a job pinned to that runner's label, triggered
+# only by `workflow_dispatch`.
 #
 # With no `hil.toml` every test skips with a reason and this exits clean, so
 # running it on a machine with nothing plugged in is a no-op rather than a
@@ -209,7 +210,7 @@ bench-alloc:
 bench-smoke:
     cargo bench -p wayfinder-bench -- --test
 
-# The `test:run:rust` CI job reports this number for the coverage badge.
+# The `test-rust` CI job reports this number for the coverage badge.
 [doc("Run the root workspace's tests with a coverage summary.")]
 coverage:
     cargo llvm-cov nextest --workspace {{ host_workspace_excludes }}
@@ -407,7 +408,7 @@ build-embedded: build-nrf52840 build-nrf52840-dongle build-stm32f411 build-loose
 clippy-embedded: clippy-nrf52840 clippy-nrf52840-dongle clippy-stm32f411 clippy-loose-drivers
 
 # Reads the linked ELF, so it depends on the build rather than on clippy (which
-# never links). Mirrors CI's `build:stack-budget`; see `scripts/stack-budget.py`
+# never links). Mirrors CI's `build-stack-budget`; see `scripts/stack-budget.py`
 # for what it gates and why it gates task polls rather than frame size at large.
 #
 # **Every board is checked in `--release`, which is the profile that gets
@@ -598,7 +599,7 @@ esp-check:
 # Its own section rather than joining `build-embedded`/`clippy-embedded`: those
 # aggregates are reached by `just ci`, and this board's compiler is not the
 # workspace toolchain but a fork installed out of band by `esp-toolchain` above.
-# Folding it in would make the full local gate — and CI's `build:embedded` job —
+# Folding it in would make the full local gate — and CI's `build-embedded` job —
 # fail on every machine that has not spent the ~2 GB. Run these explicitly while
 # working on the board; the `no_std` crates it will eventually link are covered
 # by the root workspace either way.

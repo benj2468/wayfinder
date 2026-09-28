@@ -43,15 +43,16 @@ doc claims).
 
 *Neither:*
 
-- **`.gitlab-ci.yml`** — nothing now; §4.6 records what a `tags: [hardware]`
-  job needs so standing a runner up later is not a research project.
+- **`.github/workflows/ci.yml`** — nothing now; §4.6 records what a job
+  pinned to a `[self-hosted, hardware]` runner needs so standing one up later
+  is not a research project.
 
 **Explicitly not touched:**
 
 - **Any shipped crate's behaviour, API or wire format.** If a test cannot be
   written without changing the firmware, that change is its own MR with its own
   argument — see §6.3.
-- **The shared GitLab docker runner.** It has no boards and never will; §4.6.
+- **The shared GitHub Actions runner.** It has no boards and never will; §4.6.
 - **`bins/wayfinder-stm32f411`.** No management port at all
   (`bins/wayfinder-stm32f411/src/main.rs:7-8`) and no `runner` configured, so
   Tier B cannot reach it and Tier A would be greenfield. Out of scope here and
@@ -72,8 +73,8 @@ Four tiers of test exist and none executes an instruction on a microcontroller:
 | `libs/wayfinder-shark` pytest, docker sim | wire format, host-binary topologies |
 | nix VM tests | host node deployment |
 
-Plus two static firmware gates, and they are the good kind — `build:embedded`
-(cross-compile + clippy) and `build:stack-budget`, which reads a linked ELF and
+Plus two static firmware gates, and they are the good kind — `build-embedded`
+(cross-compile + clippy) and `build-stack-budget`, which reads a linked ELF and
 fails if a task's poll frame reserves more stack than `memory.x` can spare.
 Root `CLAUDE.md:100-109` holds these up as the pattern to reach for first, and
 that advice stands: anything decidable from the image should stay decidable
@@ -187,8 +188,8 @@ Recorded here because an implementing session will otherwise trust them:
 - **Covering every board.** The nRF52840 DK is the only part with an onboard
   probe, so it is the only one Tier A can target; the dongle is reachable over
   Tier B only. STM32 is out of scope entirely (§1).
-- **Replacing the static gates.** `build:stack-budget` stays. A property
-  decidable from the ELF should be decided from the ELF: it runs on every MR,
+- **Replacing the static gates.** `build-stack-budget` stays. A property
+  decidable from the ELF should be decided from the ELF: it runs on every PR,
   needs no hardware, and cannot be flaky.
 - **Replacing hand bring-up.** Design 19 §12 is a hand-written hardware log —
   real MACs, boot output, a fragmentation-vs-loss table. That kind of
@@ -210,9 +211,9 @@ under `probe-rs run`, which already is the DK's configured cargo runner
 **Where it lives: `bins/wayfinder-hil-nrf52840`**, its own `[workspace]`, beside
 the three board binaries and copying their shape — `memory.x`, `flip-link`,
 `panic = "abort"`, `.cargo/config.toml`. Not a prettier path like `tests/hil/`,
-for one concrete reason: `just build-embedded` and CI's `build:embedded` walk
+for one concrete reason: `just build-embedded` and CI's `build-embedded` walk
 the board workspaces, so a crate that lives there is cross-compiled and
-clippied on every MR *for free*. That is goal 2 applied to Tier A, and it is
+clippied on every PR *for free*. That is goal 2 applied to Tier A, and it is
 the whole difference between a harness that survives between sessions and one
 that rots.
 
@@ -379,7 +380,7 @@ reachable after a reset, and it is also exactly the case worth diagnosing.
 
 ### 4.6 Never on the shared runner; what a self-hosted one needs
 
-The shared GitLab docker runner has no boards, so this is not a merge gate.
+The shared GitHub Actions runner has no boards, so this is not a merge gate.
 That is the same call the benchmarks made and for the same reason: a job that
 cannot run where CI runs either fails constantly or is quietly disabled.
 
@@ -389,11 +390,12 @@ Recorded so a runner can be stood up without rediscovery:
   `/dev/ttyACM*` — `probe-rs list`'s own hint on a machine without it is "most
   likely a permissions problem", and the CDC-ACM half is the one people forget
   because it is not the probe.
-- **A container gets the devices passed in**, or the job runs on a shell
-  executor. Enumeration inside a container also has to survive a board
-  re-enumerating after a reset.
-- **Job shape:** `tags: [hardware]`, `when: manual`, `allow_failure: false`,
-  `stage: test`, and it must not be in any other job's `needs`.
+- **A container gets the devices passed in**, or the self-hosted runner's job
+  runs directly on the host. Enumeration inside a container also has to
+  survive a board re-enumerating after a reset.
+- **Job shape:** `runs-on: [self-hosted, hardware]`, triggered only by
+  `workflow_dispatch` (never `push`/`pull_request`), `continue-on-error:
+  false`, and no other job's `needs` may point at it.
 - **A power-cycle path.** Reset over the probe covers most of it, but a wedged
   USB stack needs the bus cut. A switchable hub is the cheap answer, and until
   there is one, §5's reboot tests are reset-only — stated in §6.2.
@@ -439,7 +441,7 @@ Ordered by what they would have caught. All are Tier B unless marked.
 
 **Regressions the static gates cannot see**
 
-8. **Stack headroom after a soak.** `build:stack-budget` bounds one task's poll
+8. **Stack headroom after a soak.** `build-stack-budget` bounds one task's poll
    frame statically; this bounds *actual* peak use after real traffic, read
    from `stack::report()`.
 9. **Fragmentation across payload sizes.** Design 19 §12's hand-made
@@ -482,7 +484,7 @@ Ordered by what they would have caught. All are Tier B unless marked.
 ### 6.1 It is not a substitute for the static gates
 
 A hardware test is slower, needs a part, and can fail for reasons unrelated to
-the change. `build:stack-budget` runs on every MR in seconds and cannot be
+the change. `build-stack-budget` runs on every PR in seconds and cannot be
 flaky. The rule stays as `CLAUDE.md:100-109` states it: **reach for the ELF
 first**, and use this tier for what is genuinely undecidable without a running
 part.

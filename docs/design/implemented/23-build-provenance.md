@@ -20,7 +20,7 @@ Owns GitLab #59.
   both board bring-up paths (`libs/wayfinder-nrf/src/node.rs`, shared by the
   two nRF boards, and `bins/wayfinder-stm32f411/src/main.rs`).
 - Build-environment injection: `flake.nix` + `nix/default.nix`,
-  `containers/Dockerfile`, `.gitlab-ci.yml`'s `deploy` job.
+  `containers/Dockerfile`, `.github/workflows/ci.yml`'s `deploy` job.
 - `libs/wayfinder-hil/tests/smoke.rs` — a staleness assertion.
 
 **Explicitly not touched:**
@@ -67,7 +67,7 @@ identifies nothing; `wayfinder-tap`, `wayfinder-tui` and `wayfinder-web` had no
 - A node reports the build it is running, over the management API, host and
   board alike.
 - Correct in all four build environments: a developer tree, `nix build`, the
-  container build, GitLab CI.
+  container build, GitHub Actions.
 - A **tagged** commit reports its tag. For a release the tag is the identity;
   the hash under it is an implementation detail.
 - Never fail a build because git is unavailable.
@@ -79,7 +79,7 @@ identifies nothing; `wayfinder-tap`, `wayfinder-tui` and `wayfinder-web` had no
 - **A build timestamp.** It would break Nix reproducibility, and the hash is the
   part that identifies *what code*. A commit *date* would be reproducible and is
   a cheap later addition if wanted.
-- **A flash-fit CI gate.** None exists today (`build:stack-budget` checks RAM
+- **A flash-fit CI gate.** None exists today (`build-stack-budget` checks RAM
   only). §8 measures the cost; building the gate is a follow-up.
 
 ## 4. Design: resolving the identity
@@ -255,8 +255,8 @@ Neither is fixable inside `wayfinder-version`, because both are cases where the
   deliberately treats blank as absent. Inside the Dockerfile, blank means the
   build-arg was omitted, misspelled, or expanded empty, which is exactly when an
   image gets published under a tag while reporting `unknown`. So the *Dockerfile*
-  warns, and `.gitlab-ci.yml` refuses outright: for a release, "unknown" is never
-  an acceptable answer.
+  warns, and `.github/workflows/ci.yml` refuses outright: for a release,
+  "unknown" is never an acceptable answer.
 - **`docker compose build`** (the documented non-NixOS path) passes no args at
   all, so a locally built image reports `unknown`. The warning above is what an
   operator sees; wiring compose `args:` is deliberately left out, since compose
@@ -467,6 +467,6 @@ rule that an alarm system must not become the flood it reports applies.
 - `libs/wayfinder-hil/src/diagnostics.rs`, `libs/wayfinder-hil/tests/smoke.rs`
 - `flake.nix` (`buildVersion`), `nix/default.nix` (`buildVersionEnv`)
 - `containers/Dockerfile` (`ARG` + both `cargo build` invocations),
-  `.gitlab-ci.yml` (`deploy`)
+  `.github/workflows/ci.yml` (`deploy`)
 - Startup logs: `bins/wayfinder-tap/src/main.rs`,
   `libs/wayfinder-nrf/src/node.rs`, `bins/wayfinder-stm32f411/src/main.rs`

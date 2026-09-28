@@ -392,7 +392,7 @@ const RAM_ORIGIN: usize = const_str_parse!(env!("WAYFINDER_RAM_ORIGIN"));
 
 One source of truth, and the existing hand-sync hazard is deleted rather than
 duplicated. `DURABLE_STORE_BASE` is derived from the flash layout the same
-way. The `build:stack-budget` CI job (`just stack-budget`) reads each board's
+way. The `build-stack-budget` CI job (`just stack-budget`) reads each board's
 ELF against `memory.x`, so it validates the generated layout with no change —
 and its budget rises by the 13,112 bytes the SoftDevice no longer reserves.
 

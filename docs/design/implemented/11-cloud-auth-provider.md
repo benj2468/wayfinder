@@ -61,8 +61,8 @@ mesh links at all is a complete, useful deployment: it serves `SubmitCsr`,
   be true — a config block and one ingress rule, no redesign.)
 - Not managing the provisioned secret files declaratively. `sops-nix`/`agenix` is the
   natural follow-up; v1 copies them once, by hand, per `infra/oracle/README.md`.
-- Not deploying from CI. That needs cloud credentials in GitLab CI and is a
-  separate decision.
+- Not deploying from CI. That needs cloud credentials in GitHub Actions and is
+  a separate decision.
 
 ## 3. Why not Cloudflare, and why not GCP
 

@@ -229,7 +229,7 @@ services:
   ctl:
     build:
       target: ctl-vpn
-    image: ${WAYFINDER_REGISTRY:-registry.haganah.net}/wayfinder-ctl-vpn:nightly
+    image: ${WAYFINDER_REGISTRY:-ghcr.io/benj2468/wayfinder}/wayfinder-ctl-vpn:nightly
     network_mode: service:tailscale
     volumes:
       - tailscale-sock:/var/run/tailscale

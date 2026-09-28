@@ -714,7 +714,7 @@ loop evaluate it without a router borrow.
 does not run in this environment — 44 failures and 13 collection errors on a
 clean tree, unrelated to this work — so the version bump in
 `libs/wayfinder-shark/tests/test_ogm_dissector.py` and the field relabel in
-`wayfinder.lua` are unexercised.  CI's `test:run:python` job covers them.
+`wayfinder.lua` are unexercised.  CI's `test-python` job covers them.
 
 ---
 
@@ -763,4 +763,4 @@ thing about it that matters.
 **Not verified locally:** the Wireshark dissector, for the same reason as
 Part A — its pytest suite does not run in this environment (44 failures and 13
 collection errors on a clean tree, unrelated to this work).  CI's
-`test:run:python` job covers it.
+`test-python` job covers it.

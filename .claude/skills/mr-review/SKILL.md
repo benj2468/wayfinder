@@ -3,16 +3,16 @@ name: mr-review
 description: Use after pushing a wayfinder MR/branch that is non-trivial logic, security-sensitive, introduces a new wire format, or spans multiple crates — e.g. "review this MR", "get a second opinion on this branch", "is this ready for review". Decides whether CLAUDE.md's review bar is met, then runs pr-review-toolkit:review-pr against the branch diff and gates human review on findings being addressed.
 ---
 
-# Second-opinion review for a complex wayfinder MR
+# Second-opinion review for a complex wayfinder pull request
 
-CLAUDE.md requires this for any MR that is non-trivial logic,
+CLAUDE.md requires this for any PR that is non-trivial logic,
 security-sensitive, introduces a new wire format, or touches multiple crates.
-Trivial MRs (small fixes, doc tweaks, mechanical refactors) don't need it —
+Trivial PRs (small fixes, doc tweaks, mechanical refactors) don't need it —
 say so and stop if the branch clearly falls in that bucket.
 
 ## 1. Confirm the diff scope
 
-Identify the branch and note the diff it would produce as an MR:
+Identify the branch and note the diff it would produce as a PR:
 
 ```bash
 git diff origin/main...<branch>
@@ -27,10 +27,11 @@ branch is fully committed and pushed, so it must be told explicitly to use
 ## 2. Run the review toolkit
 
 Invoke `pr-review-toolkit:review-pr all`, briefing it to diff against
-`origin/main...<branch>` instead of its default working-tree diff. Its `gh pr
-view` step is a no-op here (this repo has no GitHub PR) — that's fine, ignore
-any failure from it. Let it run its full agent set (comment accuracy, test
-coverage, silent-failure hunting, type design, general code review, then
+`origin/main...<branch>` instead of its default working-tree diff. If a
+GitHub PR already exists for the branch, its `gh pr view` step can read that
+PR directly; otherwise it's a no-op — that's fine, ignore any failure from it.
+Let it run its full agent set (comment accuracy, test coverage,
+silent-failure hunting, type design, general code review, then
 simplification) rather than a single pass — that breadth is the reason to use
 it instead of a hand-rolled reviewer.
 
@@ -58,7 +59,7 @@ necessary**. Brief it to diff `origin/main...<branch>` and push back on:
 - **Ceremony without payoff** — confirmation steps, wrapper types, or error
   variants that add code without protecting against a real failure.
 - **Scope creep** — anything in the branch that isn't part of the one logical
-  change the MR is supposed to be (CLAUDE.md: one logical change per MR).
+  change the PR is supposed to be (CLAUDE.md: one logical change per PR).
 
 Tell it to cite file:line, argue *why* each thing may be unnecessary, and
 propose the simpler alternative — its job is to push back, not rubber-stamp. It
@@ -69,6 +70,6 @@ the complexity earns its keep; record that reason if you keep it.
 ## 3. Address the findings
 
 For each finding: fix it, or write down why it's not being fixed (false
-positive, out of scope, intentional trade-off already covered in the MR
+positive, out of scope, intentional trade-off already covered in the PR
 description). Do not request human review with unaddressed, unexplained
 findings outstanding.

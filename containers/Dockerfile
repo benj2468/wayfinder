@@ -13,7 +13,7 @@
 # arch-independent and comes from the separate `site` stage below.
 #
 # The builder stage is pinned to `--platform=$BUILDPLATFORM`, so it always runs
-# natively on the build host (the GitLab runners are amd64) no matter which
+# natively on the build host (CI's runners are amd64) no matter which
 # TARGETPLATFORM buildx is currently assembling, and cross-compiles to that
 # target's Rust triple via the matching cross linker. That's a deliberate
 # choice over letting buildx emulate the whole build under QEMU: emulating a
@@ -41,6 +41,24 @@
 #       --platform linux/amd64,linux/arm64 -t wayfinder-tap --push .
 #
 # (Building with no --target stops at `web`, the last stage.)
+
+# ---------------------------------------------------------------------------
+# sccache: the compiler cache the two build stages below run cargo through.
+# ---------------------------------------------------------------------------
+#
+# A static (musl) release binary for the build host, pinned by checksum. Both
+# architectures are fetched because `ADD --checksum` cannot be made conditional
+# on BUILDARCH; the one that matches is kept. It is only *used* when the build
+# is given the cache's credentials as a secret — see containers/with-sccache.sh.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS sccache
+ARG BUILDARCH
+ADD --checksum=sha256:45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89 \
+    https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz /tmp/sccache-amd64.tar.gz
+ADD --checksum=sha256:2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a \
+    https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-aarch64-unknown-linux-musl.tar.gz /tmp/sccache-arm64.tar.gz
+RUN tar -xzf "/tmp/sccache-$BUILDARCH.tar.gz" -C /tmp \
+    && mv /tmp/sccache-v0.18.0-*/sccache /usr/local/bin/sccache
+COPY containers/with-sccache.sh /usr/local/bin/with-sccache
 
 # ---------------------------------------------------------------------------
 # Shared build stage: cross-compile the whole workspace for TARGETARCH.
@@ -78,6 +96,7 @@ RUN dpkg --add-architecture arm64 \
         libdbus-1-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 ENV PROTOC=/usr/bin/protoc
+COPY --from=sccache /usr/local/bin/sccache /usr/local/bin/with-sccache /usr/local/bin/
 
 ARG TARGETARCH
 
@@ -131,7 +150,7 @@ ENV LEPTOS_OUTPUT_NAME=wayfinder-web
 #
 # Empty is a real state and a bad one — it means the `--build-arg` was omitted,
 # misspelled, or expanded empty — so the build warns rather than silently
-# shipping an image that cannot say what it is. `.gitlab-ci.yml` refuses
+# shipping an image that cannot say what it is. CI's `deploy` job refuses
 # outright, because for a release "unknown" is never acceptable.
 ARG WAYFINDER_BUILD_VERSION=""
 ARG WAYFINDER_BUILD_COMMIT=""
@@ -154,13 +173,17 @@ COPY assets ./assets
 # Binaries land under a target-triple-suffixed directory; copy them to a
 # fixed, arch-independent path so the final stages below don't need to know
 # the triple.
-RUN if [ -z "$WAYFINDER_BUILD_VERSION" ]; then \
+#
+# Both cargo builds in this stage go through `with-sccache`, which is a no-op
+# unless the build was given the `sccache` secret (CI's `deploy` does).
+RUN --mount=type=secret,id=sccache,required=false \
+    if [ -z "$WAYFINDER_BUILD_VERSION" ]; then \
         echo "WARNING: no --build-arg WAYFINDER_BUILD_VERSION; the binaries in this" >&2; \
         echo "         image will report their build as \"unknown\"." >&2; \
     fi \
     && WAYFINDER_BUILD_VERSION="$WAYFINDER_BUILD_VERSION" \
        WAYFINDER_BUILD_COMMIT="$WAYFINDER_BUILD_COMMIT" \
-       cargo build --release --workspace --target "$(cat /rust_target)" \
+       with-sccache cargo build --release --workspace --target "$(cat /rust_target)" \
     && mkdir /out \
     && cp target/"$(cat /rust_target)"/release/wayfinder-tap \
         target/"$(cat /rust_target)"/release/wayfinder-tui \
@@ -172,9 +195,10 @@ RUN if [ -z "$WAYFINDER_BUILD_VERSION" ]; then \
 # dependencies the axum server hangs off), which means the workspace build above
 # produced a stub `main` that only panics. `--features ssr` is what compiles the
 # real server. The browser half it serves is built in the `site` stage below.
-RUN WAYFINDER_BUILD_VERSION="$WAYFINDER_BUILD_VERSION" \
+RUN --mount=type=secret,id=sccache,required=false \
+    WAYFINDER_BUILD_VERSION="$WAYFINDER_BUILD_VERSION" \
     WAYFINDER_BUILD_COMMIT="$WAYFINDER_BUILD_COMMIT" \
-    cargo build --release -p wayfinder-web --features ssr \
+    with-sccache cargo build --release -p wayfinder-web --features ssr \
     --target "$(cat /rust_target)" \
     && cp target/"$(cat /rust_target)"/release/wayfinder-web /out/
 
@@ -207,6 +231,7 @@ RUN apt-get update \
 ENV PROTOC=/usr/bin/protoc
 
 RUN rustup target add wasm32-unknown-unknown
+COPY --from=sccache /usr/local/bin/sccache /usr/local/bin/with-sccache /usr/local/bin/
 
 # cargo-binstall pulls prebuilt binaries instead of compiling cargo-leptos from
 # source, the same trick containers/testenv.Dockerfile uses.
@@ -231,7 +256,8 @@ COPY libs ./libs
 COPY bins ./bins
 COPY assets ./assets
 
-RUN cargo leptos build --release --frontend-only
+RUN --mount=type=secret,id=sccache,required=false \
+    with-sccache cargo leptos build --release --frontend-only
 
 # ---------------------------------------------------------------------------
 # Runtime libs stage: the shared libraries a distroless runtime image lacks.

@@ -55,7 +55,7 @@ def repo(tmp_path):
             f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n{deps}',
         )
         write(tmp_path, f"{name}/src/lib.rs", f"// {name}\n")
-    write(tmp_path, ".gitlab-ci.yml", "stages: [build]\n")
+    write(tmp_path, ".github/workflows/ci.yml", "on: [push]\n")
     write(tmp_path, "containers/testenv.Dockerfile", "FROM rust\n")
     git(tmp_path, "init", "-q")
     git(tmp_path, "config", "user.email", "ci@example.invalid")
@@ -112,24 +112,13 @@ def test_changes_when_the_lockfile_changes(repo):
 
 def test_changes_when_the_ci_definition_or_image_changes(repo):
     before = hash_of(repo)
-    write(repo, ".gitlab-ci.yml", "stages: [build, test]\n")
+    write(repo, ".github/workflows/ci.yml", "on: [push, pull_request]\n")
     commit(repo)
     after_ci = hash_of(repo)
     assert after_ci != before
     write(repo, "containers/testenv.Dockerfile", "FROM rust:1.90\n")
     commit(repo)
     assert hash_of(repo) != after_ci
-
-
-def test_changes_when_the_github_workflow_changes(repo):
-    """CI runs on GitHub Actions as well as GitLab while the forge moves, so a
-    pass marker must not survive an edit to either job definition."""
-    write(repo, ".github/workflows/ci.yml", "on: [push]\n")
-    commit(repo)
-    before = hash_of(repo)
-    write(repo, ".github/workflows/ci.yml", "on: [push, pull_request]\n")
-    commit(repo)
-    assert hash_of(repo) != before
 
 
 def test_changes_when_an_extra_path_changes(repo):
