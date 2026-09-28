@@ -375,12 +375,41 @@ jobs:
         with:
           path: .ci-passed
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  # Everything the NixOS tests need except running them, built once. Each
+  # test's `.driver` holds its machines' full system closures — the wayfinder
+  # packages included — so building all four drivers here, in one job, builds
+  # every package they share exactly once and pushes it to the R2 cache. The
+  # test jobs below then substitute their driver instead of each compiling the
+  # same workspace in parallel.
+  build-nixos-tests:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.nixos)
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          public-key: ${{ vars.NIX_CACHE_PUBLIC_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      - run: >-
+          nix build --print-build-logs --no-link .#wayfinder-simple.driver .#wayfinder-ethernet-egress.driver .#wayfinder-ca-provider.driver .#wayfinder-vpn-data-plane.driver
+      # Not `if: always()` as elsewhere: the tests only start once this job
+      # passes, so its push is what they substitute from.
+      - uses: ./.github/actions/nix-cache-push
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   # The NixOS integration tests (nix/tests), on `main` or on demand, as on
   # GitLab. They are systemd-nspawn container tests, so they need a real build
   # sandbox with `uid-range` — which a hosted runner, being a full VM, gives
   # where GitLab's docker runner could not (that needed the `privileged` one).
   # See `.gitlab-ci.yml`'s `test:nixos` for each setting's reason.
   test-nixos:
+    needs: build-nixos-tests
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.nixos)
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
