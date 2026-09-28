@@ -21,7 +21,7 @@ workspace = true
 [dependencies]
 # The management-API client. Every test drives a board through this and not
 # through a bespoke transport, so authenticating the board's port later
-# (GitLab #57) is a harness change rather than a rewrite of the tests.
+# (#59) is a harness change rather than a rewrite of the tests.
 wayfinder-client.workspace = true
 wayfinder-protos.workspace = true
 # The build identity of *this* checkout, to compare against what an attached

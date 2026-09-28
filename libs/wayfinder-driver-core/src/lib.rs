@@ -2365,7 +2365,7 @@ mod tests {
     /// A frame that arrived but did not parse is the *sender's* fault, and the
     /// sender can be anyone in radio range. Alarming on it would let a stranger
     /// keep an interface's `LinkErrors` row permanently latched and hide a real
-    /// link fault behind it (#75), so it is dropped at `trace!` like any other
+    /// link fault behind it (#77), so it is dropped at `trace!` like any other
     /// malformed peer input — and plans nothing, as every recv error does.
     #[test]
     fn a_malformed_frame_raises_no_alarm() {

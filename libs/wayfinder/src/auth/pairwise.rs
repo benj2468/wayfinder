@@ -554,7 +554,7 @@ impl<
     ///   and admits peers on their signatures. What keeps it latent rather than
     ///   exploitable is narrower than it used to be — no board constructs an
     ///   `OgmAuth` at all, because a bare-metal node cannot hold a membership
-    ///   credential until #52 persists one.
+    ///   credential until #54 persists one.
     ///
     ///   An *anchored* board is [`Clocked::AtLeast`], which judges windows, so
     ///   the rule does apply there and closes as boards gain anchors. It stays
@@ -613,7 +613,7 @@ impl<
             // its address. Left as it is deliberately: refusing to evict a
             // live entry instead would mean a full table could never admit a
             // new neighbor, which is a worse and more easily reached denial.
-            // See the MR for #48 and the follow-up it names.
+            // See the MR for #50 and the follow-up it names.
             if let Some(first) = self.neighbors.first_mut() {
                 *first = keys;
                 // The displaced member's keys are gone under its own address —

@@ -55,10 +55,15 @@ on:
         description: Run the NixOS integration tests (nix/tests)
         type: boolean
         default: false
-# A newer push to the same PR makes a running pipeline moot. `main` and tags
-# are never cancelled: half a deploy is worse than a redundant one.
+# A newer push to the same PR makes a running pipeline moot, so a PR's runs
+# share a group and the older is cancelled. Everything else — `main`, tags, a
+# dispatch — gets a group of its own (the run id) and never waits on another
+# run: a shared never-cancelling group would queue each merge's run behind the
+# whole of the previous one, and GitHub keeps only one pending run per group,
+# so a third merge in that window would silently displace the second's run.
+# What must not overlap is only `deploy`, which has its own job-level group.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 # `packages: read` is what lets a container job pull the rust-ci image from
 # ghcr with the job's own token; without it every pull is `denied`, even
@@ -357,9 +362,9 @@ jobs:
   # Three suites. The workspace; `wayfinder-server`'s `embedded` feature, off
   # by default because a host build must not pull `embedded-io-async`/
   # `embassy-sync`, so `--workspace` compiles neither the module nor its tests
-  # (#22); and `wayfinder-auth` with `compact-sha512`, since every board builds
+  # (#24); and `wayfinder-auth` with `compact-sha512`, since every board builds
   # SHA-512 rolled while the host builds it unrolled, so the RFC 8032 known
-  # answers are re-run on the board's build (#71).
+  # answers are re-run on the board's build (#73).
   #
   # Coverage on `main` only: instrumentation is a separate, slower build of the
   # whole workspace. The reports upload even from a red run — that is the run

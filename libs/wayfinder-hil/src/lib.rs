@@ -43,7 +43,7 @@
 //! A board's management port is currently unauthenticated: the embedded serve
 //! path dispatches straight to `handle_router` with no tier check, so anyone
 //! with the cable can `SetAuth` and `SetTime`. That is why this harness needs
-//! no credentials. It is tracked as GitLab #57, and **this crate must not
+//! no credentials. It is tracked as #59, and **this crate must not
 //! become the reason the port stays open** — every test drives a board through
 //! [`wayfinder_client::Client`], so authenticating the transport later is a
 //! change here and not a rewrite of the tests.

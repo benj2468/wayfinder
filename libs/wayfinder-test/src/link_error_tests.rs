@@ -1,4 +1,4 @@
-//! Link I/O error policy tests (issue #5).
+//! Link I/O error policy tests (issue #7).
 //!
 //! A mesh link's `send`/`recv` errors are transient by design — a serial
 //! cable wiggle, a radio brownout, a reconnecting transport returning

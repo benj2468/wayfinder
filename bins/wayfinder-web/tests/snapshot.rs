@@ -94,7 +94,7 @@ async fn snapshot_survives_a_node_that_is_not_a_certificate_authority() {
 /// The node refuses `GetLogs` and `ListVpnPeers` to the viewer tier, and this
 /// poll fails whole if any request in it fails — so asking for either would
 /// cost a viewer the entire dashboard, not just the pane they cannot see. That
-/// is the regression this guards: the fix for issue #32 narrowed the tier, and
+/// is the regression this guards: the fix for issue #34 narrowed the tier, and
 /// the client half has to stop asking in the same change.
 #[tokio::test]
 async fn a_read_only_poll_skips_the_admin_gated_queries() {

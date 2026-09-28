@@ -27,7 +27,7 @@
 //! the address its identity key derives, so the node's address is
 //! [`NodeRecord::mac`] — `Keypair::from_seed(&seed).derived_mac()` — and
 //! storing it beside the seed would be storing the same fact twice, with the
-//! two able to disagree. They did disagree: GitLab #58 is a board routing
+//! two able to disagree. They did disagree: #60 is a board routing
 //! under a FICR-derived address while holding a certificate naming another,
 //! found on real hardware by `libs/wayfinder-hil`.
 //!
@@ -279,7 +279,7 @@ impl NodeRecord {
     ///
     /// Derived rather than stored, so a certificate naming this MAC is by
     /// construction a certificate for the address the board routes under
-    /// (design 09 §5, and GitLab #58 for what happens when the two are allowed
+    /// (design 09 §5, and #60 for what happens when the two are allowed
     /// to be separate facts).
     pub fn mac(&self) -> Mac {
         self.keypair().derived_mac()
@@ -792,7 +792,7 @@ mod tests {
 
     /// **There is no MAC in the record.** It is `derived_mac()` of the seed's
     /// keypair, and storing it beside the seed would be storing the same fact
-    /// twice — which is exactly the defect GitLab #58 reports, in durable
+    /// twice — which is exactly the defect #60 reports, in durable
     /// form.
     #[test]
     fn the_mac_is_derived_from_the_seed_and_not_stored() {

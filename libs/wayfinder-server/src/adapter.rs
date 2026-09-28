@@ -1558,7 +1558,7 @@ impl<
         // `self_ident` is fixed at construction — a mid-flight address change
         // is a topology event every peer would have to be told about. That
         // window is legitimate and self-clearing, but it must not be *silent*:
-        // it is the state GitLab #58 was filed for, and the fault there was
+        // it is the state #60 was filed for, and the fault there was
         // that the only evidence was `GetNodeInfo`'s `node_id` disagreeing with
         // `GetSecurityStatus`'s `node_mac` for anyone who thought to look.
         //
@@ -3081,9 +3081,9 @@ mod tests {
     /// this node certified for one MAC and routing under another until the next
     /// boot derives the address from the seed just installed.
     ///
-    /// That window is exactly the state GitLab #58 was filed for — observed on
+    /// That window is exactly the state #60 was filed for — observed on
     /// hardware, `node_id=da18…` against `node_mac=663d…` — and the fault there
-    /// was that nothing reported it. Design 22 takes #58's option 3 (the
+    /// was that nothing reported it. Design 22 takes #60's option 3 (the
     /// address follows the seed) and keeps option 1's substance here: the node
     /// latches the condition itself, so an operator reads it over the API
     /// instead of noticing two fields disagree.

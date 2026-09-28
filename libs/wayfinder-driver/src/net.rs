@@ -1114,7 +1114,7 @@ mod tests {
     /// carrier the sender is anyone who can reach the port. It must surface as
     /// [`LinkError::MalformedFrame`] — which the driver drops without raising
     /// `LinkErrors` — not as `Io`, which would let that stranger keep the
-    /// interface's alarm latched (#75). Nor may it teach the hub a peer.
+    /// interface's alarm latched (#77). Nor may it teach the hub a peer.
     #[tokio::test]
     async fn a_runt_datagram_is_a_malformed_frame() {
         let mut hub_link = hub(addr(0)).await;

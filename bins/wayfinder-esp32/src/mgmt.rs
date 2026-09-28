@@ -45,7 +45,7 @@
 //! # Authentication
 //!
 //! Unauthenticated, **by decision rather than by omission** — the same posture
-//! `libs/wayfinder-hil` records for the nRF's mgmt port (#57). Physical access
+//! `libs/wayfinder-hil` records for the nRF's mgmt port (#59). Physical access
 //! to the cable is the boundary. Do not add a network-reachable transport on
 //! top of this without revisiting that.
 

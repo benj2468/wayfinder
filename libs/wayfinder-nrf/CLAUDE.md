@@ -217,7 +217,7 @@ supplies a `SettingsStore`, so a credential written over that port is
 *durable*: the cable changes the node's identity permanently, not until the
 next reset.
 
-**This is the accepted posture (GitLab #57, design 06 F7), not a gap to
+**This is the accepted posture (#59, design 06 F7), not a gap to
 re-file.** The port is USB on a board in someone's hand: whoever can reach it
 is standing next to the device, and on these boards that also means an SWD
 header that reads flash outright. A gate would not move that boundary, and it

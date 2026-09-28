@@ -5,13 +5,13 @@
 wall clock *load-bearing* on a board.
 
 One piece is deliberately carried forward rather than built here: §4.5's
-**persisted checkpoint**, which belongs with the credential #52 persists and is
+**persisted checkpoint**, which belongs with the credential #54 persists and is
 stated there as a constraint on that work. Everything else in this document is
 in the code, including the two decisions §6.2 and §9 left to the implementing
 session — recorded in §11 below.
 
-Owns GitLab #51, subsumes #54, unblocks #53, and imposes a hard constraint on
-#52 (§4.5). Two latent bugs in `main` are recorded in §2.2.
+Owns #53, subsumes #56, unblocks #55, and imposes a hard constraint on
+#54 (§4.5). Two latent bugs in `main` are recorded in §2.2.
 
 ## 1. Scope
 
@@ -79,7 +79,7 @@ oscillator drifted" is the wrong design for this hardware.
 
 ### 2.2 Two bugs the objection surfaced
 
-Neither is reachable today — no board runs auth — and both fire the moment #53
+Neither is reachable today — no board runs auth — and both fire the moment #55
 lands.
 
 **Bug A — the unclocked posture is applied inconsistently.** Four places treat
@@ -194,7 +194,7 @@ is performed identically under all three. Only *expiry* varies.
 `verify_ogm`'s cached-cert fast path (`auth.rs:1661`) takes the same posture,
 which is what makes Bug A's two fail-closed sites agree with the four advisory
 ones. The already-advisory sites keep their behaviour and gain an honest
-spelling. That is the whole of #54: with the posture explicit,
+spelling. That is the whole of #56: with the posture explicit,
 `identity_conflict`'s early return stops being an accident of sentinel choice
 and becomes a stated rule.
 
@@ -302,17 +302,17 @@ the last thing I wrote down". The deficit is *powered-off time plus time since
 the last checkpoint*, and it persists for the session. Behind is safe; ahead is
 not. This is precisely why the posture is `AtLeast` and not `At`.
 
-### 4.5 The checkpoint is a hard prerequisite on #52
+### 4.5 The checkpoint is a hard prerequisite on #54
 
 Today nothing survives a reset, because `identity.rs` persists only the `Mac`.
 A board boots uncredentialed and must be enrolled, which re-anchors it — so the
 reboot story is vacuous in the shipped scope and §4.4's boot rule has nothing to
 restore from.
 
-It stops being vacuous the moment #52 persists a credential, and that is the
+It stops being vacuous the moment #54 persists a credential, and that is the
 constraint this design hands forward:
 
-> **#52 must persist the clock checkpoint in the same blob as the credential,
+> **#54 must persist the clock checkpoint in the same blob as the credential,
 > written, loaded and erased with it.** A board that reloads a credential
 > without a checkpoint boots credentialed-and-`Unknown`, which is a supported
 > state but a needless one — and any attempt to fill the gap from the
@@ -323,7 +323,7 @@ because a board loses power without warning. The interval is a **wear trade-off,
 not a correctness one**: a coarser interval only widens the deficit, and can
 never make the clock wrong in the other direction. Two 4 KiB pages at roughly
 10 000 erase cycles is the budget; flash wear, rotation and erasure are already
-#52's questions, which is why the checkpoint belongs there rather than being
+#54's questions, which is why the checkpoint belongs there rather than being
 split across two designs.
 
 ### 4.6 The host side: only a clock that can be vouched for
@@ -524,7 +524,7 @@ something that reaches the wire. **Decided: option 1** — see §11.
 
 - **The superseded draft: an anchored clock as a hard dependency.** Rejected per
   §2.1. It also rested on "clocked iff credentialed", an invariant that held only
-  while nothing persisted a credential — i.e. it would have been broken by #52,
+  while nothing persisted a credential — i.e. it would have been broken by #54,
   the very next task in the epic.
 - **Skip *every* clock-specific operation on a board.** Fails on exactly one
   thing: §4.3's keep-alive bucket is a signed wire field, so one-sided skipping
@@ -564,7 +564,7 @@ something that reaches the wire. **Decided: option 1** — see §11.
   certificate verification); `interfaces` if a second crate needs it.
 - **Whether `GetNodeInfo`'s `clock_trusted` bool widens to an enum** or gains a
   sibling field. §7 requires the information, not the encoding.
-- **Checkpoint interval.** A wear question, deferred to #52 with the note that
+- **Checkpoint interval.** A wear question, deferred to #54 with the note that
   it is not a correctness knob (§4.5).
 - **Whether the STM32 board takes this at once.** Nothing here is nRF-specific.
 
@@ -630,7 +630,7 @@ Per `CLAUDE.md`, these land before the implementation they specify.
 16. `ClockSync::Unsupported` counts as trusted, so a macOS operator machine is
     not blocked.
 
-Tests 7 and 8 need `wayfinder-server`'s `embedded` feature, which per GitLab #22
+Tests 7 and 8 need `wayfinder-server`'s `embedded` feature, which per #24
 **never runs in CI**. That is a one-line CI fix and belongs in this MR;
 otherwise the tests proving the interop claim are the ones nothing runs.
 

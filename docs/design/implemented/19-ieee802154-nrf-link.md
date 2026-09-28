@@ -929,7 +929,7 @@ each for a stated reason:
   unrepresentable rather than merely rejected. Worth doing; too large to ride
   along here.
 - **This driver's `LinkMetrics::quality` was unscaled.** Fixed since — §12.7
-  records the mechanism and the conversion. Was issue #56.
+  records the mechanism and the conversion. Was issue #58.
 - **Bring-up degradation is logged, not latched.** A node running on one of
   three interfaces says so once, into a bounded ring that per-frame traffic
   evicts. `wayfinder-alarm` exists for exactly that, and neither
@@ -937,7 +937,7 @@ each for a stated reason:
   now names which links came up, which is the cheap half; the alarm is the
   right fix.
 
-### 12.7 The LQI scale (issue #56)
+### 12.7 The LQI scale (issue #58)
 
 `Packet::lqi()` was handed to `LinkMetrics::quality` raw, and it is not an
 LQI. It returns the correlator indicator the hardware appends after the
@@ -1001,7 +1001,7 @@ value survives; and `interop.rs`'s `assert_scaled_lqi` is the on-hardware
 check, asserting the best `dot15d4` row clears 128 — a floor an unscaled build
 is structurally incapable of reaching, since the correlator tops out at 63.
 
-**Other drivers set the field too**, contrary to how #56 was filed. Two, in
+**Other drivers set the field too**, contrary to how #58 was filed. Two, in
 fact: `at86rf233` passes its chip's appended byte, which is correct because
 the AT86RF23x appends a conformant IEEE `0..=255` LQI; and `PyLinkMetrics` in
 `wayfinder-py` exposes it to a Python simulation author as a settable field,

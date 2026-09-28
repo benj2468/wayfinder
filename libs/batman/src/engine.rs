@@ -4608,7 +4608,7 @@ mod tests {
         assert_eq!(low.classify(5u32.wrapping_add(1 << 31)), Implausible);
     }
 
-    /// Failure mode A of issue #29: the dedup table is filled with fabricated
+    /// Failure mode A of issue #31: the dedup table is filled with fabricated
     /// originators, which used to make every *subsequent* originator's
     /// broadcasts undeliverable for the life of the process ("table full, drop
     /// packet").  A full table must evict its least-recently-updated entry
@@ -4646,7 +4646,7 @@ mod tests {
         assert_eq!(bcast_high_water(&engine, 20), Some(1));
     }
 
-    /// Issue #36: the dedup table's occupancy gauge saturates on first contact
+    /// Issue #38: the dedup table's occupancy gauge saturates on first contact
     /// and stays pinned, so the only signal that separates a busy mesh from a
     /// ghost-originator flood is how often a full table has to evict. Filling
     /// the table and re-hearing a known originator must not count; each new
@@ -4682,7 +4682,7 @@ mod tests {
         assert_eq!(engine.broadcast_seqno.len(), 4, "table stays at capacity");
     }
 
-    /// Issue #36: a member whose broadcasts are being suppressed — its dedup
+    /// Issue #38: a member whose broadcasts are being suppressed — its dedup
     /// high-water pushed out of band, so every honest frame it sends is refused
     /// until the resync watch completes — must be countable without trace
     /// logging. Only the out-of-band refusals count: an exact duplicate (the
@@ -4760,7 +4760,7 @@ mod tests {
         );
     }
 
-    /// Failure mode B of issue #29: one unauthenticated frame carrying a
+    /// Failure mode B of issue #31: one unauthenticated frame carrying a
     /// victim's `orig` and `seqno = u32::MAX` used to pin that victim's
     /// high-water at the maximum, silencing it forever.  Measured by wrapping
     /// distance, `u32::MAX` sits six *behind* a high-water of five, so it is

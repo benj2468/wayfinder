@@ -3,7 +3,7 @@
 **Status:** Implemented — landed on `main` in `85dd963`. §9 records what the
 implementing session decided.
 
-Owns GitLab #59.
+Owns #61.
 
 ## 1. Scope
 
@@ -337,7 +337,7 @@ trusting any future size comparison between two checkouts.
   `just hil` does *not* flash — only `just hil-fresh` does — so this test turns
   "these hardware results are about firmware that is not the code under test"
   from an invisible condition into a red one. That was previously unknowable, and
-  is the second thing this change buys beyond answering #59's question.
+  is the second thing this change buys beyond answering #61's question.
 
 ## 10. Hardware validation
 

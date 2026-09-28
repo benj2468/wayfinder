@@ -119,7 +119,7 @@ impl Diagnostics {
 
         // The MAC is worth printing beside `node_id`: a credential binds a key
         // to a MAC, so the two disagreeing is a real condition, and it is
-        // invisible from either field alone (GitLab #58).
+        // invisible from either field alone (#60).
         let security = step("GetSecurityStatus", node.security_status())
             .await
             .map(|sec| {

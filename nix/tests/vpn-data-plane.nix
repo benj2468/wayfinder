@@ -12,7 +12,7 @@
 # It is also where a tunnel *registration* is revoked, for the same reason: a
 # revocation can only be checked against a node that really registered, and
 # every other test in the repo revokes a MAC whose preauth key was never spent.
-# See the last subtest — that gap is how #27 shipped.
+# See the last subtest — that gap is how #29 shipped.
 #
 # This is also the regression test for the relay gap it originally uncovered:
 # every stage but the last used to pass while the two spokes never saw each
@@ -504,7 +504,7 @@ testers.nixosTest {
         )
 
     with subtest("revoking a spoke's registration takes its node off the tunnel"):
-        # The regression this exists for (#27): `revoke` deleted only the
+        # The regression this exists for (#29): `revoke` deleted only the
         # per-MAC Headscale *user*, on the reasoning that this takes the node's
         # registrations with it. It does not — `enroll` tags every key it mints
         # and Headscale reassigns a tagged node to the synthetic

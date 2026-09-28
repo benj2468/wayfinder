@@ -28,7 +28,7 @@ with its defaults and no host node can choose another:
 |---|---|---|
 | originators (also sizes broadcast dedup, keepalive, proofs) | 128 | evicts the least recently heard |
 | identity table | 128 (100 live) | evicts; slot index is a `u8`, so no profile can exceed 254 |
-| neighbour keys (also sizes the cert-request and renewal rate limiters) | 64 | overwrites the first slot, which can be a live member (deliberate trade-off, #48) |
+| neighbour keys (also sizes the cert-request and renewal rate limiters) | 64 | overwrites the first slot, which can be a live member (deliberate trade-off, #50) |
 | multicast members | 64 | silently drops the rest |
 | revocations | 32 | evicts the live entry with the lowest flood budget |
 | in-flight cert requests / pending replies | 16 / 16 | refuses / overwrites |

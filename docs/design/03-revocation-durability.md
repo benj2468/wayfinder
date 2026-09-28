@@ -1,6 +1,6 @@
 # Design: Revocation durability — local persistence + peer catch-up + CA-pull reconciliation
 
-**Status:** Proposed. Grew out of issue #3's still-open "revocation
+**Status:** Proposed. Grew out of issue #5's still-open "revocation
 re-propagation" question, generalized beyond CA restart to any node restart.
 
 **Scope:** `libs/wayfinder-auth` (`RevocationRecord`; the durable-cache trait
@@ -44,7 +44,7 @@ which is retained unchanged as the steady-state propagation path.
 
 `OgmAuth.revocations` (`libs/wayfinder/src/auth.rs`) is bounded (`MAX_REVOKED`
 = 32), in-RAM, and **never persisted** — by design, since router state is a
-documented host-persistence non-goal (issue #3 scopes persistence to
+documented host-persistence non-goal (issue #5 scopes persistence to
 `wayfinder-server`'s `CertAuthority` only; the `no_std` core stays ephemeral).
 Meanwhile, propagation of a new revocation is a deliberately *one-shot* burst:
 each node that ingests a new record re-advertises it on its own OGMs for
@@ -586,7 +586,7 @@ shape) that refuses to answer the same requester more than once per window. See
   No wasted reply, no error.
 - **CA itself is down or unreachable long-term**: node stays stale
   indefinitely but keeps enforcing what it has and keeps getting peer top-ups;
-  this is the same degradation class issue #3 already accepted for CA
+  this is the same degradation class issue #5 already accepted for CA
   persistence (fail toward "keep working with what you have," not toward
   blocking).
 - **Partial CA reply (some pages lost)**: `last_reconciled_unix` is set only on

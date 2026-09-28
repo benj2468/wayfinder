@@ -1484,7 +1484,7 @@ mod tests {
     }
 
     /// `p` on the Routing tab queues a ping against the highlighted originator
-    /// — the one action reachable from that tab, and the whole of issue #25's
+    /// — the one action reachable from that tab, and the whole of issue #27's
     /// ask for the TUI.
     #[test]
     fn p_on_the_routing_tab_queues_a_ping_for_the_selection() {

@@ -210,7 +210,7 @@ trust boundary as a JTAG header.
 > whoever re-wires it, and is recorded in `libs/wayfinder-server/CLAUDE.md`
 > beside the transport it governs.
 
-**Resolved differently (2026-09-11, GitLab #57): the opt-in half of F7 is
+**Resolved differently (2026-09-11, #59): the opt-in half of F7 is
 withdrawn. The port stays unconditional, and the physical port is the trust
 boundary.**
 
@@ -222,7 +222,7 @@ straight to `handle_router` with no tier check — so `SetAuth` and `SetTime`
 are available to anything that can open `/dev/ttyACM*`. Design 20 made that
 path functional where it had previously rejected every certificate as
 not-yet-valid, and design 22 made its effect durable; between them a dormant
-gap became a live and permanent one, which is what prompted #57.
+gap became a live and permanent one, which is what prompted #59.
 
 The decision there was to **accept it and say so**, not to gate it:
 
@@ -657,7 +657,7 @@ resulted.
    a query and the second like a debugging convenience: the first is a read by
    shape but the mesh's admission credential by content, and the second
    changes what every sink on the node emits rather than merely observing one.
-   `GetLogs` joined them later (issue #32) as the clearest member of that
+   `GetLogs` joined them later (issue #34) as the clearest member of that
    class: it is an unambiguous read that returns whatever the process logged
    rather than a chosen set of fields, and on a provider that includes the
    account-administration records naming who may administer the mesh — so a
