@@ -307,13 +307,14 @@ fn the_host_profile_is_no_smaller_than_default_in_any_table() {
 /// the number is a proxy rather than a board's own — but every byte a table
 /// adds shows up here too. Design 26 widened the identity table's slot index to
 /// `u16` for every profile, which a board pays for (§3.1); anything more should
-/// be a decision someone makes, not a drift.
+/// be a decision someone makes, not a drift. The last raise, 12,240 → 12,248 B,
+/// is `BatmanEngine`'s out-of-band broadcast seqno refusal counter (3ee184e).
 #[test]
 fn embedded_router_size_is_pinned() {
     let size = size_of::<TinyRouter>();
     assert!(
-        size <= 12_240,
-        "a board-sized router is {size} B, up from 12,240 B; if that growth is \
+        size <= 12_248,
+        "a board-sized router is {size} B, up from 12,248 B; if that growth is \
          intended, raise this bound and say why in the commit"
     );
 }
