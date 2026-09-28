@@ -40,8 +40,8 @@ implementation, including the one gate that needed a per-board threshold.
 
 **Changed:**
 
-- **`justfile` / `.gitlab-ci.yml`** — `build-wl55jc`, `clippy-wl55jc`,
-  `stack-budget-wl55jc`, and the new crate in `build:embedded`.
+- **`justfile` / `.github/workflows/ci.yml`** — `build-wl55jc`, `clippy-wl55jc`,
+  `stack-budget-wl55jc`, and the new crate in `build-embedded`.
 
 **Explicitly not touched:**
 
@@ -207,15 +207,15 @@ that lands.
 > | relay, rebased | 219,532 | 31,692 |
 > | relay, rebased, `ring` off (§4.7) | 219,036 — **43,108 spare** | 27,564 |
 > | + management port, on `main` | 299,016 — **over by 36,872** | 43,984 |
-> | + float fields kept out of `core::fmt` (GitLab #69) and rolled SHA-512 (#71) | 276,104 — **over by 13,960** | 43,984 |
+> | + float fields kept out of `core::fmt` (#71) and rolled SHA-512 (#73) | 276,104 — **over by 13,960** | 43,984 |
 >
 > So `main` made the relay 4 KB larger in flash and 3 KB smaller in RAM, and
 > the port's shortfall *grew* before the size work began to close it. With the
 > port, 21,552 bytes are left for stack. The two changes in the last row cut
-> 22,912 bytes here; the remaining 13.6 KiB is #70's and #72's to find. The
+> 22,912 bytes here; the remaining 13.6 KiB is #72's and #74's to find. The
 > largest single consumers of that image by `cargo bloat --crates`:
 > `embassy_executor` 23.9 KiB (really this board's own task bodies inlined into
-> their polls, #72), `wayfinder_protos` 23.2, `curve25519_dalek` 15.0, `batman`
+> their polls, #74), `wayfinder_protos` 23.2, `curve25519_dalek` 15.0, `batman`
 > 12.9, `prost` 11.9, `wayfinder_driver_core` 10.0.
 
 For reference, the F411 image the design was planned against had statics of
@@ -655,10 +655,10 @@ the Trickle schedule, as its own design.
 ### 6.4 The management port is unauthenticated
 
 Unchanged and not made worse: the embedded serve path dispatches to
-`handle_router` with no tier check (GitLab #57), so anyone with the cable can
+`handle_router` with no tier check (#59), so anyone with the cable can
 `SetAuth`. This board adds one more part with that property, which is an
-argument for #57 and not a new hole. The HIL harness drives it through
-`wayfinder_client::Client`, so closing #57 stays a harness change rather than a
+argument for #59 and not a new hole. The HIL harness drives it through
+`wayfinder_client::Client`, so closing #59 stays a harness change rather than a
 test rewrite.
 
 ## 7. Observability
@@ -725,8 +725,8 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
   like the `Some(1)` case, none of them declares it, and the method's own docs
   say it is dead weight until design 17 lands. Worth settling once, for all of
   them, rather than per driver.
-- **How to fit the management port in 256 KB of flash — GitLab #73**, with
-  #69 (the `flt2dec` waste below), #70 (routing core), #71 (crypto) and #72
+- **How to fit the management port in 256 KB of flash — #75**, with
+  #71 (the `flt2dec` waste below), #72 (routing core), #73 (crypto) and #74
   (async platform) under it. The single largest open question, since without
   the port this board cannot be reached by `libs/wayfinder-hil`, cannot be
   enrolled, cannot renew (design 24), and has no observability at all once SWD
@@ -734,7 +734,7 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
 
   The gap is 28.8 KiB and splits into a bounded half and a decision:
 
-  - **~13 KiB is recoverable waste** with a known cause and fix (#69).
+  - **~13 KiB is recoverable waste** with a known cause and fix (#71).
     Necessary, and on its own not sufficient.
   - **The remaining ~16 KiB is a decision.** The cost is the protobuf
     dispatch — `handle_router` 13.3 KiB, `wayfinder_protos` 22.6 KiB, `prost`
@@ -742,7 +742,7 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
     cuts against `rpc_table!`'s declare-once contract, where a kind missing
     from the table does not compile *deliberately*, so that a request cannot
     become silently unanswerable. Changing that is a change to a shipped
-    crate's central invariant and **wants its own design doc**; #73 records it
+    crate's central invariant and **wants its own design doc**; #75 records it
     as unfiled.
 
 - **What the durable store costs.** Design 22's flash A/B store plus identity
@@ -759,7 +759,7 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
   `record_debug` and relies on those defaults (its `rtt.rs:172` comment says
   exactly that). Overriding the three on bare metal with integer-only
   rendering should reclaim it, and would shrink both nRF images too. Its own
-  small MR, since it touches a crate every target links. **GitLab #69.**
+  small MR, since it touches a crate every target links. **#71.**
 - **Whether `stack-budget.py` should validate `memory.x` against the chip**
   (§4.1). It passed on an image whose stack top was past the end of RAM. This
   design wants that gate, and it is arguably its own small MR.
@@ -777,7 +777,7 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
 | `libs/wayfinder-hil/src/inventory.rs` | `BoardKind::Stm32wl55Nucleo`, `chip()`, `has_probe()` |
 | `example.hil.toml` | a WL55 entry; correct the shared-serial comment (§4.9) |
 | `justfile` | `build-wl55jc`, `clippy-wl55jc`, `stack-budget-wl55jc`, wired into `build-embedded` / `clippy-embedded` / `stack-budget` / `clean-embedded` |
-| `.gitlab-ci.yml` | the new crate in `build:embedded` and `build:stack-budget` |
+| `.github/workflows/ci.yml` | the new crate in `build-embedded` and `build-stack-budget` |
 | `CLAUDE.md` | the new crate and board in the architecture map |
 
 ### Failing tests to write first
