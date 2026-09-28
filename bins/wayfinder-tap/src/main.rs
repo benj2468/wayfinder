@@ -1332,9 +1332,9 @@ mod tests {
     fn this_binary_holds_a_hub_sized_neighbour_table() {
         use wayfinder::router_ops::RouterOps;
         type TapAuth = <TapRouter as RouterOps>::Auth;
-        type HostAuth = <wayfinder::CentralRouter as RouterOps>::Auth;
+        type DefaultAuth = <wayfinder::CentralRouter as RouterOps>::Auth;
         assert!(
-            size_of::<TapAuth>() > 8 * size_of::<HostAuth>(),
+            size_of::<TapAuth>() > 8 * size_of::<DefaultAuth>(),
             "TapRouter's auth state is sized for default's neighbour table, not a hub's"
         );
     }

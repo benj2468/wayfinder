@@ -34,10 +34,10 @@ struct LruNode<Ident> {
 ///   head = MRU, tail = LRU.  Move-to-front and evict-tail are both O(1).
 /// - **Free-slot stack** (`free_stack`/`free_len`): O(1) slot allocation.
 ///
-/// At most `IDENT_TABLE_MAX` (100) live entries are kept.  When the table is
-/// full and a new identifier arrives, the tail (LRU entry) is evicted in O(1).
-/// The underlying heapless map is sized to `IDENT_TABLE_CAP` (128) because
-/// `FnvIndexMap` requires a power-of-two capacity.
+/// At most `MAX_LIVE` live entries are kept (100 at the `default` profile).
+/// When the table is full and a new identifier arrives, the tail (LRU entry)
+/// is evicted in O(1). The underlying heapless map is sized to `CAP` (128 at
+/// `default`) because `FnvIndexMap` requires a power-of-two capacity.
 pub struct IdentTable<
     Ident: MeshIdentifier,
     const CAP: usize = IDENT_TABLE_CAP,
@@ -62,8 +62,9 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
 {
     /// Slot indices are held as `u16` with `u16::MAX` reserved as the null
     /// sentinel, and the backing map is a `FnvIndexMap`, so a profile must keep
-    /// `CAP` a power of two below that and leave headroom above `MAX_LIVE` for
-    /// the map's load factor. (It was a `u8`, which — `CAP` being a power of two
+    /// `CAP` a power of two below that, with `MAX_LIVE <= CAP`. A full map still
+    /// works; profiles keep `MAX_LIVE` below `CAP` only so linear probing stays
+    /// short, which is a tuning choice rather than an invariant. (It was a `u8`, which — `CAP` being a power of two
     /// below the `u8::MAX` sentinel — capped every profile at 128
     /// live entries: fine for a board, not for a host node sized to its mesh.)
     const _INVARIANTS: () = {
@@ -628,7 +629,7 @@ mod tests {
     /// sized to the mesh, and the slot index used to be a `u8`, which capped
     /// every profile at a 128-slot table.
     #[test]
-    fn more_than_254_live_entries() {
+    fn more_live_entries_than_a_u8_index_allows() {
         let mut table = std::boxed::Box::new(IdentTable::<interfaces::frame::Mac, 512, 400>::new());
         for n in 0..400u16 {
             table.add_record(usize::from(n % 8), mac(n));

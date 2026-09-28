@@ -297,7 +297,7 @@ impl MeshSink for LoopOutput {
 /// point-to-point carriers and self-routing multi-access links can be mixed.
 ///
 /// Generic over the router type `R: RouterOps`, defaulting to [`CentralRouter`]
-/// at its host capacities — the way `wayfinder-embedded-driver`'s `Driver`
+/// at the `default` profile's capacities — the way `wayfinder-embedded-driver`'s `Driver`
 /// already is (design 26 phase 1 slice 2). The event loop, planning and
 /// dispatch are expressed against `R` alone; the management-API surface
 /// (`router_handle`, `with_router`/`with_router_mut`, `run`/`run_once`/
@@ -440,7 +440,8 @@ pub struct Driver<Local: FrameIo, R: RouterOps = CentralRouter> {
 }
 
 /// Whether `n` configured mesh links exceed router type `R`'s own interface
-/// capacity ([`RouterOps::INTERFACES`]), not a fixed host constant.
+/// capacity ([`RouterOps::INTERFACES`]), not the fixed crate constant
+/// [`wayfinder::MAX_INTERFACES`].
 ///
 /// Pulled out of [`Driver::new`] as a pure function so the bound it checks —
 /// which varies by capacity profile — is assertable directly, rather than
@@ -3760,7 +3761,7 @@ mod tests {
     }
 
     /// `Driver::new` must warn about a link count past the router's own
-    /// capacity, not past a fixed host constant.
+    /// capacity, not past the fixed crate constant `wayfinder::MAX_INTERFACES`.
     ///
     /// `wayfinder::MAX_INTERFACES` is `batman::MAX_INTERFACES` (8) — the
     /// `default` profile's own interface count, but not every profile's.
@@ -3881,7 +3882,7 @@ mod tests {
     /// test runs on an ordinary test thread, so building the router inline
     /// aborts the process with a stack overflow rather than failing an assert.
     #[tokio::test]
-    async fn a_cloud_profile_driver_builds_on_an_ordinary_thread() {
+    async fn a_host_profile_driver_builds_on_an_ordinary_thread() {
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(1);
         let driver: Driver<NeverIo, HostRouter> = Driver::new(
             mac(1),
@@ -3913,7 +3914,7 @@ mod tests {
     /// its loop on: `driver.run()` is awaited on the main thread, which gets
     /// the platform's 8 MiB default rather than a spawned thread's 2 MiB.
     #[test]
-    fn a_cloud_profile_driver_installs_a_credential_over_set_auth() {
+    fn a_host_profile_driver_installs_a_credential_over_set_auth() {
         const MAIN_THREAD_STACK: usize = 8 << 20;
         std::thread::Builder::new()
             .stack_size(MAIN_THREAD_STACK)
@@ -3922,14 +3923,14 @@ mod tests {
                     .enable_all()
                     .build()
                     .unwrap()
-                    .block_on(install_a_credential_on_a_cloud_driver());
+                    .block_on(install_a_credential_on_a_host_driver());
             })
             .unwrap()
             .join()
             .unwrap();
     }
 
-    async fn install_a_credential_on_a_cloud_driver() {
+    async fn install_a_credential_on_a_host_driver() {
         let seed = [3u8; 32];
         let kp = Keypair::from_seed(&seed);
         let mac_addr = kp.derived_mac();

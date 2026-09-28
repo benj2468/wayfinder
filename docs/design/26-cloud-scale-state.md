@@ -122,7 +122,7 @@ CSRs, enrollment policy, users and invites in one JSON document,
 
 - **Naming.** The profile was proposed as `cloud` and shipped as `host`:
   `wayfinder-tap` runs on Linux gateways and laptops as well as in the cloud,
-  and all of them get it (§3.1's measurements are why that costs nothing
+  and all of them get it (the measurements below are why that costs nothing
   worth a second build). The previous `host` profile, `CentralRouter`'s
   default capacities, is now `default`; it stays small because tests, the
   simulator and the tick driver build routers on ordinary thread stacks.

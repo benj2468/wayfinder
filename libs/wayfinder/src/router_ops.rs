@@ -56,7 +56,6 @@ use crate::LocalSendError;
 use crate::McastPlan;
 use crate::RxOutcome;
 use crate::auth::OgmAuth;
-use crate::auth::VerifiedRenewal;
 use crate::features::LinkFeatures;
 use interfaces::engine::FrameSink;
 
@@ -381,10 +380,6 @@ pub trait RouterOps {
     /// persist it. See [`CentralRouter::take_self_revocation`].
     fn take_self_revocation(&mut self) -> Option<wayfinder_auth::RevocationRecord>;
 
-    /// Take a verified renewal request another node addressed to this one, if
-    /// any is waiting. See [`CentralRouter::take_renewal_request`].
-    fn take_renewal_request(&mut self) -> Option<VerifiedRenewal>;
-
     /// Advance both of the router's clocks and reconcile the engine's next-hop
     /// proofs against the key material behind them.
     ///
@@ -704,10 +699,6 @@ impl<
     fn take_self_revocation(&mut self) -> Option<wayfinder_auth::RevocationRecord> {
         Self::take_self_revocation(self)
     }
-
-    fn take_renewal_request(&mut self) -> Option<VerifiedRenewal> {
-        Self::take_renewal_request(self)
-    }
 }
 
 impl<
@@ -851,17 +842,18 @@ mod tests {
     /// diverges, the trait is leaking capacity into behaviour.
     #[test]
     fn one_generic_signature_drives_both_profiles_identically() {
-        let mut host: CentralRouter = CentralRouter::new(mac(1));
+        let mut default_router: CentralRouter = CentralRouter::new(mac(1));
         let mut tiny = TinyRouter::with_capacities(mac(1));
 
-        let mut host_buf = [0u8; 256];
+        let mut default_buf = [0u8; 256];
         let mut tiny_buf = [0u8; 256];
 
-        let host_ogm = drive_one_ogm(&mut host, &mut host_buf).expect("host emits an OGM");
+        let default_ogm = drive_one_ogm(&mut default_router, &mut default_buf)
+            .expect("default router emits an OGM");
         let tiny_ogm = drive_one_ogm(&mut tiny, &mut tiny_buf).expect("tiny emits an OGM");
 
         assert_eq!(
-            host_ogm, tiny_ogm,
+            default_ogm, tiny_ogm,
             "a capacity profile must not change the OGM a node originates"
         );
     }
@@ -892,13 +884,13 @@ mod tests {
             router.originator_count()
         }
 
-        let mut host: CentralRouter = CentralRouter::new(mac(1));
+        let mut default_router: CentralRouter = CentralRouter::new(mac(1));
         let mut tiny = TinyRouter::with_capacities(mac(1));
 
         assert_eq!(
-            receive(&mut host, &ogm),
+            receive(&mut default_router, &ogm),
             1,
-            "host router should learn the originator through the trait"
+            "default router should learn the originator through the trait"
         );
         assert_eq!(
             receive(&mut tiny, &ogm),

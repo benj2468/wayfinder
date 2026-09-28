@@ -51,10 +51,10 @@ type TinyRouter = crate::router_for!(embedded);
 #[test]
 fn tiny_router_profile_is_substantially_smaller() {
     let tiny = size_of::<TinyRouter>();
-    let host = size_of::<CentralRouter>();
+    let default_router = size_of::<CentralRouter>();
     assert!(
-        tiny * 4 < host,
-        "tiny router ({tiny} B) should be well under a quarter of host ({host} B)"
+        tiny * 4 < default_router,
+        "tiny router ({tiny} B) should be well under a quarter of default ({default_router} B)"
     );
 }
 
@@ -90,21 +90,21 @@ fn router_defaults_preserve_todays_capacities() {
 fn tiny_router_originates_the_same_frame_as_a_default_router() {
     let now = Duration::from_secs(1);
     let mut tiny = TinyRouter::with_capacities(mac(1));
-    let mut host = CentralRouter::new(mac(1));
+    let mut default_router = CentralRouter::new(mac(1));
 
     let payload = [0xAAu8; 32];
     let mut tiny_buf = [0u8; 256];
-    let mut host_buf = [0u8; 256];
+    let mut default_buf = [0u8; 256];
 
     let tiny_frame = tiny
         .handle_local(now, mac(2), &payload, &mut tiny_buf)
         .expect("tiny router originates");
-    let host_frame = host
-        .handle_local(now, mac(2), &payload, &mut host_buf)
-        .expect("host router originates");
+    let default_frame = default_router
+        .handle_local(now, mac(2), &payload, &mut default_buf)
+        .expect("default router originates");
 
-    assert_eq!(tiny_frame.protocol, host_frame.protocol);
-    assert_eq!(tiny_frame.payload, host_frame.payload);
+    assert_eq!(tiny_frame.protocol, default_frame.protocol);
+    assert_eq!(tiny_frame.payload, default_frame.payload);
 }
 
 /// The interface bound must follow the profile: a two-interface router has to
@@ -128,9 +128,9 @@ fn link_features_respect_the_profile_interface_bound() {
     );
 
     // The default profile still admits it, so the bound really is per-profile.
-    let mut host = CentralRouter::new(mac(1));
-    host.set_link_features(2, features);
-    assert_eq!(host.num_interfaces(), 3);
+    let mut default_router = CentralRouter::new(mac(1));
+    default_router.set_link_features(2, features);
+    assert_eq!(default_router.num_interfaces(), 3);
 }
 
 // ── The individual tables ─────────────────────────────────────────────────
@@ -236,13 +236,13 @@ fn occupancy_gauges_report_the_profile_capacity() {
 /// The default profile keeps reporting today's numbers, so this is a fix to the
 /// *profiled* case rather than a change to what a gateway says.
 #[test]
-fn a_host_router_still_reports_the_crate_capacities() {
-    let host = CentralRouter::new(mac(1));
+fn a_default_router_still_reports_the_crate_capacities() {
+    let default_router = CentralRouter::new(mac(1));
 
-    assert_eq!(host.originator_occupancy(), (0, 128));
-    assert_eq!(host.broadcast_dedup_occupancy(), (0, 128));
-    assert_eq!(host.local_mcast_occupancy(), (0, 16));
-    assert_eq!(host.mcast_member_occupancy(), (0, 64));
+    assert_eq!(default_router.originator_occupancy(), (0, 128));
+    assert_eq!(default_router.broadcast_dedup_occupancy(), (0, 128));
+    assert_eq!(default_router.local_mcast_occupancy(), (0, 16));
+    assert_eq!(default_router.mcast_member_occupancy(), (0, 64));
 }
 
 /// The `host` profile is sized so no mesh we run gets near it (design 26 §3).
@@ -307,8 +307,9 @@ fn the_host_profile_is_no_smaller_than_default_in_any_table() {
 /// the number is a proxy rather than a board's own — but every byte a table
 /// adds shows up here too. Design 26 widened the identity table's slot index to
 /// `u16` for every profile, which a board pays for (§3.1); anything more should
-/// be a decision someone makes, not a drift. The last raise, 12,240 → 12,248 B,
-/// is `BatmanEngine`'s out-of-band broadcast seqno refusal counter (3ee184e).
+/// be a decision someone makes, not a drift. Pinned at 12,248 B: 12,240 after
+/// the `u16` widening, plus 8 for `BatmanEngine`'s out-of-band broadcast seqno
+/// refusal counter (3ee184e).
 #[test]
 fn embedded_router_size_is_pinned() {
     let size = size_of::<TinyRouter>();

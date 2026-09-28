@@ -51,7 +51,7 @@ wayfinder::define_profile! {
     ///
     /// **Not optional on this part.** `Driver::new` builds at the default
     /// `default` capacities — 128 originators, 8 interfaces, 2048-byte frames —
-    /// which is a Linux gateway's sizing and overflows this part's 128 KB of
+    /// which is sized for a host with RAM to spare and overflows this part's 128 KB of
     /// SRAM outright: `.bss` does not fit, by ~9 KB. That went unnoticed
     /// because `memory.x` claimed the nRF52840's 256 KB, so the link
     /// succeeded against RAM the STM32F411RE does not have.

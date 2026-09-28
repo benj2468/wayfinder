@@ -1100,19 +1100,19 @@ mod tests {
     fn auth_defaults_preserve_todays_capacities() {
         assert_eq!(
             core::mem::size_of::<OgmAuth>(),
-            core::mem::size_of::<HostAuth>()
+            core::mem::size_of::<DefaultAuth>()
         );
     }
 
     /// The point of the exercise: a small profile must actually reclaim RAM.
-    /// `neighbors` alone is 64 × 360 bytes at host capacity.
+    /// `neighbors` alone is 64 × 360 bytes at `default` capacity.
     #[test]
     fn tiny_auth_profile_is_substantially_smaller() {
         let tiny = core::mem::size_of::<TinyAuth>();
-        let host = core::mem::size_of::<HostAuth>();
+        let default_auth = core::mem::size_of::<DefaultAuth>();
         assert!(
-            tiny * 4 < host,
-            "tiny profile ({tiny} B) should be well under a quarter of host ({host} B)"
+            tiny * 4 < default_auth,
+            "tiny profile ({tiny} B) should be well under a quarter of default ({default_auth} B)"
         );
     }
 

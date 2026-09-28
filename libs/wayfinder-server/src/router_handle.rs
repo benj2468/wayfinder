@@ -70,8 +70,8 @@ use crate::authority_task::EnrollmentPolicyRx;
 /// also what stops a read from observing a router that has been re-keyed while
 /// the seed still names the old identity.
 ///
-/// Generic over the router type, defaulting to [`CentralRouter`] at its host
-/// capacities, so `wayfinder-driver`'s `Driver<Local, R>` can hold one at any
+/// Generic over the router type, defaulting to [`CentralRouter`] at the
+/// `default` profile's capacities, so `wayfinder-driver`'s `Driver<Local, R>` can hold one at any
 /// `R: RouterOps` (design 26 phase 1 slice 2).
 pub struct SharedRouter<R = CentralRouter> {
     /// The routing engine. `&mut` only ever through the driver's write guard.

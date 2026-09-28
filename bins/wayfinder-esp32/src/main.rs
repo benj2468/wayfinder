@@ -74,7 +74,7 @@ wayfinder::define_profile! {
     ///
     /// Sized against the 192 KB of DRAM `esp-hal` actually gives the
     /// application (see the module docs), which statics and stack share. The
-    /// host defaults `Driver::new` would use are a Linux gateway's — 128
+    /// `default` capacities `Driver::new` would use are a host's — 128
     /// originators, 8 interfaces, 2048-byte frames — and naming a profile is
     /// how the STM32F411 avoided discovering that at link time.
     ///

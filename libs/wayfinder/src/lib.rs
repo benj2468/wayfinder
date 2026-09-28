@@ -62,7 +62,9 @@ pub use crate::link_quality::LinkQualityRecord;
 
 crate::define_profile! {
     /// The default capacities a `CentralRouter` is built with when no profile is
-    /// named — sized for a Linux gateway. Downstream crates whose own defaults
+    /// named. Small enough to build on an ordinary thread's stack, which tests,
+    /// the simulator and the tick driver do; a gateway binary names [`host`]
+    /// instead (design 26). Downstream crates whose own defaults
     /// must match the router's name this rather than repeating the literals;
     /// `router_defaults_preserve_todays_capacities` pins the two together.
     pub default {
