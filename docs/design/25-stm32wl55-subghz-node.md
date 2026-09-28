@@ -880,9 +880,9 @@ Recorded as the design is built, per `docs/design/README.md`.
   now runs at 12%.** After the rebase onto `main` the `main` task's poll
   measures 2,788 bytes, not 6,820, and the stack region 37,968, so the justfile
   recipe carries the current numbers and a tighter share. The poll is reserved
-  with Thumb-2 `subw`, which `stack-budget.py` reads as a zero-byte frame until
-  MR !199 teaches it the encoding; before that lands, this board's gate
-  measures only the radio task.
+  with Thumb-2 `subw`, which `stack-budget.py` read as a zero-byte frame until
+  92a2100 taught it the encoding; without that fix this board's gate measures
+  only the radio task.
   What follows is the original reasoning, kept for the record.
 
 - **Transmit goes through a queue to the radio task, not a `Mutex<LoRa>`** as

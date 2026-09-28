@@ -483,8 +483,8 @@ stack-budget-stm32f411: build-stm32f411
 # That 6,820 was measured before this board was rebased onto the footprint
 # work on main; the same poll now measures 2,788 (which change shrank it was
 # not pinned down). It is reserved with Thumb-2 `subw sp, sp, #0xae4`, so it
-# is only visible to a `stack-budget.py` that counts `subw` (MR !199) -- one
-# that does not reads this poll as zero and passes it at any percentage.
+# is only visible because `stack-budget.py` counts `subw` (92a2100) -- a gate
+# that did not read this poll as zero and passed it at any percentage.
 #
 # The body chain, checked as the guidance requires: the two task polls reserve
 # 2,788 + 1,220 = 4,008 bytes for the node's life, and the deepest transient
