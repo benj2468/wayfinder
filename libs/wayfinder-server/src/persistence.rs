@@ -1303,8 +1303,8 @@ mod tests {
         })
     }
 
-    /// `mutate_issued_and_held` is backed by a single [`Persisted::mutate`]
-    /// call, so a persist failure must roll back *both* collections
+    /// `mutate_issued_and_held` is one mutation committed in one store
+    /// transaction, so a persist failure must roll back *both* collections
     /// together — never leaving one mutation durably applied while the
     /// other silently reverts. This is the actual mechanism
     /// `CertAuthority::approve_csr` relies on (see this method's own doc for
@@ -1337,7 +1337,7 @@ mod tests {
         });
         assert!(
             persisted.is_err(),
-            "the write should have failed: its directory is gone"
+            "the write should have failed: commits are doomed"
         );
 
         assert_eq!(
@@ -1438,7 +1438,7 @@ mod tests {
         });
         assert!(
             persisted.is_err(),
-            "the write should have failed: its directory is gone"
+            "the write should have failed: commits are doomed"
         );
 
         assert_eq!(
@@ -1492,7 +1492,7 @@ mod tests {
         });
         assert!(
             persisted.is_err(),
-            "the write should have failed: its directory is gone"
+            "the write should have failed: commits are doomed"
         );
 
         assert!(

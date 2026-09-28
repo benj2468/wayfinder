@@ -214,9 +214,9 @@ catch-up parts stay design 03's own.
   meant making it async end to end or blocking a tokio worker per write. The
   `CaStore` trait (load everything; commit one change set atomically) is still
   the seam a PostgreSQL backend plugs into.
-- **Rows keyed by content.** None of the collections has a unique natural key
-  (the issued log keeps every certificate a MAC was given), and `authority.rs`
-  mutates whole `Vec`s through `CaLog`'s sealed `mutate_*` closures. So a row is
+- **Rows keyed by content.** The collections have no stored key column to
+  index on (the issued log is one record per MAC only because every write
+  replaces by MAC), and `authority.rs` mutates whole `Vec`s through `CaLog`'s sealed `mutate_*` closures. So a row is
   `(id, collection, body)`, and a mutation re-encodes only the collections it
   touched, diffs them against an index of stored bodies, and commits the
   deleted and inserted rows in one transaction. `authority.rs` is unchanged
