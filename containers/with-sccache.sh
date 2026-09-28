@@ -22,7 +22,14 @@ if [ -s "$secret" ]; then
   . "$secret"
   set +a
   RUSTC_WRAPPER=/usr/local/bin/sccache
-  export RUSTC_WRAPPER
+  # A Unix socket in this RUN's own filesystem, not sccache's default TCP port.
+  # BuildKit's RUN steps share one network namespace, and a multi-platform
+  # build runs the amd64 and arm64 builders at once: on a shared 127.0.0.1:4226
+  # the second builder's compiles reach the first's server, which runs rustc
+  # inside the *other* container — where the target's std is not installed
+  # ("can't find crate for `core`"). A socket path cannot be shared that way.
+  SCCACHE_SERVER_UDS=/tmp/sccache.sock
+  export RUSTC_WRAPPER SCCACHE_SERVER_UDS
 fi
 
 "$@"
