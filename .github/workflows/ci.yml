@@ -14,8 +14,9 @@
 # - **Images.** The rust-ci image goes to ghcr.io instead of
 #   registry.haganah.net, under the same content-hash tag. ghcr is served over
 #   TLS, so the insecure-registry buildkitd config is gone.
-# - **sccache** uses the GitHub Actions cache backend instead of a volume on the
-#   runner host, since a hosted runner keeps nothing between jobs.
+# - **sccache** uses an R2 bucket instead of a volume on the runner host, since
+#   a hosted runner keeps nothing between jobs, falling back to the Actions
+#   cache for a run with no secrets (see `.github/actions/sccache`).
 # - **Pass markers** (`scripts/ci-cached.sh`) move from `/sccache/ci-passed` to
 #   an `actions/cache` entry per job. A marker lost to cache eviction or a race
 #   between two branches only means a step runs again; a marker is still only
@@ -65,8 +66,8 @@ env:
   # sccache cannot cache incrementally-compiled crates, and a fresh runner has
   # no incremental state to reuse anyway.
   CARGO_INCREMENTAL: "0"
+  # Which store it uses is `.github/actions/sccache`'s choice, per job.
   RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 jobs:
   # The rust-ci image tag: a hash of containers/testenv.Dockerfile's content.
   # Built and pushed only when that exact content is not in ghcr yet.
@@ -159,7 +160,12 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: sccache --show-stats
   build-embedded:
@@ -175,7 +181,12 @@ jobs:
       CI_JOB_NAME: build-embedded
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - uses: actions/cache/restore@v4
         with:
           path: .ci-passed
@@ -203,7 +214,12 @@ jobs:
       CI_JOB_NAME: build-stack-budget
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - uses: actions/cache/restore@v4
         with:
           path: .ci-passed
@@ -232,7 +248,12 @@ jobs:
       CI_JOB_NAME: build-web
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - uses: actions/cache/restore@v4
         with:
           path: .ci-passed
@@ -261,7 +282,12 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       # Coverage on `main` only, as on GitLab.
       - run: |
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then RUN="cargo llvm-cov nextest --no-report"; else RUN="cargo nextest run"; fi
@@ -293,7 +319,12 @@ jobs:
       CI_JOB_NAME: test-alloc-gate
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - uses: actions/cache/restore@v4
         with:
           path: .ci-passed
@@ -318,7 +349,12 @@ jobs:
       CI_JOB_NAME: test-python
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - uses: actions/cache/restore@v4
         with:
           path: .ci-passed
@@ -386,7 +422,12 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       - run: cargo bench -p wayfinder-bench
       - uses: actions/upload-artifact@v4
         if: always()
