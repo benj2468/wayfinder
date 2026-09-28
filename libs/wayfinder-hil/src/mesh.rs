@@ -54,7 +54,7 @@
 //!   to a MAC, so before the reset this node's OGMs carry an originator its
 //!   credential does not name and a clocked peer should refuse them.
 //!
-//! This used to be GitLab #58 — a board whose address was FICR-derived and
+//! This used to be #60 — a board whose address was FICR-derived and
 //! could therefore *never* match its certificate, on any boot. Design 22 made
 //! the board seed-derived, so the two agree by construction and the divergence
 //! is bounded by one restart. Two notes kept from that entry:
@@ -63,7 +63,7 @@
 //!   *empty* seed — is the other shape, and it checks the certificate's MAC
 //!   against the node's rather than being exempt as the wholesale install is.
 //!   It needs the board's public key, so it wants a CSR step here rather than
-//!   a locally minted seed. That is the enrolment path, GitLab #53.
+//!   a locally minted seed. That is the enrolment path, #55.
 //! - **Do not try to avoid the window by grinding a keypair** to match some
 //!   address the board already has. The MAC is a hash of the public key; that
 //!   was never a fixture problem.
@@ -283,7 +283,7 @@ impl TestMesh {
     /// **no reboot is involved**: the address does not change, and the
     /// credential is usable the moment it lands.
     ///
-    /// It is also the shape real enrolment takes (GitLab #53). The node's
+    /// It is also the shape real enrolment takes (#55). The node's
     /// public keys come off `GetSecurityStatus` — an un-enrolled node reports
     /// them, which is exactly what makes this possible — and the subject is
     /// *derived* from the Ed25519 key rather than taken from the node's word

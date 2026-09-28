@@ -612,7 +612,7 @@ mod tests {
     ///
     /// A CRC failure is off-air corruption — noise, a collision, or anyone on
     /// the channel transmitting garbage — so it is `MalformedFrame`, which does
-    /// not latch the interface's `LinkErrors` alarm (#75).
+    /// not latch the interface's `LinkErrors` alarm (#77).
     #[test]
     fn map_err_distinguishes_known_variants() {
         assert!(matches!(

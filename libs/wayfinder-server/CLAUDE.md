@@ -370,7 +370,7 @@ outright, and a challenge-response would be a real protocol on a link with no
 connection boundary to hang it off.
 
 F7 also asked, at the time, that the port be brought up only when a board is
-configured to. **That half was withdrawn in GitLab #57 (2026-09-11): the port
+configured to. **That half was withdrawn in #59 (2026-09-11): the port
 is unconditional, and that is the accepted posture, not an unmet requirement.**
 Both nRF boards bring the CDC-ACM port up whenever USB init succeeds
 (`libs/wayfinder-nrf/src/node.rs`'s `usb_mgmt::init`) — no feature flag, no

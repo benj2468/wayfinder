@@ -2,7 +2,7 @@
 //!
 //! Every test drives a node through [`wayfinder_client::Client`] and never
 //! through a transport of its own. That is deliberate: the board's port is
-//! unauthenticated today (GitLab #57), and when it stops being so, this is the
+//! unauthenticated today (#59), and when it stops being so, this is the
 //! one place that changes.
 
 use std::time::Duration;

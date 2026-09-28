@@ -2216,10 +2216,10 @@ impl MeshAuthority for CertAuthority {
         // `RevocationRecord` `not_after` at `now + cert_ttl_secs`, so it
         // outlives the certificate it cancels, and this log row does not.
         // Between the row expiring and the revocation expiring the MAC was free
-        // again — issue #37, and a stranger issued in that window got a
+        // again — issue #39, and a stranger issued in that window got a
         // certificate post-dating the revocation and honoured mesh-wide.
         //
-        // **Closed**, and closed more completely than #37's planned fix
+        // **Closed**, and closed more completely than #39's planned fix
         // (consulting persisted revocations): since design 09 §5's key↔address
         // binding, `check_mac_derives_from` above has already refused any key
         // but the one that derives this address, at any time, expired record or
@@ -4443,7 +4443,7 @@ mod tests {
             "a rejected claim parked a held entry for the MAC"
         );
 
-        // Issue #37's window, folded in from the test that used to pin it open.
+        // Issue #39's window, folded in from the test that used to pin it open.
         //
         // The lock read off the issued record was strictly shorter than the
         // revocation that made it matter: `revoke` stamps the record's
@@ -4454,7 +4454,7 @@ mod tests {
         // mesh-wide.
         //
         // The key↔address binding closes it, and closes it more completely than
-        // the fix #37 anticipated (consulting persisted revocations): the
+        // the fix #39 anticipated (consulting persisted revocations): the
         // address is not this key's to claim at *any* time, so there is no
         // window to be inside.
         ca.set_now_unix(1101); // past the issued row's `not_after` of 1100

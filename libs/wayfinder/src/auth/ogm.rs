@@ -370,7 +370,7 @@ impl<
         // The certificate really is CA-signed and its signature really does
         // check out, so this stays a decision about what the node *caches*.
         //
-        // Since issue #16 (design 09 §5) landed, a certificate cannot name an
+        // Since issue #18 (design 09 §5) landed, a certificate cannot name an
         // address its key does not derive, so a second *certified* key for one
         // address no longer reaches here at all — `verify_cert` refuses it
         // first. What survives for this to catch is a `derive_mac` collision:

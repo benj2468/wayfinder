@@ -12,7 +12,7 @@
 //!
 //! - **A board's address is derived from its identity seed.** Before that an
 //!   nRF board's MAC came from FICR, so no certificate could name the address
-//!   it routed under (GitLab #58) — and a peer performing the key↔address
+//!   it routed under (#60) — and a peer performing the key↔address
 //!   binding check should have refused its OGMs. A two-node authenticated test
 //!   was not merely unwritten, it could not have passed.
 //! - **A board can be certified in place.** `TestMesh::certify` uses
@@ -148,7 +148,7 @@ async fn two_boards_on_one_mesh_route_to_each_other() -> anyhow::Result<()> {
 /// is the ambiguous band, so the floor goes above it.
 const DESK_RANGE_LQI_FLOOR: u32 = 128;
 
-/// **The scale half of GitLab #56, which no host test can reach.**
+/// **The scale half of #58, which no host test can reach.**
 ///
 /// `ieee_lqi`'s unit tests pin the mapping against the Product Specification,
 /// and `capture_reports_a_scaled_lqi` pins the wiring — but both are arguments

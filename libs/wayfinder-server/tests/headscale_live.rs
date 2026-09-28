@@ -21,7 +21,7 @@
 //! needing a node to have *registered*. That takes a real `tailscaled`, which a
 //! cargo test has no way to bring up. This file used to claim it checked
 //! "whether deleting a user takes its nodes with it" — it does not, and the
-//! answer turned out to be no for exactly the nodes this system creates (#27:
+//! answer turned out to be no for exactly the nodes this system creates (#29:
 //! a tagged node belongs to the synthetic `tagged-devices` user, not to its
 //! MAC's). `nix/tests/vpn-data-plane.nix` is where a registered node is
 //! revoked.
@@ -93,7 +93,7 @@ async fn mints_revokes_and_is_idempotent() {
     // representation. That gap is how a dead correlation shipped: every live
     // assertion here passed while `vpn list` could not name a single peer.
     //
-    // The same gap swallowed #27 a second time, one call further on: `revoke`
+    // The same gap swallowed #29 a second time, one call further on: `revoke`
     // below removes a user that owns no node, so the case that was broken —
     // deleting a node that really registered — is never reached. Twice now, so
     // treat a green run of this file as evidence about the *wire format* only,

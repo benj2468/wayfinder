@@ -116,7 +116,7 @@ async fn set_time_anchors_forward_and_refuses_to_roll_back() -> anyhow::Result<(
 }
 
 /// Design 21 §5's test 3, **flipped**, which is what its previous form said to
-/// do when GitLab #52 landed.
+/// do when #54 landed.
 ///
 /// It used to assert that a reset returned the board to `Unknown`, because
 /// nothing persisted a clock checkpoint. Design 22 persists one, in the same
@@ -222,7 +222,7 @@ async fn a_reset_restores_the_credential_and_the_clock() -> anyhow::Result<()> {
     .await
 }
 
-/// **GitLab #58, on the hardware that found it.**
+/// **#60, on the hardware that found it.**
 ///
 /// A certificate binds a key to a MAC, and since design 09 §5 that MAC *is* the
 /// address the key derives. The nRF board used to derive its address from FICR
@@ -291,7 +291,7 @@ async fn an_installed_credential_is_adopted_across_a_reset() -> anyhow::Result<(
         anyhow::ensure!(
             node.security_status().await?.node_mac == info.node_id,
             "the certified address and the routed address must now be one value -- that \
-             is the whole of #58",
+             is the whole of #60",
         );
         // Holding it *after* a reboot is the case that does not self-clear, and
         // the board raises it from its own boot path — so this is a real

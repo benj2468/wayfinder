@@ -3,12 +3,12 @@
 **Status:** Implemented. §11 records what the implementing session decided,
 where it deviated, and the one thing it deliberately did not build.
 
-Finishes the embedded-auth work that GitLab #50 opened. Designs 20, 21 and 22
-gave a board a clock posture, hardware tests and a durable credential, and #53
+Finishes the embedded-auth work that #52 opened. Designs 20, 21 and 22
+gave a board a clock posture, hardware tests and a durable credential, and #55
 put it on an authenticated mesh. This is the one thing left: a board that has
 enrolled cannot stay enrolled.
 
-Owns the renewal half of GitLab #50's follow-on. Depends on nothing unlanded.
+Owns the renewal half of #52's follow-on. Depends on nothing unlanded.
 
 ## 1. Scope
 
@@ -108,7 +108,7 @@ proves. There is no new credential format to design.
 
 - **Enrollment over the mesh.** A board with no credential cannot route
   authenticated, so it cannot reach the authority this way. First enrollment
-  stays an operator act over the serial port — which #57 just resolved is a
+  stays an operator act over the serial port — which #59 just resolved is a
   trusted boundary. This design renews an existing membership and nothing else.
 - **Renewal for a lapsed board.** One second past `not_after` a node is a
   stranger, not a renewing holder (`renew.rs`); the authority parks it for
@@ -369,7 +369,7 @@ render time-to-expiry against renewal state without new wire.
   independence.
 - **Mgmt-over-BLE / an IP stack on the board.** Would let a board be a real
   client and renew the host's way. Much larger, parked elsewhere, and it
-  re-opens #57's authentication question (a transport with no physical
+  re-opens #59's authentication question (a transport with no physical
   precondition does not inherit that decision). Not a prerequisite for this.
 - **Accept the weekly ritual.** What happens if nothing is done. It makes
   embedded membership an operator subscription, and it scales with the number of

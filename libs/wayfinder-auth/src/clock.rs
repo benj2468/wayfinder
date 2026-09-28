@@ -271,7 +271,7 @@ impl WallClock {
     /// against the stored anchor — otherwise a correction equal to an old
     /// anchor would discard the free-run since.
     ///
-    /// # The boot rule, for whoever persists a checkpoint (#52)
+    /// # The boot rule, for whoever persists a checkpoint (#54)
     ///
     /// Restoring a checkpoint at boot is this call, with the persisted value —
     /// and going through the `max` is the point, so a stale page read after a
@@ -424,7 +424,7 @@ mod wall_clock_tests {
     /// what was written — the deficit (powered-off time, plus time since the
     /// last write) is unmeasurable and is left as slack in the floor.
     ///
-    /// Persisting is `estimate` and restoring is `anchor`; #52 owns the storage
+    /// Persisting is `estimate` and restoring is `anchor`; #54 owns the storage
     /// either side. What this pins is the property that makes those two safe to
     /// use that way, which is design 20 §4.4's boot rule.
     #[test]

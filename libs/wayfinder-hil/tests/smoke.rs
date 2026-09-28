@@ -34,7 +34,7 @@ async fn every_inventoried_board_answers() -> anyhow::Result<()> {
 /// Every board is running firmware built from *this* commit, and both sides are
 /// a committed tree so that comparison means something.
 ///
-/// The question GitLab #59 exists for, asked the only way it can be answered:
+/// The question #61 exists for, asked the only way it can be answered:
 /// over the management API. Before this, "does the board carry fix X?" was
 /// settled by the mtime of a `.hex` file and a question to whoever last flashed
 /// it — which on a board flashed weeks ago by someone else is not even a guess.

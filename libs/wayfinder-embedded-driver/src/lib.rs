@@ -729,7 +729,7 @@ impl<
     /// It cannot fail on a record this build wrote — the address is derived
     /// from the seed the certificate names — but a record from a build
     /// predating that rule could hold one, and arming from it would have the
-    /// board sign OGMs no peer attributes to it (GitLab #58).
+    /// board sign OGMs no peer attributes to it (#60).
     pub fn restore(&mut self, record: &crate::identity::NodeRecord) -> Restored {
         use wayfinder::auth::OgmAuth;
         use wayfinder::wayfinder_auth::MembershipCert;
@@ -1784,7 +1784,7 @@ mod restore_tests {
     /// Unreachable through `SetAuth`, which checks the key against the seed it
     /// installs — but a record written by a build predating the seed-derived
     /// address could hold one, and arming from it would have the board sign
-    /// OGMs no peer attributes to it. GitLab #58, refused rather than run.
+    /// OGMs no peer attributes to it. #60, refused rather than run.
     #[test]
     fn a_credential_for_another_mac_is_refused() {
         let now = Duration::from_secs(30);
@@ -2308,7 +2308,7 @@ mod restore_tests {
     ///
     /// Reachable, not theoretical: `WallClock::anchor` accepts any plausible
     /// instant, so an operator (or anyone with the cable — the port is
-    /// unauthenticated, GitLab #57) can `SetTime` a board to the far future,
+    /// unauthenticated, #59) can `SetTime` a board to the far future,
     /// and that estimate is then what gets checkpointed and restored.
     #[test]
     fn a_checkpoint_near_the_end_of_time_does_not_overflow() {

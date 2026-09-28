@@ -88,7 +88,7 @@ What is left over is everything that is only true of a running part:
   `recv` mid-frame is host-tested against a mock; against a real radio task it
   is a different program. Design 19 §4 says so outright.
 - **Reboot.** The retained fault record, the durable store's A/B ping-pong,
-  and — the moment #52 lands — design 20's clock checkpoint.
+  and — the moment #54 lands — design 20's clock checkpoint.
 - **Resource exhaustion at real sizes.** The 32 KiB heap
   (`libs/wayfinder-nrf/src/lib.rs:83`), against real response sizes.
 - **RF.** Fragmentation under loss, range, the N² OGM cost on a shared segment.
@@ -416,7 +416,7 @@ Ordered by what they would have caught. All are Tier B unless marked.
    rules, on the path that actually carries them.
 3. **A reset returns the board to `Unknown`.** True today, because nothing
    persists a checkpoint. **This test is written to be flipped**: it is the
-   executable form of design 20 §4.5's constraint on #52, and it is the thing
+   executable form of design 20 §4.5's constraint on #54, and it is the thing
    that will fail loudly if a credential is persisted without a checkpoint, or
    with one that boots from the certificate's `not_before` instead — the
    rollback §4.4 forbids in bold. Its doc comment must say so, or someone will
@@ -543,7 +543,7 @@ Two things follow, and the second is the one that matters:
   Design 06's F7 asks that bringing the port up be an explicit, auditable act,
   and `libs/wayfinder-server/CLAUDE.md` records it as a requirement on whoever
   wires the port up (§2.4) — a requirement the current wiring does not meet.
-  Tracked as **GitLab #57**, which also carries the three options (gate it,
+  Tracked as **#59**, which also carries the three options (gate it,
   authenticate it, or accept it and say so) rather than presuming the answer.
 
   Whichever is chosen, the rig follows: the tests in §5 are written against
@@ -624,7 +624,7 @@ contains.
   value is in failing later; a test held back until the change it guards
   against is not a guard.
 - **The unauthenticated management port (§7.1) is ticketed, not fixed here** —
-  **GitLab #57**, which revisits design 06's F7 — bringing the port up should be an
+  **#59**, which revisits design 06's F7 — bringing the port up should be an
   explicit, auditable act, and the wiring is currently unconditional. The rig is
   built against `Client`, so when auth arrives it is a harness change and not a
   rewrite. The two stale doc claims in §2.4 are corrected in this MR regardless,
@@ -714,7 +714,7 @@ miniature:
   runs a test with its working directory at the package root — which made every
   test skip as though no boards were attached, on a bench where one was. The
   second is the more dangerous shape: it fails by looking exactly like success.
-- **A finding in the firmware, not the harness: GitLab #58.** A board accepts a
+- **A finding in the firmware, not the harness: #60.** A board accepts a
   credential naming a MAC it does not route under, silently. Its peer-visible
   consequence is reasoned rather than observed, because confirming it needs the
   second board §5's test 4 wants.

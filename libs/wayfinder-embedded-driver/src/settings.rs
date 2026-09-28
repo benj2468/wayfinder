@@ -435,7 +435,7 @@ mod tests {
 
     /// Re-installing the *same* seed is not a rotation and needs no scrub —
     /// certifying the identity a board already holds, which is the enrolment
-    /// shape #53 will use.
+    /// shape #55 will use.
     #[test]
     fn recertifying_the_same_seed_does_not_scrub() {
         let (mut store, medium) = fresh(0x88);

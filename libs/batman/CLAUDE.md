@@ -131,7 +131,7 @@ the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
      resynchronises **to the seqno that opened the run**, not to whichever
      frame trips the deadline.
 
-   Three properties there are load-bearing, and issue #29's history is the
+   Three properties there are load-bearing, and issue #31's history is the
    argument for each — the first cut of the fix had only the first of them and
    was still exploitable:
 
@@ -170,7 +170,7 @@ the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
    for the three ways the first cut of the fix was still exploitable.
 
    The `frame.src`-based gate that keeps suggesting itself here is *not* the
-   answer and has been rejected twice (issue #29, and
+   answer and has been rejected twice (issue #31, and
    `docs/design/implemented/09-mesh-auth-gaps.md` §3's "What does *not* fix
    it"): an outsider copies a member MAC off the air, and the damage is keyed
    on `orig` anyway.

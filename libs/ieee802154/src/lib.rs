@@ -856,7 +856,7 @@ mod tests {
     /// Reassembled bytes too short for a `LinkFrame` header are a *peer's*
     /// fault — a corrupted reassembly, or a stranger's frame — so they must
     /// surface as [`LinkError::MalformedFrame`], which the driver drops without
-    /// raising the interface's `LinkErrors` alarm (#75).
+    /// raising the interface's `LinkErrors` alarm (#77).
     #[test]
     fn decode_frame_reports_a_short_buffer_as_malformed() {
         assert!(matches!(

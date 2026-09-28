@@ -676,7 +676,7 @@ surface this change created rather than closed —
 worth when the attacker *is* the authority, and what it still does not buy) and
 `attack_agreement_key_theft_via_address_binding` (what the deliberate narrowness
 of binding `ed_pubkey` alone costs) — plus
-`attack_squat_a_lapsed_members_address` for issue #37's closed window.
+`attack_squat_a_lapsed_members_address` for issue #39's closed window.
 
 Both of the older fixtures had to be rebuilt before they measured anything: each
 ran the victim node alongside the imposter, so the victim's address was in the
@@ -751,12 +751,12 @@ one that would have shipped a broken product.
    which seed they meant, and one who passes the wrong one is told which half is
    wrong.
 
-3. **`submit_csr`'s live-cert lock stopped being load-bearing, and issue #37
+3. **`submit_csr`'s live-cert lock stopped being load-bearing, and issue #39
    closed with it.** The lock was read off the *issued record*, whose window is
    strictly shorter than the revocation that makes it matter — so between a
    record expiring and its revocation expiring, a stranger could be issued a
    certificate for a departed member's address and have it honoured mesh-wide.
-   The binding closes that more completely than #37's own planned fix
+   The binding closes that more completely than #39's own planned fix
    (consulting persisted revocations): the address is not another key's to claim
    at *any* time, so there is no window to be inside. The test that pinned the
    window open said in its own assertion message what to do when it started
@@ -916,7 +916,7 @@ wall-clock question.
 
    One consequence of that `Bcast` exemption was closed separately, because it
    did not need authentication to fix and was far worse than the injection
-   nuisance this document had conceded (issue #29). A `Bcast`'s `orig` and
+   nuisance this document had conceded (issue #31). A `Bcast`'s `orig` and
    `seqno` are read from inside the payload, so the receiver's dedup table is
    state an outsider writes to directly — and it neither evicted nor bounded a
    seqno jump. One frame naming a member with `seqno = u32::MAX` silenced that
@@ -1719,8 +1719,8 @@ neighbor, count climbing one per round.
 | `libs/wayfinder-driver-core/src/lib.rs` | §7 | `tag_directed_into` counter + `warn!` → `trace!` (line ~215) |
 | `libs/wayfinder-embedded-driver/src/lib.rs` | 2 | wall-clock source, once §2's question is settled (see line 467) — **not** needed for §4's fix |
 | `libs/wayfinder/src/auth.rs` | §4 | the challenge/response pair over `frame_tag` + the pairwise-key cache |
-| `libs/batman/src/engine.rs` | §8.6 | `handle_broadcast`'s dedup step — done (issue #29) |
-| `libs/batman/src/lib.rs` | §8.6 | `BroadcastSeqnoEntry::admit` and its three constants — done (issue #29) |
+| `libs/batman/src/engine.rs` | §8.6 | `handle_broadcast`'s dedup step — done (issue #31) |
+| `libs/batman/src/lib.rs` | §8.6 | `BroadcastSeqnoEntry::admit` and its three constants — done (issue #31) |
 | `libs/batman/src/engine.rs` | §4 | gate `best_next_hop` promotion (`handle_rx`'s incumbent/challenger comparison) and both selection paths (`next_hop`, `lookup_route`) on a proven next hop |
 | `libs/batman/src/wire.rs` | §4 | `BatmanPacketType` variants for the challenge and its response |
 | `sim/tests/test_security.py`, `sim/tests/test_adversary.py` | all | the gap tests flip from asserting the gap to asserting the fix |

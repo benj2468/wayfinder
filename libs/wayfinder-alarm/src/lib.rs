@@ -246,7 +246,7 @@ pub enum AlarmKind {
     /// it the condition is visible only to somebody who thinks to compare
     /// `GetNodeInfo`'s `node_id` against `GetSecurityStatus`'s `node_mac`,
     /// which is how it went unnoticed until a hardware rig found it
-    /// (GitLab #58).
+    /// (#60).
     ///
     /// Distinct from [`IdentityConflict`](Self::IdentityConflict), which is
     /// two keys claiming one address and is about *somebody else*: that one is

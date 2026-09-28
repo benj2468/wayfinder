@@ -727,7 +727,7 @@ def attack_squat_a_lapsed_members_address() -> Finding:
     """An attacker claiming an address whose certificate has expired.
 
     The authority's own lock on an address was read off the *issued record*
-    and so expired with it — issue #37's window, in which a stranger could be
+    and so expired with it — issue #39's window, in which a stranger could be
     issued a certificate for a departed member's address and have it honoured
     mesh-wide. The address was, briefly, first-come again.
 
@@ -2829,7 +2829,7 @@ def attack_broadcast_seqno_blackhole() -> Finding:
 
     It must fail because `handle_broadcast` no longer takes any `u32` as the new
     high-water: the comparison is a wrapping distance, so the maxed value lands
-    *behind* hq's high-water rather than above it and is discarded (issue #29).
+    *behind* hq's high-water rather than above it and is discarded (issue #31).
     The auth scope note concedes an outsider can *inject* a broadcast flood on
     an auth mesh — a nuisance. What it must not become is durable, targeted
     suppression of a named member from a single frame. Measured by whether
@@ -2886,7 +2886,7 @@ def attack_broadcast_seqno_in_window_jump() -> Finding:
     accepted as the new high-water — and every genuine broadcast the victim then
     sends sits *behind* it.
 
-    This is the attack the first cut of the issue #29 fix missed, and it was
+    This is the attack the first cut of the issue #31 fix missed, and it was
     strictly better for the attacker than the one that fix blocked: the victim's
     own frames were dropped as ordinary duplicates, touching no state, so it
     stayed silent until its counter climbed past the forged value — thousands of
@@ -2969,7 +2969,7 @@ def attack_broadcast_resync_hijack() -> Finding:
     resynchronisation lands on *her* number instead of hq's.
 
     If it did, she would hold field's high-water at an unreachable value again
-    and could renew it every interval — issue #29's failure mode B rebuilt out
+    and could renew it every interval — issue #31's failure mode B rebuilt out
     of the machinery meant to close it, for two frames per interval.
 
     It must fail because the resynchronisation restores the sequence number that
@@ -3065,7 +3065,7 @@ def attack_broadcast_evict_then_reseed() -> Finding:
 
     So eve floods ghost origs until hq's entry is evicted, then re-creates it
     under hq's name at an unreachable number. If that stuck, the two halves of
-    the issue #29 fix would cancel out: the eviction added for failure mode A
+    the issue #31 fix would cancel out: the eviction added for failure mode A
     would be a fresh route into failure mode B.
 
     It must fail — but notably not because the seeding is checked. It is not,
@@ -3159,7 +3159,7 @@ def attack_broadcast_dedup_table_exhaustion() -> Finding:
     saturate it. What matters is what a full table then does.
 
     It must fail because a full table evicts its least-recently-updated entry
-    rather than refusing the packet (issue #29), the way the originator and
+    rather than refusing the packet (issue #31), the way the originator and
     keep-alive tables already do — so saturation costs at worst a duplicate
     re-flood, which the TTL bounds, instead of black-holing every originator not
     already present for the life of the process. Distinct mechanism from the

@@ -219,7 +219,7 @@ No new trust boundary: this stores data that's already either self-verifying
 already trusted local state (`CaLog`'s issued-cert log, already `std`-local
 today). A corrupted or missing store degrades to "fresh/empty," per each
 caller's own existing fail-closed posture (`RevocationStore`: falls back to
-peer catch-up / CA-pull, design 03 §4; `CaLog`: fails closed per issue #3).
+peer catch-up / CA-pull, design 03 §4; `CaLog`: fails closed per issue #5).
 
 ## 6. Testing strategy (TDD)
 

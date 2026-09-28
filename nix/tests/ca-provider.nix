@@ -629,7 +629,7 @@ testers.nixosTest {
         # What this cannot reach, for the same reason the enrollment subtest
         # above stops at `--print-command`: no tailscaled has spent the key, so
         # there is no registered *node* to delete and only the user half of a
-        # revocation runs here. That is precisely the gap #27 shipped through —
+        # revocation runs here. That is precisely the gap #29 shipped through —
         # every assertion below passed while a node that had actually
         # registered kept its tunnel. `nix/tests/vpn-data-plane.nix` revokes a
         # spoke that a real tailscaled registered, and is the test that covers

@@ -3,8 +3,8 @@
 **Status:** Implemented — landed on `main` in `7e91bb5`. §11 records what the
 implementing session decided and where it deviated.
 
-Owns GitLab #52, resolves #58, discharges design 20 §4.5's constraint, and
-unblocks #53. Two facts in `main` this changes are recorded in §2.
+Owns #54, resolves #60, discharges design 20 §4.5's constraint, and
+unblocks #55. Two facts in `main` this changes are recorded in §2.
 
 ## 1. Scope
 
@@ -38,7 +38,7 @@ unblocks #53. Two facts in `main` this changes are recorded in §2.
 - **Host behaviour.** `wayfinder-tap`'s `SettingsFile` and `FileStore` are
   untouched apart from `FileStore` gaining the two erasure methods.
 - **Enrolment, and what a credential-less board does about `require_auth`.**
-  Those are #53. See §3's non-goals for exactly where the line falls.
+  Those are #55. See §3's non-goals for exactly where the line falls.
 - **`bins/wayfinder-stm32f411`.** It has a compile-time `Mac` constant and no
   durable store at all; §6.3 records why that is left alone.
 
@@ -58,7 +58,7 @@ passes today and is written to be flipped by this work.
 
 ### 2.2 The board's address is not derived from its key
 
-Found on a real DK by the HIL rig (#58), and directly observed:
+Found on a real DK by the HIL rig (#60), and directly observed:
 
 ```
 node info: node_id=da182c334bc4  ...  clock_posture=AtLeast
@@ -76,7 +76,7 @@ seed-derived**. `wayfinder-tap` loads a seed and takes `keypair.derived_mac()`;
 the remedy — *"Restart it on a build that derives its MAC from its seed, so it
 comes up under the certified address."* There is no such build. This makes one.
 
-That is also why #58 cannot be fixed in the rig: a certificate's MAC is a hash
+That is also why #60 cannot be fixed in the rig: a certificate's MAC is a hash
 of its public key, so matching a specific FICR address would mean grinding
 keypairs.
 
@@ -84,7 +84,7 @@ keypairs.
 
 Design 20 §4.5, in bold:
 
-> **#52 must persist the clock checkpoint in the same blob as the credential,
+> **#54 must persist the clock checkpoint in the same blob as the credential,
 > written, loaded and erased with it.**
 
 with the wear budget ("two 4 KiB pages at roughly 10 000 erase cycles") and the
@@ -110,7 +110,7 @@ rewrite interval explicitly handed forward as this design's call.
 **Non-goals**
 
 - **Enrolment from the board.** A board still cannot ask a CA for a
-  certificate; an operator installs one over the management port. #53.
+  certificate; an operator installs one over the management port. #55.
 - **Renewal.** A board cannot renew itself, so the renewal provider is
   deliberately *not* persisted (§4.2).
 
@@ -120,7 +120,7 @@ rewrite interval explicitly handed forward as this design's call.
   > key is now persisted; see design 24 §2.1, which cites §4.2 below by name as
   > the behaviour it overturns.
 - **`require_auth` on a board.** What a credential-less board does — route
-  unauthenticated or stay inert — is #53's decision. This design persists the
+  unauthenticated or stay inert — is #55's decision. This design persists the
   flag; it does not choose its default.
 - **Confidentiality against a debug probe.** §4.7 — that is APPROTECT's job and
   no software on this part can substitute for it.
@@ -184,7 +184,7 @@ seed-rotation path, and §4.4 is what makes it safe.
   > was right at the time.
 - **The MAC.** It is `Keypair::from_seed(&seed).derived_mac()`. Storing it
   beside the seed is storing the same fact twice, and the two disagreeing is
-  precisely the defect #58 reports.
+  precisely the defect #60 reports.
 
 ### 4.3 First boot, and the boot that cannot reach flash
 
@@ -332,10 +332,10 @@ certificate's age, triggerable by anyone who can pull the USB cable — and the
 damage lands on the board's judgement of *everyone else's* certificates, not
 just its own.
 
-Step 6 is #53's first bullet, moved here on purpose. A credential that is
-persisted and never reloaded is unobservable, so leaving it in #53 would mean
+Step 6 is #55's first bullet, moved here on purpose. A credential that is
+persisted and never reloaded is unobservable, so leaving it in #55 would mean
 landing this design with no way to test the thing it exists to do. What stays
-in #53 is the harder and genuinely separate half: enrolment, and the policy a
+in #55 is the harder and genuinely separate half: enrolment, and the policy a
 board applies when step 6 finds nothing.
 
 A restored credential that **fails** to verify — a trust anchor rotated under
@@ -382,7 +382,7 @@ and it is filed rather than smuggled in here.
   wholesale-install path is deliberately exempt from the MAC check because
   naming a new MAC is what it is for. After this design the board adopts the
   installed seed, so the address follows on the next boot and the two agree —
-  which is the host's behaviour and closes #58. **The divergence still exists
+  which is the host's behaviour and closes #60. **The divergence still exists
   between the install and the reset**, and that is not a bug being tolerated: a
   mid-flight MAC change is a topology event (`CentralRouter::self_ident` is set
   in `new` and has no setter, deliberately, because every peer holds the old
@@ -426,7 +426,7 @@ nothing could store one.
 Net: **stronger**, in three ways, and weaker in none.
 
 - A board's key↔address binding becomes true by construction rather than
-  reasoned about (#58).
+  reasoned about (#60).
 - A rotated seed stops lingering in flash (§4.4).
 - A self-revocation survives a reset, which is design 16's whole premise and
   today is lost on the first power cycle.
@@ -434,8 +434,8 @@ Net: **stronger**, in three ways, and weaker in none.
 The new secret at rest is discussed in §4.7. The one genuinely new attack
 surface is that `SetAuth` becomes *durable* on a board, so an attacker with the
 cable can now change the node's identity permanently rather than until the next
-reset. That port is unauthenticated (#57) and this raises the stakes of that
-gap; it does not create it, and #57 is the fix.
+reset. That port is unauthenticated (#59) and this raises the stakes of that
+gap; it does not create it, and #59 is the fix.
 
 ### 6.3 The STM32
 
@@ -449,7 +449,7 @@ there when that board grows a port.
 ## 7. Observability
 
 The install-to-reset divergence in §5 must be visible, since a node routing
-under an address its credential does not name is exactly the state #58 was
+under an address its credential does not name is exactly the state #60 was
 filed for and it remains reachable for the length of one session.
 
 `GetSecurityStatus` already reports both halves — `node_mac` from the
@@ -464,7 +464,7 @@ The boot path raises it too, and that one matters more: a record whose stored
 certificate names an address the restored seed does not derive is refused, does
 **not** self-clear, and would otherwise be the only case going unreported —
 precisely because the install-time latch did not survive the reset. That turns a silent incoherent state into a latched, stated one
-an operator reads over the API, which is the argument #58's option 1 makes and
+an operator reads over the API, which is the argument #60's option 1 makes and
 which survives even though this design takes option 3.
 
 ## 8. Alternatives considered
@@ -485,7 +485,7 @@ which survives even though this design takes option 3.
   is fixed at `CentralRouter::new` deliberately, and a mid-flight address
   change is a topology event that strands every peer holding the old
   originator. The host does not do this either.
-- **#58 option 1 alone** (refuse a credential whose MAC is not the board's).
+- **#60 option 1 alone** (refuse a credential whose MAC is not the board's).
   Rejected as *sufficient* — it leaves a board unable to hold any credential at
   all, since no CA can issue for a FICR address. Its substance is kept as §7's
   alarm.
@@ -551,7 +551,7 @@ Hardware (`libs/wayfinder-hil`), which is where this design is actually proven:
     Its doc comment already says this is the intended edit.
 11. **The board adopts the certified address across a reset** — `node_id`
     differs from the certificate's MAC before the reset and equals it after.
-    That is #58, closed, on the hardware that found it.
+    That is #60, closed, on the hardware that found it.
 12. A second reset does not move the posture backwards.
 
 ## 11. What the implementing session decided

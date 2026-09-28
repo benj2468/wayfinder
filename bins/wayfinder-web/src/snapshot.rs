@@ -145,7 +145,7 @@ pub enum PollScope {
 ///   at whatever rate it polls.
 /// - `GetLogs` returns the process's whole log ring, which on a provider carries
 ///   the account-administration records naming each username and role — the
-///   roster `ListUsers` is admin-gated to protect. Narrowed for issue #32.
+///   roster `ListUsers` is admin-gated to protect. Narrowed for issue #34.
 #[cfg(feature = "ssr")]
 pub async fn build_snapshot(
     conn: &NodeConnection,
