@@ -328,7 +328,7 @@ jobs:
       # tshark will not load the Lua dissector as root, so the suite runs as
       # the image's unprivileged `ci` user (see `.gitlab-ci.yml`).
       - run: >-
-          scripts/ci-cached.sh python --package wayfinder-py --manifest-path libs/wayfinder-py/Cargo.toml --extra '*.py' --extra sim --extra ml --extra scripts --extra libs/wayfinder-shark --extra pyproject.toml --extra uv.lock -- sh -c 'MATURIN_PEP517_ARGS="--profile dev" uv sync --locked && install -d -o ci target/pytest && runuser -u ci -- uv run pytest --junitxml=target/pytest/junit.xml'
+          scripts/ci-cached.sh python --package wayfinder-py --manifest-path libs/wayfinder-py/Cargo.toml --extra '*.py' --extra sim --extra ml --extra scripts --extra libs/wayfinder-shark --extra pyproject.toml --extra uv.lock -- sh -c 'uv sync --locked && install -d -o ci target/pytest && runuser -u ci -- uv run pytest --junitxml=target/pytest/junit.xml'
       - uses: actions/upload-artifact@v4
         if: always()
         with:

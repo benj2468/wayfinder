@@ -545,9 +545,11 @@ test:run:python:
     # member, built from source via its `maturin` build backend) — nothing
     # else builds/installs it, since `cargo build --workspace` deliberately
     # never touches that crate's own independent Cargo workspace.
-    # maturin builds release by default; the suite checks behaviour, which
-    # a debug extension has the same of.
-    - MATURIN_PEP517_ARGS="--profile dev" uv sync --locked
+    # The one cargo build CI keeps at release (maturin's default), besides the
+    # stack-budget gate: the suite's simulations run inside this extension, so
+    # a debug build made the job slower overall (3 → 8+ minutes on GitHub's
+    # runners), not faster.
+    - uv sync --locked
     # tshark won't load the Lua dissector as root, so drop to the unprivileged
     # `ci` user (baked into the image) for the suite. The cargo jobs still run as
     # root over the root-owned checkout; only this job needs to be non-root.
