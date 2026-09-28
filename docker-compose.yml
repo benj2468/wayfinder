@@ -25,6 +25,16 @@
 # <ca-host>:7700 --provider-key <hex> --node-key <hex>` — and it holds no
 # credential at all: each viewer signs in for a session certificate of their
 # own, and the shared volume goes away with it.
+#
+# Images are pulled from `$WAYFINDER_REGISTRY` (set it in a `.env` beside this
+# file), defaulting to registry.haganah.net while both forges publish. CI on
+# GitHub pushes the same tags to ghcr.io; to move a host there:
+#
+#   WAYFINDER_REGISTRY=ghcr.io/benj2468/wayfinder
+#
+# plus `docker login ghcr.io` while the packages are private. Every service
+# here is `pull_policy: always`, so a registry the host cannot reach or is not
+# logged in to fails `up` rather than falling back to a local build.
 name: wayfinder
 services:
   node:
@@ -32,7 +42,7 @@ services:
       context: .
       dockerfile: containers/Dockerfile
       target: tap
-    image: registry.haganah.net/wayfinder-tap:nightly
+    image: ${WAYFINDER_REGISTRY:-registry.haganah.net}/wayfinder-tap:nightly
     pull_policy: always
     command: ["--config", "/etc/wayfinder/node.yml"]
     network_mode: host
@@ -70,7 +80,7 @@ services:
       context: .
       dockerfile: containers/Dockerfile
       target: web
-    image: registry.haganah.net/wayfinder-web:nightly
+    image: ${WAYFINDER_REGISTRY:-registry.haganah.net}/wayfinder-web:nightly
     pull_policy: always
     # Host networking, same as `node`. `--listen` (the dashboard's own bind
     # address, distinct from `--connect` below) is passed explicitly rather than
@@ -139,7 +149,7 @@ services:
       context: .
       dockerfile: containers/Dockerfile
       target: ctl
-    image: registry.haganah.net/wayfinder-ctl:nightly
+    image: ${WAYFINDER_REGISTRY:-registry.haganah.net}/wayfinder-ctl:nightly
     pull_policy: always
     # Host networking, like everything else here: the node's management API is
     # on the host's loopback, and an offline `cert` subcommand opens no
