@@ -3902,6 +3902,93 @@ mod tests {
         );
     }
 
+    /// A `host` node does per-frame work on an ordinary thread, and its
+    /// management API reports that work against the `host` capacities.
+    ///
+    /// The other `host` tests only build a router or install a credential; this
+    /// drives one real OGM from one `host` driver into another over a datagram
+    /// pair, on a 2 MiB test thread, so a router- or `OgmAuth`-sized value
+    /// (1.8 MB / 548 KB, copied a few times in a debug build) moved onto the
+    /// stack anywhere on the receive path overflows here. It then reads
+    /// `GetMetrics` through the type-erased handle, where a fallback to
+    /// `default`'s constants would report 128 rather than 4096.
+    ///
+    /// Not a guard against per-frame *cost*: `IdentTable::clear` once built a
+    /// >100 KB temporary on every frame, which fits a 2 MiB stack and passes
+    /// here. Only `wayfinder-bench`'s `host` suite sees that kind of
+    /// regression.
+    #[tokio::test]
+    async fn a_host_profile_driver_learns_a_peer_and_reports_it_at_host_capacity() {
+        let (a_sock, b_sock) = tokio::net::UnixDatagram::pair().expect("socketpair");
+        let link_a: Box<DynLinkT<'static>> = DynLinkT::new_box(crate::Link::new(a_sock));
+        let link_b: Box<DynLinkT<'static>> = DynLinkT::new_box(crate::Link::new(b_sock));
+
+        let (_a_query_tx, a_query_rx) = tokio::sync::mpsc::channel(1);
+        let mut a: Driver<NeverIo, HostRouter> = Driver::new(
+            mac(1),
+            NeverIo,
+            vec![link_a],
+            vec![TrickleConfig::default()],
+            vec![LinkFeatures::default()],
+            Vec::new(),
+            a_query_rx,
+        );
+        let (_b_query_tx, b_query_rx) = tokio::sync::mpsc::channel(1);
+        let mut b: Driver<NeverIo, HostRouter> = Driver::new(
+            mac(2),
+            NeverIo,
+            vec![link_b],
+            vec![TrickleConfig::default()],
+            vec![LinkFeatures::default()],
+            Vec::new(),
+            b_query_rx,
+        );
+
+        // Tick `b` until its Trickle timer emits, and let `a` drain each tick.
+        let mut now = Duration::ZERO;
+        while a.with_router(|r| r.originator_occupancy().0).await == 0
+            && now < Duration::from_secs(60)
+        {
+            b.poll_due(now).await.expect("poll_due does not fail");
+            a.process_pending()
+                .await
+                .expect("process_pending does not fail");
+            now += Duration::from_millis(100);
+        }
+        assert_eq!(
+            a.with_router(|r| r.originator_occupancy()).await,
+            (1, wayfinder::host::ORIGINATORS),
+            "a host node must learn its peer from a received OGM"
+        );
+
+        let response = a
+            .router_handle()
+            .serve_read(wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+                request: Some(
+                    wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::GetMetrics(
+                        wayfinder_protos::wayfinder::v1alpha::GetMetricsRequest {},
+                    ),
+                ),
+            })
+            .await
+            .expect("GetMetrics is a router read");
+        match response.response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::Metrics(
+                metrics,
+            )) => {
+                let originators = metrics
+                    .originators
+                    .expect("originator occupancy is reported");
+                assert_eq!(
+                    (originators.used, originators.capacity),
+                    (1, wayfinder::host::ORIGINATORS as u32),
+                    "GetMetrics must report the host profile's capacity, not default's"
+                );
+            }
+            other => panic!("expected Metrics, got {other:?}"),
+        }
+    }
+
     /// Installing a credential is the other place auth state crosses the stack
     /// by value: `SetAuth` builds an `OgmAuth` and hands it to the router, and
     /// at the `host` profile's 1024 neighbour keys and 1024 revocations that
