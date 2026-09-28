@@ -17,7 +17,7 @@ variables:
 # runners share a host with GitLab itself, so a stale pipeline is not just
 # slow — enough of them starve the server. `interruptible` lets GitLab cancel
 # the superseded one (with "Auto-cancel redundant pipelines" on in the project
-# settings). `deploy` and `mirror:github` opt back out: half a push is worse
+# settings). `deploy` opts back out: half a push is worse
 # than a redundant one.
 default:
   interruptible: true
@@ -668,34 +668,3 @@ deploy:
           --push \
           .
       done
-# Mirror the repository to GitHub on every merge to the default branch. We don't
-# let GitLab check out a working tree (GIT_STRATEGY: none); instead we make a
-# fresh `--mirror` clone of this project over HTTPS using the per-job
-# CI_JOB_TOKEN, then push branches and tags to GitHub. The refspecs deliberately
-# only mirror refs/heads/* and refs/tags/* (with --prune so deletions
-# propagate), so GitLab-internal refs like refs/merge-requests/* are not pushed.
-# Auth to GitHub uses a Personal Access Token (scope: repo / Contents:write)
-# stored as the masked CI/CD variable GITHUB_MIRROR_TOKEN.
-mirror:github:
-  stage: deploy
-  interruptible: false
-  # alpine/git sets ENTRYPOINT ["git"], so the runner's `sh`-based setup script
-  # would be invoked as `git sh ...` ("git: 'sh' is not a git command"). Clear
-  # the entrypoint so the runner gets a real shell.
-  image:
-    name: alpine/git:latest
-    entrypoint: [""]
-  tags:
-    - docker
-  # Run independently of the build/test/deploy graph — mirroring just replicates
-  # whatever landed on the default branch and shouldn't wait on image builds.
-  needs: []
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"'
-  variables:
-    GIT_STRATEGY: none
-    GIT_SSL_NO_VERIFY: false
-  script:
-    - git clone --mirror "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" repo.git
-    - cd repo.git
-    - git push --prune "https://x-access-token:${GITHUB_MIRROR_TOKEN}@github.com/benj2468/wayfinder.git" "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
