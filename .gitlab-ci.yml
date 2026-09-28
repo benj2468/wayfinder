@@ -326,9 +326,10 @@ build:embedded:
     # target dir between a plain build and a clippy build of the same crate).
     - scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings'
     - scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings'
-    # The STM32F411RE (512 KB flash) needs an optimized build to fit the crypto
-    # stack, so it's built --release rather than debug like the 1 MB nRF.
-    - scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml -- sh -c 'cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings'
+    # Debug like the others: clippy never links, so the STM32F411RE's 512 KB
+    # flash (which is why it is *flashed* --release) does not constrain a lint.
+    # The linked release image is build:stack-budget's to check.
+    - scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml -- sh -c 'cd bins/wayfinder-stm32f411 && cargo clippy --locked -- -D warnings'
     # Both boards now wire 802.15.4, so the clippy runs above cover
     # `nrf-ieee802154`. What nothing links any more is `blue`'s SoftDevice
     # backend — 802.15.4 and BLE contend for the same RADIO, and the boards
@@ -409,8 +410,11 @@ build:web:
       optional: true
   script:
     # The real cargo-leptos path, which also runs wasm-bindgen and emits the
-    # site bundle the binary serves.
-    - cargo leptos build --release
+    # site bundle the binary serves. Debug, not --release: the optimised server
+    # and wasm builds were ten of this job's sixteen minutes, shared nothing
+    # with the debug clippy/nextest runs below, and the release build is
+    # already exercised on `main` by the Nix package the NixOS tests boot.
+    - cargo leptos build
     - cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings
     - cargo nextest run -p wayfinder-web --features mock-node
     - sccache --show-stats
@@ -479,7 +483,10 @@ test:alloc-gate:
     - job: build-image
       optional: true
   script:
-    - scripts/ci-cached.sh alloc --package wayfinder-bench -- cargo bench -p wayfinder-bench --features alloc-gate --bench alloc
+    # `--profile dev`: an allocation count is the code's semantics, not its
+    # optimisation, so the bench profile's release build buys this gate
+    # nothing but compile time.
+    - scripts/ci-cached.sh alloc --package wayfinder-bench -- cargo bench -p wayfinder-bench --features alloc-gate --bench alloc --profile dev
     - sccache --show-stats
 # The wall-clock packet-path benchmarks.
 #
@@ -538,6 +545,10 @@ test:run:python:
     # member, built from source via its `maturin` build backend) — nothing
     # else builds/installs it, since `cargo build --workspace` deliberately
     # never touches that crate's own independent Cargo workspace.
+    # The one cargo build CI keeps at release (maturin's default), besides the
+    # stack-budget gate: the suite's simulations run inside this extension, so
+    # a debug build made the job slower overall (3 → 8+ minutes on GitHub's
+    # runners), not faster.
     - uv sync --locked
     # tshark won't load the Lua dissector as root, so drop to the unprivileged
     # `ci` user (baked into the image) for the suite. The cargo jobs still run as
