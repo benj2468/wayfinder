@@ -1195,10 +1195,31 @@ async fn main() -> anyhow::Result<()> {
         let on_file = ca.live_revocations();
         if !on_file.is_empty() {
             let flooded = driver.reflood_revocations(&on_file).await;
-            tracing::info!(
-                on_file = on_file.len(),
-                flooded,
-                "re-flooding the revocations this authority has on file"
+            if flooded == on_file.len() {
+                tracing::info!(
+                    on_file = on_file.len(),
+                    flooded,
+                    "re-flooding the revocations this authority has on file"
+                );
+            } else {
+                tracing::warn!(
+                    on_file = on_file.len(),
+                    flooded,
+                    "some revocations on file could not be re-flooded; nodes offline when \
+                     they were issued may never hear of them"
+                );
+            }
+        }
+        // Revoked before this authority kept signed records: there is nothing
+        // to re-flood for these, so say which they are and how to fix it.
+        let unsigned = ca.revoked_without_a_signed_record();
+        if !unsigned.is_empty() {
+            tracing::warn!(
+                count = unsigned.len(),
+                macs = ?unsigned,
+                "revoked certificates with no signed revocation on file, so nothing to \
+                 re-flood; revoke each again (`wayfinderctl provider revoke <mac>`) to \
+                 sign one"
             );
         }
         let policy = ca.enrollment_policy();

@@ -968,7 +968,10 @@ impl<
         for record in records {
             match ingest_signed_revocation(&mut guard.router, record, now, now_unix) {
                 Ok(()) => accepted += 1,
-                Err(reason) => warn!(
+                // Only this node can cause it — its own records failing its own
+                // anchor, or its auth or clock not ready — and the revocation
+                // then stops spreading: an operator must act.
+                Err(reason) => error!(
                     reason,
                     node_mac = ?record.node_mac,
                     "a revocation on file could not be flooded after the restart"

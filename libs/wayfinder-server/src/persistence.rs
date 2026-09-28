@@ -1091,18 +1091,18 @@ impl Backing {
         // visitor the CA's absolute state-file path and its errno, under
         // the heading "This invitation cannot be used".
         //
-        // A handled-and-retried error (the caller keeps serving from memory
-        // and the next successful mutation retries the write), so `warn!`
-        // rather than `error!` — but still surfaced to the caller as an
-        // `Err`, since the caller is best placed to decide whether to retry,
-        // alert, or accept the risk.
-        tracing::warn!(
+        // The mutation is rolled back, not kept in memory to retry later, so
+        // the change did not happen: a local failure an operator must act on
+        // (a full disk, a broken database), hence `error!`. Still surfaced to
+        // the caller as an `Err`, since the caller is best placed to decide
+        // whether to retry or alert.
+        tracing::error!(
             path = %path_display,
             error = %detail,
-            "failed to persist CA state; durability of certificates, held CSRs, accounts and invitations is degraded until this is fixed"
+            "failed to persist CA state; the change was not made, and none will be until this is fixed"
         );
-        "the node could not record this change; it is still serving from memory. \
-         Try again shortly, and check the node's logs"
+        "the node could not record this change, so it was not made. Try again \
+         shortly, and check the node's logs"
             .to_string()
     }
 }
@@ -1120,8 +1120,10 @@ fn record_revocations(
 /// Every record of `collection` in `state`, serialised as the store holds it.
 ///
 /// Issued certificates go through [`IssuedRecord`], the on-disk mirror of the
-/// protobuf type; one too malformed to mirror is dropped with a warning, as the
-/// JSON snapshot always did.
+/// protobuf type. One too malformed to mirror fails the whole encoding, so the
+/// mutation that produced it rolls back: the JSON snapshot used to drop it with
+/// a warning and report success, telling the caller a change was durable that
+/// a restart would lose.
 fn encode_collection(state: &CaLogState, collection: Collection) -> Result<Vec<Vec<u8>>, String> {
     fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
         serde_json::to_vec(value).map_err(|e| format!("failed to serialize CA record: {e}"))
@@ -1130,15 +1132,15 @@ fn encode_collection(state: &CaLogState, collection: Collection) -> Result<Vec<V
         Collection::Issued => {
             let mut out = Vec::with_capacity(state.issued.len());
             for c in &state.issued {
-                match IssuedRecord::from_proto(c) {
-                    Some(record) => out.push(json(&record)?),
-                    None => tracing::warn!(
-                        node_mac_len = c.node_mac.len(),
-                        ed_pubkey_len = c.ed_pubkey.len(),
-                        "dropping malformed issued-cert record from CA state; its \
-                         revocation status, if any, will not survive a restart"
-                    ),
-                }
+                let record = IssuedRecord::from_proto(c).ok_or_else(|| {
+                    format!(
+                        "malformed issued-cert record (node_mac {} bytes, ed_pubkey {} \
+                         bytes) cannot be stored",
+                        c.node_mac.len(),
+                        c.ed_pubkey.len()
+                    )
+                })?;
+                out.push(json(&record)?);
             }
             Ok(out)
         }

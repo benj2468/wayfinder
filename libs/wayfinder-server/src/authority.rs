@@ -1362,6 +1362,25 @@ impl CertAuthority {
             .collect()
     }
 
+    /// The MACs of revoked certificates, still inside their validity window,
+    /// that have no signed revocation on file to flood.
+    ///
+    /// A certificate revoked before the CA kept signed records (design 26
+    /// phase 2) carries only the flag: nothing a restarted CA can announce
+    /// again, so a node offline when it was revoked never hears of it.
+    /// Revoking it again signs a fresh record and clears it from this list.
+    pub fn revoked_without_a_signed_record(&self) -> Vec<Vec<u8>> {
+        let now = self.now_unix();
+        let live = self.live_revocations();
+        self.log
+            .issued()
+            .iter()
+            .filter(|c| c.revoked && c.not_after > now)
+            .filter(|c| !live.iter().any(|r| r.node_mac[..] == c.node_mac[..]))
+            .map(|c| c.node_mac.clone())
+            .collect()
+    }
+
     /// Whether `username` holds at least one session certificate that revoking
     /// would actually end.
     ///
