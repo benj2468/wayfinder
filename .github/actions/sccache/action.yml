@@ -1,0 +1,59 @@
+# Point sccache at the R2 bucket when this run has its credentials, and at the
+# GitHub Actions cache when it does not.
+#
+# R2 is the real cache: every branch and PR shares it, it has no 10 GB cap, and
+# it does not throttle the burst of writes a pipeline's parallel jobs make at
+# once (the Actions cache dropped two thirds of them on the first run). The
+# Actions-cache fallback is for a run with no secrets, i.e. a PR from a fork
+# once the repository is public: it still gets a cache, just one it cannot
+# poison anyone else's builds through.
+#
+# sccache's server starts lazily on the first compile, so the variables this
+# writes to $GITHUB_ENV are in place before it reads them. Run it after
+# checkout (it is a local action) and before any cargo step.
+name: Set up sccache
+description: Use the R2 sccache bucket when credentials are present, else the Actions cache
+inputs:
+  bucket:
+    description: The R2 bucket's name (the SCCACHE_BUCKET repository variable).
+    required: false
+    default: ""
+  endpoint:
+    description: R2's S3 endpoint, https://<account>.r2.cloudflarestorage.com.
+    required: false
+    default: ""
+  access-key-id:
+    description: The bucket-scoped token's S3 access key.
+    required: false
+    default: ""
+  secret-access-key:
+    description: The bucket-scoped token's S3 secret key.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Use the R2 bucket
+      if: inputs.bucket != '' && inputs.access-key-id != ''
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        ENDPOINT: ${{ inputs.endpoint }}
+        KEY_ID: ${{ inputs.access-key-id }}
+        SECRET: ${{ inputs.secret-access-key }}
+      run: |
+        {
+          echo "SCCACHE_BUCKET=$BUCKET"
+          echo "SCCACHE_ENDPOINT=$ENDPOINT"
+          echo "SCCACHE_REGION=auto"
+          echo "AWS_ACCESS_KEY_ID=$KEY_ID"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET"
+        } >> "$GITHUB_ENV"
+    # Exposes the Actions cache's runtime token to sccache; only needed for
+    # the fallback.
+    - if: inputs.bucket == '' || inputs.access-key-id == ''
+      uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Use the Actions cache
+      if: inputs.bucket == '' || inputs.access-key-id == ''
+      shell: bash
+      run: echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"

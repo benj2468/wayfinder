@@ -1,0 +1,55 @@
+# Sign and upload everything this job built to the R2 binary cache.
+#
+# Reads the list `.github/actions/nix`'s post-build hook wrote, so only paths
+# built here are pushed; what came from cache.nixos.org is never re-uploaded.
+# Run it with `if: always()`: a job that fails half an hour in should still
+# leave its finished work in the cache for the next attempt.
+#
+# A failed push never fails the job. The cache is an optimisation, and a
+# pipeline that goes red because R2 hiccuped would be worse than a slow one.
+name: Push to the Nix cache
+description: Sign and upload the paths this job built to the R2 binary cache
+inputs:
+  cache-url:
+    description: The cache's s3:// URL (see .github/actions/nix).
+    required: false
+    default: ""
+  signing-key:
+    description: The cache's secret signing key (`name:base64`, from `nix key generate-secret`).
+    required: false
+    default: ""
+  aws-access-key-id:
+    description: R2 API token access key id with write access to the bucket.
+    required: false
+    default: ""
+  aws-secret-access-key:
+    description: R2 API token secret with write access to the bucket.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Sign and push built paths
+      if: inputs.cache-url != '' && inputs.signing-key != ''
+      shell: bash
+      env:
+        CACHE_URL: ${{ inputs.cache-url }}
+        SIGNING_KEY: ${{ inputs.signing-key }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+      run: |
+        built="$RUNNER_TEMP/nix-built-paths"
+        if [ ! -s "$built" ]; then
+          echo "nothing was built locally; nothing to push"
+          exit 0
+        fi
+        key="$RUNNER_TEMP/nix-signing-key"
+        (umask 077 && printf '%s' "$SIGNING_KEY" > "$key")
+        # Built paths can have been garbage-collected or be a failed build's
+        # partial output list; keep only the ones that are really there.
+        paths=$(tr ' ' '\n' < "$built" | sort -u | while read -r p; do [ -e "$p" ] && echo "$p"; done)
+        {
+          nix store sign --key-file "$key" $paths &&
+            nix copy --to "$CACHE_URL" $paths
+        } || echo "cache push failed; not failing the job for it"
+        rm -f "$key"

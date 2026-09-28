@@ -121,6 +121,17 @@ def test_changes_when_the_ci_definition_or_image_changes(repo):
     assert hash_of(repo) != after_ci
 
 
+def test_changes_when_the_github_workflow_changes(repo):
+    """CI runs on GitHub Actions as well as GitLab while the forge moves, so a
+    pass marker must not survive an edit to either job definition."""
+    write(repo, ".github/workflows/ci.yml", "on: [push]\n")
+    commit(repo)
+    before = hash_of(repo)
+    write(repo, ".github/workflows/ci.yml", "on: [push, pull_request]\n")
+    commit(repo)
+    assert hash_of(repo) != before
+
+
 def test_changes_when_an_extra_path_changes(repo):
     write(repo, "sim/model.py", "x = 1\n")
     commit(repo)

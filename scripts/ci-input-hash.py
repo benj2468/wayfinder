@@ -13,8 +13,9 @@ What goes in:
   dependencies affect tests and build scripts too), across workspaces;
 - each touched workspace's root `Cargo.toml`, `Cargo.lock`, and
   `.cargo/config.toml`;
-- `.gitlab-ci.yml` and `containers/testenv.Dockerfile`, the job definition
-  and the image (and so the toolchain) it runs in;
+- `.gitlab-ci.yml`, `.github/workflows/ci.yml` and
+  `containers/testenv.Dockerfile`, the job definitions and the image (and
+  so the toolchain) they run in;
 - any extra git pathspecs the job names, for inputs that aren't Rust crates.
 
 Registry dependencies need no walking: `Cargo.lock` pins them. The graph comes
@@ -32,7 +33,11 @@ import sys
 from pathlib import Path
 
 # Always part of the hash, relative to the repository root, if tracked.
-GLOBAL_INPUTS = [".gitlab-ci.yml", "containers/testenv.Dockerfile"]
+GLOBAL_INPUTS = [
+    ".gitlab-ci.yml",
+    ".github/workflows/ci.yml",
+    "containers/testenv.Dockerfile",
+]
 
 
 def cargo_metadata(manifest):

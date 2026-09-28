@@ -1,0 +1,514 @@
+# GitHub Actions port of `.gitlab-ci.yml`, for moving the forge off rabin.
+#
+# Job for job the same pipeline, and the comments there still carry the *why*
+# of each job; this file only explains what is different on GitHub. While both
+# forges run, keep the two in step: `scripts/ci-input-hash.py` hashes both files
+# into every pass marker, so an edit to either invalidates the skips.
+#
+# What changed in the move:
+#
+# - **Runners.** Every job takes `runs-on` from the `CI_RUNNER` repository
+#   variable, defaulting to GitHub's hosted `ubuntu-latest`. Pointing it at a
+#   self-hosted runner's label moves the whole pipeline in one setting, which
+#   is the lever for a private repository, where hosted minutes are billed.
+# - **Images.** The rust-ci image goes to ghcr.io instead of
+#   registry.haganah.net, under the same content-hash tag. ghcr is served over
+#   TLS, so the insecure-registry buildkitd config is gone.
+# - **sccache** uses an R2 bucket instead of a volume on the runner host, since
+#   a hosted runner keeps nothing between jobs, falling back to the Actions
+#   cache for a run with no secrets (see `.github/actions/sccache`).
+# - **Pass markers** (`scripts/ci-cached.sh`) move from `/sccache/ci-passed` to
+#   an `actions/cache` entry per job. A marker lost to cache eviction or a race
+#   between two branches only means a step runs again; a marker is still only
+#   ever written after its step passed.
+# - **Nix** substitutes from, and pushes to, an R2 bucket instead of Attic —
+#   see `.github/actions/nix`. Nothing on rabin is needed, so step-ca and the
+#   `NIX_SSL_CERT_FILE` workaround go with it.
+# - **Secret scanning** runs gitleaks over the whole history rather than
+#   GitLab's template, since the history is what goes public with the repo.
+# - **The mirror job is gone**: GitHub is the destination.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Build and push the multi-arch images for this ref
+        type: boolean
+        default: false
+      bench:
+        description: Run the wall-clock benchmarks and upload the report
+        type: boolean
+        default: false
+      nixos:
+        description: Run the NixOS integration tests (nix/tests)
+        type: boolean
+        default: false
+# A newer push to the same PR makes a running pipeline moot. `main` and tags
+# are never cancelled: half a deploy is worse than a redundant one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# `packages: read` is what lets a container job pull the rust-ci image from
+# ghcr with the job's own token; without it every pull is `denied`, even
+# though the `image` job (which asks for `packages: write`) pushed it fine.
+permissions:
+  contents: read
+  packages: read
+env:
+  # See `.gitlab-ci.yml`: line tables keep backtraces useful without the link
+  # time and target size of full debuginfo.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # sccache cannot cache incrementally-compiled crates, and a fresh runner has
+  # no incremental state to reuse anyway.
+  CARGO_INCREMENTAL: "0"
+  # Which store it uses is `.github/actions/sccache`'s choice, per job.
+  RUSTC_WRAPPER: sccache
+jobs:
+  # The rust-ci image tag: a hash of containers/testenv.Dockerfile's content.
+  # Built and pushed only when that exact content is not in ghcr yet.
+  image:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: tag
+        run: |
+          repo=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "tag=$repo/rust-ci:$(sha256sum containers/testenv.Dockerfile | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push unless already published
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          CACHE_IMAGE: ${{ steps.tag.outputs.repo }}/rust-ci:cache
+        run: |
+          if docker manifest inspect "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already published for this Dockerfile content; skipping rebuild."
+            exit 0
+          fi
+          docker pull "$CACHE_IMAGE" || true
+          docker build -f containers/testenv.Dockerfile --cache-from "$CACHE_IMAGE" -t "$TAG" -t "$CACHE_IMAGE" .
+          docker push "$TAG"
+          docker push "$CACHE_IMAGE"
+  # Formatting on a PR, the full `nix flake check` on `main`.
+  lint-nix:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          public-key: ${{ vars.NIX_CACHE_PUBLIC_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      - run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            nix flake check
+          else
+            nix build --no-link ".#checks.$(nix eval --impure --raw --expr builtins.currentSystem).treefmt"
+          fi
+      - uses: ./.github/actions/nix-cache-push
+        if: always()
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  # The PR title becomes the squash-merge commit, so it is the one that must
+  # follow Conventional Commits (commitlint.config.ts).
+  lint-pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v5
+      # The title goes through the environment, never interpolated into the
+      # script: it is attacker-controlled text on a PR.
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$TITLE" | docker run -i --rm -v "$PWD:/app" -w /app commitlint/commitlint
+  # Every commit reachable from this ref, not only the tree: once the
+  # repository is public, a secret anywhere in history is published.
+  # `.gitleaks.toml` holds the allowlist for known non-secrets.
+  secret-scan:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      # As the runner user, so git does not refuse a checkout it does not own.
+      - run: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1 git --no-banner --redact --exit-code 1 .
+  build:
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: sccache --show-stats
+  build-embedded:
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      BARE_METAL_TARGET: thumbv7em-none-eabihf
+      CI_JOB_NAME: build-embedded
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ci-passed-${{ github.job }}-
+      - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
+      - run: scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings'
+      - run: scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings'
+      - run: scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml -- sh -c 'cd bins/wayfinder-stm32f411 && cargo clippy --locked -- -D warnings'
+      - run: scripts/ci-cached.sh blue --package blue -- cargo clippy --locked -p blue --no-default-features --features hardware,softdevice-log --target "$BARE_METAL_TARGET" -- -D warnings
+      - run: sccache --show-stats
+      - uses: actions/cache/save@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  build-stack-budget:
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CI_JOB_NAME: build-stack-budget
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ci-passed-${{ github.job }}-
+      - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
+      # The nRF boards' 18% share is argued in the `justfile` next to
+      # `stack-budget-nrf52840`; keep the two in step.
+      - run: scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-nrf52840 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x --task-poll-pct 18'
+      - run: scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x --task-poll-pct 18'
+      - run: scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-stm32f411 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x'
+      - run: sccache --show-stats
+      - uses: actions/cache/save@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  build-web:
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CI_JOB_NAME: build-web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ci-passed-${{ github.job }}-
+      - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
+      # The largest job on GitLab by a distance (4,500 runner-minutes in the
+      # 30 days before the move), so it skips whenever wayfinder-web and every
+      # crate it reaches are unchanged since a passing run. Debug throughout:
+      # the release leptos build was ten of its sixteen minutes, and `main`'s
+      # Nix build already covers release (see `.gitlab-ci.yml`'s `build:web`).
+      - run: >-
+          scripts/ci-cached.sh web --package wayfinder-web -- sh -c 'cargo leptos build && cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings && cargo nextest run -p wayfinder-web --features mock-node'
+      - run: sccache --show-stats
+      - uses: actions/cache/save@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  test-rust:
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      # Coverage on `main` only, as on GitLab.
+      - run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then RUN="cargo llvm-cov nextest --no-report"; else RUN="cargo nextest run"; fi
+          $RUN --profile ci --workspace
+          $RUN --profile ci -p wayfinder-server --features embedded
+          $RUN --profile ci -p wayfinder-auth --features compact-sha512
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            cargo llvm-cov report --cobertura --output-path coverage.xml
+            cargo llvm-cov report
+          fi
+      - run: sccache --show-stats
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-rust-reports
+          path: |
+            target/nextest/ci/junit.xml
+            coverage.xml
+          if-no-files-found: ignore
+  test-alloc-gate:
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CI_JOB_NAME: test-alloc-gate
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ci-passed-${{ github.job }}-
+      - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
+      - run: scripts/ci-cached.sh alloc --package wayfinder-bench -- cargo bench -p wayfinder-bench --features alloc-gate --bench alloc --profile dev
+      - run: sccache --show-stats
+      - uses: actions/cache/save@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  test-python:
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CI_JOB_NAME: test-python
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ci-passed-${{ github.job }}-
+      - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
+      # tshark will not load the Lua dissector as root, so the suite runs as
+      # the image's unprivileged `ci` user (see `.gitlab-ci.yml`).
+      - run: >-
+          scripts/ci-cached.sh python --package wayfinder-py --manifest-path libs/wayfinder-py/Cargo.toml --extra '*.py' --extra sim --extra ml --extra scripts --extra libs/wayfinder-shark --extra pyproject.toml --extra uv.lock -- sh -c 'uv sync --locked && install -d -o ci target/pytest && runuser -u ci -- uv run pytest --junitxml=target/pytest/junit.xml'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-python-reports
+          path: target/pytest/junit.xml
+          if-no-files-found: ignore
+      - uses: actions/cache/save@v4
+        with:
+          path: .ci-passed
+          key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  # The NixOS integration tests (nix/tests), on `main` or on demand, as on
+  # GitLab. They are systemd-nspawn container tests, so they need a real build
+  # sandbox with `uid-range` — which a hosted runner, being a full VM, gives
+  # where GitLab's docker runner could not (that needed the `privileged` one).
+  # See `.gitlab-ci.yml`'s `test:nixos` for each setting's reason.
+  test-nixos:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.nixos)
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [simple, ethernet-egress, ca-provider, vpn-data-plane]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          public-key: ${{ vars.NIX_CACHE_PUBLIC_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          extra-config: |
+            experimental-features = nix-command flakes auto-allocate-uids cgroups
+            sandbox = true
+            auto-allocate-uids = true
+            system-features = kvm nixos-test uid-range big-parallel benchmark
+            extra-sandbox-paths = /dev/net/tun
+      - run: nix build --print-build-logs --no-link ".#wayfinder-${{ matrix.test }}"
+      - uses: ./.github/actions/nix-cache-push
+        if: always()
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  # Wall-clock benchmarks never gate (see CLAUDE.md); on demand only.
+  bench:
+    if: github.event_name == 'workflow_dispatch' && inputs.bench
+    needs: image
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      - run: cargo bench -p wayfinder-bench
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion
+          path: target/criterion/
+          retention-days: 30
+  # The one check to mark required in branch protection: it fails if any job
+  # it depends on failed or was cancelled, and passes over skipped ones (a PR
+  # skips nothing here, but `lint-pr-title` is skipped off a PR).
+  ci-ok:
+    if: always()
+    needs:
+      - lint-nix
+      - lint-pr-title
+      - secret-scan
+      - build
+      - build-embedded
+      - build-stack-budget
+      - build-web
+      - test-rust
+      - test-alloc-gate
+      - test-python
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "all required jobs passed"
+  # Multi-arch images for each runnable binary, to ghcr.io. Automatic for a
+  # release tag or a push to main; on demand elsewhere. See `.gitlab-ci.yml`'s
+  # `deploy` for the tagging scheme, which is unchanged.
+  deploy:
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deploy)
+    needs: [test-rust, test-python]
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - run: |
+          registry=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          short_sha=$(git rev-parse --short HEAD)
+          EXTRA_TAG=""
+          if [ "${{ github.ref_type }}" = tag ]; then
+            IMAGE_TAG="${{ github.ref_name }}"
+          else
+            IMAGE_TAG="dev-$short_sha"
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              EXTRA_TAG="nightly"
+            fi
+          fi
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "refusing to build an unlabelled image: IMAGE_TAG is empty" >&2
+            exit 1
+          fi
+          for app in tap tui ctl ctl-vpn web; do
+            image="$registry/wayfinder-$app:$IMAGE_TAG"
+            extra_tag_arg=""
+            if [ -n "$EXTRA_TAG" ]; then
+              extra_tag_arg="--tag $registry/wayfinder-$app:$EXTRA_TAG"
+            fi
+            # shellcheck disable=SC2086 # $extra_tag_arg is zero or two words
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              -f containers/Dockerfile \
+              --target "$app" \
+              --build-arg "WAYFINDER_BUILD_VERSION=$IMAGE_TAG" \
+              --build-arg "WAYFINDER_BUILD_COMMIT=$short_sha" \
+              -t "$image" \
+              $extra_tag_arg \
+              --push \
+              .
+          done

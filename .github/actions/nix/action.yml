@@ -1,0 +1,88 @@
+# Install Nix, with the shared binary cache on Cloudflare R2 as an extra
+# substituter when one is configured.
+#
+# The cache is a plain S3 binary cache in an R2 bucket (`nix copy --to
+# s3://...`), not an Attic server: there is nothing to run, and R2 charges no
+# egress, which is the whole cost of a binary cache. Reads go through the same
+# authenticated `s3://` URL as writes, so the bucket stays private while the
+# repository is.
+#
+# Every input is optional. With none set this installs Nix and builds exactly
+# as it would with no cache, so a fork (or a repository whose cache variables
+# are not set yet) still gets a working pipeline.
+#
+# Pair it with `.github/actions/nix-cache-push` at the end of the job: the
+# post-build hook installed here records every path this job *built* (never
+# the ones it substituted), and that action signs and uploads them.
+name: Set up Nix
+description: Install Nix and wire in the R2 binary cache
+inputs:
+  cache-url:
+    description: "The cache's s3:// URL, e.g. s3://wayfinder-nix?endpoint=<account>.r2.cloudflarestorage.com&region=auto"
+    required: false
+    default: ""
+  public-key:
+    description: The cache's public signing key (`name:base64`), trusted for substitution.
+    required: false
+    default: ""
+  aws-access-key-id:
+    description: R2 API token access key id, for reading the bucket.
+    required: false
+    default: ""
+  aws-secret-access-key:
+    description: R2 API token secret, for reading the bucket.
+    required: false
+    default: ""
+  extra-config:
+    description: More nix.conf lines, e.g. the sandbox features the NixOS tests need.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Write the post-build hook and nix.conf fragment
+      id: conf
+      shell: bash
+      env:
+        CACHE_URL: ${{ inputs.cache-url }}
+        PUBLIC_KEY: ${{ inputs.public-key }}
+        EXTRA_CONFIG: ${{ inputs.extra-config }}
+      run: |
+        hook="$RUNNER_TEMP/nix-post-build-hook"
+        printf '#!/bin/sh\necho $OUT_PATHS >> %s/nix-built-paths\n' "$RUNNER_TEMP" > "$hook"
+        chmod +x "$hook"
+        {
+          echo "post-build-hook = $hook"
+          # A runner that cannot sandbox should fail at once, not build
+          # unsandboxed for half an hour and fail at the first derivation
+          # that needs it (see the nixos tests on the GitLab side).
+          echo "sandbox-fallback = false"
+          if [ -n "$CACHE_URL" ] && [ -n "$PUBLIC_KEY" ]; then
+            echo "extra-substituters = $CACHE_URL"
+            echo "extra-trusted-public-keys = $PUBLIC_KEY"
+          fi
+          printf '%s\n' "$EXTRA_CONFIG"
+        } > "$RUNNER_TEMP/nix.conf.extra"
+        {
+          echo 'config<<EOF'
+          cat "$RUNNER_TEMP/nix.conf.extra"
+          echo EOF
+        } >> "$GITHUB_OUTPUT"
+    - uses: cachix/install-nix-action@v31
+      with:
+        extra_nix_config: ${{ steps.conf.outputs.config }}
+    # The daemon, not this shell, fetches from the substituter, so the R2
+    # credentials go in its environment rather than the job's.
+    - name: Give the nix daemon the cache credentials
+      if: inputs.cache-url != '' && inputs.aws-access-key-id != ''
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+      run: |
+        sudo mkdir -p /etc/systemd/system/nix-daemon.service.d
+        printf '[Service]\nEnvironment=AWS_ACCESS_KEY_ID=%s\nEnvironment=AWS_SECRET_ACCESS_KEY=%s\n' \
+          "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+          | sudo tee /etc/systemd/system/nix-daemon.service.d/r2.conf >/dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl restart nix-daemon
