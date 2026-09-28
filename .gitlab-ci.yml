@@ -89,12 +89,54 @@ image-tag:
   artifacts:
     reports:
       dotenv: image.env
+# The shared binary cache, https://cache.haganah.net (Attic, on rabin), for any
+# job that runs Nix. Every such job pulls from it and pushes to it, MR pipelines
+# included (ATTIC_TOKEN is deliberately not protected), so an MR's builds are
+# reused by its own retries and later commits, and by other MRs. The cost: any
+# branch pipeline can write paths that `main` and developer machines trust.
+#
+# What gets pushed is what the job *built*: scripts/ci-nix-record-built.sh is a
+# `post-build-hook`, which fires for built paths and never for substituted ones,
+# and after_script pushes the lot in one go. after_script runs on failure too,
+# so a job that fails half an hour in still leaves its work in the cache.
+#
+# The cache's public key is the non-secret ATTIC_PUBLIC_KEY variable (from
+# `attic cache info haganah:wayfinder`). Unset, the job builds exactly as it
+# would with no cache. The runners mount the host CA bundle and point
+# NIX_SSL_CERT_FILE at it, which is how Nix trusts the step-ca certificate.
+.nix-cache:
+  variables:
+    ATTIC_SERVER: https://cache.haganah.net
+    ATTIC_CACHE: wayfinder
+    # The first push of a cold cache uploads a whole workspace closure;
+    # after_script's 5-minute default would cut it off.
+    RUNNER_AFTER_SCRIPT_TIMEOUT: 30m
+  before_script:
+    - |
+      if [ -n "${ATTIC_PUBLIC_KEY:-}" ]; then
+        export NIX_CONFIG="${NIX_CONFIG:-}
+      extra-substituters = $ATTIC_SERVER/$ATTIC_CACHE
+      extra-trusted-public-keys = $ATTIC_PUBLIC_KEY
+      post-build-hook = $CI_PROJECT_DIR/scripts/ci-nix-record-built.sh"
+      fi
+  after_script:
+    - |
+      if [ -n "${ATTIC_TOKEN:-}" ] && [ -s /tmp/nix-built-paths ]; then
+        nix --extra-experimental-features "nix-command flakes" profile install --inputs-from . nixpkgs#attic-client
+        # attic verifies TLS through rustls' platform verifier, which reads
+        # SSL_CERT_FILE, not NIX_SSL_CERT_FILE — without this it trusts only
+        # the image's public CAs and rejects the step-ca certificate.
+        export SSL_CERT_FILE="${NIX_SSL_CERT_FILE:-/etc/ssl/certs/ca-bundle.crt}"
+        attic login haganah "$ATTIC_SERVER" "$ATTIC_TOKEN"
+        attic push "haganah:$ATTIC_CACHE" --stdin </tmp/nix-built-paths || echo "cache push failed; not failing the job for it"
+      fi
 # Also the repo's formatting gate: `nix flake check` includes treefmt-nix's
 # `treefmt` check, which runs rustfmt (nightly, with `rustfmt.toml`'s unstable
 # options) alongside every other formatter. A separate `lint:rust` job used to
 # run a bare `cargo fmt` — which rewrites instead of checking, so it could never
 # fail — on a ~1.5 GB nightly image pulled every pipeline.
 lint:nix:
+  extends: .nix-cache
   stage: lint
   image: nixos/nix
   tags:
@@ -109,6 +151,61 @@ lint:nix:
       else
         nix --extra-experimental-features "nix-command flakes" build --no-link ".#checks.$(nix --extra-experimental-features nix-command eval --impure --raw --expr builtins.currentSystem).treefmt"
       fi
+# The four NixOS integration tests (nix/tests/*.nix): the NixOS module's
+# privilege derivation, the no-local-egress CA posture, ethernet egress, and
+# mesh traffic over a real Tailscale tunnel. They are the repo's only
+# end-to-end deployment tests.
+#
+# Built explicitly here rather than moved into the flake's `checks`: `lint:nix`
+# on `main` runs the whole `flake check`, and folding four container boots into
+# the formatting gate would make it the slowest job in the pipeline. They stay
+# `packages`, so `nix build .#wayfinder-simple` still works by hand.
+#
+# They are systemd-nspawn container tests, not QEMU VMs, so the runner needs
+# no /dev/kvm. What it does need is the derivation's `requiredSystemFeatures`
+# (`kvm nixos-test uid-range`): `uid-range` means sandboxed builds with
+# auto-allocated uids, which needs kernel namespaces — and the general `docker`
+# runners cannot create any (verified on !209: Nix there builds unsandboxed and
+# only the final test derivation fails). So this runs on the `privileged`
+# runner. `kvm` is declared but not exercised by the nspawn backend.
+#
+# Automatic on `main`, where a failure is fixed forward. On an MR it is a
+# manual button: each test boots containers on runners that share a host with
+# GitLab itself, too heavy to gate every push on, and most MRs cannot reach
+# the NixOS module at all.
+test:nixos:
+  extends: .nix-cache
+  stage: test
+  image: nixos/nix
+  tags:
+    - privileged
+  needs: []
+  parallel:
+    matrix:
+      - TEST: [simple, ethernet-egress, ca-provider, vpn-data-plane]
+  variables:
+    NIX_CONFIG: |
+      experimental-features = nix-command flakes auto-allocate-uids cgroups
+      sandbox = true
+      # Nix silently builds unsandboxed when it cannot create the namespaces
+      # a sandbox needs, and only the final test derivation (which requires
+      # `uid-range`) then fails — 30 minutes in. Fail at the first build
+      # instead, with the reason.
+      sandbox-fallback = false
+      auto-allocate-uids = true
+      system-features = kvm nixos-test uid-range big-parallel benchmark
+      # The node under test creates its TAP egress by opening /dev/net/tun,
+      # and a build sandbox starts with a minimal /dev: without this the unit
+      # fails `failed to create TAP device: No such file or directory`. The
+      # NixOS hosts set the same (nixconf host/default.nix). No
+      # `?` suffix: a runner without the device should fail here, at once.
+      extra-sandbox-paths = /dev/net/tun
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"'
+    - when: manual
+      allow_failure: true
+  script:
+    - nix build --print-build-logs --no-link ".#wayfinder-$TEST"
 lint:mr-title:
   stage: lint
   image:

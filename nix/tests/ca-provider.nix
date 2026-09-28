@@ -158,6 +158,18 @@ testers.nixosTest {
               };
             };
             runtime_state_path = "/var/lib/wayfinder/settings.json";
+            # The clock gate off, here and on `node` below, and *only* in this
+            # test. The containers run under systemd-nspawn, whose seccomp
+            # allowlist answers `adjtimex` with EPERM unless the container holds
+            # CAP_SYS_TIME — so the node reads its NTP status as `unreadable`
+            # and refuses every issuance, and enrollment fails with "the
+            # authority has no usable clock". Letting the syscall through would
+            # not help: the status word is the *host* kernel's, so the verdict
+            # would track whatever the CI runner's own time daemon is doing, and
+            # there is no NTP server in the sandbox to discipline it here.
+            # Nothing below tests the gate itself; it is unit-tested in
+            # `wayfinder-clock-trust`.
+            require_time_sync = false;
           };
         };
 
@@ -187,6 +199,9 @@ testers.nixosTest {
             };
             mac_state_path = "/var/lib/wayfinder/node.mac";
             runtime_state_path = "/var/lib/wayfinder/settings.json";
+            # See the CA's config: nspawn denies the NTP status read, and this
+            # node installs the certificate it is issued.
+            require_time_sync = false;
           };
         };
 
@@ -242,6 +257,7 @@ testers.nixosTest {
         # on its own behalf (`libs/wayfinder-server/src/authz.rs`). Reaching the
         # admin tier at all therefore takes a key this node does not hold.
         ca.succeed("wayfinder-ctl cert keygen --out-seed /tmp/operator.seed")
+        now = int(ca.succeed("date +%s").strip())
         ca.succeed(
             "wayfinder-ctl cert issue "
             "--ca-seed /var/lib/wayfinder/root.seed --mesh-id 0x5741594e "
@@ -503,10 +519,14 @@ testers.nixosTest {
         node.succeed(f"echo {cert_b64} | base64 -d > /tmp/node.cert")
         node.succeed(f"echo {anchor_b64} | base64 -d > /tmp/anchor")
 
+        # `--unsafe-allow-untrustworthy-clock` for the reason the node configs
+        # set `require_time_sync = false`: `csr install` stamps the operator's
+        # clock onto the node, and inside nspawn nothing can vouch for it.
         node.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "csr install --cert /tmp/node.cert --trust-anchor /tmp/anchor"
+            "csr install --cert /tmp/node.cert --trust-anchor /tmp/anchor "
+            "--unsafe-allow-untrustworthy-clock"
         )
 
     with subtest("an operator's admin identity is refused a tunnel credential"):
