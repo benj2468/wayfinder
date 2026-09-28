@@ -642,10 +642,11 @@ impl CaLog {
     /// upgrades — committed in one transaction, and renamed to
     /// `<name>.imported`. It is kept, not deleted: it is the only copy of the
     /// CA's state that predates the database. A file still present beside an
-    /// initialized database is either an import that committed and crashed
-    /// before the rename (same contents: the rename is finished) or a
-    /// different CA's state (refused, since picking either loses the other's
-    /// revocations).
+    /// initialized database is either that import's leftover — a crash before
+    /// the rename, or a rename that failed — recognised by the digest the
+    /// import recorded, however much the CA has changed since, and then the
+    /// rename is finished; or a different CA's state, refused, since picking
+    /// either loses the other's revocations.
     pub(crate) fn open(db: &Path, legacy: Option<&Path>) -> Result<Self, String> {
         let store = SqliteStore::open(db)?;
         let mut log = Self::with_store(Box::new(store), legacy)?;
@@ -679,8 +680,11 @@ impl CaLog {
             // initialized and a later start never imports over it.
             let state = legacy
                 .as_ref()
-                .map_or_else(CaLogState::empty, |(_, state)| state.clone());
+                .map_or_else(CaLogState::empty, |(_, (state, _))| state.clone());
             let mut change = ChangeSet::default();
+            if let Some((_, (_, digest))) = &legacy {
+                change.record_import(digest.clone());
+            }
             let mut pending = Vec::new();
             for collection in Collection::ALL {
                 for body in encode_collection(&state, collection)? {
@@ -705,12 +709,23 @@ impl CaLog {
         for row in loaded.rows {
             backing.remember(row.collection, row.body, row.id);
         }
-        if let Some((path, legacy_state)) = legacy {
-            if same_records(&state, &legacy_state)? {
+        if let Some((path, (legacy_state, digest))) = legacy {
+            // The file this database was imported from, byte for byte, is the
+            // import's own leftover however much the CA has changed since —
+            // re-reading it to compare states cannot tell that, since a v5/v6
+            // snapshot mints fresh account ids on every parse. Comparing
+            // states remains for a database imported before the digest was
+            // recorded.
+            if loaded.imported_digest.as_deref() == Some(digest.as_str())
+                || same_records(&state, &legacy_state)?
+            {
                 move_aside(path);
             } else {
                 return Err(format!(
-                    "{} is still present beside an initialized CA database and holds                      different state; refusing to start rather than choose between                      them. If its state is already in the database, move it aside",
+                    "{} is still present beside an initialized CA database and is not \
+                     the file it was imported from; refusing to start rather than \
+                     choose between them. If its state is already in the database, \
+                     move it aside",
                     path.display()
                 ));
             }
@@ -1182,7 +1197,7 @@ fn decode_rows(loaded: &Loaded) -> Result<CaLogState, String> {
 ///
 /// Bounded: a snapshot larger than [`MAX_STATE_BYTES`] fails closed rather than
 /// being read in whole, as it always has.
-fn read_legacy(path: &Path) -> Result<CaLogState, String> {
+fn read_legacy(path: &Path) -> Result<(CaLogState, String), String> {
     let len = std::fs::metadata(path)
         .map_err(|e| format!("failed to read CA state file {}: {e}", path.display()))?
         .len();
@@ -1194,10 +1209,21 @@ fn read_legacy(path: &Path) -> Result<CaLogState, String> {
     }
     let bytes = std::fs::read(path)
         .map_err(|e| format!("failed to read CA state file {}: {e}", path.display()))?;
-    CaStateCodec {
+    let state = CaStateCodec {
         path: Some(path.to_path_buf()),
     }
-    .decode(&bytes)
+    .decode(&bytes)?;
+    Ok((state, snapshot_digest(&bytes)))
+}
+
+/// A legacy snapshot's identity: `Blake2s256` of its bytes under a label, hex
+/// encoded, as [`Loaded::imported_digest`] records it.
+fn snapshot_digest(bytes: &[u8]) -> String {
+    use blake2::Digest as _;
+    let mut h = blake2::Blake2s256::new();
+    h.update(b"wayfinder ca-state.json import v1");
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Whether two states hold the same records in every collection, ignoring
@@ -1216,8 +1242,8 @@ fn same_records(a: &CaLogState, b: &CaLogState) -> Result<bool, String> {
 }
 
 /// Rename an imported `ca-state.json` to `<name>.imported`. A failure is only
-/// logged: the state is committed, and the next start finds the same contents
-/// beside the database and finishes the rename then.
+/// logged: the state is committed, and the next start recognises the file by
+/// the digest the import recorded and finishes the rename then.
 fn move_aside(path: &Path) {
     let mut aside = path.as_os_str().to_owned();
     aside.push(".imported");

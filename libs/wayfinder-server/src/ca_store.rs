@@ -89,6 +89,11 @@ pub(crate) struct Loaded {
     /// Whether anything has ever been committed. `false` is a store that has
     /// never held a CA; an empty CA that has committed is `true`.
     pub(crate) initialized: bool,
+    /// The digest of the legacy `ca-state.json` this store was initialized
+    /// from, if it was imported from one. How a later start recognises that
+    /// file, should it still be beside the database, as the one already
+    /// imported rather than a different CA's state.
+    pub(crate) imported_digest: Option<String>,
     /// Every row, in no particular order.
     pub(crate) rows: Vec<Row>,
 }
@@ -99,12 +104,19 @@ pub(crate) struct Loaded {
 pub(crate) struct ChangeSet {
     inserts: Vec<(Collection, Vec<u8>)>,
     deletes: Vec<(Collection, i64)>,
+    imported_digest: Option<String>,
 }
 
 impl ChangeSet {
     /// Insert a new row holding `body` into `collection`.
     pub(crate) fn insert(&mut self, collection: Collection, body: Vec<u8>) {
         self.inserts.push((collection, body));
+    }
+
+    /// Record, in the same transaction, that this change imports the legacy
+    /// snapshot whose digest is `digest`. See [`Loaded::imported_digest`].
+    pub(crate) fn record_import(&mut self, digest: String) {
+        self.imported_digest = Some(digest);
     }
 
     /// Delete row `id`, which must exist in `collection`.
@@ -127,7 +139,7 @@ impl ChangeSet {
 
     /// Whether this change writes nothing.
     pub(crate) fn is_empty(&self) -> bool {
-        self.inserts.is_empty() && self.deletes.is_empty()
+        self.inserts.is_empty() && self.deletes.is_empty() && self.imported_digest.is_none()
     }
 }
 
@@ -245,6 +257,18 @@ impl CaStore for SqliteStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(false),
                 e => Err(err(e)),
             })?;
+        let imported_digest = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'imported_digest'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(err(e)),
+            })?;
         let mut stmt = self
             .conn
             .prepare("SELECT id, collection, body FROM records")
@@ -266,7 +290,11 @@ impl CaStore for SqliteStore {
                 body,
             });
         }
-        Ok(Loaded { initialized, rows })
+        Ok(Loaded {
+            initialized,
+            imported_digest,
+            rows,
+        })
     }
 
     fn commit(&mut self, change: &ChangeSet) -> Result<Vec<i64>, String> {
@@ -302,6 +330,13 @@ impl CaStore for SqliteStore {
             [],
         )
         .map_err(err)?;
+        if let Some(digest) = &change.imported_digest {
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('imported_digest', ?1)",
+                [digest],
+            )
+            .map_err(err)?;
+        }
         tx.commit().map_err(err)?;
         Ok(ids)
     }
