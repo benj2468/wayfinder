@@ -1,6 +1,6 @@
 # Design: cloud-scale state — a host capacity profile, and the CA on SQLite
 
-**Status:** Phase 1 implemented (see §3.1); phase 2 not started. Numbered 26 because 25 is taken by the WL55 design on `bjc/wl55jc-relay`.
+**Status:** Phases 1 and 2 implemented (see §3.1 and §4.1); the revocation index of §5 is not built yet. Numbered 26 because 25 is taken by the WL55 design on `bjc/wl55jc-relay`.
 
 **Scope:**
 - `libs/interfaces` (`define_profile!`) and `libs/wayfinder` (`router_for!`, a
@@ -233,8 +233,9 @@ catch-up parts stay design 03's own.
   through `Driver::reflood_revocations`, which applies a live revocation's
   trust-anchor check.
 - **Not yet:** the complete revocation index of §5. The CA's router still
-  checks revocations against its bounded table (32 at `host`, 1024 at `cloud`), so a CA with
-  more live revocations than that re-floods the newest it can hold.
+  checks revocations against its bounded table (1024 at the `host` profile
+  `wayfinder-tap` runs, 32 at `default`), so a CA with more live revocations
+  than that re-floods the newest it can hold.
 
 ## 5. Tiering: which state gets a cache in front of a store
 
