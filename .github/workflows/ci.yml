@@ -184,7 +184,7 @@ jobs:
       - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
       - run: scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings'
       - run: scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings'
-      - run: scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml -- sh -c 'cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings'
+      - run: scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml -- sh -c 'cd bins/wayfinder-stm32f411 && cargo clippy --locked -- -D warnings'
       - run: scripts/ci-cached.sh blue --package blue -- cargo clippy --locked -p blue --no-default-features --features hardware,softdevice-log --target "$BARE_METAL_TARGET" -- -D warnings
       - run: sccache --show-stats
       - uses: actions/cache/save@v4
@@ -241,9 +241,11 @@ jobs:
       - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
       # The largest job on GitLab by a distance (4,500 runner-minutes in the
       # 30 days before the move), so it skips whenever wayfinder-web and every
-      # crate it reaches are unchanged since a passing run.
+      # crate it reaches are unchanged since a passing run. Debug throughout:
+      # the release leptos build was ten of its sixteen minutes, and `main`'s
+      # Nix build already covers release (see `.gitlab-ci.yml`'s `build:web`).
       - run: >-
-          scripts/ci-cached.sh web --package wayfinder-web -- sh -c 'cargo leptos build --release && cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings && cargo nextest run -p wayfinder-web --features mock-node'
+          scripts/ci-cached.sh web --package wayfinder-web -- sh -c 'cargo leptos build && cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings && cargo nextest run -p wayfinder-web --features mock-node'
       - run: sccache --show-stats
       - uses: actions/cache/save@v4
         with:
@@ -298,7 +300,7 @@ jobs:
           key: ci-passed-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ci-passed-${{ github.job }}-
       - run: echo "CI_PASS_DIR=$PWD/.ci-passed" >> "$GITHUB_ENV"
-      - run: scripts/ci-cached.sh alloc --package wayfinder-bench -- cargo bench -p wayfinder-bench --features alloc-gate --bench alloc
+      - run: scripts/ci-cached.sh alloc --package wayfinder-bench -- cargo bench -p wayfinder-bench --features alloc-gate --bench alloc --profile dev
       - run: sccache --show-stats
       - uses: actions/cache/save@v4
         with:
@@ -326,7 +328,7 @@ jobs:
       # tshark will not load the Lua dissector as root, so the suite runs as
       # the image's unprivileged `ci` user (see `.gitlab-ci.yml`).
       - run: >-
-          scripts/ci-cached.sh python --package wayfinder-py --manifest-path libs/wayfinder-py/Cargo.toml --extra '*.py' --extra sim --extra ml --extra scripts --extra libs/wayfinder-shark --extra pyproject.toml --extra uv.lock -- sh -c 'uv sync --locked && install -d -o ci target/pytest && runuser -u ci -- uv run pytest --junitxml=target/pytest/junit.xml'
+          scripts/ci-cached.sh python --package wayfinder-py --manifest-path libs/wayfinder-py/Cargo.toml --extra '*.py' --extra sim --extra ml --extra scripts --extra libs/wayfinder-shark --extra pyproject.toml --extra uv.lock -- sh -c 'MATURIN_PEP517_ARGS="--profile dev" uv sync --locked && install -d -o ci target/pytest && runuser -u ci -- uv run pytest --junitxml=target/pytest/junit.xml'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
