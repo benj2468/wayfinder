@@ -91,10 +91,10 @@ already announced a change the box has not taken is the wrong way round.
 go, and `wayfinder-ca.sh site` publishes the page alone when only copy changed.
 
 **Why Direct Upload and not Cloudflare's Git integration:** the Git integration
-connects only to `github.com` and `gitlab.com`, and this project lives on a
-self-hosted GitLab. The GitHub mirror (`mirror:github`) is push-only and lags,
-so pointing Cloudflare at it would mean deploying from a second source of
-truth.
+deploys on every push, and the paragraph above is why the page must not. (It
+also used to be impossible: the integration connects only to `github.com` and
+`gitlab.com`, and the project lived on a self-hosted GitLab until it moved to
+GitHub.)
 
 ### One-time setup
 
