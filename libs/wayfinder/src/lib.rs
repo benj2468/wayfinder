@@ -62,10 +62,12 @@ pub use crate::link_quality::LinkQualityRecord;
 
 crate::define_profile! {
     /// The default capacities a `CentralRouter` is built with when no profile is
-    /// named — sized for a Linux gateway. Downstream crates whose own defaults
+    /// named. Small enough to build on an ordinary thread's stack, which tests,
+    /// the simulator and the tick driver do; a gateway binary names [`host`]
+    /// instead (design 26). Downstream crates whose own defaults
     /// must match the router's name this rather than repeating the literals;
     /// `router_defaults_preserve_todays_capacities` pins the two together.
-    pub host {
+    pub default {
         originators: 128,
         interfaces: 8,
         mcast_members: 64,
@@ -77,6 +79,32 @@ crate::define_profile! {
         revoked: 32,
         in_flight_cert_requests: 16,
         pending_replies: 16,
+        max_frame_len: 2048,
+    }
+}
+
+crate::define_profile! {
+    /// Capacities for a node with a server's memory: the certificate authority,
+    /// a VPN hub, any `wayfinder-tap` in a data centre (design 26). Sized so no
+    /// mesh we run gets near them — on a VPN hub every peer is a direct
+    /// neighbour, which is what fills `default`'s 64 neighbour keys first.
+    ///
+    /// A router at these sizes is about 1.8 MB, so it cannot be built on a
+    /// default thread's stack: `wayfinder-driver` builds it on a short-lived
+    /// thread with room for it and keeps only the `Arc` it is moved into.
+    /// `the_host_profile_pins_design_26s_capacities` pins every number.
+    pub host {
+        originators: 4096,
+        interfaces: 8,
+        mcast_members: 1024,
+        local_mcast: 64,
+        ident_table: 4096,
+        ident_live: 3500,
+        link_quality: 1024,
+        neighbor_keys: 1024,
+        revoked: 1024,
+        in_flight_cert_requests: 256,
+        pending_replies: 256,
         max_frame_len: 2048,
     }
 }
@@ -668,7 +696,7 @@ pub struct CentralRouter<
 }
 
 impl CentralRouter {
-    /// A router at the default (host) capacities.
+    /// A router at the default capacities.
     ///
     /// Kept on the fully-defaulted type rather than the generic impl below: a
     /// struct's default const parameters do not drive inference in expression

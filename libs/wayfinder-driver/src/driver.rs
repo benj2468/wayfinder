@@ -39,6 +39,8 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::router_ops::OgmAuthOps;
+use wayfinder::router_ops::RouterOps;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
@@ -293,7 +295,20 @@ impl MeshSink for LoopOutput {
 /// `Local` is the host-facing device (a TUN/TAP in production, an observable
 /// channel in tests); the mesh interfaces are type-erased [`LinkT`]s, so simple
 /// point-to-point carriers and self-routing multi-access links can be mixed.
-pub struct Driver<Local: FrameIo> {
+///
+/// Generic over the router type `R: RouterOps`, defaulting to [`CentralRouter`]
+/// at the `default` profile's capacities — the way `wayfinder-embedded-driver`'s `Driver`
+/// already is (design 26 phase 1 slice 2). The event loop, planning and
+/// dispatch are expressed against `R` alone; the management-API surface
+/// (`router_handle`, `with_router`/`with_router_mut`, `run`/`run_once`/
+/// `process_pending`) is expressed against a concrete `CentralRouter`
+/// const-generic over its eleven table capacities instead — matching
+/// `wayfinder-server`'s `RouterAdapter`/`RouterHandle`, which are themselves
+/// const-generic over those capacities rather than generic over `RouterOps`
+/// (design 26 phase 1 slice 3). So that surface reaches every capacity
+/// *profile* `CentralRouter` is built at, but — like `RouterAdapter` — not an
+/// arbitrary `R: RouterOps` implementor.
+pub struct Driver<Local: FrameIo, R: RouterOps = CentralRouter> {
     /// The local host network device.
     local: Local,
     /// The mesh interfaces, indexed by interface index.
@@ -314,7 +329,7 @@ pub struct Driver<Local: FrameIo> {
     /// frames. This loop takes the write guard — in short scopes, never across
     /// a link send — and a connection task reads through a
     /// [`RouterHandle`](wayfinder_server::RouterHandle).
-    shared: Arc<RwLock<SharedRouter>>,
+    shared: Arc<RwLock<SharedRouter<R>>>,
     /// Management-API queries forwarded from the server tasks.
     query_rx: QueryRx,
     /// Requests from the TLS management server for a snapshot of this node's
@@ -424,7 +439,51 @@ pub struct Driver<Local: FrameIo> {
     mesh_renewal_rx: tokio::sync::mpsc::Receiver<(Mac, wayfinder_server::RenewalOutcome)>,
 }
 
-impl<Local: FrameIo> Driver<Local> {
+/// Whether `n` configured mesh links exceed router type `R`'s own interface
+/// capacity ([`RouterOps::INTERFACES`]), not the fixed crate constant
+/// [`wayfinder::MAX_INTERFACES`].
+///
+/// Pulled out of [`Driver::new`] as a pure function so the bound it checks —
+/// which varies by capacity profile — is assertable directly, rather than
+/// only observable by capturing the `warn!` line it gates.
+fn links_beyond_capacity<R: RouterOps>(n: usize) -> bool {
+    n > R::INTERFACES
+}
+
+/// Run `build` to completion on a short-lived thread whose stack is sized for a
+/// value of `value_bytes`, and return what it produced.
+///
+/// For constructing a router at a large capacity profile. A `no_std` router
+/// has no way to be built in place, so construction returns it by value, and
+/// an unoptimized build keeps several copies of that value live on the stack
+/// at once — for a `host` router, more than a whole default thread's worth.
+/// The fix is to build somewhere with room and hand back something small (an
+/// `Arc`), not to raise every thread's stack in the process: the router is
+/// constructed once, and nothing after that moves it.
+///
+/// The stack is sixteen times the value. Measured at the `host` profile, a
+/// debug build needs more than six times and no more than eight; a release
+/// build needs a fraction of one, so the margin is for the build that is
+/// slowest to notice. It is reserved address space, committed only as far as
+/// construction actually reaches. A thread that cannot be spawned at all is a
+/// node that cannot start, so that panics.
+fn build_off_stack<T: Send>(value_bytes: usize, build: impl FnOnce() -> T + Send) -> T {
+    const MIN_STACK: usize = 2 << 20;
+    let stack = value_bytes.saturating_mul(16).max(MIN_STACK);
+    std::thread::scope(|scope| {
+        let builder = std::thread::Builder::new()
+            .name("router-build".into())
+            .stack_size(stack);
+        match builder.spawn_scoped(scope, build) {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(e) => panic!("cannot spawn a {stack}-byte thread to build the router: {e}"),
+        }
+    })
+}
+
+impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.  `trickle` supplies each
     /// interface's per-link adaptive OGM bounds (`i_min`/`i_max`), `features`
@@ -442,49 +501,66 @@ impl<Local: FrameIo> Driver<Local> {
         features: Vec<LinkFeatures>,
         names: Vec<String>,
         query_rx: QueryRx,
-    ) -> Self {
+    ) -> Self
+    where
+        R: Send + Sync,
+    {
         // Gated on the host's NTP verdict by default: a node whose clock
         // nothing is disciplining reports zero rather than a plausible wrong
         // time, and every certificate-validity check refuses on that sentinel.
         // `wayfinder-tap` overrides the policy from config.
         let clock = AuthClock::Host;
         let clock_trust = ClockTrust::default();
-        let mut router = CentralRouter::new(mac);
-        // Install each interface's adaptive OGM schedule and participation
-        // features up front so the periodic loop and the egress gates have a
-        // per-interface entry to consult from the start.  The Trickle timer is
-        // armed on every interface regardless of `tx_ogm`; a `tx_ogm`-off link
-        // simply has its emission suppressed at poll time, which keeps the
-        // features runtime-toggleable without arming/disarming timers.
-        // The router only tracks `MAX_INTERFACES` interfaces; links past that cap
+        let link_count = interfaces.len();
+        // The router only tracks `R::INTERFACES` interfaces; links past that cap
         // are silently never OGM-scheduled *and* silently revert to full
         // participation (a `set_link_features` past the cap no-ops), so a link
         // configured as a read-only tap would still transmit. Warn rather than
-        // ship that misconfiguration mutely.
-        if interfaces.len() > wayfinder::MAX_INTERFACES {
+        // ship that misconfiguration mutely. Checked against this router's own
+        // capacity, not the fixed `default`-profile constant: a smaller profile
+        // (`tiny_host`'s 2, say) must be flagged well below that constant, and
+        // a larger one must not be flagged below it either.
+        if links_beyond_capacity::<R>(link_count) {
             warn!(
-                configured = interfaces.len(),
-                max = wayfinder::MAX_INTERFACES,
+                configured = link_count,
+                max = R::INTERFACES,
                 "more mesh links than the router supports; links past the cap are unscheduled and ungated"
             );
         }
-        for idx in 0..interfaces.len() {
-            let cfg = trickle.get(idx).copied().unwrap_or_default();
-            router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
-            let link_features = features.get(idx).copied().unwrap_or_default();
-            router.set_link_features(idx, link_features);
-            if let Some(name) = names.get(idx) {
-                router.set_interface_name(idx, name);
+        // Built — and configured — on a thread whose stack fits the router,
+        // then handed back already behind its `Arc`. At the `host` profile a
+        // router is ~1.8 MB, and a debug build copies it through
+        // `with_capacities` and each wrapper on the way into the lock: done
+        // here, on a 2 MiB tokio worker or test thread, that overflows the
+        // stack. What comes back is a pointer, so nothing on this side ever
+        // holds the router by value.
+        let shared = build_off_stack(size_of::<SharedRouter<R>>(), move || {
+            let mut router = R::with_capacities(mac);
+            // Install each interface's adaptive OGM schedule and participation
+            // features up front so the periodic loop and the egress gates have a
+            // per-interface entry to consult from the start.  The Trickle timer is
+            // armed on every interface regardless of `tx_ogm`; a `tx_ogm`-off link
+            // simply has its emission suppressed at poll time, which keeps the
+            // features runtime-toggleable without arming/disarming timers.
+            for idx in 0..link_count {
+                let cfg = trickle.get(idx).copied().unwrap_or_default();
+                router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
+                let link_features = features.get(idx).copied().unwrap_or_default();
+                router.set_link_features(idx, link_features);
+                if let Some(name) = names.get(idx) {
+                    router.set_interface_name(idx, name);
+                }
+                // Keep-alive rides on the same per-link `features` entry (no
+                // separate constructor vector) — its `tx_keepalive` supplies the
+                // schedule, `None` leaving that interface's timer unarmed.
+                router.configure_interface_keepalive(
+                    idx,
+                    link_features.tx_keepalive.map(|c| c.interval()),
+                    Duration::ZERO,
+                );
             }
-            // Keep-alive rides on the same per-link `features` entry (no
-            // separate constructor vector) — its `tx_keepalive` supplies the
-            // schedule, `None` leaving that interface's timer unarmed.
-            router.configure_interface_keepalive(
-                idx,
-                link_features.tx_keepalive.map(|c| c.interval()),
-                Duration::ZERO,
-            );
-        }
+            Arc::new(RwLock::new(SharedRouter::new(router)))
+        });
         let fan_out = interfaces.iter().map(|i| i.fan_out()).collect();
         // Depth one: at most one renewal attempt is ever outstanding, so a
         // second result cannot exist to be queued behind the first.
@@ -499,7 +575,7 @@ impl<Local: FrameIo> Driver<Local> {
             local,
             interfaces,
             fan_out,
-            shared: Arc::new(RwLock::new(SharedRouter::new(router))),
+            shared,
             query_rx,
             mac,
             snooper: McastSnooper::new(),
@@ -733,14 +809,75 @@ impl<Local: FrameIo> Driver<Local> {
             auth_present,
         });
     }
+}
 
+/// The management-API surface: read/mutate the router directly, hand a shared
+/// handle to the TLS server, and run the event loop.
+///
+/// Const-generic over `CentralRouter`'s eleven table capacities rather than
+/// generic over `R: RouterOps` (design 26 phase 1 slice 3): `RouterAdapter`
+/// and `RouterHandle` are themselves const-generic over those same eleven
+/// capacities — same names, same order, same `wayfinder::default` defaults — not
+/// generic over the trait, so a query-handling arm built against them still
+/// cannot be written for an arbitrary `R` today. What this buys is every
+/// *capacity profile* of `CentralRouter`, not only the default one: a driver
+/// built at `wayfinder::router_for!(host)` gets a working management API
+/// exactly as a `default`-profile one does.
+impl<
+    Local: FrameIo,
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    Driver<
+        Local,
+        CentralRouter<
+            ORIGINATORS,
+            INTERFACES,
+            MCAST_MEMBERS,
+            LOCAL_MCAST,
+            IDENT_TABLE,
+            IDENT_LIVE,
+            LINK_QUALITY,
+            NEIGHBOR_KEYS,
+            REVOKED,
+            IN_FLIGHT_CERT_REQUESTS,
+            PENDING_REPLIES,
+        >,
+    >
+{
     /// Read the router under the shared lock.
     ///
     /// A scoped callback rather than a returned guard, so a caller cannot hold
     /// the lock across an `await` it did not think about — which on this type
     /// means stalling the mesh, since the event loop needs the write half for
     /// every frame it forwards.
-    pub async fn with_router<R>(&self, f: impl FnOnce(&CentralRouter) -> R) -> R {
+    pub async fn with_router<T>(
+        &self,
+        f: impl FnOnce(
+            &CentralRouter<
+                ORIGINATORS,
+                INTERFACES,
+                MCAST_MEMBERS,
+                LOCAL_MCAST,
+                IDENT_TABLE,
+                IDENT_LIVE,
+                LINK_QUALITY,
+                NEIGHBOR_KEYS,
+                REVOKED,
+                IN_FLIGHT_CERT_REQUESTS,
+                PENDING_REPLIES,
+            >,
+        ) -> T,
+    ) -> T {
         f(&self.shared.read().await.router)
     }
 
@@ -750,7 +887,24 @@ impl<Local: FrameIo> Driver<Local> {
     ///
     /// Scoped for the same reason as [`with_router`](Self::with_router), and
     /// more so: this takes the write half, which excludes every reader.
-    pub async fn with_router_mut<R>(&self, f: impl FnOnce(&mut CentralRouter) -> R) -> R {
+    pub async fn with_router_mut<T>(
+        &self,
+        f: impl FnOnce(
+            &mut CentralRouter<
+                ORIGINATORS,
+                INTERFACES,
+                MCAST_MEMBERS,
+                LOCAL_MCAST,
+                IDENT_TABLE,
+                IDENT_LIVE,
+                LINK_QUALITY,
+                NEIGHBOR_KEYS,
+                REVOKED,
+                IN_FLIGHT_CERT_REQUESTS,
+                PENDING_REPLIES,
+            >,
+        ) -> T,
+    ) -> T {
         f(&mut self.shared.write().await.router)
     }
 
@@ -760,7 +914,21 @@ impl<Local: FrameIo> Driver<Local> {
     /// Read-only by construction: [`RouterHandle`](wayfinder_server::RouterHandle)
     /// exposes no way to take the write guard, so wiring one up cannot move a
     /// mutation off this loop by accident.
-    pub fn router_handle(&self) -> wayfinder_server::RouterHandle {
+    pub fn router_handle(
+        &self,
+    ) -> wayfinder_server::RouterHandle<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    > {
         wayfinder_server::RouterHandle::new(Arc::clone(&self.shared), self.start)
             .with_enrollment_policy(Some(self.authority.enrollment_policy_rx()))
             .with_clock_trust(Some(self.clock_trusted_tx.subscribe()))
@@ -1533,7 +1701,12 @@ impl<Local: FrameIo> Driver<Local> {
             ),
         }
     }
+}
 
+/// Back to the generic surface: planning and dispatch, expressible for any
+/// `R: RouterOps` (see the concrete-only block above for why the
+/// management-API methods cannot join them yet).
+impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Inject one host Ethernet frame as if it had arrived from the local
     /// device, wrapping it for the mesh and dispatching the resulting copies
     /// immediately.  Equivalent to the host-device arm of [`run_once`], exposed
@@ -1605,7 +1778,40 @@ impl<Local: FrameIo> Driver<Local> {
         )
         .await
     }
+}
 
+/// Back to the concrete-only management surface (see above).
+impl<
+    Local: FrameIo,
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    Driver<
+        Local,
+        CentralRouter<
+            ORIGINATORS,
+            INTERFACES,
+            MCAST_MEMBERS,
+            LOCAL_MCAST,
+            IDENT_TABLE,
+            IDENT_LIVE,
+            LINK_QUALITY,
+            NEIGHBOR_KEYS,
+            REVOKED,
+            IN_FLIGHT_CERT_REQUESTS,
+            PENDING_REPLIES,
+        >,
+    >
+{
     /// Drain every already-pending event — host frames, mesh frames, management
     /// queries, authorization snapshots and signed revocations — in
     /// non-blocking sweeps until nothing remains.
@@ -1739,7 +1945,11 @@ impl<Local: FrameIo> Driver<Local> {
         self.record_self_revocation().await;
         Ok(())
     }
+}
 
+/// Back to the generic surface for the remaining helpers, which touch only
+/// what [`RouterOps`] already covers.
+impl<Local: FrameIo, R: RouterOps> Driver<Local, R> {
     /// Persist and alarm on a revocation of *this* node, if the router acted
     /// on one this iteration.
     ///
@@ -1812,8 +2022,8 @@ impl<Local: FrameIo> Driver<Local> {
 /// to that one interface.  Thin `std`-side wrapper that stages the shared
 /// core's [`poll_due_ogms`](wayfinder_driver_core::poll_due_ogms) output into an
 /// owned [`Vec`].
-fn poll_due_ogms(
-    router: &mut CentralRouter,
+fn poll_due_ogms<R: RouterOps>(
+    router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
 ) -> Vec<OutgoingFrame> {
@@ -1827,8 +2037,8 @@ fn poll_due_ogms(
 /// stages the shared core's
 /// [`poll_due_keepalives`](wayfinder_driver_core::poll_due_keepalives) output
 /// into an owned [`Vec`].
-fn poll_due_keepalives(
-    router: &mut CentralRouter,
+fn poll_due_keepalives<R: RouterOps>(
+    router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
 ) -> Vec<OutgoingFrame> {
@@ -1848,8 +2058,8 @@ fn poll_due_keepalives(
 /// process, so "the authority produced something this loop cannot parse" was
 /// never a condition that could arise — only one the receiver had to invent an
 /// answer for.
-fn ingest_signed_revocation(
-    router: &mut CentralRouter,
+fn ingest_signed_revocation<R: RouterOps>(
+    router: &mut R,
     record: &wayfinder::wayfinder_auth::RevocationRecord,
     now: Duration,
     now_unix: u64,
@@ -1913,8 +2123,8 @@ fn ingest_signed_revocation(
 /// certificate authority says "revoked" while the mesh was never told. That is
 /// the precise divergence this hop exists to surface, so the log lives on this
 /// side of the channel too.
-fn ingest_and_report(
-    router: &mut CentralRouter,
+fn ingest_and_report<R: RouterOps>(
+    router: &mut R,
     record: &wayfinder::wayfinder_auth::RevocationRecord,
     now: Duration,
     now_unix: u64,
@@ -1997,7 +2207,7 @@ fn read_enrollment_policy(
 /// TLS listener, and nothing configures a TLS listener without an identity
 /// seed), so reaching it still warns: it silently disables the bootstrap grant
 /// for this node.
-fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
+fn build_auth_snapshot<R: RouterOps>(router: &R, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
     let own_key = identity_seed.map(|seed| Keypair::from_seed(&seed).ed_pubkey());
     if own_key.is_none() {
         warn!(
@@ -2053,9 +2263,9 @@ impl FrameSink for OwnedFrameSink<'_> {
 /// for a multicast group with a known, bounded listener set — an individual
 /// `BatmanPacketType::Mcast` copy per interested node.  IGMP is snooped first so the
 /// groups the host joins/leaves are announced on the next OGM.
-fn plan_host_frame(
+fn plan_host_frame<R: RouterOps>(
     now: Duration,
-    router: &mut CentralRouter,
+    router: &mut R,
     snooper: &mut McastSnooper,
     eth: &[u8],
     tx_buffer: &mut [u8],
@@ -2074,7 +2284,7 @@ fn plan_host_frame(
     let dst = Mac(dst_mac);
 
     // Locally originated frames flood out every interface (no ingress to omit).
-    let flood = |router: &mut CentralRouter, mesh: &mut Vec<OutgoingFrame>, buf: &mut [u8]| {
+    let flood = |router: &mut R, mesh: &mut Vec<OutgoingFrame>, buf: &mut [u8]| {
         if let Ok(f) = router.handle_local(now, Mac::BROADCAST, eth, buf) {
             mesh.push(OutgoingFrame {
                 dst: f.dst,
@@ -2137,10 +2347,10 @@ fn plan_host_frame(
 
 /// Deliver one unit of work: write any inner frame to the host device and
 /// dispatch each outgoing frame onto the mesh via `get_egress_interface`.
-async fn dispatch<Local: FrameIo>(
+async fn dispatch<Local: FrameIo, R: RouterOps>(
     local: &Local,
     interfaces: &mut [Box<DynLinkT<'static>>],
-    shared: &RwLock<SharedRouter>,
+    shared: &RwLock<SharedRouter<R>>,
     mac: Mac,
     now: Duration,
     output: LoopOutput,
@@ -2805,7 +3015,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -2888,7 +3098,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -3098,7 +3308,7 @@ mod tests {
         // The node: running under that first certificate, and told where it
         // came from.
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -3197,7 +3407,7 @@ mod tests {
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac_addr,
             NeverIo,
             Vec::new(),
@@ -3430,7 +3640,7 @@ mod tests {
         ca.set_now_unix(1_700_000_000);
 
         let (query_tx, query_rx) = tokio::sync::mpsc::channel(4);
-        let mut driver = Driver::new(
+        let mut driver: Driver<NeverIo> = Driver::new(
             mac(1),
             NeverIo,
             Vec::new(),
@@ -3496,6 +3706,375 @@ mod tests {
             authority_reply_rx.try_recv().is_err(),
             "the authority was still working when the router answered — if it had already \
              finished, this test proved nothing and needs a slower authority request"
+        );
+    }
+
+    // ---- design 26 phase 1 slice 2: the host driver at a non-default profile --
+
+    wayfinder::define_profile! {
+        /// A capacity profile smaller than `default` in every dimension, so a test
+        /// exercising it cannot pass merely because it happens to coincide with
+        /// the router's built-in defaults.
+        pub tiny_host {
+            originators: 16,
+            interfaces: 2,
+            mcast_members: 8,
+            local_mcast: 4,
+            ident_table: 16,
+            ident_live: 12,
+            link_quality: 16,
+            neighbor_keys: 8,
+            revoked: 4,
+            in_flight_cert_requests: 2,
+            pending_replies: 2,
+            max_frame_len: 256,
+        }
+    }
+
+    /// The concrete router type for [`tiny_host`] — a stand-in for the `host`
+    /// profile design 26 itself adds, at a size cheap enough for a unit test.
+    type TinyRouter = wayfinder::router_for!(tiny_host);
+
+    /// A mesh interface that only ever captures what is sent on it, so a test
+    /// can observe that the driver's periodic loop actually produced and
+    /// dispatched an OGM rather than merely type-checking.
+    struct CapturingLink(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl LinkT for CapturingLink {
+        async fn send(
+            &mut self,
+            _origin: Mac,
+            data: &LinkFrameData<'_>,
+        ) -> Result<usize, interfaces::link::LinkError> {
+            let payload = data.payload.to_vec();
+            let len = payload.len();
+            #[expect(clippy::unwrap_used, reason = "test harness: an uncontended mutex")]
+            self.0.lock().unwrap().push(payload);
+            Ok(len)
+        }
+
+        async fn recv<'a>(
+            &'a mut self,
+        ) -> Result<wayfinder::link::Received<'a>, interfaces::link::LinkError> {
+            std::future::pending().await
+        }
+    }
+
+    /// `Driver::new` must warn about a link count past the router's own
+    /// capacity, not past the fixed crate constant `wayfinder::MAX_INTERFACES`.
+    ///
+    /// `wayfinder::MAX_INTERFACES` is `batman::MAX_INTERFACES` (8) — the
+    /// `default` profile's own interface count, but not every profile's.
+    /// `tiny_host` has only 2, so 3 links must be flagged there even though
+    /// 3 is nowhere near the fixed constant. Conversely the `default` profile's
+    /// 8 links is exactly at its own capacity, not past it, and must not be
+    /// flagged. Checked through the pure helper rather than `Driver::new`
+    /// itself so the assertion does not need to capture a `warn!` line.
+    #[test]
+    fn links_beyond_capacity_checks_the_routers_own_interface_bound() {
+        assert!(
+            links_beyond_capacity::<TinyRouter>(3),
+            "tiny_host has only 2 interfaces, so 3 links is past its capacity"
+        );
+        assert!(
+            !links_beyond_capacity::<CentralRouter>(8),
+            "the default profile's own capacity is 8, so 8 links is at capacity, not past it"
+        );
+        // And the other side of each boundary, so an off-by-one fails.
+        assert!(!links_beyond_capacity::<TinyRouter>(2));
+        assert!(links_beyond_capacity::<CentralRouter>(9));
+    }
+
+    /// The whole point of this slice: the host driver, generic over `R:
+    /// RouterOps`, runs its real event loop — construction, per-interface
+    /// Trickle scheduling, and dispatch — at a capacity profile other than the
+    /// `default` one, and actually emits an OGM onto a link. Before this
+    /// slice `Driver<Local>` named `CentralRouter` outright, so a router of
+    /// another profile could not be handed to it at all — this test could not
+    /// even be *written*, let alone pass.
+    #[tokio::test]
+    async fn the_host_driver_runs_at_a_non_default_router_profile() {
+        let sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Box<DynLinkT<'static>> = DynLinkT::new_box(CapturingLink(sent.clone()));
+
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        let mut driver: Driver<NeverIo, TinyRouter> = Driver::new(
+            mac(1),
+            NeverIo,
+            vec![link],
+            vec![TrickleConfig::default()],
+            vec![LinkFeatures::default()],
+            Vec::new(),
+            query_rx,
+        );
+
+        // Advance until the one interface's Trickle timer is due — the exact
+        // instant is Trickle's own choice, not this test's, exactly as
+        // `wayfinder::router_ops`'s own `drive_one_ogm` test helper does.
+        let mut now = Duration::ZERO;
+        while sent.lock().expect("uncontended mutex").is_empty() && now < Duration::from_secs(60) {
+            driver.poll_due(now).await.expect("poll_due does not fail");
+            now += Duration::from_millis(100);
+        }
+
+        assert!(
+            !sent.lock().expect("uncontended mutex").is_empty(),
+            "the driver must emit an OGM on its one interface even at a non-default \
+             capacity profile"
+        );
+    }
+
+    /// The management-API surface (`router_handle`, `with_router*`,
+    /// `run`/`run_once`/`process_pending`) reaches every capacity profile, not
+    /// only `default`: it is const-generic over `CentralRouter`'s eleven table
+    /// capacities, as `RouterAdapter`/`RouterHandle` are. When it lived only on
+    /// the default-profile `CentralRouter`, calling `router_handle` on a
+    /// `TinyRouter`-backed driver did not compile.
+    #[tokio::test]
+    async fn a_non_default_router_profile_serves_a_management_read() {
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        let driver: Driver<NeverIo, TinyRouter> = Driver::new(
+            mac(9),
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+
+        let handle = driver.router_handle();
+        let response = handle
+            .serve_read(wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+                request: Some(
+                    wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::GetNodeInfo(
+                        wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest {},
+                    ),
+                ),
+            })
+            .await
+            .expect("GetNodeInfo is a router read");
+
+        match response.response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::NodeInfo(
+                info,
+            )) => {
+                assert_eq!(
+                    info.node_id,
+                    mac(9).0.to_vec(),
+                    "a management read on a non-default router profile must answer from \
+                     that same router, not a default-profile stand-in"
+                );
+            }
+            other => panic!("expected NodeInfo, got {other:?}"),
+        }
+    }
+
+    // ---- design 26 phase 1: the `host` profile itself --------------------
+
+    /// The router type `wayfinder-tap` runs every node at.
+    type HostRouter = wayfinder::router_for!(wayfinder::host);
+
+    /// A `host` router is about 1.8 MB, well past a 2 MiB thread's stack once
+    /// a debug build has copied it through a constructor or two — which is how
+    /// every host path used to build one. `Driver::new` must therefore put it
+    /// on the heap without ever holding it by value on the caller's stack: this
+    /// test runs on an ordinary test thread, so building the router inline
+    /// aborts the process with a stack overflow rather than failing an assert.
+    #[tokio::test]
+    async fn a_host_profile_driver_builds_on_an_ordinary_thread() {
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let driver: Driver<NeverIo, HostRouter> = Driver::new(
+            mac(1),
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+
+        let occupancy = driver.with_router(|r| r.originator_occupancy()).await;
+        assert_eq!(
+            occupancy,
+            (0, wayfinder::host::ORIGINATORS),
+            "the driver must be running the host profile it was asked for"
+        );
+    }
+
+    /// A `host` node does per-frame work on an ordinary thread, and its
+    /// management API reports that work against the `host` capacities.
+    ///
+    /// The other `host` tests only build a router or install a credential; this
+    /// drives one real OGM from one `host` driver into another over a datagram
+    /// pair, on a 2 MiB test thread, so a router- or `OgmAuth`-sized value
+    /// (1.8 MB / 548 KB, copied a few times in a debug build) moved onto the
+    /// stack anywhere on the receive path overflows here. It then reads
+    /// `GetMetrics` through the type-erased handle, where a fallback to
+    /// `default`'s constants would report 128 rather than 4096.
+    ///
+    /// Not a guard against per-frame *cost*: `IdentTable::clear` once built a
+    /// >100 KB temporary on every frame, which fits a 2 MiB stack and passes
+    /// here. Only `wayfinder-bench`'s `host` suite sees that kind of
+    /// regression.
+    #[tokio::test]
+    async fn a_host_profile_driver_learns_a_peer_and_reports_it_at_host_capacity() {
+        let (a_sock, b_sock) = tokio::net::UnixDatagram::pair().expect("socketpair");
+        let link_a: Box<DynLinkT<'static>> = DynLinkT::new_box(crate::Link::new(a_sock));
+        let link_b: Box<DynLinkT<'static>> = DynLinkT::new_box(crate::Link::new(b_sock));
+
+        let (_a_query_tx, a_query_rx) = tokio::sync::mpsc::channel(1);
+        let mut a: Driver<NeverIo, HostRouter> = Driver::new(
+            mac(1),
+            NeverIo,
+            vec![link_a],
+            vec![TrickleConfig::default()],
+            vec![LinkFeatures::default()],
+            Vec::new(),
+            a_query_rx,
+        );
+        let (_b_query_tx, b_query_rx) = tokio::sync::mpsc::channel(1);
+        let mut b: Driver<NeverIo, HostRouter> = Driver::new(
+            mac(2),
+            NeverIo,
+            vec![link_b],
+            vec![TrickleConfig::default()],
+            vec![LinkFeatures::default()],
+            Vec::new(),
+            b_query_rx,
+        );
+
+        // Tick `b` until its Trickle timer emits, and let `a` drain each tick.
+        let mut now = Duration::ZERO;
+        while a.with_router(|r| r.originator_occupancy().0).await == 0
+            && now < Duration::from_secs(60)
+        {
+            b.poll_due(now).await.expect("poll_due does not fail");
+            a.process_pending()
+                .await
+                .expect("process_pending does not fail");
+            now += Duration::from_millis(100);
+        }
+        assert_eq!(
+            a.with_router(|r| r.originator_occupancy()).await,
+            (1, wayfinder::host::ORIGINATORS),
+            "a host node must learn its peer from a received OGM"
+        );
+
+        let response = a
+            .router_handle()
+            .serve_read(wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+                request: Some(
+                    wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::GetMetrics(
+                        wayfinder_protos::wayfinder::v1alpha::GetMetricsRequest {},
+                    ),
+                ),
+            })
+            .await
+            .expect("GetMetrics is a router read");
+        match response.response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::Metrics(
+                metrics,
+            )) => {
+                let originators = metrics
+                    .originators
+                    .expect("originator occupancy is reported");
+                assert_eq!(
+                    (originators.used, originators.capacity),
+                    (1, wayfinder::host::ORIGINATORS as u32),
+                    "GetMetrics must report the host profile's capacity, not default's"
+                );
+            }
+            other => panic!("expected Metrics, got {other:?}"),
+        }
+    }
+
+    /// Installing a credential is the other place auth state crosses the stack
+    /// by value: `SetAuth` builds an `OgmAuth` and hands it to the router, and
+    /// at the `host` profile's 1024 neighbour keys and 1024 revocations that
+    /// value alone is ~548 KB. A `no_std` value cannot be built in place, so
+    /// an unoptimized build holds a few copies across `RouterAdapter::set_auth`
+    /// and `CentralRouter::set_auth` — about 2.1 MB, measured, just past a
+    /// 2 MiB test thread (a release build fits in a fraction of that).
+    ///
+    /// So this pins the install on the thread `wayfinder-tap` actually runs
+    /// its loop on: `driver.run()` is awaited on the main thread, which gets
+    /// the platform's 8 MiB default rather than a spawned thread's 2 MiB.
+    #[test]
+    fn a_host_profile_driver_installs_a_credential_over_set_auth() {
+        const MAIN_THREAD_STACK: usize = 8 << 20;
+        std::thread::Builder::new()
+            .stack_size(MAIN_THREAD_STACK)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(install_a_credential_on_a_host_driver());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn install_a_credential_on_a_host_driver() {
+        let seed = [3u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let mac_addr = kp.derived_mac();
+
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_700_000_000);
+        let cert = match ca
+            .submit_csr(
+                zerocopy::IntoBytes::as_bytes(&mac_addr),
+                &kp.ed_pubkey(),
+                &kp.x_pubkey(),
+                "",
+            )
+            .unwrap()
+        {
+            wayfinder_protos::service::CsrOutcome::Issued(issued) => issued.cert,
+            other => panic!("expected the CSR to be issued outright, got {other:?}"),
+        };
+        let anchor = ca.trust_anchor_bytes();
+
+        let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let mut driver: Driver<NeverIo, HostRouter> = Driver::new(
+            mac_addr,
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+        driver.set_identity_seed(seed).await;
+        driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
+
+        let request = wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+            request: Some(
+                wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::SetAuth(
+                    wayfinder_protos::wayfinder::v1alpha::SetAuthRequest {
+                        seed: Vec::new(),
+                        cert,
+                        trust_anchor: anchor,
+                        provider: None,
+                        installer_unix: 0,
+                    },
+                ),
+            ),
+        };
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        query_tx.send((request, resp_tx)).await.unwrap();
+        driver.process_pending().await.unwrap();
+
+        match resp_rx.await.unwrap().response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::Empty(_)) => {}
+            other => panic!("expected SetAuth to install on a host router, got {other:?}"),
+        }
+        assert!(
+            driver.with_router(|r| r.auth().is_some()).await,
+            "the credential must actually be installed"
         );
     }
 }

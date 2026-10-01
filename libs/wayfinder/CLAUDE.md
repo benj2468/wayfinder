@@ -60,14 +60,14 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
   `OgmAuth<MAX_NEIGHBOR_KEYS, MAX_REVOKED, MAX_IN_FLIGHT_CERT_REQUESTS,
   MAX_PENDING_REPLIES>` is const-generic over its table sizes; all four default
   to the module constants of the same name. The neighbour cache dominates the
-  footprint (`NeighborKeys` is 360 B, ×64 at host capacity), so a constrained
+  footprint (`NeighborKeys` is 360 B, ×64 at `default` capacity), so a constrained
   node picks a smaller profile: `OgmAuth<8, 4, 2, 2>` is 5,744 bytes against the
-  host profile's 32,984. (Measured, not estimated — `size_of` at each profile.
+  default profile's 32,984. (Measured, not estimated — `size_of` at each profile.
   `tiny_auth_profile_is_substantially_smaller` asserts only the *ratio*, so
   these absolute figures have nothing keeping them honest; re-measure rather
   than trust them if you are sizing a board.)
 
-  **Capacity never reaches the wire** — a host-profile and a tiny-profile node
+  **Capacity never reaches the wire** — a default-profile and a tiny-profile node
   interoperate unchanged; `profiles_do_not_change_the_wire_format` pins this.
 
   `new` lives in its own impl on the fully-defaulted type, *not* on the generic

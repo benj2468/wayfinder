@@ -150,8 +150,8 @@ pub(in crate::auth) fn admit_each_other(x: &mut OgmAuth, x_mac: Mac, y: &mut Ogm
     assert_eq!(x.verify_ogm(&buf[..len]), OgmVerdict::Verified);
 }
 
-/// Today's host capacities, spelled out positionally.
-pub(in crate::auth) type HostAuth =
+/// The `default` profile's capacities, spelled out positionally.
+pub(in crate::auth) type DefaultAuth =
     OgmAuth<MAX_NEIGHBOR_KEYS, MAX_REVOKED, MAX_IN_FLIGHT_CERT_REQUESTS, MAX_PENDING_REPLIES>;
 
 /// Exchange OGMs both ways so `a` and `b` each cache the other's verified

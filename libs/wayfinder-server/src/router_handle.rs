@@ -43,7 +43,10 @@
 //! lock to recover, and an `RwLock` there would be ceremony bought with flash.
 //! The `no_std` half of this crate is unchanged.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
 use core::time::Duration;
 
 use tokio::sync::RwLock;
@@ -66,9 +69,13 @@ use crate::authority_task::EnrollmentPolicyRx;
 /// the value a `SetAuth` has since installed. Keeping the two under one lock is
 /// also what stops a read from observing a router that has been re-keyed while
 /// the seed still names the old identity.
-pub struct SharedRouter {
+///
+/// Generic over the router type, defaulting to [`CentralRouter`] at the
+/// `default` profile's capacities, so `wayfinder-driver`'s `Driver<Local, R>` can hold one at any
+/// `R: RouterOps` (design 26 phase 1 slice 2).
+pub struct SharedRouter<R = CentralRouter> {
     /// The routing engine. `&mut` only ever through the driver's write guard.
-    pub router: CentralRouter,
+    pub router: R,
     /// This node's own identity seed, or `None` on a node that has none.
     ///
     /// Written by `SetAuth` on the driver loop, read here and by the TLS accept
@@ -86,9 +93,9 @@ pub struct SharedRouter {
     pub renewal_provider: Option<RenewalProviderData>,
 }
 
-impl SharedRouter {
+impl<R> SharedRouter<R> {
     /// Wrap `router` with no identity seed configured.
-    pub fn new(router: CentralRouter) -> Self {
+    pub fn new(router: R) -> Self {
         Self {
             router,
             identity_seed: None,
@@ -104,9 +111,46 @@ impl SharedRouter {
 /// no method here that takes a write lock, which is what makes "reads are
 /// served from this, mutations from the loop" a property of the type rather
 /// than a rule to remember.
+///
+/// Const-generic over [`CentralRouter`]'s eleven table capacities, matching
+/// [`RouterAdapter`](crate::RouterAdapter)/[`RouterView`](crate::adapter::RouterView)
+/// exactly — same names, same order, same `wayfinder::default` defaults — so a
+/// management read is reachable at any capacity profile, not only the default
+/// one (design 26 phase 1 slice 3). `wayfinder-driver`'s `Driver<Local, R>`
+/// builds one at whichever profile its own `R` names.
 #[derive(Clone)]
-pub struct RouterHandle {
-    inner: Arc<RwLock<SharedRouter>>,
+pub struct RouterHandle<
+    const ORIGINATORS: usize = { wayfinder::default::ORIGINATORS },
+    const INTERFACES: usize = { wayfinder::default::INTERFACES },
+    const MCAST_MEMBERS: usize = { wayfinder::default::MCAST_MEMBERS },
+    const LOCAL_MCAST: usize = { wayfinder::default::LOCAL_MCAST },
+    const IDENT_TABLE: usize = { wayfinder::default::IDENT_TABLE },
+    const IDENT_LIVE: usize = { wayfinder::default::IDENT_LIVE },
+    const LINK_QUALITY: usize = { wayfinder::default::LINK_QUALITY },
+    const NEIGHBOR_KEYS: usize = { wayfinder::default::NEIGHBOR_KEYS },
+    const REVOKED: usize = { wayfinder::default::REVOKED },
+    const IN_FLIGHT_CERT_REQUESTS: usize = { wayfinder::default::IN_FLIGHT_CERT_REQUESTS },
+    const PENDING_REPLIES: usize = { wayfinder::default::PENDING_REPLIES },
+> {
+    inner: Arc<
+        RwLock<
+            SharedRouter<
+                CentralRouter<
+                    ORIGINATORS,
+                    INTERFACES,
+                    MCAST_MEMBERS,
+                    LOCAL_MCAST,
+                    IDENT_TABLE,
+                    IDENT_LIVE,
+                    LINK_QUALITY,
+                    NEIGHBOR_KEYS,
+                    REVOKED,
+                    IN_FLIGHT_CERT_REQUESTS,
+                    PENDING_REPLIES,
+                >,
+            >,
+        >,
+    >,
     /// Reference instant for the router's monotonic clock — the same `start`
     /// the driver measures `now` from.
     ///
@@ -140,10 +184,57 @@ pub struct RouterHandle {
     clock_trusted: Option<watch::Receiver<bool>>,
 }
 
-impl RouterHandle {
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    RouterHandle<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
     /// Build a handle over `inner`, whose router's monotonic clock is measured
     /// from `start`.
-    pub fn new(inner: Arc<RwLock<SharedRouter>>, start: std::time::Instant) -> Self {
+    pub fn new(
+        inner: Arc<
+            RwLock<
+                SharedRouter<
+                    CentralRouter<
+                        ORIGINATORS,
+                        INTERFACES,
+                        MCAST_MEMBERS,
+                        LOCAL_MCAST,
+                        IDENT_TABLE,
+                        IDENT_LIVE,
+                        LINK_QUALITY,
+                        NEIGHBOR_KEYS,
+                        REVOKED,
+                        IN_FLIGHT_CERT_REQUESTS,
+                        PENDING_REPLIES,
+                    >,
+                >,
+            >,
+        >,
+        start: std::time::Instant,
+    ) -> Self {
         Self {
             inner,
             start,
@@ -183,7 +274,27 @@ impl RouterHandle {
     /// is the property this type exists to hold. A `pub` accessor here would be
     /// the one crack in it.
     #[cfg(test)]
-    fn shared(&self) -> Arc<RwLock<SharedRouter>> {
+    fn shared(
+        &self,
+    ) -> Arc<
+        RwLock<
+            SharedRouter<
+                CentralRouter<
+                    ORIGINATORS,
+                    INTERFACES,
+                    MCAST_MEMBERS,
+                    LOCAL_MCAST,
+                    IDENT_TABLE,
+                    IDENT_LIVE,
+                    LINK_QUALITY,
+                    NEIGHBOR_KEYS,
+                    REVOKED,
+                    IN_FLIGHT_CERT_REQUESTS,
+                    PENDING_REPLIES,
+                >,
+            >,
+        >,
+    > {
         Arc::clone(&self.inner)
     }
 
@@ -230,6 +341,60 @@ impl RouterHandle {
     /// `true` where no publisher was wired — see the field's doc comment.
     fn clock_trusted(&self) -> bool {
         self.clock_trusted.as_ref().is_none_or(|rx| *rx.borrow())
+    }
+}
+
+/// A [`RouterHandle`] with its capacity profile erased, for the management
+/// transport to hold.
+///
+/// The TLS server only ever asks a handle to [`serve_read`](RouterHandle::serve_read),
+/// and threading `CentralRouter`'s eleven capacities through every connection
+/// type to do that would make the transport's types depend on which profile the
+/// binary chose (design 26). A node holds one handle for its lifetime, and a
+/// read already allocates its response, so the boxed future costs nothing that
+/// matters.
+pub trait ServeRouterRead: Send + Sync {
+    /// See [`RouterHandle::serve_read`]: answers a router read, or hands the
+    /// request back unconsumed when this half does not own it.
+    fn serve_read(
+        &self,
+        request: WayfinderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<WayfinderResponse, WayfinderRequest>> + Send + '_>>;
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> ServeRouterRead
+    for RouterHandle<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
+    fn serve_read(
+        &self,
+        request: WayfinderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<WayfinderResponse, WayfinderRequest>> + Send + '_>>
+    {
+        Box::pin(RouterHandle::serve_read(self, request))
     }
 }
 

@@ -33,6 +33,8 @@ mod router_handle;
 #[cfg(feature = "std")]
 pub use router_handle::RouterHandle;
 #[cfg(feature = "std")]
+pub use router_handle::ServeRouterRead;
+#[cfg(feature = "std")]
 pub use router_handle::SharedRouter;
 
 /// The certificate authority's own executor: the task that owns a

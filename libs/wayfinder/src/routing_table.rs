@@ -4,8 +4,9 @@ pub use interfaces;
 use interfaces::frame::MeshIdentifier;
 
 /// Sentinel value meaning "no node" in the LRU linked list.
-/// Valid slot indices are 0..IDENT_TABLE_MAX (at most 99), so 255 is safe.
-const NONE_IDX: u8 = u8::MAX;
+/// The null slot index. Valid indices are below `CAP`, which the invariants
+/// keep under this, so it never names a real slot.
+const NONE_IDX: u16 = u16::MAX;
 /// `heapless::FnvIndexMap` requires a power-of-two capacity.
 pub(crate) const IDENT_TABLE_CAP: usize = 128;
 /// Actual maximum live entries before LRU eviction kicks in.
@@ -19,8 +20,8 @@ pub(crate) const IDENT_TABLE_MAX: usize = 100;
 struct LruNode<Ident> {
     key: Ident,
     iface_idx: usize,
-    prev: u8,
-    next: u8,
+    prev: u16,
+    next: u16,
 }
 
 /// Maps mesh identifiers to egress interfaces with **O(1)** insert, lookup,
@@ -33,10 +34,10 @@ struct LruNode<Ident> {
 ///   head = MRU, tail = LRU.  Move-to-front and evict-tail are both O(1).
 /// - **Free-slot stack** (`free_stack`/`free_len`): O(1) slot allocation.
 ///
-/// At most `IDENT_TABLE_MAX` (100) live entries are kept.  When the table is
-/// full and a new identifier arrives, the tail (LRU entry) is evicted in O(1).
-/// The underlying heapless map is sized to `IDENT_TABLE_CAP` (128) because
-/// `FnvIndexMap` requires a power-of-two capacity.
+/// At most `MAX_LIVE` live entries are kept (100 at the `default` profile).
+/// When the table is full and a new identifier arrives, the tail (LRU entry)
+/// is evicted in O(1). The underlying heapless map is sized to `CAP` (128 at
+/// `default`) because `FnvIndexMap` requires a power-of-two capacity.
 pub struct IdentTable<
     Ident: MeshIdentifier,
     const CAP: usize = IDENT_TABLE_CAP,
@@ -45,24 +46,27 @@ pub struct IdentTable<
     /// Flat node pool; slots whose index is in `free_stack` are unoccupied.
     nodes: [Option<LruNode<Ident>>; CAP],
     /// Key → slot index in `nodes`.
-    map: FnvIndexMap<Ident, u8, CAP>,
+    map: FnvIndexMap<Ident, u16, CAP>,
     /// Index of the most-recently-used node; `NONE_IDX` when the table is empty.
-    head: u8,
+    head: u16,
     /// Index of the least-recently-used node; `NONE_IDX` when the table is empty.
-    tail: u8,
+    tail: u16,
     /// Stack of available slot indices.
-    free_stack: [u8; CAP],
+    free_stack: [u16; CAP],
     /// Number of entries in `free_stack`.
-    free_len: u8,
+    free_len: u16,
 }
 
 impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     IdentTable<Ident, CAP, MAX_LIVE>
 {
-    /// Slot indices are held as `u8` with 255 reserved as the null sentinel, and
-    /// the backing map is a `FnvIndexMap`, so a profile must keep `CAP` a power
-    /// of two under 255 and leave headroom above `MAX_LIVE` for the map's load
-    /// factor.
+    /// Slot indices are held as `u16` with `u16::MAX` reserved as the null
+    /// sentinel, and the backing map is a `FnvIndexMap`, so a profile must keep
+    /// `CAP` a power of two below that, with `MAX_LIVE <= CAP`. A full map still
+    /// works; profiles keep `MAX_LIVE` below `CAP` only so linear probing stays
+    /// short, which is a tuning choice rather than an invariant. (It was a `u8`, which — `CAP` being a power of two
+    /// below the `u8::MAX` sentinel — capped every profile at 128
+    /// live entries: fine for a board, not for a host node sized to its mesh.)
     const _INVARIANTS: () = {
         assert!(
             CAP.is_power_of_two(),
@@ -70,7 +74,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
         );
         assert!(
             CAP < NONE_IDX as usize,
-            "IdentTable CAP must fit in a u8 index"
+            "IdentTable CAP must fit in a u16 index"
         );
         assert!(MAX_LIVE <= CAP, "IdentTable MAX_LIVE cannot exceed CAP");
     };
@@ -78,9 +82,9 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     /// An empty table at this profile's capacities.
     pub fn new() -> Self {
         let () = Self::_INVARIANTS;
-        let mut free_stack = [0u8; CAP];
+        let mut free_stack = [0u16; CAP];
         for (i, slot) in free_stack.iter_mut().enumerate() {
-            *slot = i as u8;
+            *slot = i as u16;
         }
         Self {
             nodes: core::array::from_fn(|_| None),
@@ -91,21 +95,36 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
             // Only vend the first MAX_LIVE slots; the remaining CAP - MAX_LIVE
             // slots act as unused padding required by the power-of-two heapless
             // capacity.
-            free_len: MAX_LIVE as u8,
+            free_len: MAX_LIVE as u16,
         }
     }
 
     /// Drop every learned `(dest → interface)` mapping, restoring an empty
     /// table (including the LRU list and free-slot stack).  Used when routing
     /// state is invalidated wholesale, e.g. on a runtime authentication change.
+    ///
+    /// Resets each field in place rather than assigning `Self::new()`. The
+    /// assignment reads the same, but it builds a whole table as a temporary,
+    /// and at the `host` profile that is >100 KB: every function this inlines
+    /// into — `CentralRouter::apply_self_revocation`, which runs on every frame
+    /// — then reserves a stack frame that size and probes it page by page on
+    /// each call, whether or not it ever clears anything. Measured as ~2.5 µs
+    /// on every frame at `host` (design 26 phase 1).
     pub fn clear(&mut self) {
-        *self = Self::new();
+        self.map.clear();
+        self.nodes.iter_mut().for_each(|node| *node = None);
+        for (i, slot) in self.free_stack.iter_mut().enumerate() {
+            *slot = i as u16;
+        }
+        self.head = NONE_IDX;
+        self.tail = NONE_IDX;
+        self.free_len = MAX_LIVE as u16;
     }
 
     // ── linked-list helpers ──────────────────────────────────────────────────
 
     /// Remove node `idx` from the doubly-linked list.  O(1).
-    fn unlink(&mut self, idx: u8) {
+    fn unlink(&mut self, idx: u16) {
         // `LruNode` is `Copy`, so `.expect()` gives us a value, not a reference,
         // keeping the borrow of `self.nodes` trivially short.
         #[expect(
@@ -142,7 +161,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     /// Insert node `idx` at the MRU head of the list.  O(1).
     ///
     /// The slot must already be populated in `self.nodes` but not yet linked.
-    fn link_at_head(&mut self, idx: u8) {
+    fn link_at_head(&mut self, idx: u16) {
         let old_head = self.head;
 
         // Update the new head's own pointers (copy-modify-store).
@@ -173,7 +192,7 @@ impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
     }
 
     /// Move an already-linked node to the MRU head.  O(1).
-    fn move_to_front(&mut self, idx: u8) {
+    fn move_to_front(&mut self, idx: u16) {
         if self.head == idx {
             return;
         }
@@ -271,6 +290,38 @@ mod tests {
 
     // `u8` implements `MeshIdentifier`, so it's the natural choice for tests.
 
+    /// `clear` must leave the table indistinguishable from a new one: every
+    /// mapping gone, the LRU list empty, and all `MAX_LIVE` slots vendable
+    /// again. Exercised from a table that has already evicted, so the free
+    /// stack and the list have both been churned before the reset.
+    #[test]
+    fn clear_restores_an_empty_table_with_its_full_capacity() {
+        let mut table: IdentTable<u8, 16, 12> = IdentTable::new();
+        for n in 0..20u8 {
+            table.add_record(usize::from(n % 3), n);
+        }
+        table.assert_invariants();
+
+        table.clear();
+        table.assert_invariants();
+        for n in 0..20u8 {
+            assert_eq!(table.peek_egress_interface(n), None, "{n} survived clear");
+        }
+
+        // Every live slot is usable again: twelve fit without evicting.
+        for n in 100..112u8 {
+            table.add_record(1, n);
+            table.assert_invariants();
+        }
+        for n in 100..112u8 {
+            assert_eq!(
+                table.peek_egress_interface(n),
+                Some(1),
+                "{n} was evicted early"
+            );
+        }
+    }
+
     // ── invariant checker ────────────────────────────────────────────────────
 
     impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
@@ -280,7 +331,7 @@ mod tests {
         /// consistency.  Panics on any violation — call this liberally in tests.
         fn assert_invariants(&self) {
             // Forward walk: head → tail
-            let mut forward: std::vec::Vec<u8> = std::vec::Vec::new();
+            let mut forward: std::vec::Vec<u16> = std::vec::Vec::new();
             let mut cur = self.head;
             let mut expected_prev = NONE_IDX;
             while cur != NONE_IDX {
@@ -302,7 +353,7 @@ mod tests {
             );
 
             // Backward walk: tail → head
-            let mut backward: std::vec::Vec<u8> = std::vec::Vec::new();
+            let mut backward: std::vec::Vec<u16> = std::vec::Vec::new();
             let mut cur = self.tail;
             let mut expected_next = NONE_IDX;
             while cur != NONE_IDX {
@@ -372,7 +423,7 @@ mod tests {
         assert_eq!(table.get_egress_interface(42), None);
         assert_eq!(table.head, NONE_IDX);
         assert_eq!(table.tail, NONE_IDX);
-        assert_eq!(table.free_len, IDENT_TABLE_MAX as u8);
+        assert_eq!(table.free_len, IDENT_TABLE_MAX as u16);
         table.assert_invariants();
     }
 
@@ -565,6 +616,38 @@ mod tests {
             "key 3 should still be present"
         );
         assert_eq!(table.map.len(), 100);
+        table.assert_invariants();
+    }
+
+    /// A distinct `Mac` per `n`, for tables larger than `u8` keys can fill.
+    fn mac(n: u16) -> interfaces::frame::Mac {
+        let [hi, lo] = n.to_be_bytes();
+        interfaces::frame::Mac([0x02, 0, 0, 0, hi, lo])
+    }
+
+    /// A profile can hold more than a `u8` can index: a host node's table is
+    /// sized to the mesh, and the slot index used to be a `u8`, which capped
+    /// every profile at a 128-slot table.
+    #[test]
+    fn more_live_entries_than_a_u8_index_allows() {
+        let mut table = std::boxed::Box::new(IdentTable::<interfaces::frame::Mac, 512, 400>::new());
+        for n in 0..400u16 {
+            table.add_record(usize::from(n % 8), mac(n));
+        }
+        table.assert_invariants();
+        for n in 0..400u16 {
+            assert_eq!(
+                table.peek_egress_interface(mac(n)),
+                Some(usize::from(n % 8))
+            );
+        }
+
+        // Full: the next insert evicts the least recently used, which is the
+        // first one added.
+        table.add_record(0, mac(400));
+        assert_eq!(table.peek_egress_interface(mac(0)), None);
+        assert_eq!(table.peek_egress_interface(mac(400)), Some(0));
+        assert_eq!(table.map.len(), 400);
         table.assert_invariants();
     }
 }

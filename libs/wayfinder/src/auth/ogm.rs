@@ -752,7 +752,7 @@ mod tests {
 
         // Hand-build an OGM with a small pre-existing TVLV record in the tail.
         let (mut buf, mut len) = bare_ogm(mac(2), 7);
-        len = HostAuth::write_tvlv(&mut buf, len, batman::wire::TvlvType::Mcast, &[1, 2, 3, 4]);
+        len = DefaultAuth::write_tvlv(&mut buf, len, batman::wire::TvlvType::Mcast, &[1, 2, 3, 4]);
         let mcast_record = TVLV_HDR + 4;
         buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&(mcast_record as u16).to_be_bytes());
 
@@ -1172,14 +1172,14 @@ mod tests {
         seqno.copy_from_slice(&buf[SEQNO_OFF..SEQNO_OFF + 4]);
         let signature = {
             let signed =
-                HostAuth::signed_message(&orig, &seqno, cert_bytes, &mut auth.sign_scratch)
+                DefaultAuth::signed_message(&orig, &seqno, cert_bytes, &mut auth.sign_scratch)
                     .unwrap();
             auth.keypair.sign(signed)
         };
         let fp = cert.fingerprint();
         let mut off = len;
-        off = HostAuth::write_tvlv(buf, off, TvlvType::CertFp, &fp);
-        off = HostAuth::write_tvlv(buf, off, TvlvType::OgmSig, &signature);
+        off = DefaultAuth::write_tvlv(buf, off, TvlvType::CertFp, &fp);
+        off = DefaultAuth::write_tvlv(buf, off, TvlvType::OgmSig, &signature);
         let tvlv_len = (off - len) as u16;
         buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&tvlv_len.to_be_bytes());
         off

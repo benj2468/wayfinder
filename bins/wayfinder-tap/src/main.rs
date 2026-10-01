@@ -67,6 +67,15 @@ use zerocopy::IntoBytes;
 
 use crate::tap::TapDevice;
 
+/// The capacity profile this binary's router runs at: `host` (design 26),
+/// since this binary is what the certificate authority, VPN hubs and container
+/// nodes all run.
+///
+/// One name, so the profile is a one-line choice rather than a search for every
+/// place this binary names its router — the host equivalent of a board's
+/// per-board profile.
+type TapRouter = wayfinder::router_for!(wayfinder::host);
+
 /// Command-line arguments.
 #[derive(clap::Parser, Debug)]
 // `--version` reports the build this node is running, which is the same answer
@@ -785,7 +794,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut driver = Driver::new(
+    let mut driver: Driver<Box<dyn FrameIo>, TapRouter> = Driver::new(
         Mac(mac_addr),
         local,
         interfaces,
@@ -1119,7 +1128,7 @@ async fn main() -> anyhow::Result<()> {
                 .await;
         } else {
             driver
-                .with_router_mut(|r| r.set_auth(OgmAuth::new(keypair, cert, anchor)))
+                .with_router_mut(|r| r.set_auth(OgmAuth::with_capacities(keypair, cert, anchor)))
                 .await;
             tracing::info!("mesh authentication enabled (mesh_id = {:#x})", mesh_id);
         }
@@ -1266,7 +1275,7 @@ async fn main() -> anyhow::Result<()> {
                 wayfinder_server::ServerServices {
                     vpn,
                     authority_tx: authority,
-                    router: Some(router_handle),
+                    router: Some(std::sync::Arc::new(router_handle)),
                 },
             )
             .await
@@ -1277,6 +1286,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::trace!("Failed to notify systemd: {}", err);
     }
 
+    // Awaited here, on the main thread, and not `tokio::spawn`ed: at the `host`
+    // profile, installing a credential moves a ~548 KB `OgmAuth` by value, and
+    // an unoptimised build needs ~2.1 MB of stack for it — more than a 2 MiB
+    // tokio worker has, well inside the main thread's 8 MiB. Moving the loop
+    // onto a worker would abort a debug build's first `SetAuth`.
+    //
     // Not `driver.run().await`: every listener and carrier spawned above lives
     // in `join_set`, and awaiting only the driver let one of them die leaving
     // the node routing perfectly with no management API and nothing said about
@@ -1307,6 +1322,22 @@ mod tests {
     /// keys held by one process.
     const ROOT_SEED: [u8; 32] = [7u8; 32];
     const NODE_SEED: [u8; 32] = [9u8; 32];
+
+    /// Every `wayfinder-tap` node runs with a hub-sized neighbour table
+    /// (design 26 §3 step 5): `default`'s 64 neighbour keys is the limit a VPN
+    /// hub hits first, and each peer past it displaces a member's keys. Read
+    /// off the router's own auth type, so reverting `TapRouter` to a smaller
+    /// profile fails here rather than on a hub.
+    #[test]
+    fn this_binary_holds_a_hub_sized_neighbour_table() {
+        use wayfinder::router_ops::RouterOps;
+        type TapAuth = <TapRouter as RouterOps>::Auth;
+        type DefaultAuth = <wayfinder::CentralRouter as RouterOps>::Auth;
+        assert!(
+            size_of::<TapAuth>() > 8 * size_of::<DefaultAuth>(),
+            "TapRouter's auth state is sized for default's neighbour table, not a hub's"
+        );
+    }
 
     /// The trust anchor a provider derives is the one its root seed defines —
     /// the same 36 bytes `wayfinderctl cert init-ca --out-anchor` would have

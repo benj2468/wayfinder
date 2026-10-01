@@ -543,7 +543,7 @@ struct KnownRevocation {
     floods_left: u8,
 }
 
-/// Constructor for the default (host) capacities.
+/// Constructor for the default capacities.
 ///
 /// Kept in its own impl on the fully-defaulted type rather than on the generic
 /// impl below: a struct's default const parameters do **not** drive inference in
@@ -567,7 +567,7 @@ impl OgmAuth {
 /// name, so `OgmAuth::new` keeps exactly the sizing it had before they existed.
 ///
 /// Capacity is a purely **local** memory decision — it never reaches the wire,
-/// so a host-profile node and a tiny-profile node interoperate unchanged.
+/// so a default-profile node and a tiny-profile node interoperate unchanged.
 /// Every bound enforced at runtime, and every occupancy metric's denominator,
 /// reads these parameters rather than the module constants.
 pub struct OgmAuth<
@@ -1100,19 +1100,19 @@ mod tests {
     fn auth_defaults_preserve_todays_capacities() {
         assert_eq!(
             core::mem::size_of::<OgmAuth>(),
-            core::mem::size_of::<HostAuth>()
+            core::mem::size_of::<DefaultAuth>()
         );
     }
 
     /// The point of the exercise: a small profile must actually reclaim RAM.
-    /// `neighbors` alone is 64 × 360 bytes at host capacity.
+    /// `neighbors` alone is 64 × 360 bytes at `default` capacity.
     #[test]
     fn tiny_auth_profile_is_substantially_smaller() {
         let tiny = core::mem::size_of::<TinyAuth>();
-        let host = core::mem::size_of::<HostAuth>();
+        let default_auth = core::mem::size_of::<DefaultAuth>();
         assert!(
-            tiny * 4 < host,
-            "tiny profile ({tiny} B) should be well under a quarter of host ({host} B)"
+            tiny * 4 < default_auth,
+            "tiny profile ({tiny} B) should be well under a quarter of default ({default_auth} B)"
         );
     }
 
@@ -1157,7 +1157,7 @@ mod tests {
         assert_eq!(b.neighbors().len(), 8);
     }
 
-    /// Capacity is a purely local memory decision: a host-profile node's OGM
+    /// Capacity is a purely local memory decision: a default-profile node's OGM
     /// must still verify at a tiny-profile peer, and vice versa. If this ever
     /// fails, a profile has leaked into the wire format.
     #[test]

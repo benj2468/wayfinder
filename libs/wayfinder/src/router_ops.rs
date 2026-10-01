@@ -52,6 +52,8 @@ use interfaces::link::LinkMetrics;
 
 use crate::CentralRouter;
 use crate::EgressInterface;
+use crate::LocalSendError;
+use crate::McastPlan;
 use crate::RxOutcome;
 use crate::auth::OgmAuth;
 use crate::features::LinkFeatures;
@@ -96,6 +98,13 @@ pub trait OgmAuthOps {
     /// Verify a fan-out multicast trailer from neighbour `src`.
     /// See [`OgmAuth::verify_fanout`].
     fn verify_fanout(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool;
+
+    /// This node's own trust anchor. See [`OgmAuth::anchor`].
+    fn anchor(&self) -> &wayfinder_auth::TrustAnchor;
+
+    /// The revocation records this node currently holds. See
+    /// [`OgmAuth::revocations`].
+    fn revocations(&self) -> impl Iterator<Item = &wayfinder_auth::RevocationRecord> + '_;
 }
 
 impl<
@@ -123,6 +132,14 @@ impl<
 
     fn verify_fanout(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
         OgmAuth::verify_fanout(self, src, frame, trailer)
+    }
+
+    fn anchor(&self) -> &wayfinder_auth::TrustAnchor {
+        OgmAuth::anchor(self)
+    }
+
+    fn revocations(&self) -> impl Iterator<Item = &wayfinder_auth::RevocationRecord> + '_ {
+        OgmAuth::revocations(self)
     }
 }
 
@@ -300,6 +317,68 @@ pub trait RouterOps {
 
     /// This router's authentication state, or `None` when auth is off.
     fn auth_mut(&mut self) -> Option<&mut Self::Auth>;
+
+    /// This router's authentication state, or `None` when auth is off.
+    ///
+    /// The shared-borrow sibling of [`auth_mut`](Self::auth_mut), for a driver
+    /// that only needs to ask whether auth is installed (or reach a read-only
+    /// verb on [`OgmAuthOps`]) without excluding a concurrent mutator.
+    fn auth(&self) -> Option<&Self::Auth>;
+
+    // ---- local host egress --------------------------------------------------
+
+    /// Wrap host data destined for `dest` in the appropriate BATMAN packet,
+    /// ready to hand to a link. See [`CentralRouter::handle_local`].
+    fn handle_local<'tx>(
+        &mut self,
+        now: Duration,
+        dest: Mac,
+        payload: &[u8],
+        tx_buf: &'tx mut [u8],
+    ) -> Result<LinkFrameData<'tx>, LocalSendError>;
+
+    /// Wrap host data for a whole set of multicast listeners, emitting one
+    /// frame per next hop into `out`. See [`CentralRouter::handle_local_mcast`].
+    fn handle_local_mcast(
+        &mut self,
+        now: Duration,
+        dests: &[Mac],
+        payload: &[u8],
+        tx_buf: &mut [u8],
+        out: &mut dyn FrameSink,
+    ) -> Result<(), LocalSendError>;
+
+    /// Decide how to deliver a multicast frame for `group`: as individual
+    /// unicasts to each known listener, or by flooding. See
+    /// [`CentralRouter::mcast_plan`].
+    fn mcast_plan(&self, group: Mac) -> McastPlan;
+
+    /// The originators that have announced interest in `group` — the targets
+    /// for [`McastPlan::Unicast`]. See [`CentralRouter::mcast_targets`].
+    fn mcast_targets(&self, group: Mac) -> impl Iterator<Item = Mac> + '_;
+
+    /// Set the multicast groups the local host listens to (typically from IGMP
+    /// snooping). See [`CentralRouter::set_local_mcast_groups`].
+    fn set_local_mcast_groups(&mut self, now: Duration, groups: &[Mac]);
+
+    // ---- revocation and renewal ---------------------------------------------
+
+    /// Ingest a signed revocation (the operator/management-API entry point for
+    /// an emergency purge), returning whether it was newly recorded. See
+    /// [`CentralRouter::ingest_revocation`].
+    fn ingest_revocation(
+        &mut self,
+        record: &wayfinder_auth::RevocationRecord,
+        now: Duration,
+    ) -> bool;
+
+    /// Whether this node has a self-revocation recorded that has not yet been
+    /// taken for persistence. See [`CentralRouter::self_revocation_pending`].
+    fn self_revocation_pending(&self) -> bool;
+
+    /// Take this node's own recorded self-revocation, if any, so a caller can
+    /// persist it. See [`CentralRouter::take_self_revocation`].
+    fn take_self_revocation(&mut self) -> Option<wayfinder_auth::RevocationRecord>;
 
     /// Advance both of the router's clocks and reconcile the engine's next-hop
     /// proofs against the key material behind them.
@@ -567,6 +646,59 @@ impl<
     fn auth_mut(&mut self) -> Option<&mut Self::Auth> {
         Self::auth_mut(self)
     }
+
+    fn auth(&self) -> Option<&Self::Auth> {
+        Self::auth(self)
+    }
+
+    fn handle_local<'tx>(
+        &mut self,
+        now: Duration,
+        dest: Mac,
+        payload: &[u8],
+        tx_buf: &'tx mut [u8],
+    ) -> Result<LinkFrameData<'tx>, LocalSendError> {
+        Self::handle_local(self, now, dest, payload, tx_buf)
+    }
+
+    fn handle_local_mcast(
+        &mut self,
+        now: Duration,
+        dests: &[Mac],
+        payload: &[u8],
+        tx_buf: &mut [u8],
+        out: &mut dyn FrameSink,
+    ) -> Result<(), LocalSendError> {
+        Self::handle_local_mcast(self, now, dests, payload, tx_buf, out)
+    }
+
+    fn mcast_plan(&self, group: Mac) -> McastPlan {
+        Self::mcast_plan(self, group)
+    }
+
+    fn mcast_targets(&self, group: Mac) -> impl Iterator<Item = Mac> + '_ {
+        Self::mcast_targets(self, group)
+    }
+
+    fn set_local_mcast_groups(&mut self, now: Duration, groups: &[Mac]) {
+        Self::set_local_mcast_groups(self, now, groups);
+    }
+
+    fn ingest_revocation(
+        &mut self,
+        record: &wayfinder_auth::RevocationRecord,
+        now: Duration,
+    ) -> bool {
+        Self::ingest_revocation(self, record, now)
+    }
+
+    fn self_revocation_pending(&self) -> bool {
+        Self::self_revocation_pending(self)
+    }
+
+    fn take_self_revocation(&mut self) -> Option<wayfinder_auth::RevocationRecord> {
+        Self::take_self_revocation(self)
+    }
 }
 
 impl<
@@ -705,22 +837,23 @@ mod tests {
     }
 
     /// The contract, stated once: the same generic function drives the default
-    /// (host) profile and a constrained profile, and both originate the *same*
+    /// (default) profile and a constrained profile, and both originate the *same*
     /// OGM. Capacity is a memory decision, never a behavioural one — so if this
     /// diverges, the trait is leaking capacity into behaviour.
     #[test]
     fn one_generic_signature_drives_both_profiles_identically() {
-        let mut host: CentralRouter = CentralRouter::new(mac(1));
+        let mut default_router: CentralRouter = CentralRouter::new(mac(1));
         let mut tiny = TinyRouter::with_capacities(mac(1));
 
-        let mut host_buf = [0u8; 256];
+        let mut default_buf = [0u8; 256];
         let mut tiny_buf = [0u8; 256];
 
-        let host_ogm = drive_one_ogm(&mut host, &mut host_buf).expect("host emits an OGM");
+        let default_ogm = drive_one_ogm(&mut default_router, &mut default_buf)
+            .expect("default router emits an OGM");
         let tiny_ogm = drive_one_ogm(&mut tiny, &mut tiny_buf).expect("tiny emits an OGM");
 
         assert_eq!(
-            host_ogm, tiny_ogm,
+            default_ogm, tiny_ogm,
             "a capacity profile must not change the OGM a node originates"
         );
     }
@@ -751,13 +884,13 @@ mod tests {
             router.originator_count()
         }
 
-        let mut host: CentralRouter = CentralRouter::new(mac(1));
+        let mut default_router: CentralRouter = CentralRouter::new(mac(1));
         let mut tiny = TinyRouter::with_capacities(mac(1));
 
         assert_eq!(
-            receive(&mut host, &ogm),
+            receive(&mut default_router, &ogm),
             1,
-            "host router should learn the originator through the trait"
+            "default router should learn the originator through the trait"
         );
         assert_eq!(
             receive(&mut tiny, &ogm),
