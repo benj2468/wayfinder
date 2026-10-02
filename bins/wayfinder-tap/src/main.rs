@@ -87,8 +87,14 @@ type TapRouter = wayfinder::router_for!(wayfinder::host);
 ///
 /// [`RouterOps::INTERFACES`]: wayfinder::router_ops::RouterOps::INTERFACES
 fn ensure_links_fit<R: wayfinder::router_ops::RouterOps>(links: usize) -> anyhow::Result<()> {
-    let _ = links;
-    todo!("#81")
+    let max = <R as wayfinder::router_ops::RouterOps>::INTERFACES;
+    if links > max {
+        bail!(
+            "configuration names {links} mesh links but this node's router supports at most \
+             {max}; links past that would run unscheduled and with every traffic class enabled"
+        );
+    }
+    Ok(())
 }
 
 /// Command-line arguments.
@@ -434,6 +440,10 @@ async fn main() -> anyhow::Result<()> {
     // The config can carry sensitive material (enrollment tokens, seed paths),
     // so keep the full dump at DEBUG rather than INFO.
     tracing::debug!(?config, "loaded configuration");
+    if let Err(e) = ensure_links_fit::<TapRouter>(config.links.len()) {
+        tracing::error!(%e, "invalid configuration");
+        return Err(e);
+    }
 
     // Security settings an operator changed at runtime, from the previous run.
     // Loaded before anything reads the config, because these override it —
