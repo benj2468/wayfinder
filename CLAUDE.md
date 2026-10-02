@@ -79,7 +79,11 @@ Two rules about them, both easy to get wrong:
 `libs/wayfinder-py`, each embedded board, each `libs/*/fuzz`), each with its
 own `target/` directory that a plain `cargo clean` in the root won't touch. If
 a build fails with "No space left on device", run `just clean` — it cleans
-every workspace's `target/` in one shot, not just the root's.
+every workspace's `target/` in one shot, not just the root's. A full debug
+build of the root workspace plus both `wayfinder-web` halves needs ~11 GB;
+it stays that small only because dependencies and `wayfinder-web` keep line
+tables rather than full debuginfo (`[profile.dev.package."*"]` in the root
+`Cargo.toml`). Without that it outgrew 18 GB.
 
 The `libs/wayfinder-shark` Wireshark dissector is tested with pytest
 (`libs/wayfinder-shark/tests/`), which drives `tshark` against the Lua
