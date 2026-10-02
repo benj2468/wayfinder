@@ -472,7 +472,14 @@ impl CertAuthority {
     /// fail-closed behaviour of an authority that has none.
     pub fn from_config(root_seed: &[u8; 32], cfg: &ProviderConfig) -> Result<Self, String> {
         check_cert_ttl(cfg.cert_ttl_secs, cfg.allow_unbounded_cert_ttl)?;
-        let log = CaLog::load(cfg.state_path.as_ref().map(PathBuf::from))?;
+        let log = match cfg.state_path.as_ref().map(PathBuf::from) {
+            // The database lives beside the snapshot `state_path` names, which
+            // is imported into it on the first start and moved aside (design 26
+            // phase 2) — so an existing deployment migrates with no config
+            // change.
+            Some(json) => CaLog::open(&json.with_extension("sqlite3"), Some(&json))?,
+            None => CaLog::empty(),
+        };
         let mut ca = Self {
             pending_ttl_secs: cfg.pending_ttl_secs,
             allow_unbounded_cert_ttl: cfg.allow_unbounded_cert_ttl,
@@ -1050,8 +1057,9 @@ impl CertAuthority {
     ) -> Result<Vec<RevocationRecord>, String> {
         let account = self.account_id_of(username)?;
         let sessions = self.live_sessions_of(account);
-        self.revoke_sessions(username, &sessions, |log, revoked| {
-            let (_, persisted) = log.mutate_issued(|issued| mark_revoked(issued, revoked));
+        self.revoke_sessions(username, &sessions, |log, revoked, records, now| {
+            let (_, persisted) =
+                log.mutate_issued_recording(records, now, |issued| mark_revoked(issued, revoked));
             persisted
         })
     }
@@ -1081,8 +1089,8 @@ impl CertAuthority {
         let account = self.account_id_of(username)?;
         let sessions = self.live_sessions_of(account);
         let name = username.to_string();
-        self.revoke_sessions(username, &sessions, move |log, revoked| {
-            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        self.revoke_sessions(username, &sessions, move |log, revoked, records, now| {
+            let (_, persisted) = log.mutate_users_and_issued(records, now, |users, issued| {
                 users.retain(|u| u.username != name);
                 mark_revoked(issued, revoked);
             });
@@ -1136,8 +1144,8 @@ impl CertAuthority {
             UserRole::Admin => Vec::new(),
         };
         let name = username.to_string();
-        self.revoke_sessions(username, &sessions, move |log, revoked| {
-            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        self.revoke_sessions(username, &sessions, move |log, revoked, records, now| {
+            let (_, persisted) = log.mutate_users_and_issued(records, now, |users, issued| {
                 if let Some(user) = users.iter_mut().find(|u| u.username == name) {
                     user.role = role;
                 }
@@ -1194,8 +1202,8 @@ impl CertAuthority {
             self.live_sessions_of(account)
         };
         let name = username.to_string();
-        self.revoke_sessions(username, &sessions, move |log, revoked| {
-            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        self.revoke_sessions(username, &sessions, move |log, revoked, records, now| {
+            let (_, persisted) = log.mutate_users_and_issued(records, now, |users, issued| {
                 if let Some(user) = users.iter_mut().find(|u| u.username == name) {
                     user.disabled = !enabled;
                     if enabled {
@@ -1309,7 +1317,7 @@ impl CertAuthority {
         &mut self,
         username: &str,
         sessions: &[(Mac, u64)],
-        commit: impl FnOnce(&mut CaLog, &[Mac]) -> Result<(), String>,
+        commit: impl FnOnce(&mut CaLog, &[Mac], &[RevocationRecord], u64) -> Result<(), String>,
     ) -> Result<Vec<RevocationRecord>, String> {
         // Only when there is something to sign. An account with no live
         // sessions is removable on a node whose clock was never set, exactly as
@@ -1329,7 +1337,8 @@ impl CertAuthority {
             .map(|(mac, not_after)| self.authority.revoke(*mac, self.now_unix(), *not_after))
             .collect();
         let macs: Vec<Mac> = sessions.iter().map(|(mac, _)| *mac).collect();
-        commit(&mut self.log, &macs)?;
+        let now = self.now_unix();
+        commit(&mut self.log, &macs, &records, now)?;
         // Logged even at zero: "revoked nothing" is the answer to a question an
         // operator asked, and its absence reads as a failure.
         tracing::info!(
@@ -1338,6 +1347,38 @@ impl CertAuthority {
             "revoked an account's session certificates"
         );
         Ok(records)
+    }
+
+    /// The signed revocations still in force, for a restarted node to flood
+    /// again: a revocation that reached only the peers online when it was
+    /// issued would otherwise stop spreading the moment the CA restarted.
+    pub fn live_revocations(&self) -> Vec<RevocationRecord> {
+        let now = self.now_unix();
+        self.log
+            .revocations()
+            .iter()
+            .filter(|r| r.not_after.get() > now)
+            .copied()
+            .collect()
+    }
+
+    /// The MACs of revoked certificates, still inside their validity window,
+    /// that have no signed revocation on file to flood.
+    ///
+    /// A certificate revoked before the CA kept signed records (design 26
+    /// phase 2) carries only the flag: nothing a restarted CA can announce
+    /// again, so a node offline when it was revoked never hears of it.
+    /// Revoking it again signs a fresh record and clears it from this list.
+    pub fn revoked_without_a_signed_record(&self) -> Vec<Vec<u8>> {
+        let now = self.now_unix();
+        let live = self.live_revocations();
+        self.log
+            .issued()
+            .iter()
+            .filter(|c| c.revoked && c.not_after > now)
+            .filter(|c| !live.iter().any(|r| r.node_mac[..] == c.node_mac[..]))
+            .map(|c| c.node_mac.clone())
+            .collect()
     }
 
     /// Whether `username` holds at least one session certificate that revoking
@@ -2585,8 +2626,11 @@ impl MeshAuthority for CertAuthority {
         let not_after = self.now_unix().saturating_add(self.cert_ttl_secs);
         let record = self.authority.revoke(mac, self.now_unix(), not_after);
 
-        // Mark the issued entry revoked (retained for ListCerts observability).
-        let (_, persisted) = self.log.mutate_issued(|issued| {
+        // Mark the issued entry revoked (retained for ListCerts observability),
+        // and keep the signed record in the same write, so a restarted CA can
+        // flood it again.
+        let now = self.now_unix();
+        let (_, persisted) = self.log.mutate_issued_recording(&[record], now, |issued| {
             if let Some(entry) = issued.iter_mut().find(|c| c.node_mac == mac.0) {
                 entry.revoked = true;
             }
@@ -4809,6 +4853,162 @@ mod tests {
         std::fs::remove_dir_all(&path).ok();
     }
 
+    /// The signed revocation itself survives a restart, not only the flag on
+    /// the issued entry — so a restarted CA can flood it again (design 26
+    /// phase 2, closing design 03's CA-restart gap). Byte for byte: it is the
+    /// record the mesh already verified, not a re-signing.
+    #[test]
+    fn a_signed_revocation_survives_a_restart() {
+        use zerocopy::IntoBytes;
+        let path = unique_state_path("revocation-restart");
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let record = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            issued_cert(&mut ca, &mac, &ed, &x, "");
+            ca.revoke(&mac).unwrap()
+        };
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(200);
+        let live = ca.live_revocations();
+        assert_eq!(live.len(), 1, "the revocation is on file after the restart");
+        assert_eq!(live[0].as_bytes(), record.as_bytes());
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        assert!(anchor.verify_revocation(&live[0], ca.now_unix()).is_ok());
+    }
+
+    /// Editing a record that is not the last one survives a restart with every
+    /// lookup unchanged.
+    ///
+    /// The store keeps rows, not positions: an edit deletes a record's row and
+    /// inserts a new one, so after a restart the edited record comes back at
+    /// the end of its list. That is harmless only because each MAC has at most
+    /// one issued record (every write replaces by MAC), so a first-match
+    /// lookup by MAC cannot find a different record than it did before. This
+    /// pins both halves: the order may change, the answers may not.
+    #[test]
+    fn editing_an_earlier_record_survives_a_restart_with_lookups_unchanged() {
+        let path = unique_state_path("edit-earlier-record");
+        let macs = [node_mac(2), node_mac(3), node_mac(4)];
+        {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            for (i, mac) in macs.iter().enumerate() {
+                let (ed, x) = node_keys(2 + i as u8);
+                issued_cert(&mut ca, mac, &ed, &x, "");
+            }
+            // The first record, not the last: its row is replaced.
+            ca.revoke(&macs[0]).unwrap();
+        }
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(200);
+        let issued = ca.log.issued();
+        assert_eq!(
+            issued.len(),
+            macs.len(),
+            "one record per MAC, none duplicated"
+        );
+        for (i, mac) in macs.iter().enumerate() {
+            let matching: Vec<_> = issued.iter().filter(|c| c.node_mac == mac).collect();
+            assert_eq!(matching.len(), 1, "exactly one issued record for each MAC");
+            assert_eq!(
+                matching[0].revoked,
+                i == 0,
+                "only the edited record is revoked, wherever it now sits"
+            );
+        }
+    }
+
+    /// A certificate revoked before the CA kept signed records has nothing on
+    /// file to flood after a restart. Those are named, so a startup warning
+    /// can tell the operator which nodes to revoke again; revoking again signs
+    /// a fresh record and clears the entry.
+    #[test]
+    fn revoked_certs_without_a_signed_record_are_named_until_revoked_again() {
+        let path = unique_state_path("revoked-without-record");
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(100);
+        issued_cert(&mut ca, &mac, &ed, &x, "");
+        assert!(ca.revoked_without_a_signed_record().is_empty());
+
+        // As an import from a snapshot that predates signed records leaves it.
+        ca.log
+            .mutate_issued(|issued| issued[0].revoked = true)
+            .1
+            .unwrap();
+        assert_eq!(
+            ca.revoked_without_a_signed_record(),
+            alloc::vec![mac.to_vec()]
+        );
+
+        ca.revoke(&mac).unwrap();
+        assert!(ca.revoked_without_a_signed_record().is_empty());
+    }
+
+    /// Only revocations still in force are handed back to flood: one past its
+    /// `not_after` cancels nothing a peer would still accept.
+    #[test]
+    fn an_expired_revocation_is_not_handed_back() {
+        let path = unique_state_path("revocation-expired");
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let not_after = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            issued_cert(&mut ca, &mac, &ed, &x, "");
+            ca.revoke(&mac).unwrap().not_after.get()
+        };
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(not_after + 1);
+        assert!(ca.live_revocations().is_empty());
+    }
+
+    /// The revocations a removal signs for an account's sessions are kept too,
+    /// in the same write that marks the certificates revoked.
+    #[test]
+    fn session_revocations_from_a_removal_survive_a_restart() {
+        let path = unique_state_path("session-revocations");
+        let records = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap();
+            let secret = user.totp_secret.clone().unwrap();
+            ca.add_user(user).unwrap();
+            sign_in(&mut ca, "ops", &secret, 2);
+            ca.remove_user_revoking_sessions("ops").unwrap()
+        };
+        assert_eq!(records.len(), 1);
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(200);
+        let live = ca.live_revocations();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].node_mac, records[0].node_mac);
+    }
+
+    /// A revocation whose write fails is not kept either: the CA reports the
+    /// failure, and a restart must not flood a revocation the operator was
+    /// told did not happen.
+    #[test]
+    fn a_revocation_that_cannot_be_written_is_not_kept() {
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let mut ca =
+            CertAuthority::from_config(&[1; 32], &persisted_cfg(&unique_state_path("rev-doom")))
+                .unwrap();
+        ca.set_now_unix(100);
+        issued_cert(&mut ca, &mac, &ed, &x, "");
+        ca.log.fail_commits();
+        assert!(ca.revoke(&mac).is_err());
+        assert!(ca.live_revocations().is_empty());
+    }
+
     #[test]
     fn issued_certs_persist_across_a_restart() {
         let path = unique_state_path("restart");
@@ -4850,16 +5050,19 @@ mod tests {
         // Build a real v7 snapshot through the ordinary path, then age it back
         // to v6 by hand. Hand-writing the v6 file directly would mean
         // hand-writing an Argon2id hash and a TOTP secret to sign in against.
-        let secret = {
-            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        // Built against a scratch path and exported, so the aged snapshot
+        // lands at `path` with no database beside it yet — as an upgrade
+        // from a pre-database CA finds it.
+        let (secret, current) = {
+            let scratch = unique_state_path("pre-id-scratch");
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&scratch)).unwrap();
             ca.set_now_unix(100);
             let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap();
             let secret = user.totp_secret.clone().unwrap();
             ca.add_user(user).unwrap();
-            secret
+            (secret, ca.log.snapshot_json())
         };
-        let mut snapshot: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_slice(&current).unwrap();
         snapshot["version"] = serde_json::json!(6);
         for user in snapshot["users"].as_array_mut().unwrap() {
             user.as_object_mut().unwrap().remove("id");
@@ -4882,6 +5085,29 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A CA whose database cannot be created refuses to start.
+    ///
+    /// It used to start and fail every write instead — serving from memory,
+    /// forgetting every issuance and revocation at the next restart, and
+    /// saying so only in a warning per mutation. For the mesh's root of trust
+    /// the earlier, louder failure is the right one.
+    #[test]
+    fn a_state_path_in_a_missing_directory_fails_at_startup() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "wayfinder-server-test-{}-no-such-dir",
+                std::process::id()
+            ))
+            .join("state.json");
+        let err = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path))
+            .err()
+            .expect("a CA with nowhere to persist must not start");
+        assert!(
+            err.contains("database"),
+            "the error says what failed: {err}"
+        );
     }
 
     #[test]
@@ -5015,19 +5241,19 @@ mod tests {
         // empty rather than erroring.
         assert!(ca.list_pending().is_empty());
 
-        // A subsequent mutation rewrites the file under the current version,
-        // with a `held` section now present.
+        // The snapshot was imported into the database and moved aside, and a
+        // held CSR submitted afterwards survives a restart beside the
+        // migrated certificate.
+        assert!(
+            !path.exists(),
+            "the v1 snapshot is moved aside once imported"
+        );
         let (ed2, x2) = node_keys(3);
         ca.submit_csr(&node_mac(3), &ed2, &x2, "").unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            on_disk["version"],
-            crate::persistence::CURRENT_STATE_VERSION
-        );
-        assert!(on_disk["held"].is_array());
-
-        std::fs::remove_file(&path).ok();
+        drop(ca);
+        let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        // `persisted_cfg` auto-approves, so the new CSR was issued outright.
+        assert_eq!(ca.list_certs().len(), 2);
     }
 
     #[test]
@@ -5114,18 +5340,11 @@ mod tests {
 
     #[test]
     fn failed_persist_rolls_back_the_in_memory_mutation_but_caller_is_told() {
-        // state_path under a directory that doesn't exist, so every write
-        // attempt fails; a missing *file* is a normal fresh-install case
-        // (`Ok(None)`), but a missing *directory* dooms every persist.
-        let path = std::env::temp_dir()
-            .join(format!(
-                "wayfinder-server-test-{}-nonexistent-dir",
-                std::process::id()
-            ))
-            .join("state.json");
-
+        let path = unique_state_path("doomed");
         let cfg = persisted_cfg(&path);
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        // Every write fails from here on, as a full disk would make it.
+        ca.log.fail_commits();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
         let mac = node_mac(2);
@@ -5192,7 +5411,7 @@ mod tests {
         ));
 
         // Now doom every subsequent write.
-        std::fs::remove_dir_all(&dir).ok();
+        ca.log.fail_commits();
 
         let err = ca.approve_csr(&mac, None).unwrap_err();
         assert!(
@@ -5226,7 +5445,7 @@ mod tests {
         // again, a subsequent deny succeeds against the (correctly
         // still-Pending) entry, and there is no already-issued certificate
         // left behind for it to have failed to revoke.
-        std::fs::create_dir_all(&dir).unwrap();
+        ca.log.restore_commits();
         ca.deny_csr(&mac)
             .expect("deny succeeds against the rolled-back entry");
         assert_eq!(ca.list_certs().len(), 0);
@@ -5262,7 +5481,7 @@ mod tests {
         ));
 
         // Now doom the deny's write.
-        std::fs::remove_dir_all(&dir).ok();
+        ca.log.fail_commits();
 
         let err = ca.deny_csr(&mac).unwrap_err();
         assert!(
@@ -5281,7 +5500,7 @@ mod tests {
 
         // Once storage is available again, denying still works normally
         // against the rolled-back (still-Pending) entry.
-        std::fs::create_dir_all(&dir).unwrap();
+        ca.log.restore_commits();
         ca.deny_csr(&mac)
             .expect("deny succeeds once storage recovers");
         assert!(ca.list_pending().is_empty());
@@ -5564,9 +5783,10 @@ mod tests {
             "wayfinder-server-test-{}-policy-nodir",
             std::process::id()
         ));
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
         let cfg = persisted_cfg(&dir.join("state.json"));
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.log.fail_commits();
 
         let result = ca.set_enrollment_policy(&EnrollmentPolicyData {
             auto_approve: Some(false),
@@ -6536,7 +6756,7 @@ mod tests {
         let live = ca.live_session_macs("ops");
         assert_eq!(live.len(), 1, "the account holds one session to revoke");
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        ca.log.fail_commits();
 
         let err = ca
             .set_user_role_revoking_sessions("ops", UserRole::Viewer)

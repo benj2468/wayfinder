@@ -312,6 +312,13 @@ in
         # Without this a restart forgets every revocation and every pending
         # approval, and the impersonation guard starts empty — so it is not
         # optional on a node that is the mesh's root of trust.
+        #
+        # The state itself lives in `ca-state.sqlite3` beside this path
+        # (design 26 phase 2); a `ca-state.json` found here on first start is
+        # imported and renamed `ca-state.json.imported`. Back it up with
+        # `sqlite3 /var/lib/wayfinder/ca-state.sqlite3 ".backup <dest>"`, which
+        # is safe against the running CA. Do not edit it beside the running
+        # CA: change state over the management API, which has one writer.
         state_path = "/var/lib/wayfinder/ca-state.json";
       };
 

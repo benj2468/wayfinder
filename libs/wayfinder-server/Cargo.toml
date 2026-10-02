@@ -27,6 +27,7 @@ std = [
     "tracing/std",
     "wayfinder-auth/std",
     "dep:wayfinder-storage",
+    "dep:rusqlite",
     "wayfinder-storage/std",
     "dep:argon2",
     "dep:blake2",
@@ -79,6 +80,12 @@ zerocopy.workspace = true
 # `tracing/std` under the `std` feature.
 tracing = { version = "0.1.44", default-features = false }
 prost = { version = "0.13", default-features = false }
+# The certificate authority's durable store (design 26 phase 2). Synchronous on
+# purpose: `CertAuthority` is, and an async driver would mean either making six
+# thousand lines of it async or blocking a tokio worker on every write.
+# `bundled` compiles SQLite itself, so the CA does not depend on the host's
+# library version. Only under `std` — the embedded build never links a CA.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }

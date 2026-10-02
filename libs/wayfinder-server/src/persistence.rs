@@ -1,17 +1,17 @@
-//! Durable on-disk snapshot of [`CertAuthority`](crate::CertAuthority)'s
-//! issued-certificate log and held-CSR store, so the impersonation guard,
-//! revocations, and pending operator approvals survive a restart.
+//! The durable state of [`CertAuthority`](crate::CertAuthority) — issued
+//! certificates, held CSRs, policy overrides, accounts and invitations — so the
+//! impersonation guard, revocations, and pending operator approvals survive a
+//! restart.
 //!
-//! The on-disk schema is independent of the management-API protobuf wire
-//! format (which is free to evolve on its own schedule): a JSON snapshot with
-//! an explicit [`CURRENT_STATE_VERSION`], so a future format change ships with
-//! an encoded migration rather than silently reinterpreting old bytes.
+//! [`CaLog`] holds it in memory and writes it through to a SQLite
+//! [`CaStore`] record by record (design 26 phase 2). The records' serialised
+//! forms are this module's own schema, independent of the management-API
+//! protobuf.
 //!
-//! [`CaLog`] itself is a thin, CA-specific skin over
-//! [`wayfinder_storage::Persisted`]: the "mutate, then persist, then roll
-//! back in memory if the persist failed" orchestration lives entirely in
-//! that generic type now — this module only supplies *what's inside the
-//! blob* ([`CaLogState`]) and *how it's encoded* ([`CaStateCodec`]).
+//! The JSON snapshot the CA used to keep (`ca-state.json`, versioned by
+//! [`CURRENT_STATE_VERSION`] with ordered migrations in [`parse_state`]) is now
+//! read once, as an import, the first time a CA starts against an empty
+//! database.
 
 use alloc::format;
 use alloc::string::String;
@@ -22,45 +22,36 @@ use wayfinder_protos::service::IssuedCertData;
 
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 use wayfinder_storage::Codec;
-use wayfinder_storage::FileStore;
-use wayfinder_storage::LoadError;
-use wayfinder_storage::PersistError;
-use wayfinder_storage::PersistOutcome;
-use wayfinder_storage::Persisted;
+
+use crate::ca_store::CaStore;
+use crate::ca_store::ChangeSet;
+use crate::ca_store::Collection;
+use crate::ca_store::Loaded;
+use crate::ca_store::Row;
+use crate::ca_store::SqliteStore;
 
 use crate::authority::HeldCsr;
 use wayfinder_auth::CERT_FLAG_ADMIN;
 use wayfinder_auth::CERT_FLAG_USER;
 use wayfinder_auth::CERT_FLAG_VIEWER;
+use wayfinder_auth::RevocationRecord;
 
 use crate::users::AccountId;
 use crate::users::UserInvite;
 use crate::users::UserRecord;
 
-/// Largest encoded CA-state snapshot [`CaLog::load`] will read. `FileStore`
-/// (per `DurableStore::load`'s contract) needs a caller-supplied buffer
-/// rather than allocating to fit the file, so `CaLog::load` allocates (and
-/// zero-fills) a buffer this size up front, once, per load — 1 MiB is
-/// generous (tens-to-hundreds of times) over the "tens of KB" this snapshot
-/// is expected to occupy in practice, without being large enough for the
-/// startup allocation itself to be worth worrying about; a snapshot that
-/// somehow exceeds it fails closed (via `DurableStore`'s own oversized-blob
-/// error) rather than silently truncating.
+/// Largest legacy `ca-state.json` the one-time import will read. The cap the
+/// snapshot was always read under, kept for the import so a file it could never
+/// have loaded fails closed here too rather than being half-trusted. Nothing
+/// is read under it after the import: the database has no such cliff.
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 
 /// Current on-disk schema version. Bump this — and add an ordered migration
 /// from the prior version into [`parse_state`] — whenever [`CaState`]'s shape
 /// changes.
 pub(crate) const CURRENT_STATE_VERSION: u32 = 7;
-
-/// Permission bits the CA state file is written with.
-///
-/// Restricted rather than left to the umask because the snapshot carries the
-/// enrollment token once an operator has set one at runtime — a shared secret
-/// that gates who may join the mesh. The file held no secrets before version 3,
-/// so this tightens the mode of an existing snapshot on its first rewrite.
-const STATE_FILE_MODE: u32 = 0o600;
 
 /// One issued-certificate record in the on-disk snapshot. Mirrors
 /// [`IssuedCertData`] but with fixed-size arrays (the snapshot's own schema,
@@ -443,12 +434,10 @@ struct VersionProbe {
     version: u32,
 }
 
-/// Decode a CA state snapshot's raw bytes (as read from a [`FileStore`] via
-/// [`CaStateCodec::decode`]), dispatching to the right schema/migration by
-/// probing `version` first. `path`, when known, is used only to name the
-/// offending file in error messages — `None` when this snapshot isn't backed
-/// by a real file (in-memory-only `CaLog`s never reach this function, since
-/// their `Persisted` store starts empty rather than loading anything).
+/// Decode a CA state snapshot's raw bytes (via [`CaStateCodec::decode`]),
+/// dispatching to the right schema/migration by probing `version` first.
+/// `path`, when known, is used only to name the offending file in error
+/// messages.
 ///
 /// Any outcome that isn't a clean, known-version snapshot (after migration)
 /// — corrupt JSON, a foreign shape, or a newer-than-known version — is
@@ -513,11 +502,8 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
     }
 }
 
-/// The in-memory value a [`CaLog`] wraps in [`Persisted`]: everything
-/// `authority.rs` can mutate. Cheap to `Clone` at the scale this is meant for
-/// (see [`Persisted::mutate`]'s own doc on why that bound exists) — needed so
-/// a failed persist can roll the in-memory value back to its pre-mutation
-/// snapshot.
+/// Everything `authority.rs` can mutate, as [`CaLog`] holds it in memory.
+/// `Clone` so a failed commit can roll it back to its pre-mutation snapshot.
 #[derive(Clone)]
 struct CaLogState {
     issued: Vec<IssuedCertData>,
@@ -525,6 +511,9 @@ struct CaLogState {
     policy: PolicyOverrides,
     users: Vec<UserRecord>,
     invites: Vec<UserInvite>,
+    /// Signed revocations still in force when last written. Not in the legacy
+    /// JSON snapshot, which never kept them.
+    revocations: Vec<RevocationRecord>,
 }
 
 impl CaLogState {
@@ -536,14 +525,14 @@ impl CaLogState {
             policy: PolicyOverrides::default(),
             users: Vec::new(),
             invites: Vec::new(),
+            revocations: Vec::new(),
         }
     }
 }
 
-/// Translates [`CaLogState`] to/from the CA's on-disk JSON snapshot
-/// ([`CaState`]) — the only caller-specific piece [`Persisted`] needs;
-/// everything about *when* to encode/decode and *what to do with the bytes*
-/// is [`Persisted`]'s own concern, not this type's.
+/// Translates [`CaLogState`] to/from the legacy JSON snapshot ([`CaState`]):
+/// decoding for the one-time import, encoding only for tests that hand-age a
+/// snapshot.
 struct CaStateCodec {
     /// The state file this codec's blobs are read from/written to, kept only
     /// to name the offending file in error messages — `None` for an
@@ -588,110 +577,252 @@ impl Codec<CaLogState> for CaStateCodec {
             policy: state.policy,
             users: state.users,
             invites: state.invites,
+            revocations: Vec::new(),
         })
     }
 }
 
-/// The authority's durable state: the issued-certificate log and the
-/// held-CSR store, both backed by one snapshot file — a thin skin over
-/// [`Persisted`], which owns the actual "mutate, persist, roll back on
-/// failure" mechanics (see [`Self::mutate_issued`]/[`Self::mutate_held`]/
-/// [`Self::mutate_issued_and_held`]).
+/// The authority's durable state: the issued-certificate log, held CSRs,
+/// enrollment-policy overrides, user accounts and invitations, held in memory
+/// and written through to a [`CaStore`] record by record (design 26 phase 2).
 ///
-/// `persisted`'s fields are private to [`Persisted`] itself, so
-/// `authority.rs` has no way to reach either `Vec` except through the
-/// read-only [`Self::issued`]/[`Self::held`] views or the `mutate_*` methods
-/// — this is what makes "every mutation is followed by a persist attempt" a
-/// property of the type rather than a convention call sites must remember.
-/// This is a per-*call* guarantee: an operator action that only needs to
-/// touch one collection performs one `mutate_*` call and one persist, but an
-/// action that must keep both collections in lockstep (`approve_csr`, which
-/// records a newly-issued certificate and flips the held entry to
-/// `Approved`) uses [`Self::mutate_issued_and_held`] so that one persist
-/// covers the whole action rather than durably splitting across two — see
-/// that method's own doc for the impersonation-guard gap a split write would
-/// otherwise open.
+/// The only way `authority.rs` can change any of it is a `mutate_*` call, and
+/// every one of those ends in a commit attempt — "every mutation is followed by
+/// a persist" is a property of the type, not a convention call sites must
+/// remember. A mutation touching two collections (`approve_csr` recording a
+/// certificate and approving its CSR) commits them as one transaction, so the
+/// two can never durably split; see [`Self::mutate_issued_and_held`].
+///
+/// A commit writes only what changed. Each collection is re-encoded after the
+/// mutation and diffed, by content, against the rows the store already holds
+/// (`index`): rows whose record disappeared are deleted and new records are
+/// inserted. An unchanged record is never rewritten, so a login costs one row,
+/// not the whole CA.
 pub(crate) struct CaLog {
-    persisted: Persisted<CaLogState, Option<FileStore>, CaStateCodec>,
-    /// Mirrors the path (if any) inside `persisted`'s own `FileStore` (and
-    /// inside `persisted`'s `CaStateCodec`, which keeps its own copy for its
-    /// decode-error messages) — three copies of one fact, purely so each
-    /// layer can name the offending file in its own error/log messages
-    /// without a way to read it back out of `Persisted`, whose `store` and
-    /// `codec` fields are both private. Safe only because none of the three
-    /// copies is ever mutated after `Self::load`/`Self::empty` builds them
-    /// all from the same `state_path` value — a future change that lets one
-    /// of them change independently (e.g. rebinding the store) would need
-    /// to keep all three in sync by hand. Used by [`Self::mutate_issued`]/
-    /// [`Self::mutate_held`]/[`Self::mutate_issued_and_held`] (via
-    /// [`Self::report_persist_outcome`]) to name the offending file when a
-    /// persist's underlying I/O fails — `DurableStore::Error` (a bare
-    /// `io::Error` for `FileStore`) carries no path of its own.
-    state_path: Option<PathBuf>,
+    /// What the authority reads. Always the committed state: a mutation whose
+    /// commit fails is rolled back before the caller sees it.
+    state: CaLogState,
+    /// Where `state` is persisted, or `None` for an in-memory-only CA.
+    backing: Option<Backing>,
+}
+
+/// A [`CaLog`]'s store, and its record of what the store holds.
+struct Backing {
+    store: Box<dyn CaStore>,
+    /// Per collection, each stored record body and the ids of the rows holding
+    /// it — a multiset, since two records can serialise identically. Kept in
+    /// step with the store by every successful commit.
+    index: HashMap<Collection, HashMap<Vec<u8>, Vec<i64>>>,
+    /// The database file, to name in a failure's log line. `None` for a store
+    /// that is not a file.
+    path: Option<PathBuf>,
+    /// Fault injection: while set, every commit fails without reaching the
+    /// store. The only way to make a SQLite write fail on demand — removing
+    /// the directory under an open database does not.
+    #[cfg(test)]
+    fail_commits: bool,
 }
 
 impl CaLog {
-    /// An empty, in-memory-only log (no snapshot file). Used by
+    /// An empty, in-memory-only log. Used by
     /// [`CertAuthority::new`](crate::CertAuthority::new), which has no
     /// `ProviderConfig` to read a `state_path` from.
     pub(crate) fn empty() -> Self {
         Self {
-            persisted: Persisted::new(CaLogState::empty(), None, CaStateCodec { path: None }),
-            state_path: None,
+            state: CaLogState::empty(),
+            backing: None,
         }
     }
 
-    /// Build a log for `state_path`. When `Some`, the existing snapshot (if
-    /// any) is loaded now via a [`FileStore`] — migrating an older schema
-    /// version if needed; a corrupt, foreign, or newer-than-known snapshot is
-    /// `Err` (fail closed — see [`parse_state`]). `None` behaves like
-    /// [`Self::empty`].
-    pub(crate) fn load(state_path: Option<PathBuf>) -> Result<Self, String> {
-        let codec = CaStateCodec {
-            path: state_path.clone(),
+    /// The log persisted in the SQLite database at `db`, created if absent.
+    ///
+    /// `legacy` is the `ca-state.json` this CA ran on before the database
+    /// existed. On the first start against an uninitialized database it is
+    /// imported — through the versioned loader, so any schema version
+    /// upgrades — committed in one transaction, and renamed to
+    /// `<name>.imported`. It is kept, not deleted: it is the only copy of the
+    /// CA's state that predates the database. A file still present beside an
+    /// initialized database is either that import's leftover — a crash before
+    /// the rename, or a rename that failed — recognised by the digest the
+    /// import recorded, however much the CA has changed since, and then the
+    /// rename is finished; or a different CA's state, refused, since picking
+    /// either loses the other's revocations.
+    pub(crate) fn open(db: &Path, legacy: Option<&Path>) -> Result<Self, String> {
+        let store = SqliteStore::open(db)?;
+        let mut log = Self::with_store(Box::new(store), legacy)?;
+        if let Some(backing) = log.backing.as_mut() {
+            backing.path = Some(db.to_path_buf());
+        }
+        Ok(log)
+    }
+
+    /// The log persisted in `store`. See [`Self::open`] for `legacy`.
+    pub(crate) fn with_store(
+        mut store: Box<dyn CaStore>,
+        legacy: Option<&Path>,
+    ) -> Result<Self, String> {
+        let loaded = store.load()?;
+        let legacy = match legacy {
+            Some(path) if path.exists() => Some((path, read_legacy(path)?)),
+            _ => None,
         };
-        let persisted = match &state_path {
-            Some(path) => {
-                let mut buf = vec![0u8; MAX_STATE_BYTES];
-                Persisted::load(
-                    Some(FileStore::new(path).with_mode(STATE_FILE_MODE)),
-                    codec,
-                    CaLogState::empty(),
-                    &mut buf,
-                )
-                .map_err(|e| match e {
-                    LoadError::Store(io_err) => {
-                        format!("failed to read CA state file {}: {io_err}", path.display())
-                    }
-                    LoadError::Decode(msg) => msg,
-                })?
+        let mut backing = Backing {
+            store,
+            index: HashMap::new(),
+            path: None,
+            #[cfg(test)]
+            fail_commits: false,
+        };
+
+        if !loaded.initialized {
+            // A fresh database: take the legacy snapshot's state if there is
+            // one, and commit it — or an empty CA — so the database is marked
+            // initialized and a later start never imports over it.
+            let state = legacy
+                .as_ref()
+                .map_or_else(CaLogState::empty, |(_, (state, _))| state.clone());
+            let mut change = ChangeSet::default();
+            if let Some((_, (_, digest))) = &legacy {
+                change.record_import(digest.clone());
             }
-            None => Persisted::new(CaLogState::empty(), None, codec),
-        };
+            let mut pending = Vec::new();
+            for collection in Collection::ALL {
+                for body in encode_collection(&state, collection)? {
+                    change.insert(collection, body.clone());
+                    pending.push((collection, body));
+                }
+            }
+            let ids = backing.store.commit(&change)?;
+            for ((collection, body), id) in pending.into_iter().zip(ids) {
+                backing.remember(collection, body, id);
+            }
+            if let Some((path, _)) = &legacy {
+                move_aside(path);
+            }
+            return Ok(Self {
+                state,
+                backing: Some(backing),
+            });
+        }
+
+        let state = decode_rows(&loaded)?;
+        for row in loaded.rows {
+            backing.remember(row.collection, row.body, row.id);
+        }
+        if let Some((path, (legacy_state, digest))) = legacy {
+            // The file this database was imported from, byte for byte, is the
+            // import's own leftover however much the CA has changed since —
+            // re-reading it to compare states cannot tell that, since a v5/v6
+            // snapshot mints fresh account ids on every parse. Comparing
+            // states remains for a database imported before the digest was
+            // recorded.
+            if loaded.imported_digest.as_deref() == Some(digest.as_str())
+                || same_records(&state, &legacy_state)?
+            {
+                move_aside(path);
+            } else {
+                return Err(format!(
+                    "{} is still present beside an initialized CA database and is not \
+                     the file it was imported from; refusing to start rather than \
+                     choose between them. If its state is already in the database, \
+                     move it aside",
+                    path.display()
+                ));
+            }
+        }
         Ok(Self {
-            persisted,
-            state_path,
+            state,
+            backing: Some(backing),
         })
+    }
+
+    /// Make every later commit fail, as a full disk or a failing device would.
+    #[cfg(test)]
+    pub(crate) fn fail_commits(&mut self) {
+        if let Some(backing) = self.backing.as_mut() {
+            backing.fail_commits = true;
+        }
+    }
+
+    /// Let commits reach the store again after [`Self::fail_commits`], as
+    /// though the disk had been freed.
+    #[cfg(test)]
+    pub(crate) fn restore_commits(&mut self) {
+        if let Some(backing) = self.backing.as_mut() {
+            backing.fail_commits = false;
+        }
+    }
+
+    /// The whole state as a current-version `ca-state.json`, for tests that
+    /// need to hand-age a snapshot written through the ordinary path.
+    #[cfg(test)]
+    pub(crate) fn snapshot_json(&self) -> Vec<u8> {
+        CaStateCodec { path: None }.encode(&self.state).unwrap()
+    }
+
+    /// Run `f` against the state, then commit the collections in `touched`.
+    /// On a failed commit the state is rolled back to what it was before `f`,
+    /// and the error returned; `f`'s own result is returned either way.
+    fn mutate<R>(
+        &mut self,
+        touched: &[Collection],
+        f: impl FnOnce(&mut CaLogState) -> R,
+    ) -> (R, Result<(), String>) {
+        let Some(backing) = self.backing.as_mut() else {
+            return (f(&mut self.state), Ok(()));
+        };
+        let before = self.state.clone();
+        let result = f(&mut self.state);
+        match backing.commit(&self.state, touched) {
+            Ok(()) => (result, Ok(())),
+            Err(detail) => {
+                self.state = before;
+                (result, Err(backing.report_failure(&detail)))
+            }
+        }
     }
 
     /// Read-only view of the issued-certificate log.
     pub(crate) fn issued(&self) -> &[IssuedCertData] {
-        &self.persisted.get().issued
+        &self.state.issued
     }
 
     /// Read-only view of the held-CSR store.
     pub(crate) fn held(&self) -> &[HeldCsr] {
-        &self.persisted.get().held
+        &self.state.held
     }
 
     /// Read-only view of the operator's runtime enrollment-policy overrides.
     pub(crate) fn policy(&self) -> &PolicyOverrides {
-        &self.persisted.get().policy
+        &self.state.policy
+    }
+
+    /// The signed revocations on file, including any that have expired since
+    /// they were last written (they are pruned on the next revocation).
+    pub(crate) fn revocations(&self) -> &[RevocationRecord] {
+        &self.state.revocations
+    }
+
+    /// [`Self::mutate_issued`], also recording the signed `records` in the
+    /// same transaction — so a revocation is on file exactly when the issued
+    /// log says the certificate is revoked. Revocations past their
+    /// `not_after` at `now_unix` are dropped on the way, which keeps the
+    /// collection to the ones still in force.
+    pub(crate) fn mutate_issued_recording<R>(
+        &mut self,
+        records: &[RevocationRecord],
+        now_unix: u64,
+        f: impl FnOnce(&mut Vec<IssuedCertData>) -> R,
+    ) -> (R, Result<(), String>) {
+        self.mutate(&[Collection::Issued, Collection::Revocations], |state| {
+            record_revocations(&mut state.revocations, records, now_unix);
+            f(&mut state.issued)
+        })
     }
 
     /// Read-only view of the certificate authority's user accounts.
     pub(crate) fn users(&self) -> &[UserRecord] {
-        &self.persisted.get().users
+        &self.state.users
     }
 
     /// Run `f` against the user store, then attempt to persist the full state,
@@ -706,13 +837,13 @@ impl CaLog {
         &mut self,
         f: impl FnOnce(&mut Vec<UserRecord>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.users));
-        (result, self.report_persist_outcome(persisted))
+        let (result, persisted) = self.mutate(&[Collection::Users], |state| f(&mut state.users));
+        (result, persisted)
     }
 
     /// Read-only view of the pending invitations.
     pub(crate) fn invites(&self) -> &[UserInvite] {
-        &self.persisted.get().invites
+        &self.state.invites
     }
 
     /// Run `f` against the invite store, then attempt to persist the full
@@ -725,8 +856,9 @@ impl CaLog {
         &mut self,
         f: impl FnOnce(&mut Vec<UserInvite>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.invites));
-        (result, self.report_persist_outcome(persisted))
+        let (result, persisted) =
+            self.mutate(&[Collection::Invites], |state| f(&mut state.invites));
+        (result, persisted)
     }
 
     /// Run `f` against *both* the user store and the invite store, persisting
@@ -742,16 +874,16 @@ impl CaLog {
     /// is told their registration failed. If the deletion lands first and the
     /// account write fails, the invite is gone and the person holding the handle
     /// has nothing left to redeem and no way to ask for another. One
-    /// [`Persisted::mutate`] closes both: either the account exists and the
+    /// commit closes both: either the account exists and the
     /// invite is gone, or neither happened.
     pub(crate) fn mutate_users_and_invites<R>(
         &mut self,
         f: impl FnOnce(&mut Vec<UserRecord>, &mut Vec<UserInvite>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self
-            .persisted
-            .mutate(|state| f(&mut state.users, &mut state.invites));
-        (result, self.report_persist_outcome(persisted))
+        let (result, persisted) = self.mutate(&[Collection::Users, Collection::Invites], |state| {
+            f(&mut state.users, &mut state.invites)
+        });
+        (result, persisted)
     }
 
     /// Run `f` against *both* the user store and the issued-certificate log,
@@ -767,16 +899,29 @@ impl CaLog {
     /// end, reintroduced in the window where it is hardest to notice. If the
     /// revocations land and the deletion rolls back, the account survives with
     /// its sessions cut and can simply sign in again for a fresh one. One
-    /// [`Persisted::mutate`] closes both: either the account is gone and its
+    /// commit closes both: either the account is gone and its
     /// sessions are revoked, or neither happened.
+    ///
+    /// Every caller is revoking, so `records` — the revocations signed for the
+    /// certificates `f` marks — are recorded in the same write, as
+    /// [`Self::mutate_issued_recording`] does.
     pub(crate) fn mutate_users_and_issued<R>(
         &mut self,
+        records: &[RevocationRecord],
+        now_unix: u64,
         f: impl FnOnce(&mut Vec<UserRecord>, &mut Vec<IssuedCertData>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self
-            .persisted
-            .mutate(|state| f(&mut state.users, &mut state.issued));
-        (result, self.report_persist_outcome(persisted))
+        self.mutate(
+            &[
+                Collection::Users,
+                Collection::Issued,
+                Collection::Revocations,
+            ],
+            |state| {
+                record_revocations(&mut state.revocations, records, now_unix);
+                f(&mut state.users, &mut state.issued)
+            },
+        )
     }
 
     /// Run `f` against the enrollment-policy overrides, then attempt to
@@ -788,12 +933,12 @@ impl CaLog {
         &mut self,
         f: impl FnOnce(&mut PolicyOverrides) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.policy));
-        (result, self.report_persist_outcome(persisted))
+        let (result, persisted) = self.mutate(&[Collection::Policy], |state| f(&mut state.policy));
+        (result, persisted)
     }
 
     /// Run `f` against the issued-certificate log, then attempt to persist
-    /// the full state (issued + held) to `state_path` (if set), returning
+    /// the change, returning
     /// both `f`'s result and the persist outcome so the caller can decide how
     /// to react to a durability failure (see [`Self::mutate_held`] for the
     /// shared persist behavior).
@@ -801,17 +946,17 @@ impl CaLog {
         &mut self,
         f: impl FnOnce(&mut Vec<IssuedCertData>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.issued));
-        (result, self.report_persist_outcome(persisted))
+        let (result, persisted) = self.mutate(&[Collection::Issued], |state| f(&mut state.issued));
+        (result, persisted)
     }
 
-    /// Run `f` against the held-CSR store, then attempt to persist the full
-    /// state (issued + held) to `state_path` (if set) — the only way
+    /// Run `f` against the held-CSR store, then attempt to persist the
+    /// change — the only way
     /// `authority.rs` can mutate either collection, so a persist attempt can
     /// never be forgotten. Returns `f`'s result alongside the persist
     /// outcome: a failed persist **rolls the entire state (both `issued` and
     /// `held`) back** to what it was before `f` ran, via
-    /// [`Persisted::mutate`]'s own rollback guarantee, so the in-memory log
+    /// the commit's rollback, so the in-memory log
     /// never diverges from what's durably stored. `f`'s own return value is
     /// still handed back regardless — it's the caller's business, not tied
     /// to whether the mutation stuck — but the caller must treat a
@@ -823,8 +968,8 @@ impl CaLog {
         &mut self,
         f: impl FnOnce(&mut Vec<HeldCsr>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.held));
-        (result, self.report_persist_outcome(persisted))
+        let (result, persisted) = self.mutate(&[Collection::Held], |state| f(&mut state.held));
+        (result, persisted)
     }
 
     /// Run `f` against *both* the issued-certificate log and the held-CSR
@@ -843,68 +988,277 @@ impl CaLog {
     /// denial that never touches `issued`, silently leaving an
     /// already-issued, still-valid certificate un-revocable through the
     /// normal held-CSR flow. Running both mutations inside one
-    /// [`Persisted::mutate`] call closes that gap: either both land
-    /// durably, or [`Persisted::mutate`]'s rollback undoes both together.
+    /// commit closes that gap: either both land
+    /// durably, or the commit's rollback undoes both together.
     pub(crate) fn mutate_issued_and_held<R>(
         &mut self,
         f: impl FnOnce(&mut Vec<IssuedCertData>, &mut Vec<HeldCsr>) -> R,
     ) -> (R, Result<(), String>) {
-        let (result, persisted) = self
-            .persisted
-            .mutate(|state| f(&mut state.issued, &mut state.held));
-        (result, self.report_persist_outcome(persisted))
+        let (result, persisted) = self.mutate(&[Collection::Issued, Collection::Held], |state| {
+            f(&mut state.issued, &mut state.held)
+        });
+        (result, persisted)
+    }
+}
+
+impl Backing {
+    /// Record that row `id` holds `body` in `collection`.
+    fn remember(&mut self, collection: Collection, body: Vec<u8>, id: i64) {
+        self.index
+            .entry(collection)
+            .or_default()
+            .entry(body)
+            .or_default()
+            .push(id);
     }
 
-    /// Turn a [`Persisted::mutate`] outcome into the `Result<(), String>`
-    /// `authority.rs` expects, logging a `warn!` on the way through a
-    /// failure. `Persisted` itself never logs (it's a generic crate with no
-    /// notion of "CA state") — this is that logging's one call site, shared
-    /// by `mutate_issued`, `mutate_held`, and `mutate_issued_and_held` rather
-    /// than duplicated across all three.
-    fn report_persist_outcome(
-        &self,
-        persisted: PersistOutcome<std::io::Error, String>,
-    ) -> Result<(), String> {
-        persisted.map_err(|e| {
-            let path_display = self
-                .state_path
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            // Both arms get the same framing and structured `path` field
-            // below, even though an `Encode` failure (unlike `Store`) never
-            // actually touched the filesystem — `CaStateCodec::encode`
-            // serializing this schema (fixed arrays, `String`, `bool`, `u64`)
-            // essentially can't fail, so keeping the two arms' shape consistent
-            // matters more here than distinguishing an outcome that shouldn't
-            // occur.
-            let detail = match e {
-                PersistError::Encode(encode_err) => encode_err.to_string(),
-                PersistError::Store(io_err) => io_err.to_string(),
-            };
-            // The path and the OS error go to the log, not to the caller.
-            // Three of this store's mutations sit behind requests on the
-            // enrollment tier, which admits a caller holding no credential at
-            // all — and `begin_user_registration` reaches one on a token that
-            // matches nothing. Returning this verbatim showed an anonymous
-            // visitor the CA's absolute state-file path and its errno, under
-            // the heading "This invitation cannot be used".
-            let msg = "the node could not record this change; it is still \
-                       serving from memory. Try again shortly, and check the \
-                       node's logs"
-                .to_string();
-            // A handled-and-retried I/O error (the caller keeps serving from
-            // memory and the next successful mutation retries the write), so
-            // `warn!` rather than `error!` — but still surfaced to the
-            // caller as an `Err`, since the caller is best placed to decide
-            // whether to retry, alert, or accept the risk.
-            tracing::warn!(
-                path = %path_display,
-                error = %detail,
-                "failed to persist CA state; durability of certificates, held CSRs, accounts and invitations is degraded until this is fixed"
-            );
-            msg
-        })
+    /// Commit `state`'s `touched` collections: diff each against what the
+    /// store holds, and write the difference as one change set.
+    fn commit(&mut self, state: &CaLogState, touched: &[Collection]) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_commits {
+            return Err("commit failed by test fault injection".into());
+        }
+        let mut change = ChangeSet::default();
+        let mut deleted = Vec::new();
+        let mut inserted = Vec::new();
+        for &collection in touched {
+            let mut wanted: HashMap<Vec<u8>, usize> = HashMap::new();
+            let mut order = Vec::new();
+            for body in encode_collection(state, collection)? {
+                let n = wanted.entry(body.clone()).or_default();
+                *n += 1;
+                order.push(body);
+            }
+            let held = self.index.get(&collection);
+            // Rows whose body is wanted fewer times than it is held go.
+            if let Some(held) = held {
+                for (body, ids) in held {
+                    let keep = wanted.get(body).copied().unwrap_or(0);
+                    for &id in ids.iter().skip(keep) {
+                        change.delete(collection, id);
+                        deleted.push((collection, body.clone(), id));
+                    }
+                }
+            }
+            // Bodies wanted more times than they are held come in, in the
+            // order the collection lists them.
+            let mut have: HashMap<&[u8], usize> = HashMap::new();
+            for body in &order {
+                let held_n = held.and_then(|h| h.get(body)).map_or(0, Vec::len);
+                let seen = have.entry(body.as_slice()).or_default();
+                *seen += 1;
+                if *seen > held_n {
+                    change.insert(collection, body.clone());
+                    inserted.push((collection, body.clone()));
+                }
+            }
+        }
+        if change.is_empty() {
+            return Ok(());
+        }
+        let ids = self.store.commit(&change)?;
+        for (collection, body, id) in deleted {
+            if let Some(ids) = self
+                .index
+                .get_mut(&collection)
+                .and_then(|m| m.get_mut(&body))
+            {
+                ids.retain(|&x| x != id);
+                if ids.is_empty() {
+                    self.index.get_mut(&collection).map(|m| m.remove(&body));
+                }
+            }
+        }
+        for ((collection, body), id) in inserted.into_iter().zip(ids) {
+            self.remember(collection, body, id);
+        }
+        Ok(())
+    }
+
+    /// Log a failed commit and turn it into the message the caller is given.
+    fn report_failure(&self, detail: &str) -> String {
+        let path_display = self
+            .path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        // The path and the store's error go to the log, not to the caller.
+        // Three of this store's mutations sit behind requests on the
+        // enrollment tier, which admits a caller holding no credential at
+        // all — and `begin_user_registration` reaches one on a token that
+        // matches nothing. Returning this verbatim showed an anonymous
+        // visitor the CA's absolute state-file path and its errno, under
+        // the heading "This invitation cannot be used".
+        //
+        // The mutation is rolled back, not kept in memory to retry later, so
+        // the change did not happen: a local failure an operator must act on
+        // (a full disk, a broken database), hence `error!`. Still surfaced to
+        // the caller as an `Err`, since the caller is best placed to decide
+        // whether to retry or alert.
+        tracing::error!(
+            path = %path_display,
+            error = %detail,
+            "failed to persist CA state; the change was not made, and none will be until this is fixed"
+        );
+        "the node could not record this change, so it was not made. Try again \
+         shortly, and check the node's logs"
+            .to_string()
+    }
+}
+
+/// Drop the revocations that expired by `now_unix` and append `records`.
+fn record_revocations(
+    on_file: &mut Vec<RevocationRecord>,
+    records: &[RevocationRecord],
+    now_unix: u64,
+) {
+    on_file.retain(|r| r.not_after.get() > now_unix);
+    on_file.extend_from_slice(records);
+}
+
+/// Every record of `collection` in `state`, serialised as the store holds it.
+///
+/// Issued certificates go through [`IssuedRecord`], the on-disk mirror of the
+/// protobuf type. One too malformed to mirror fails the whole encoding, so the
+/// mutation that produced it rolls back: the JSON snapshot used to drop it with
+/// a warning and report success, telling the caller a change was durable that
+/// a restart would lose.
+fn encode_collection(state: &CaLogState, collection: Collection) -> Result<Vec<Vec<u8>>, String> {
+    fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(value).map_err(|e| format!("failed to serialize CA record: {e}"))
+    }
+    match collection {
+        Collection::Issued => {
+            let mut out = Vec::with_capacity(state.issued.len());
+            for c in &state.issued {
+                let record = IssuedRecord::from_proto(c).ok_or_else(|| {
+                    format!(
+                        "malformed issued-cert record (node_mac {} bytes, ed_pubkey {} \
+                         bytes) cannot be stored",
+                        c.node_mac.len(),
+                        c.ed_pubkey.len()
+                    )
+                })?;
+                out.push(json(&record)?);
+            }
+            Ok(out)
+        }
+        Collection::Held => state.held.iter().map(json).collect(),
+        Collection::Policy => Ok(vec![json(&state.policy)?]),
+        Collection::Users => state.users.iter().map(json).collect(),
+        Collection::Invites => state.invites.iter().map(json).collect(),
+        // The signed record's own bytes: it is flooded exactly as it was
+        // signed, so there is no serialised form to prefer over it.
+        Collection::Revocations => Ok(state
+            .revocations
+            .iter()
+            .map(|r| zerocopy::IntoBytes::as_bytes(r).to_vec())
+            .collect()),
+    }
+}
+
+/// Rebuild the state from a store's rows, in the order they were written.
+fn decode_rows(loaded: &Loaded) -> Result<CaLogState, String> {
+    fn json<T: for<'de> Deserialize<'de>>(row: &Row) -> Result<T, String> {
+        serde_json::from_slice(&row.body)
+            .map_err(|e| format!("CA database row {} is not a valid record: {e}", row.id))
+    }
+    let mut rows: Vec<&Row> = loaded.rows.iter().collect();
+    rows.sort_by_key(|r| r.id);
+    let mut state = CaLogState::empty();
+    let mut policies = 0;
+    for row in rows {
+        match row.collection {
+            Collection::Issued => state.issued.push(json::<IssuedRecord>(row)?.to_proto()),
+            Collection::Held => state.held.push(json(row)?),
+            Collection::Policy => {
+                policies += 1;
+                state.policy = json(row)?;
+            }
+            Collection::Users => state.users.push(json(row)?),
+            Collection::Invites => state.invites.push(json(row)?),
+            Collection::Revocations => {
+                let record = <RevocationRecord as zerocopy::FromBytes>::read_from_bytes(&row.body)
+                    .map_err(|_| {
+                        format!("CA database row {} is not a revocation record", row.id)
+                    })?;
+                state.revocations.push(record);
+            }
+        }
+    }
+    if policies > 1 {
+        return Err(format!(
+            "CA database holds {policies} enrollment-policy rows where there can be one"
+        ));
+    }
+    Ok(state)
+}
+
+/// Read and decode a legacy `ca-state.json`, migrating any older schema.
+///
+/// Bounded: a snapshot larger than [`MAX_STATE_BYTES`] fails closed rather than
+/// being read in whole, as it always has.
+fn read_legacy(path: &Path) -> Result<(CaLogState, String), String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("failed to read CA state file {}: {e}", path.display()))?
+        .len();
+    if len > MAX_STATE_BYTES as u64 {
+        return Err(format!(
+            "CA state file {} is {len} bytes, over the {MAX_STATE_BYTES}-byte import limit",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read CA state file {}: {e}", path.display()))?;
+    let state = CaStateCodec {
+        path: Some(path.to_path_buf()),
+    }
+    .decode(&bytes)?;
+    Ok((state, snapshot_digest(&bytes)))
+}
+
+/// A legacy snapshot's identity: `Blake2s256` of its bytes under a label, hex
+/// encoded, as [`Loaded::imported_digest`] records it.
+fn snapshot_digest(bytes: &[u8]) -> String {
+    use blake2::Digest as _;
+    let mut h = blake2::Blake2s256::new();
+    h.update(b"wayfinder ca-state.json import v1");
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether two states hold the same records in every collection, ignoring
+/// order.
+fn same_records(a: &CaLogState, b: &CaLogState) -> Result<bool, String> {
+    for collection in Collection::ALL {
+        let mut x = encode_collection(a, collection)?;
+        let mut y = encode_collection(b, collection)?;
+        x.sort();
+        y.sort();
+        if x != y {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Rename an imported `ca-state.json` to `<name>.imported`. A failure is only
+/// logged: the state is committed, and the next start recognises the file by
+/// the digest the import recorded and finishes the rename then.
+fn move_aside(path: &Path) {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(".imported");
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::info!(
+            from = %path.display(),
+            "imported the CA state snapshot into the database and moved it aside"
+        ),
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "imported the CA state snapshot but could not move it aside; the next start will retry"
+        ),
     }
 }
 
@@ -949,8 +1303,8 @@ mod tests {
         })
     }
 
-    /// `mutate_issued_and_held` is backed by a single [`Persisted::mutate`]
-    /// call, so a persist failure must roll back *both* collections
+    /// `mutate_issued_and_held` is one mutation committed in one store
+    /// transaction, so a persist failure must roll back *both* collections
     /// together — never leaving one mutation durably applied while the
     /// other silently reverts. This is the actual mechanism
     /// `CertAuthority::approve_csr` relies on (see this method's own doc for
@@ -968,14 +1322,14 @@ mod tests {
         let path = dir.join("state.json");
         std::fs::write(&path, seed_snapshot().to_string()).unwrap();
 
-        let mut log = CaLog::load(Some(path)).unwrap();
+        let mut log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
         assert_eq!(log.issued().len(), 1);
         assert_eq!(log.held().len(), 1);
         let existing_issued = log.issued()[0].clone();
         let existing_held = log.held()[0].clone();
 
-        // Doom every subsequent write.
-        std::fs::remove_dir_all(&dir).ok();
+        // Doom every subsequent write, as a full disk would.
+        log.fail_commits();
 
         let (_, persisted) = log.mutate_issued_and_held(|issued, held| {
             issued.push(existing_issued);
@@ -983,7 +1337,7 @@ mod tests {
         });
         assert!(
             persisted.is_err(),
-            "the write should have failed: its directory is gone"
+            "the write should have failed: commits are doomed"
         );
 
         assert_eq!(
@@ -1017,7 +1371,7 @@ mod tests {
         let path = dir.join("state.json");
         std::fs::write(&path, seed_snapshot().to_string()).unwrap();
 
-        let mut log = CaLog::load(Some(path)).unwrap();
+        let mut log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
         let existing_issued = log.issued()[0].clone();
         let existing_held = log.held()[0].clone();
 
@@ -1026,7 +1380,7 @@ mod tests {
         assert!(first.is_ok());
 
         // Now doom the second write.
-        std::fs::remove_dir_all(&dir).ok();
+        log.fail_commits();
         let (_, second) = log.mutate_held(|held| held.push(existing_held));
         assert!(second.is_err());
 
@@ -1065,7 +1419,7 @@ mod tests {
         let path = dir.join("state.json");
         std::fs::write(&path, seed_snapshot().to_string()).unwrap();
 
-        let mut log = CaLog::load(Some(path)).unwrap();
+        let mut log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
         log.mutate_users(|users| {
             users.push(
                 UserRecord::new("rowan", "hunter2", crate::users::UserRole::Admin, 3600).unwrap(),
@@ -1075,16 +1429,16 @@ mod tests {
         .expect("the setup write lands while the directory is still there");
         assert!(!log.issued()[0].revoked, "and the seeded cert is live");
 
-        // Doom every subsequent write.
-        std::fs::remove_dir_all(&dir).ok();
+        // Doom every subsequent write, as a full disk would.
+        log.fail_commits();
 
-        let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+        let (_, persisted) = log.mutate_users_and_issued(&[], 0, |users, issued| {
             users[0].role = crate::users::UserRole::Viewer;
             issued[0].revoked = true;
         });
         assert!(
             persisted.is_err(),
-            "the write should have failed: its directory is gone"
+            "the write should have failed: commits are doomed"
         );
 
         assert_eq!(
@@ -1116,12 +1470,12 @@ mod tests {
         let path = dir.join("state.json");
         std::fs::write(&path, seed_snapshot().to_string()).unwrap();
 
-        let mut log = CaLog::load(Some(path)).unwrap();
+        let mut log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
         assert!(log.users().is_empty());
         assert!(log.invites().is_empty());
 
-        // Doom every subsequent write.
-        std::fs::remove_dir_all(&dir).ok();
+        // Doom every subsequent write, as a full disk would.
+        log.fail_commits();
 
         let (_, persisted) = log.mutate_users_and_invites(|users, invites| {
             users.push(
@@ -1138,7 +1492,7 @@ mod tests {
         });
         assert!(
             persisted.is_err(),
-            "the write should have failed: its directory is gone"
+            "the write should have failed: commits are doomed"
         );
 
         assert!(
@@ -1178,7 +1532,7 @@ mod tests {
         )
         .unwrap();
 
-        let log = CaLog::load(Some(path.clone())).unwrap();
+        let log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
 
         assert_eq!(log.users().len(), 1, "the account survives the migration");
         assert!(
@@ -1186,14 +1540,12 @@ mod tests {
             "and the invite store starts empty rather than being invented"
         );
 
-        // The rewrite carries the new version, so a downgrade fails loudly
-        // rather than silently dropping invites.
-        let mut log = log;
-        let (_, persisted) = log.mutate_invites(|_| {});
-        persisted.unwrap();
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(written["version"], CURRENT_STATE_VERSION);
+        // The migrated state is what the database now holds.
+        drop(log);
+        let log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
+        assert_eq!(log.users().len(), 1);
+        assert!(log.invites().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A snapshot written before accounts had ids gives each one its own,
@@ -1243,7 +1595,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut log = CaLog::load(Some(path.clone())).unwrap();
+        let mut log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
 
         assert_eq!(log.users().len(), 2, "both accounts survive the migration");
         assert_ne!(
@@ -1256,14 +1608,341 @@ mod tests {
             "a certificate from before the link existed is attributed to nobody,              which is the honest answer rather than a guess"
         );
 
-        // The rewrite carries the new version, so a downgrade fails loudly
-        // rather than silently dropping the ids the accounts now depend on.
+        // The ids minted on import are committed with it, so they are the
+        // same ids after a restart — before any account has been touched.
+        let minted: Vec<_> = log.users().iter().map(|u| u.id).collect();
         let (_, persisted) = log.mutate_users(|_| {});
         persisted.unwrap();
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(written["version"], CURRENT_STATE_VERSION);
+        drop(log);
+        let log = CaLog::open(&path.with_extension("sqlite3"), Some(&path)).unwrap();
+        let reloaded: Vec<_> = log.users().iter().map(|u| u.id).collect();
+        assert_eq!(reloaded, minted);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── the SQLite-backed log (design 26 phase 2) ─────────────────────────
+
+    use crate::ca_store::CaStore;
+    use crate::ca_store::ChangeSet;
+    use crate::ca_store::Loaded;
+    use crate::ca_store::SqliteStore;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// A store that records every change set it is asked to commit, so a test
+    /// can see exactly which rows a mutation wrote.
+    struct RecordingStore {
+        inner: SqliteStore,
+        commits: Arc<Mutex<Vec<ChangeSet>>>,
+    }
+
+    impl CaStore for RecordingStore {
+        fn load(&mut self) -> Result<Loaded, String> {
+            self.inner.load()
+        }
+
+        fn commit(&mut self, change: &ChangeSet) -> Result<Vec<i64>, String> {
+            self.commits.lock().unwrap().push(change.clone());
+            self.inner.commit(change)
+        }
+    }
+
+    fn recording_log() -> (CaLog, Arc<Mutex<Vec<ChangeSet>>>) {
+        let commits = Arc::new(Mutex::new(Vec::new()));
+        let store = RecordingStore {
+            inner: SqliteStore::open_in_memory().unwrap(),
+            commits: Arc::clone(&commits),
+        };
+        let log = CaLog::with_store(Box::new(store), None).unwrap();
+        commits.lock().unwrap().clear();
+        (log, commits)
+    }
+
+    fn user(name: &str) -> UserRecord {
+        UserRecord::new(name, "correct horse", crate::users::UserRole::Admin, 900).unwrap()
+    }
+
+    /// The problem the store exists to solve: a login rewrote the whole CA.
+    /// Now changing one account writes that account's row and nothing else —
+    /// not the other accounts, and not the issued log beside them.
+    #[test]
+    fn a_mutation_writes_only_the_rows_it_changed() {
+        let (mut log, commits) = recording_log();
+        let (_, r) = log.mutate_users(|users| {
+            users.push(user("a"));
+            users.push(user("b"));
+            users.push(user("c"));
+        });
+        r.unwrap();
+        assert_eq!(commits.lock().unwrap().last().unwrap().inserts().len(), 3);
+
+        let (_, r) = log.mutate_users(|users| users[1].failed_attempts += 1);
+        r.unwrap();
+        let commits = commits.lock().unwrap();
+        let change = commits.last().unwrap();
+        assert_eq!(
+            change.inserts().len(),
+            1,
+            "only the changed account is written"
+        );
+        assert_eq!(change.deletes().len(), 1, "and only its old row is removed");
+    }
+
+    /// A mutation that changes nothing writes nothing — the common case for a
+    /// read-modify-write that finds nothing to modify.
+    #[test]
+    fn a_mutation_that_changes_nothing_writes_nothing() {
+        let (mut log, commits) = recording_log();
+        let (_, r) = log.mutate_users(|users| users.push(user("a")));
+        r.unwrap();
+        let before = commits.lock().unwrap().len();
+
+        let (_, r) = log.mutate_users(|_| {});
+        r.unwrap();
+        assert_eq!(
+            commits.lock().unwrap().len(),
+            before,
+            "an unchanged collection must not be rewritten"
+        );
+    }
+
+    /// A record that cannot be stored fails the mutation, which leaves the log
+    /// as it was. The JSON snapshot used to drop such a record with a warning
+    /// and report success, so the caller was told a change was durable that a
+    /// restart would lose — a revoked flag among it.
+    #[test]
+    fn a_record_that_cannot_be_stored_fails_the_mutation() {
+        let (mut log, _commits) = recording_log();
+        // Three bytes where a MAC is six: nothing on disk can mirror it.
+        let malformed = IssuedCertData {
+            node_mac: alloc::vec![1, 2, 3],
+            ed_pubkey: alloc::vec![0; 32],
+            not_before: 0,
+            not_after: 1,
+            revoked: true,
+            user: false,
+            admin: false,
+            viewer: false,
+            account_id: Vec::new(),
+        };
+
+        let (_, r) = log.mutate_issued(|issued| issued.push(malformed));
+
+        assert!(r.is_err(), "a record the store cannot hold is not durable");
+        assert!(
+            log.issued().is_empty(),
+            "the failed mutation is rolled back"
+        );
+    }
+
+    /// Everything a CA holds comes back after a restart, through the database.
+    #[test]
+    fn state_survives_a_restart_through_the_database() {
+        let dir = unique_dir("sqlite-restart");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ca.sqlite3");
+        {
+            let mut log = CaLog::open(&db, None).unwrap();
+            log.mutate_users(|users| users.push(user("ops"))).1.unwrap();
+            log.mutate_policy(|p| p.auto_approve = Some(true))
+                .1
+                .unwrap();
+        }
+        let log = CaLog::open(&db, None).unwrap();
+        assert_eq!(log.users().len(), 1);
+        assert_eq!(log.users()[0].username, "ops");
+        assert_eq!(log.policy().auto_approve, Some(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A commit that fails rolls every collection the mutation touched back,
+    /// in memory as well as on disk.
+    #[test]
+    fn a_failed_commit_rolls_back_every_collection_touched() {
+        let (mut log, _) = recording_log();
+        log.mutate_users(|users| users.push(user("kept")))
+            .1
+            .unwrap();
+        log.fail_commits();
+
+        let (_, r) = log.mutate_users_and_invites(|users, invites| {
+            users.clear();
+            invites.clear();
+        });
+        assert!(r.is_err());
+        assert_eq!(log.users().len(), 1, "the in-memory users rolled back");
+        assert_eq!(log.users()[0].username, "kept");
+    }
+
+    /// On its first start against an empty database, a CA takes its state from
+    /// the `ca-state.json` it ran on before, commits it, and moves the file
+    /// aside — so the import happens once, and the file is kept rather than
+    /// deleted.
+    #[test]
+    fn a_legacy_snapshot_is_imported_once_and_moved_aside() {
+        let dir = unique_dir("import");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+
+        let log = CaLog::open(&db, Some(&json)).unwrap();
+        assert_eq!(log.issued().len(), 1);
+        assert_eq!(log.held().len(), 1);
+        assert!(!json.exists(), "the snapshot is moved aside once imported");
+        assert!(dir.join("ca-state.json.imported").exists());
+        drop(log);
+
+        let log = CaLog::open(&db, Some(&json)).unwrap();
+        assert_eq!(
+            log.issued().len(),
+            1,
+            "the imported state is in the database"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The import runs through the versioned loader, so a snapshot from any
+    /// schema version upgrades on the way in — here a v1, which had no held
+    /// CSRs at all.
+    #[test]
+    fn an_old_schema_snapshot_upgrades_on_import() {
+        let dir = unique_dir("import-v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let key = [0u8; 32];
+        std::fs::write(
+            &json,
+            serde_json::json!({
+                "version": 1,
+                "issued": [{
+                    "node_mac": [0, 0, 0, 0, 0, 1],
+                    "ed_pubkey": key,
+                    "not_before": 0,
+                    "not_after": 1,
+                    "revoked": true,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let log = CaLog::open(&dir.join("ca.sqlite3"), Some(&json)).unwrap();
+        assert_eq!(log.issued().len(), 1);
+        assert!(log.issued()[0].revoked);
+        assert!(log.held().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A snapshot still sitting beside a database that already holds a CA is
+    /// either the leftover of an import that committed but crashed before the
+    /// rename — same contents, so finish the rename — or two different CAs, and
+    /// then neither can be picked without losing the other's revocations.
+    #[test]
+    fn a_snapshot_beside_a_database_that_disagrees_fails_closed() {
+        let dir = unique_dir("import-conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        {
+            let mut log = CaLog::open(&db, None).unwrap();
+            log.mutate_users(|users| users.push(user("someone-else")))
+                .1
+                .unwrap();
+        }
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+
+        let err = CaLog::open(&db, Some(&json))
+            .err()
+            .expect("must fail closed");
+        assert!(
+            err.contains("ca-state.json"),
+            "the error names the file: {err}"
+        );
+        assert!(json.exists(), "nothing is moved aside when refusing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_snapshot_beside_a_database_that_agrees_finishes_the_import() {
+        let dir = unique_dir("import-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+        drop(CaLog::open(&db, Some(&json)).unwrap());
+        // Put the file back as though the rename had never happened.
+        std::fs::rename(dir.join("ca-state.json.imported"), &json).unwrap();
+
+        let log = CaLog::open(&db, Some(&json)).unwrap();
+        assert_eq!(log.issued().len(), 1, "imported once, not twice");
+        assert!(!json.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The leftover of an import is recognised by the file it was, not by
+    /// re-reading it and comparing states. A snapshot from before accounts had
+    /// ids mints a fresh random id per account on every parse, so a re-read v6
+    /// file never compares equal to what its own import committed — and a CA
+    /// that crashed between the commit and the rename would refuse to start.
+    #[test]
+    fn a_leftover_v6_snapshot_with_accounts_finishes_the_import() {
+        let dir = unique_dir("import-resume-v6");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        let hash = "$argon2id$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaGhhc2g";
+        std::fs::write(
+            &json,
+            serde_json::json!({
+                "version": 6,
+                "issued": [],
+                "held": [],
+                "invites": [],
+                "users": [{
+                    "username": "ops",
+                    "password_hash": hash,
+                    "totp_secret": null,
+                    "session_ttl_secs": 3600,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        drop(CaLog::open(&db, Some(&json)).unwrap());
+        // Put the file back as though the rename had never happened.
+        std::fs::rename(dir.join("ca-state.json.imported"), &json).unwrap();
+
+        let log = CaLog::open(&db, Some(&json)).expect("the leftover is the imported file");
+        assert_eq!(log.users().len(), 1, "imported once, not twice");
+        assert!(!json.exists(), "the rename is finished");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rename that failed (or a power loss that undid it) leaves the
+    /// imported file in place while the CA carries on: logins, issuance and
+    /// revocations all change the database after it. The file is still the one
+    /// that was imported, so the next start finishes the rename rather than
+    /// refusing because the database has since moved on.
+    #[test]
+    fn a_leftover_snapshot_finishes_the_import_after_later_changes() {
+        let dir = unique_dir("import-resume-later");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("ca-state.json");
+        let db = dir.join("ca.sqlite3");
+        std::fs::write(&json, seed_snapshot().to_string()).unwrap();
+        {
+            let mut log = CaLog::open(&db, Some(&json)).unwrap();
+            std::fs::rename(dir.join("ca-state.json.imported"), &json).unwrap();
+            log.mutate_users(|users| users.push(user("added-after-import")))
+                .1
+                .unwrap();
+        }
+
+        let log = CaLog::open(&db, Some(&json)).expect("the leftover is the imported file");
+        assert_eq!(log.issued().len(), 1, "imported once, not twice");
+        assert_eq!(log.users().len(), 1, "the later change is kept");
+        assert!(!json.exists(), "the rename is finished");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

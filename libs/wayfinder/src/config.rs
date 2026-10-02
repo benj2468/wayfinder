@@ -834,13 +834,18 @@ pub struct ProviderConfig {
     /// approve, short enough to keep the table small.
     #[serde(default = "default_pending_ttl_secs")]
     pub pending_ttl_secs: u64,
-    /// Path to a JSON snapshot file for the authority's durable state — the
-    /// issued-certificate log (with revocation status) and the held-CSR
-    /// store — so the impersonation guard, revocations, and pending
-    /// operator approvals all survive a restart. When absent, state is
-    /// in-memory only and a restart clears it. A corrupt, foreign, or
-    /// newer-than-known snapshot at this path is refused at startup rather
-    /// than silently treated as empty.
+    /// Where the authority keeps its durable state — the issued-certificate
+    /// log (with revocation status), held CSRs, accounts and invitations — so
+    /// the impersonation guard, revocations, and pending operator approvals all
+    /// survive a restart. When absent, state is in-memory only and a restart
+    /// clears it.
+    ///
+    /// The state lives in a SQLite database beside this path, with its
+    /// extension replaced by `.sqlite3` (`ca-state.json` → `ca-state.sqlite3`).
+    /// The path itself names the JSON snapshot earlier versions kept: if one is
+    /// there when the database is first created, it is imported and renamed to
+    /// `<name>.imported`. A corrupt, foreign, or newer-than-known snapshot or
+    /// database is refused at startup rather than silently treated as empty.
     #[serde(default)]
     pub state_path: Option<String>,
     /// Optional VPN coordination: where the Headscale server is, and the file

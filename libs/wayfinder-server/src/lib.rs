@@ -156,6 +156,8 @@ pub use settings::SettingsFile;
 pub use settings::SettingsStore;
 
 #[cfg(feature = "std")]
+mod ca_store;
+#[cfg(feature = "std")]
 mod persistence;
 
 /// Whether the host's system clock is disciplined enough to make credential
