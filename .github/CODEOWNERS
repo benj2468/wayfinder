@@ -1,0 +1,17 @@
+# Every change needs the maintainer's review: branch protection on `main`
+# requires a code owner's approval, and without this file that rule matches
+# nothing.
+*                       @benj2468
+
+# What CI executes with secrets in scope, listed on its own so it stays pinned
+# to the maintainer when the catch-all above gains co-maintainers. A merged
+# change here runs on `main`, where the deploy environments release their
+# credentials.
+/.github/               @benj2468
+/scripts/               @benj2468
+/justfile               @benj2468
+/flake.nix              @benj2468
+/flake.lock             @benj2468
+/nix/                   @benj2468
+/containers/            @benj2468
+/infra/                 @benj2468
