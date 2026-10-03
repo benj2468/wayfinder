@@ -76,6 +76,27 @@ use crate::tap::TapDevice;
 /// per-board profile.
 type TapRouter = wayfinder::router_for!(wayfinder::host);
 
+/// Refuse a configuration naming more mesh links than router type `R` has
+/// interfaces ([`RouterOps::INTERFACES`]).
+///
+/// A link past that cap is not merely unscheduled: the router has no slot to
+/// hold its participation features, so it reverts to full participation — a
+/// link configured as a read-only tap would transmit every traffic class —
+/// and `SetConfig` cannot repair it at runtime, since it rejects the index as
+/// out of range. That is an invalid config, so the node does not start on it.
+///
+/// [`RouterOps::INTERFACES`]: wayfinder::router_ops::RouterOps::INTERFACES
+fn ensure_links_fit<R: wayfinder::router_ops::RouterOps>(links: usize) -> anyhow::Result<()> {
+    let max = <R as wayfinder::router_ops::RouterOps>::INTERFACES;
+    if links > max {
+        bail!(
+            "configuration names {links} mesh links but this node's router supports at most \
+             {max}; links past that would run unscheduled and with every traffic class enabled"
+        );
+    }
+    Ok(())
+}
+
 /// Command-line arguments.
 #[derive(clap::Parser, Debug)]
 // `--version` reports the build this node is running, which is the same answer
@@ -419,6 +440,10 @@ async fn main() -> anyhow::Result<()> {
     // The config can carry sensitive material (enrollment tokens, seed paths),
     // so keep the full dump at DEBUG rather than INFO.
     tracing::debug!(?config, "loaded configuration");
+    if let Err(e) = ensure_links_fit::<TapRouter>(config.links.len()) {
+        tracing::error!(%e, "invalid configuration");
+        return Err(e);
+    }
 
     // Security settings an operator changed at runtime, from the previous run.
     // Loaded before anything reads the config, because these override it —
@@ -1370,6 +1395,28 @@ mod tests {
         assert!(
             size_of::<TapAuth>() > 8 * size_of::<DefaultAuth>(),
             "TapRouter's auth state is sized for default's neighbour table, not a hub's"
+        );
+    }
+
+    /// A config naming more links than the router has interfaces is refused
+    /// rather than started with the excess links silently ungated (#81); one
+    /// that exactly fills the router is accepted. Checked at this binary's own
+    /// profile, so the bound moves with `TapRouter`.
+    #[test]
+    fn refuses_more_links_than_the_router_has_interfaces() {
+        use wayfinder::router_ops::RouterOps;
+        let cap = <TapRouter as RouterOps>::INTERFACES;
+        assert!(
+            ensure_links_fit::<TapRouter>(0).is_ok(),
+            "a node with no links is valid"
+        );
+        assert!(
+            ensure_links_fit::<TapRouter>(cap).is_ok(),
+            "a full router is valid"
+        );
+        assert!(
+            ensure_links_fit::<TapRouter>(cap + 1).is_err(),
+            "one link past the router's interfaces must refuse to start"
         );
     }
 
