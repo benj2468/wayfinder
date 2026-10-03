@@ -412,6 +412,23 @@ buffer, so this is 2 KiB of the §4.1 budget.
 RYLR module imposes base64 and a 180-byte AT-line budget that a raw PHY has no
 reason to inherit. Two LoRa links, two formats, no shared air.
 
+What "no shared air" means was measured on 2026-10-03, with a RYLR998 and
+this board on matched PHY settings (915 MHz, SF7, 125 kHz, CR 4/8, an
+8-symbol preamble, the module's default network id 18 against `lora-phy`'s
+private sync word). The PHYs interoperate; the formats do not, and the module
+decides which wins:
+
+- every `AT+SEND` goes on air behind a five-byte header,
+  `[dst_lo, dst_hi, src_lo, src_hi, len]` (`libs/rylr998/src/air.rs`, whose
+  fixtures are the captured bytes);
+- the module **silently drops any packet without that header** — this
+  board's `lora-link` frames, sent between framed ones, never surfaced.
+
+So a `lora-link` node is invisible to a RYLR998 node rather than garbled to it.
+`libs/wayfinder-hil/tests/reyax_interop.rs` pins both facts on hardware, by
+flashing a test-only echo image (`examples/hil_reyax_echo.rs`) — a module
+firmware update that changed either would fail it.
+
 `fan_out()` is **not** overridden, matching every other radio driver here
 (`rylr998`, `blue`, `ieee802154` all take the default `None`). A broadcast LoRa
 send arguably fits the `Some(1)` case its docs describe, but that method is a

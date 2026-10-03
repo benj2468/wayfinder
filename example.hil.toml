@@ -53,3 +53,19 @@ usb  = "CD1F4A0099EE"
 # kind  = "stm32wl55-nucleo"
 # probe = "003900314142500E20353451"
 # usb   = "003900314142500E20353451"
+
+# A REYAX RYLR998 LoRa module, for the WL55 interop tests
+# (`tests/reyax_interop.rs`). Not a board: no probe, no management API, our
+# firmware does not run on it. `usb` is its USB-to-UART adapter's serial
+# (`udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT`) -- a
+# CP2102 ships with `0001`, shared by every such adapter, so it identifies one
+# only while it is the only one attached.
+#
+# `frequency_hz` is required and has no default: set the band that is
+# licence-free where the rig is (902-928 MHz in the US, 863-870 MHz in the EU).
+# The tests configure the module and *build the WL55's firmware* at this value.
+# [[radio]]
+# role         = "lora"
+# kind         = "rylr998"
+# usb          = "0001"
+# frequency_hz = 915000000
