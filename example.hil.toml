@@ -38,3 +38,18 @@ usb  = "CD1F4A0099EE"
 # kind  = "nrf52840-dk"
 # probe = "001050288336"
 # usb   = "F4CE3684A1B3"
+
+# The NUCLEO-WL55JC (STM32WL55JC), whose LoRa radio is on the die.
+#
+# Note `probe` and `usb` are the *same* serial, which is correct here and not a
+# copy-paste slip: this board's onboard STLINK-V3E presents the debug interface
+# and the virtual COM port as interfaces of one USB device, so one serial names
+# both. The nRF DK's entry above is the other arrangement -- there the J-Link's
+# two CDC-ACM interfaces share a serial *with each other* and neither of them is
+# the management port, which is a different device entirely. Read each board's
+# own topology; neither is the rule.
+# [[board]]
+# role  = "wl55"
+# kind  = "stm32wl55-nucleo"
+# probe = "003900314142500E20353451"
+# usb   = "003900314142500E20353451"

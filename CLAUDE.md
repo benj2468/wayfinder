@@ -93,21 +93,24 @@ invocation from its own directory:
   must not leak into the main host build). Host-testable: `cd libs/wayfinder-py
   && cargo nextest run`. Wired into CI's `test-python` job, alongside pytest.
 - `bins/wayfinder-nrf52840`, `bins/wayfinder-nrf52840-dongle`,
-  `bins/wayfinder-stm32f411`, `bins/wayfinder-esp32` — separate `[workspace]`s,
-  `no_std`/`no_main` firmware binaries with `test = false`; a host test harness
-  can't link against them at all. Their logic is exercised indirectly through
-  the `libs/*` crates they wire together (tested in the root workspace) plus
-  CI's `build-embedded` job (cross-compile + clippy for the real target).
-  Behaviour beyond that needs hardware-in-the-loop: `libs/wayfinder-hil` (`just
-  hil`) drives a real board over its management API, `#[ignore]`d so it
-  compiles everywhere and runs only where boards are attached — see
-  `docs/design/21-hardware-in-the-loop-tests.md`. `bins/wayfinder-esp32` is the
-  one exception to "CI cross-compiles it": its target lives only in Espressif's
-  rustc fork, which `just esp-toolchain` installs out of band into `$HOME` (~2
-  GB) because no Nix package can supply it. So it is absent from
-  `build-embedded`, from `just ci` and from CI, and has its own
-  `build-esp32`/`clippy-esp32` recipes — a change that touches it is checked by
-  running those, and nothing else will catch a break.
+  `bins/wayfinder-stm32f411`, `bins/wayfinder-wl55jc`, `bins/wayfinder-esp32`
+  — separate `[workspace]`s, `no_std`/`no_main` firmware binaries with `test =
+  false`; a host test harness can't link against them at all.
+  `wayfinder-wl55jc` has a second reason to stay out: it carries the repo's only
+  `defmt` dependency (non-optional in `lora-phy`, answered with a no-op
+  `global_logger`), and a host test binary has no `global_logger` to link
+  against. Their logic is exercised indirectly through the `libs/*` crates they
+  wire together (tested in the root workspace) plus CI's `build-embedded` job
+  (cross-compile + clippy for the real target). Behaviour beyond that needs
+  hardware-in-the-loop: `libs/wayfinder-hil` (`just hil`) drives a real board
+  over its management API, `#[ignore]`d so it compiles everywhere and runs only
+  where boards are attached — see `docs/design/21-hardware-in-the-loop-tests.md`.
+  `bins/wayfinder-esp32` is the one exception to "CI cross-compiles it": its
+  target lives only in Espressif's rustc fork, which `just esp-toolchain`
+  installs out of band into `$HOME` (~2 GB) because no Nix package can supply
+  it. So it is absent from `build-embedded`, from `just ci` and from CI, and has
+  its own `build-esp32`/`clippy-esp32` recipes — a change that touches it is
+  checked by running those, and nothing else will catch a break.
 
   But not every board-only property needs a board. Anything
   decidable from the linked image is gatable without a board, and
@@ -254,8 +257,8 @@ flood the logs.
 subscribers on every target and feeds two things, *each now a Cargo feature the
 leaf binary chooses*: a text sink (`sink-rtt` over a debug probe,
 `sink-esp-println` over a UART, or none) and a bounded record ring (`ring`) that
-`GetLogs` serves. The STM32F411 takes the ring off — nothing can read it there —
-and the ESP32 takes the sink off, since its one byte stream carries the
+`GetLogs` serves. The STM32F411 and the STM32WL55 relay take the ring off —
+nothing can read it there — and the ESP32 takes the sink off, since its one byte stream carries the
 management API. **Features are additive, so this choice belongs to the binary**:
 naming one on a shared dependency puts it back on every board downstream, which
 is exactly how the STM32's saving was silently undone once already. That
@@ -379,9 +382,16 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   `NrfBleLink` (nRF52840 via `nrf-softdevice`, `no_std` — mutually exclusive
   with `nrf-ieee802154` at the RADIO peripheral) and `StdBleLink` (a Linux
   host via BlueZ/`bluer`, used by `bins/wayfinder-tap`).
+- **libs/lora-link** → hardware-agnostic framing and fragmentation for a
+  **raw LoRa PHY** — a radio that hands over a payload and nothing else, which
+  is what an on-die SX126x is. Owns a wire format because of that: unlike the
+  RYLR998 module `rylr998` drives, a raw PHY supplies no sender address, no
+  network filtering and no addressed send. Framing only, no `LinkT` — the same
+  split `ieee802154` has with its adapters. **Not interoperable with
+  `rylr998`**, deliberately.
 - **libs/wayfinder-link-utils** — shared small-MTU fragmentation/reassembly
   for `LinkT` drivers whose medium caps payload well below
-  `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`, `ieee802154`).
+  `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`, `ieee802154`, `lora-link`).
 
 **Identity & management API**
 - **libs/wayfinder-auth** → crypto identity/membership. A mesh is optionally
@@ -609,6 +619,16 @@ the root workspace" above)
   size is right there in the ELF, but `scripts/stack-budget.py`'s frame parser
   matches ARM prologues and embassy's `TaskStorage::poll` mangling, so an
   Xtensa backend is the larger half of the job.
+- **bins/wayfinder-wl55jc** — NUCLEO-WL55JC1 (STM32WL55JC), a LoRa relay on
+  the **on-die sub-GHz radio**: `lora-phy` over the `SUBGHZSPI` peripheral,
+  with `libs/lora-link`'s wire format and no external module. Two things about
+  it differ from every other board here, and each is a silent failure if copied
+  wrong: its Cortex-M4 has **no FPU** (so `thumbv7em-none-eabi`, not `eabihf`),
+  and it has **64 KB of SRAM** and gets all of it only because the Cortex-M0+
+  is never released. Like the Cortex-M boards it builds at `opt-level = "z"`
+  with fat LTO, and here that is required to fit 256 KB of flash rather than a
+  preference. The relay has no management port and no log ring (it does not fit
+  yet — see `docs/design/25-stm32wl55-subghz-node.md`).
 
 **Deployment targets** — the same `wayfinder-tap` binary, four ways
 - **nix/modules/wayfinder.nix** — the NixOS service module every host

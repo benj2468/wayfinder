@@ -253,6 +253,12 @@ jobs:
       - run: scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings'
       - run: scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings'
       - run: scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml -- sh -c 'cd bins/wayfinder-stm32f411 && cargo clippy --locked -- -D warnings'
+      # The NUCLEO-WL55JC's Cortex-M4 has no FPU, so it builds for
+      # `thumbv7em-none-eabi` (its own `.cargo/config.toml` selects it), not
+      # `$BARE_METAL_TARGET`. It is the only board whose radio is on the die, so
+      # this is what proves `libs/lora-link` and the `lora-phy` glue still
+      # compile for a real target.
+      - run: scripts/ci-cached.sh wl55jc --package wayfinder-wl55jc --manifest-path bins/wayfinder-wl55jc/Cargo.toml -- sh -c 'cd bins/wayfinder-wl55jc && cargo clippy --locked -- -D warnings'
       - run: scripts/ci-cached.sh blue --package blue -- cargo clippy --locked -p blue --no-default-features --features hardware,softdevice-log --target "$BARE_METAL_TARGET" -- -D warnings
       - run: sccache --show-stats
       - uses: actions/cache/save@v4
@@ -310,6 +316,11 @@ jobs:
       - run: scripts/ci-cached.sh nrf52840 --package wayfinder-nrf52840 --manifest-path bins/wayfinder-nrf52840/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-nrf52840 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x --task-poll-pct 18'
       - run: scripts/ci-cached.sh nrf52840-dongle --package wayfinder-nrf52840-dongle --manifest-path bins/wayfinder-nrf52840-dongle/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-nrf52840-dongle && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x --task-poll-pct 18'
       - run: scripts/ci-cached.sh stm32f411 --package wayfinder-stm32f411 --manifest-path bins/wayfinder-stm32f411/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-stm32f411 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x'
+      # `--task-poll-pct 12`, not the 8% default: this board's stack region is
+      # under a quarter of the nRF's, so the default fraction leaves its main
+      # task poll 249 bytes of room. The justfile recipe (`stack-budget-wl55jc`) carries the
+      # measurements and the body-chain check; keep the two in step.
+      - run: scripts/ci-cached.sh wl55jc --package wayfinder-wl55jc --manifest-path bins/wayfinder-wl55jc/Cargo.toml --extra scripts/stack-budget.py -- sh -c 'cd bins/wayfinder-wl55jc && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabi/release/wayfinder-wl55jc --memory-x memory.x --task-poll-pct 12'
       - run: sccache --show-stats
       - uses: actions/cache/save@v4
         with:
