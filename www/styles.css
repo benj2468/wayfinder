@@ -163,7 +163,7 @@ code {
 }
 
 .section__title,
-.pilot__title {
+.start__title {
   font-family: var(--f-display);
   font-weight: 600;
   font-size: clamp(1.95rem, 3.6vw, 2.9rem);
@@ -956,9 +956,9 @@ code {
   background: rgb(255 255 255 / 45%);
 }
 
-/* ----------------------------------------------------------------- pilot -- */
+/* ----------------------------------------------------------------- start -- */
 
-.pilot {
+.start {
   padding-block: var(--sec-y);
   border-top: 1px solid var(--rule-soft);
   background:
@@ -970,7 +970,7 @@ code {
     rgb(255 255 255 / 30%);
 }
 
-.pilot__inner {
+.start__inner {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.85fr);
   gap: clamp(2rem, 5vw, 4rem);
@@ -985,9 +985,8 @@ code {
   gap: 1.5rem;
 }
 
-/* What the pilot actually costs the partner in effort, set apart from the
- * three steps it qualifies. */
-.pilot__shape {
+/* The contribution note, set apart from the three steps above it. */
+.start__shape {
   margin: 2.25rem 0 0;
   padding-top: 1.5rem;
   border-top: 1px solid var(--rule);
@@ -1029,7 +1028,7 @@ code {
   font-size: 0.92rem;
 }
 
-.pilot__card {
+.start__card {
   position: sticky;
   top: 6rem;
   background: var(--paper-2);
@@ -1039,7 +1038,7 @@ code {
   box-shadow: 0 14px 40px rgb(10 10 10 / 7%);
 }
 
-.pilot__card-k {
+.start__card-k {
   font-family: var(--f-display);
   font-size: 1.2rem;
   font-weight: 600;
@@ -1047,20 +1046,20 @@ code {
   margin: 0 0 0.6rem;
 }
 
-.pilot__card-p {
+.start__card-p {
   font-size: 0.92rem;
   color: var(--muted);
   margin: 0 0 1.5rem;
 }
 
-.pilot__card-fine {
+.start__card-fine {
   margin: 1rem 0 0;
   font-size: 0.8rem;
   color: var(--faint);
   text-align: center;
 }
 
-.pilot__card-fine a {
+.start__card-fine a {
   color: var(--muted);
   text-decoration-color: var(--rule);
   text-underline-offset: 2px;
@@ -1153,11 +1152,11 @@ code {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .pilot__inner {
+  .start__inner {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .pilot__card {
+  .start__card {
     position: static;
   }
 }

@@ -167,12 +167,12 @@ Rollback is instant and needs none of the above: _Pages project → Deployments 
 
 ## Content that will need revisiting
 
-The page currently sells a **design-partner programme** — it says the system
-works and is looking for pilots, which is true today. Two things are placeholders
-and should be changed deliberately, not left to rot:
+The page points people at the **open-source repository**
+(`github.com/benj2468/wayfinder`) — the nav, the closing card and the footer all
+link there. A few things should be changed deliberately, not left to rot:
 
-- **`info@wayfndr.dev`** appears in three places in `index.html` (both CTAs and
-  the footer). It needs a mailbox behind it; Cloudflare Email Routing will
+- **`info@wayfndr.dev`** appears in two places in `index.html` (the closing
+  card and the footer). It needs a mailbox behind it; Cloudflare Email Routing will
   forward it to a real address without hosting mail.
 - **No claims carry numbers.** Every technical statement on the page is
   qualitative (`no_std`, "zero allocation on the packet path") because those are
