@@ -81,20 +81,28 @@ harmless, but worth doing before the link is shared anywhere.
 
 ## Deployment
 
-Cloudflare Pages, uploaded by `scripts/wayfinder-ca.sh`.
+Cloudflare Pages, uploaded by `.github/workflows/site.yml` on every merge to
+`main` that touches `www/`, `assets/logo/` or the build script. Nothing to run
+by hand; `scripts/wayfinder-ca.sh site` remains as a fallback.
 
-**Why it ships with the CA rollout and not from CI.** It used to be its own
-pipeline job, firing on every merge to `main` that touched `www/`. It is not any
-more: the page describes what the deployment is running, and a page that has
-already announced a change the box has not taken is the wrong way round.
-`wayfinder-ca.sh update` now rolls out the node and publishes the page in one
-go, and `wayfinder-ca.sh site` publishes the page alone when only copy changed.
+**Why from CI and not with the CA rollout.** It used to ride with
+`wayfinder-ca.sh update`, on the argument that the page describes what the
+deployment is running and must not announce a change the box has not taken.
+That stopped holding once the page became a general open-source project page
+rather than a description of one deployment — and a rollout run from a stale
+checkout would silently roll the page back. So it ships when its own source
+merges, and `update` no longer publishes it.
 
-**Why Direct Upload and not Cloudflare's Git integration:** the Git integration
-deploys on every push, and the paragraph above is why the page must not. (It
-also used to be impossible: the integration connects only to `github.com` and
-`gitlab.com`, and the project lived on a self-hosted GitLab until it moved to
-GitHub.)
+**Why Direct Upload and not Cloudflare's Git integration:** the workflow already
+gives deploy-on-merge, from the same `build-site.sh` the preview uses; the Git
+integration would be a second build definition living in Cloudflare's
+dashboard rather than this repo.
+
+**The token is an environment secret.** `CLOUDFLARE_API_TOKEN` lives on the
+`site` environment, whose deployment branches are limited to `main`, so it is
+released only to a run from merged code — never to a pull request or a pushed
+branch. Scope it to `Account:Cloudflare Pages:Edit` alone; the workflow's header
+lists the variables it also needs.
 
 ### One-time setup
 
@@ -131,7 +139,7 @@ them is on Cloudflare's website.
 
    ```bash
    ./scripts/wayfinder-ca.sh provision   # tofu apply
-   ./scripts/wayfinder-ca.sh site        # the first real deployment
+   ./scripts/wayfinder-ca.sh site        # first deployment (or: run the site workflow)
    ```
 
    The apply creates a **Direct Upload** project (no Git integration, for the
@@ -154,11 +162,10 @@ commands.
 
 ### Deploying
 
-- **With a rollout**: `./scripts/wayfinder-ca.sh update` publishes the page
-  after the node switches. Never fatal — a failed publish leaves the rollout
-  done and prints the command to retry.
-- **On its own**: `./scripts/wayfinder-ca.sh site`, for a copy change that does
-  not need the node rebuilt.
+- **Automatically**: merge to `main`. The `site` workflow publishes it; re-run
+  it from the Actions tab (`workflow_dispatch`) to publish `main` again.
+- **By hand**: `./scripts/wayfinder-ca.sh site`, from an up-to-date `main` — it
+  publishes your checkout, so a stale one rolls the live page back.
 - **Preview**: `just site-deploy my-branch` publishes to
   `<branch>.wayfinder-site.pages.dev` without touching the live site.
 

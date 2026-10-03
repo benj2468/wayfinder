@@ -1,0 +1,63 @@
+# Publish the wayfndr.dev landing page to Cloudflare Pages on every merge to
+# `main` that changes it.
+#
+# Its own workflow rather than a job in `ci.yml`: the page shares no code with
+# the node, needs none of that pipeline's runners, images or caches, and should
+# not wait on (or be cancelled with) a Rust build. A change to this file
+# triggers it too, so merging it publishes whatever `main` already holds.
+#
+# Needs, on the `site` environment (Settings → Environments → site):
+#
+# - secret `CLOUDFLARE_API_TOKEN` — scoped to `Account:Cloudflare Pages:Edit`
+#   and nothing else. Not the token `wayfinder-ca.sh` holds, which also carries
+#   DNS, Tunnel and cache-purge rights a page upload never needs.
+# - variable `CLOUDFLARE_ACCOUNT_ID` — a scoped token cannot list accounts, so
+#   wrangler must be told which one (see `deploy_site` in
+#   `scripts/wayfinder-ca.sh` for the misleading error it gives otherwise).
+# - variable `SITE_PROJECT_NAME` — optional, defaults to `wayfinder-site`, the
+#   default of `site_project_name` in `infra/oracle/`.
+#
+# An environment secret rather than a repository one, with the environment's
+# deployment branches limited to `main`: a repository secret is readable by
+# any workflow on any branch pushed to this repository, while this one is
+# released only to a job running from `main` — i.e. after review and merge.
+name: site
+on:
+  push:
+    branches: [main]
+    paths:
+      - "www/**"
+      - "assets/logo/**"
+      - "scripts/build-site.sh"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+# Never two uploads at once. A newer merge displacing a still-pending older run
+# is fine — both would publish `main`, and the newer `main` is the one wanted.
+concurrency:
+  group: site
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: site
+      url: https://wayfndr.dev
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/build-site.sh dist/site
+      - name: Publish to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PROJECT: ${{ vars.SITE_PROJECT_NAME || 'wayfinder-site' }}
+        run: |
+          # Fail loudly: a run that "succeeds" without publishing would leave
+          # the live page stale with nothing red to say so.
+          : "${CLOUDFLARE_API_TOKEN:?secret CLOUDFLARE_API_TOKEN is not set}"
+          : "${CLOUDFLARE_ACCOUNT_ID:?variable CLOUDFLARE_ACCOUNT_ID is not set}"
+          npx --yes wrangler@4 pages deploy dist/site \
+            --project-name "$PROJECT" \
+            --branch main \
+            --commit-hash "$GITHUB_SHA"
