@@ -174,7 +174,9 @@ pub fn enumerate_under(tty_class: &Path) -> std::io::Result<Vec<SerialDevice>> {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("ttyACM") {
+        // CDC-ACM boards, and USB-to-UART adapters (a RYLR998 sits behind a
+        // CP2102, which the kernel's vendor driver binds as `ttyUSB*`).
+        if !(name.starts_with("ttyACM") || name.starts_with("ttyUSB")) {
             continue;
         }
         let Some(usb_serial) = usb_serial_of(&entry.path().join("device")) else {
@@ -426,10 +428,11 @@ mod sysfs_tests {
         assert_eq!(found[0].usb_serial, "BBB");
     }
 
-    /// Non-ACM ttys are ignored outright: every machine has a `ttyS0` and a
-    /// `console`, and none of them is a board.
+    /// Ttys that are neither CDC-ACM nor a USB-serial adapter are ignored
+    /// outright: every machine has a `ttyS0` and a `console`, and none of them
+    /// is a board or a radio.
     #[test]
-    fn non_acm_ttys_are_ignored() {
+    fn on_board_uarts_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path(), "ttyS0", Some("AAA"), 1);
         fixture(dir.path(), "ttyACM0", Some("BBB"), 1);
@@ -437,6 +440,34 @@ mod sysfs_tests {
         let found = enumerate_under(&dir.path().join("class/tty")).unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].node, PathBuf::from("/dev/ttyACM0"));
+    }
+
+    /// A USB-to-UART adapter is a `ttyUSB*`, not a `ttyACM*`, and the rig needs
+    /// one: a RYLR998 radio sits behind a CP2102, which the kernel's
+    /// vendor driver binds rather than `cdc_acm`. Found by its serial like any
+    /// board, while the on-board UARTs stay ignored.
+    #[test]
+    fn a_usb_serial_adapter_is_found_alongside_acm_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path(), "ttyS0", Some("AAA"), 1);
+        fixture(dir.path(), "ttyACM0", Some("BBB"), 1);
+        fixture(dir.path(), "ttyUSB0", Some("0001"), 1);
+
+        let mut found = enumerate_under(&dir.path().join("class/tty")).unwrap();
+        found.sort_by(|a, b| a.node.cmp(&b.node));
+        assert_eq!(
+            found,
+            vec![
+                SerialDevice {
+                    node: PathBuf::from("/dev/ttyACM0"),
+                    usb_serial: "BBB".to_string(),
+                },
+                SerialDevice {
+                    node: PathBuf::from("/dev/ttyUSB0"),
+                    usb_serial: "0001".to_string(),
+                },
+            ]
+        );
     }
 
     /// No `/sys/class/tty` at all — a non-Linux host — is an empty list, so the

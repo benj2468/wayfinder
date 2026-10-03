@@ -539,9 +539,12 @@ clippy-stm32f411:
 build-wl55jc:
     cd bins/wayfinder-wl55jc && cargo build --release --locked
 
+# `--examples` too: `hil_reyax_echo` is built only by a hardware test, so this
+# is the one place that keeps it compiling. Built without
+# `WAYFINDER_LORA_FREQUENCY_HZ`, which that image treats as "never transmit".
 [doc("Lint the NUCLEO-WL55JC firmware.")]
 clippy-wl55jc:
-    cd bins/wayfinder-wl55jc && cargo clippy --release --locked -- -D warnings
+    cd bins/wayfinder-wl55jc && cargo clippy --release --locked --lib --bins --examples -- -D warnings
 
 # `blue`'s nRF backend is unwired: both nRF boards moved to 802.15.4, which
 # contends with BLE for the same RADIO peripheral, so nothing links
