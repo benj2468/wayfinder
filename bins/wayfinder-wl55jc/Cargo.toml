@@ -13,6 +13,12 @@ publish = false
 members = ["."]
 
 # `#[no_std]`/`#[no_main]` can't build the host `test` harness.
+[lib]
+path = "src/lib.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "wayfinder-wl55jc"
 path = "src/main.rs"
