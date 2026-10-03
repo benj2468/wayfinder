@@ -205,3 +205,19 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# Dependencies keep line tables (so a backtrace still names the file and line)
+# but not full debuginfo — the variable and type information nobody steps
+# through in a third-party crate, and most of a debug `target/`'s size. With
+# full debuginfo, a debug build of the workspace plus `wayfinder-web` filled
+# ~16 GB and `just ci` hit ENOSPC partway through `build-web` (#83). Workspace
+# crates keep full debuginfo: `"*"` matches only non-members.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+# The one workspace member that gets the same treatment. Its `cdylib` exists
+# for the wasm hydration bundle, but a host build links it too, and with full
+# debuginfo that `.so` alone was 1.8 GB — plus multi-hundred-MB codegen units
+# and ~5 GB of incremental state, almost all of it leptos' generic view types.
+[profile.dev.package.wayfinder-web]
+debug = "line-tables-only"
