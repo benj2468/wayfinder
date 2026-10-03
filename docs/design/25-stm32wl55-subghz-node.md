@@ -13,10 +13,13 @@ thing blocking `libs/wayfinder-hil`, enrolment, and observability without a
 debug probe. The durable store (§4.9) and the `fuzz/` target (§10) are also
 unbuilt.
 
-**Nothing here is hardware-verified and cannot be**: the board on the bench
-does not answer on SWD (§2.3), so every claim rests on the static gates this
-repo already trusts for board work. §11 records what deviated during
-implementation, including the one gate that needed a per-board threshold.
+**It boots on silicon** (2026-10-03): the relay flashes over the onboard
+STLINK-V3E, reaches its run loop with LD2 lit, and brings the radio up into
+receive with no error over RTT. The SWD failure that blocked this was the
+board's factory firmware, not the host or the probe (§2.3). What one board
+cannot show — a frame crossing the air to a second node — is still
+unverified. §11 records what deviated during implementation, including the
+one gate that needed a per-board threshold.
 
 ## 1. Scope
 
@@ -103,22 +106,59 @@ The lesson this design takes from that: **on this family the memory budget is
 the design, and it has to be measured rather than assumed.** A 64 KiB part is
 half of what already did not fit at default capacities.
 
-### 2.3 The board cannot currently be flashed
+### 2.3 Bringing a factory-fresh board up over SWD
 
-Nothing here is hardware-verified, and that is recorded rather than glossed.
 The onboard STLINK-V3E enumerates (four interfaces: debug, mass storage, and
 the VCP at `/dev/ttyACM0`; the drag-and-drop volume is labelled `NOD_WL55JC`),
-and its own firmware answers — but no target responds on SWD:
+and its own firmware answers — but a board straight out of the box does not
+respond on SWD:
 
 ```
 probe-rs:      JtagGetIdcodeError (SWD), JtagNoDeviceConnected (JTAG), SwdDpError (under reset)
 stlink 1.8.0:  Failed to enter SWD mode; chipid 0x000; sram 0
 ```
 
-Two independent tools agreeing makes this the probe's view of the target, not a
-tooling fault. Everything below is therefore gated on the static checks the
-repo already trusts for board work — it links, it fits, `stack-budget.py`
-passes — with the on-silicon claims explicitly deferred to §9.
+This was first recorded as a host fault — the VMware USB passthrough, the hub,
+the probe's firmware — and blocked every on-silicon claim for three weeks. **It
+is the board's factory firmware.** Erasing it is the whole fix: from then on
+the same host, hub and probe firmware attach every time. The likeliest
+mechanism is the factory LoRa demo entering a low-power mode that stops the
+debug port, though that is inferred from the symptoms rather than traced. Two
+tools agreeing was the target's real state, not the probe's.
+
+Neither obvious remedy works on this probe:
+
+- **Plain attach** finds the core already stopped: `JtagGetIdcodeError`.
+- **`--connect-under-reset`** brings SWD up, but probe-rs's STM32WL debug
+  sequence then fails with `SwdDpError`. It logs why: *"Custom reset sequences
+  are not supported on ST-Link V3"*, so it falls back to a generic reset this
+  part does not tolerate.
+
+What does work is attaching in the window just after reset, before the demo
+gets that far: loop an erase and tap RESET (B4) until one attempt lands.
+
+```
+until probe-rs erase --chip STM32WL55JC; do sleep 0.1; done
+```
+
+Holding BOOT0 high through a reset, so the part starts in its ROM bootloader
+instead of the demo, is the untried fallback. Once the demo is gone, plain
+attach works every time.
+
+**One power cycle after the first flash.** At power-on the part samples
+whether its flash is blank and, if so, maps the ROM bootloader at `0`. A
+system reset does not re-sample it. A board that was erased, power-cycled,
+and then flashed therefore keeps booting the bootloader through every
+`probe-rs reset`: LD2 stays dark, RTT is silent, and `VTOR` reads
+`0x1FFF0000` with `SYSCFG_MEMRMP` at `1`. Unplug and replug once and the
+image runs. That symptom is the boot configuration, not a firmware bug.
+
+Two smaller things about this probe and probe-rs 0.32:
+
+- `probe-rs download` leaves the core halted in the flash loader in RAM, so
+  follow it with `probe-rs reset` (`cargo run`'s `probe-rs run` does both).
+- AP 1, the Cortex-M0+, faults when probed. That is expected: the core is
+  held off until CPU1 releases it, and this firmware never does (§4.8).
 
 ## 3. Goals and non-goals
 
@@ -715,12 +755,11 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
 
 ### Genuinely open
 
-- **The SWD failure (§2.3).** Everything on-silicon is blocked on it. Unknown
-  whether it is the VMware USB passthrough this host runs behind (control
-  transfers work — the probe's own version and serial read fine — while the
-  bulk SWD path fails), the Anker hub in between, the STLINK-V3E's old **V3J7**
-  firmware, or the board. The drag-and-drop volume is a flashing fallback but
-  not an observability one, so it does not substitute.
+- ~~**The SWD failure (§2.3).**~~ Resolved 2026-10-03: the board's factory
+  firmware, not the VMware passthrough, the hub or the probe's firmware, all of
+  which were suspected. §2.3 now carries the bring-up procedure. The relay
+  boots and its radio enters receive; over-the-air exchange still needs a
+  second board.
 - **`fan_out` across all four radio drivers.** A broadcast radio send looks
   like the `Some(1)` case, none of them declares it, and the method's own docs
   say it is dead weight until design 17 lands. Worth settling once, for all of
@@ -729,8 +768,8 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
   #71 (the `flt2dec` waste below), #72 (routing core), #73 (crypto) and #74
   (async platform) under it. The single largest open question, since without
   the port this board cannot be reached by `libs/wayfinder-hil`, cannot be
-  enrolled, cannot renew (design 24), and has no observability at all once SWD
-  is unavailable — its state on the bench today.
+  enrolled, cannot renew (design 24), and has no observability without a
+  debug probe attached — RTT at a compile-time log level is all there is.
 
   The gap is 28.8 KiB and splits into a bounded half and a decision:
 
