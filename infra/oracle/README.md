@@ -430,11 +430,12 @@ Pages. Two halves again, and the same split as the node:
 | | what it does | when you run it |
 |---|---|---|
 | `tofu apply` with `manage_site = true` | creates the Pages project, its production branch and the `wayfndr.dev` / `www.wayfndr.dev` custom domains | once, and when the *project* changes |
-| `./scripts/wayfinder-ca.sh site` | uploads `dist/site` into it with `wrangler` | on every copy change, and with every `update` |
+| `.github/workflows/site.yml` | uploads `dist/site` into it with `wrangler` | automatically, on every merge to `main` that touches the page |
+| `./scripts/wayfinder-ca.sh site` | the same upload, from your checkout | by hand: the first deployment, or when CI cannot |
 
 OpenTofu owns the container; `wrangler` fills it. A static upload is a deploy
-step rather than an infrastructure change, and it rides with the node rollout on
-purpose — see `www/README.md` for why the page ships with the box it describes.
+step rather than an infrastructure change, so it ships from CI rather than with
+the node rollout — see `www/README.md`.
 
 The project name lives in `terraform.tfvars` as `site_project_name` and the
 script reads it from there, so a rename is one edit. The `just site-deploy`

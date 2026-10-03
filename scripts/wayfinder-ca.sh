@@ -25,7 +25,7 @@
 #   install     Install NixOS over the stock image          (DESTRUCTIVE, once)
 #   secrets     Copy the offline-minted trust material onto the node
 #   update      Roll out a config/code change               (nixos-rebuild)
-#   site        Publish the wayfndr.dev landing page        (Cloudflare Pages)
+#   site        Publish the landing page by hand            (Cloudflare Pages)
 #   purge       Drop the dashboard bundle from Cloudflare's cache
 #   verify      Prove the CA answers and the tunnel plane is serving
 #   status      Where it is and what it is doing
@@ -477,12 +477,11 @@ cmd_purge() {
     purge_dashboard_cache
 }
 
-# The landing page is static and shares no code with the node, so it used to
-# ship from its own CI job on every push to the default branch. It rides with
-# the rollout instead: the page describes what this deployment is running, and
-# a page that has already announced a change the box has not taken is the wrong
-# way round. Never fatal, for the same reason the cache purge is not — the node
-# is already updated by the time this runs.
+# The landing page normally ships from CI (`.github/workflows/site.yml`) on
+# every merge to `main` that touches it. This is the manual fallback — for a
+# first deployment, or when that workflow cannot run. It publishes this
+# checkout, dirty or not, so run it from an up-to-date `main` or it rolls the
+# live page back. Never fatal.
 deploy_site() {
     local code=0
 
@@ -547,8 +546,6 @@ infra/oracle/terraform.tfvars — a scoped token cannot list accounts, and
 'wrangler login', which it suggests instead, is not the fix."
 }
 
-# Standalone as well as part of `update`: a copy change under www/ is worth
-# shipping without rebuilding the node it sits in front of.
 cmd_site() {
     deploy_site
 }
@@ -570,7 +567,6 @@ cmd_update() {
     # moment the switch returns, and until this runs Cloudflare goes on serving
     # the old one to everybody.
     purge_dashboard_cache
-    deploy_site
     info "rolled out; 'wayfinder-ca.sh verify' to confirm it still answers"
 }
 
