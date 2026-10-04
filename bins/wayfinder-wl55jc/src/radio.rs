@@ -297,8 +297,10 @@ const TX_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
 /// forever, and with it `LoraLink::send` and the whole driver loop (#76).
 /// Twice the airtime is generous enough that a healthy radio never trips it.
 ///
-/// The formula is `lora-modulation`'s (SX127x's), which undercounts SF5/SF6 by
-/// two symbols against the SX126x datasheet; the doubling absorbs that.
+/// The formula is `lora-modulation`'s (SX127x's), which undercounts SF5/SF6:
+/// two symbols against the SX126x datasheet, plus four more because
+/// `lora-phy` raises the preamble to 12 there while this passes 8. At least
+/// twenty symbols of airtime against six missing, so the doubling absorbs it.
 fn tx_deadline(config: &RadioConfig, len: usize) -> Duration {
     let airtime_us = BaseBandModulationParams::new(
         config.spreading_factor,
