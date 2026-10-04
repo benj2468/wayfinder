@@ -12,7 +12,7 @@ use crate::switch::PortConfig;
 use crate::switch::PortId;
 use crate::switch::Switch;
 use crate::test_router::TestRouter;
-use core::num::NonZeroU8;
+use wayfinder::link::FanOut;
 
 /// Declarative description of a whole test topology: the switches to create and
 /// the machines to attach to them.
@@ -99,7 +99,7 @@ struct MachineSpec {
     /// where a spoke's send reaches only the hub — over-claiming here would be
     /// a correctness bug, not a missed optimisation, since a merged frame that
     /// does not actually reach everyone drops every destination but one.
-    fan_out: Vec<Option<NonZeroU8>>,
+    fan_out: Vec<Option<FanOut>>,
 }
 
 impl MachineSpec {
@@ -580,14 +580,16 @@ impl TestConfig {
             // A shared switch is a shared medium: one transmission reaches
             // every other machine on it. A star's spokes reach only the hub, so
             // they declare nothing.
-            let fan_out: Vec<Option<NonZeroU8>> = switches
+            let fan_out: Vec<Option<FanOut>> = switches
                 .iter()
                 .map(|name| {
                     self.switches
                         .iter()
                         .find(|s| &s.name == name)
                         .filter(|s| s.hub.is_none())
-                        .and_then(|_| NonZeroU8::new(2))
+                        .map(|_| {
+                            FanOut::broadcast(wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN)
+                        })
                 })
                 .collect();
             let (interfaces, handles) = h.wire_links(&switches);

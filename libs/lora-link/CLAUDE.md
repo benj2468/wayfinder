@@ -109,11 +109,12 @@ log ring — design 25 §4.7).
    silently suppresses routing through the radio rather than looking wrong
    anywhere — see `LinkMetrics::quality`'s own docs. There is no
    datasheet-pinned mapping for a LoRa RSSI/SNR pair, so do not invent one.
-6. Declare `fan_out` as `wayfinder::link::BROADCAST_FAN_OUT`. Every send
+6. Declare `fan_out` as `Some(FanOut::broadcast(MAX_REASSEMBLED_LEN))`. Every send
    is a broadcast, which is exactly what the declaration claims, and the
    multicast fan-out collapse (design 17 §4.5) reads it to merge terminal
    peers into one transmission. Two rather than one because a merge swaps the
-   pairwise tag for a signature — see the constant's docs. Every broadcast
+   pairwise tag for a signature — see `FanOut::broadcast`. The cap is what
+   lets the collapse keep directed copies when a merged frame would not fit. Every broadcast
    radio here declares the same value; keep them together.
 
 ### `recv` must be cancel-safe, and awaiting the radio directly is not

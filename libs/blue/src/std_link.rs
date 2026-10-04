@@ -642,7 +642,7 @@ async fn read_mesh_report(
 }
 
 impl LinkT for StdBleLink {
-    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
         self.inner.fan_out()
     }
 

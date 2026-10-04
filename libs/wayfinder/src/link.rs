@@ -112,7 +112,7 @@ pub trait LinkT: Send {
     /// is abandoned, delete this method along with
     /// [`send_all`](LinkT::send_all) — a declaration nothing reads is exactly
     /// the dead weight `send_all` has been since it was introduced.
-    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+    fn fan_out(&self) -> Option<FanOut> {
         None
     }
 
@@ -122,20 +122,54 @@ pub trait LinkT: Send {
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError>;
 }
 
-/// The [`LinkT::fan_out`] every broadcast medium in this repo declares: a LoRa
-/// module or raw LoRa PHY, an 802.15.4 frame to `0xffff`, a BLE
-/// advertisement, and a raw L2 segment (whose merged frame goes to the
-/// broadcast MAC). One `send` reaches every neighbor on each of those.
+/// A link's [`LinkT::fan_out`] declaration: when merging several directed
+/// copies into one transmission pays off, and how large that one transmission
+/// may be.
 ///
-/// **Two, not one**, although one directed copy costs a broadcast radio
-/// exactly what a flood does. The collapse it gates (design 17 §4.5) swaps the
-/// frame's pairwise tag for a signature, since one transmission cannot carry a
-/// tag per recipient. With a single terminal destination that swap saves no
-/// transmission and only makes the frame longer, which on a duty-cycled
-/// medium is airtime spent for nothing. From two destinations up it saves a
-/// whole transmission per extra peer. The host's multicast UDP links declare
-/// the same threshold for the same reason.
-pub const BROADCAST_FAN_OUT: Option<core::num::NonZeroU8> = core::num::NonZeroU8::new(2);
+/// The two travel together because the cap only matters where a merge can
+/// happen. A merged frame is larger than any one directed copy — its
+/// destination list is the union (6 bytes per extra peer), and on an
+/// authenticated node it carries a signature trailer where a copy carries a
+/// pairwise tag (48 bytes more) — so on a small-MTU radio a multicast whose
+/// copies each fit can merge into a frame the radio refuses. That loses every
+/// listener at once, so the collapse checks `max_frame_len` first and keeps the
+/// directed copies when the merged frame would not fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FanOut {
+    /// The number of distinct terminal destinations behind this link at which
+    /// one merged transmission beats one directed copy each. See
+    /// [`LinkT::fan_out`] for what `1` and larger values mean.
+    pub threshold: core::num::NonZeroU8,
+    /// The largest assembled link frame (`[dst][src][protocol][payload]`, the
+    /// bytes `send` is handed) this link can carry. A frame past it is refused
+    /// by `send`, typically with `LinkError::BufferFull`.
+    pub max_frame_len: usize,
+}
+
+impl FanOut {
+    /// The declaration every broadcast medium in this repo makes: a LoRa
+    /// module or raw LoRa PHY, an 802.15.4 frame to `0xffff`, a BLE
+    /// advertisement, and a raw L2 segment (whose merged frame goes to the
+    /// broadcast MAC). One `send` reaches every neighbor on each of those.
+    ///
+    /// **A threshold of two, not one**, although one directed copy costs a
+    /// broadcast radio exactly what a flood does. The collapse it gates
+    /// (design 17 §4.5) swaps the frame's pairwise tag for a signature, since
+    /// one transmission cannot carry a tag per recipient. With a single
+    /// terminal destination that swap saves no transmission and only makes
+    /// the frame longer, which on a duty-cycled medium is airtime spent for
+    /// nothing. From two destinations up it saves a whole transmission per
+    /// extra peer. The host's multicast UDP links use the same threshold.
+    pub const fn broadcast(max_frame_len: usize) -> FanOut {
+        FanOut {
+            threshold: match core::num::NonZeroU8::new(2) {
+                Some(n) => n,
+                None => unreachable!(),
+            },
+            max_frame_len,
+        }
+    }
+}
 
 /// A dynamically dispatched [`LinkT`] trait object.
 ///
@@ -168,8 +202,11 @@ mod tests {
     struct Broadcasting;
 
     impl LinkT for Broadcasting {
-        fn fan_out(&self) -> Option<NonZeroU8> {
-            NonZeroU8::new(1)
+        fn fan_out(&self) -> Option<FanOut> {
+            Some(FanOut {
+                threshold: NonZeroU8::new(1).unwrap(),
+                max_frame_len: 1500,
+            })
         }
         async fn send(&mut self, _: Mac, _: &LinkFrameData<'_>) -> Result<usize, LinkError> {
             Ok(0)
@@ -188,7 +225,10 @@ mod tests {
 
     #[test]
     fn a_broadcast_medium_declares_its_threshold() {
-        assert_eq!(Broadcasting.fan_out(), NonZeroU8::new(1));
+        assert_eq!(
+            Broadcasting.fan_out().map(|f| f.threshold),
+            NonZeroU8::new(1)
+        );
     }
 
     /// The declaration has to survive type erasure: the host driver holds its
@@ -200,6 +240,6 @@ mod tests {
         let plain = DynLinkT::new_box(Plain);
         assert_eq!(plain.fan_out(), None);
         let broadcasting = DynLinkT::new_box(Broadcasting);
-        assert_eq!(broadcasting.fan_out(), NonZeroU8::new(1));
+        assert_eq!(broadcasting.fan_out(), Broadcasting.fan_out());
     }
 }

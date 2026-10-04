@@ -386,8 +386,8 @@ mod tokio_impl {
         /// broadcast MAC, which every station on the segment receives. So one
         /// send does reach every neighbor, the property the declaration
         /// claims, at the same threshold as the radios.
-        fn fan_out(&self) -> Option<core::num::NonZeroU8> {
-            wayfinder::link::BROADCAST_FAN_OUT
+        fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+            Some(wayfinder::link::FanOut::broadcast(MAX_LINK_FRAME_LEN))
         }
 
         async fn send(

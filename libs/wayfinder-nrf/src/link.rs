@@ -36,7 +36,7 @@ pub enum MeshLink {
 impl LinkT for MeshLink {
     /// Forwarded, never defaulted: an enum over links that swallowed this
     /// would hide a broadcast radio's declaration from the driver.
-    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
         match self {
             MeshLink::Dot15d4(link) => link.fan_out(),
             MeshLink::Usb(link) => link.fan_out(),

@@ -164,14 +164,14 @@ pub struct UdpMultiLink {
     /// `discovery_addr`, because the distinction that decides it (a subnet
     /// broadcast versus a unicast peer) is not recoverable from the address
     /// alone once the classifier has been left behind.
-    fan_out: Option<core::num::NonZeroU8>,
+    fan_out: Option<wayfinder::link::FanOut>,
     /// Scratch buffer for the most recently sent or received frame, sized to
     /// [`MAX_LINK_FRAME_LEN`] like every other data-path buffer.
     wire_buf: [u8; MAX_LINK_FRAME_LEN],
 }
 
 impl LinkT for UdpMultiLink {
-    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
         self.fan_out
     }
 
@@ -508,7 +508,14 @@ pub async fn build_udp_multi_link(
     Ok(DynLinkT::new_box(UdpMultiLink {
         socket,
         discovery_addr,
-        fan_out: mode.native_fan_out(),
+        // A datagram carries a whole `MAX_LINK_FRAME_LEN` frame, the same
+        // bound `wire_buf` and every other data-path buffer use.
+        fan_out: mode
+            .native_fan_out()
+            .map(|threshold| wayfinder::link::FanOut {
+                threshold,
+                max_frame_len: MAX_LINK_FRAME_LEN,
+            }),
         peers: UdpPeerTable::default(),
         wire_buf: [0u8; MAX_LINK_FRAME_LEN],
     }))
@@ -961,7 +968,7 @@ mod tests {
         let link = build_udp_multi_link(bind, Some(group), Some(loopback_nic()))
             .await
             .expect("a wildcard bind on the loopback NIC is a valid multicast config");
-        assert_eq!(link.fan_out(), NonZeroU8::new(2));
+        assert_eq!(link.fan_out().map(|f| f.threshold), NonZeroU8::new(2));
     }
 
     /// The hub-mode link built the same way declares nothing.

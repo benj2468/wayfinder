@@ -62,8 +62,8 @@ use wayfinder::link::LinkT;
 
 use crate::snoop::McastSnooper;
 use crate::transport::FrameIo;
-use core::num::NonZeroU8;
 use interfaces::engine::FrameSink;
+use wayfinder::link::FanOut;
 
 /// Where the driver's certificate-validity clock comes from.
 ///
@@ -319,7 +319,7 @@ pub struct Driver<Local: FrameIo, R: RouterOps = CentralRouter> {
     /// `interfaces` through its `recv` futures, so the medium cannot be asked
     /// about itself while one of its frames is in hand. It is a property of the
     /// medium and fixed once the link is built, so one read is enough.
-    fan_out: Vec<Option<NonZeroU8>>,
+    fan_out: Vec<Option<FanOut>>,
     /// The routing engine for this node, and the identity seed beside it,
     /// behind the lock the management reads share.
     ///

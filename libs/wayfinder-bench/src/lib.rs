@@ -25,8 +25,8 @@
 //! - **auth on/off** — the Ed25519 tax, which is large enough to hide
 //!   everything else and so is always a separate axis, never folded in.
 
-use core::num::NonZeroU8;
 use core::time::Duration;
+use wayfinder::link::FanOut;
 
 use batman::wire::BATMAN_VERSION;
 use batman::wire::BatmanOgmPacket;
@@ -62,7 +62,7 @@ use zerocopy::IntoBytes;
 ///
 /// Timing the collapse itself needs a fixture that converges several multicast
 /// destinations behind one fan-out interface; there is no such benchmark yet.
-pub const NO_FAN_OUT: &[Option<NonZeroU8>] = &[];
+pub const NO_FAN_OUT: &[Option<FanOut>] = &[];
 
 /// Physical-layer metrics attached to every benchmarked receive: a strong,
 /// noiseless link.

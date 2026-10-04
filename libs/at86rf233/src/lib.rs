@@ -309,9 +309,11 @@ where
     RST: OutputPin + Send,
 {
     /// A broadcast medium: every `send` reaches every neighbor, whatever
-    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
-    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
-        wayfinder::link::BROADCAST_FAN_OUT
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(
+            ieee802154::MAX_REASSEMBLED_LEN,
+        ))
     }
 
     /// Fragment `data` and transmit every fragment, returning the total
@@ -821,6 +823,11 @@ mod tests {
         let radio = At86Rf233::new(FakeSpi(chip), FakeIrq, FakeReset, 11)
             .await
             .unwrap();
-        assert_eq!(radio.fan_out(), wayfinder::link::BROADCAST_FAN_OUT);
+        assert_eq!(
+            radio.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(
+                ieee802154::MAX_REASSEMBLED_LEN
+            ))
+        );
     }
 }
