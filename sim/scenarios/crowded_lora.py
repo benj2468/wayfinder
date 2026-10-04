@@ -373,12 +373,13 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
                 series=[
                     Series("simulated (≥95% delivered)", schedules, [float(capacity(runs, i) or 0) for i in schedules], kind="line"),
                     Series("collision ceiling √(0.025·0.75I/T)", schedules, [collision_limited_n(i) for i in schedules], kind="line"),
-                    Series("duty-cycle ceiling 0.01·0.75I/T", schedules, [duty_limited_n(i) for i in schedules], kind="line"),
                 ],
                 x_log=True,
                 caption=(
-                    "Both closed forms assume a quiet channel's advert rate; contention raises it, so "
-                    "the simulation lands below them. Collisions bind long before the duty cycle."
+                    "The closed form assumes a quiet channel's advert rate; contention raises it, so the "
+                    "simulation lands below. The duty-cycle ceiling (0.01·0.75I/T) is far higher — "
+                    f"{duty_limited_n(schedules[0]):.0f} to {duty_limited_n(schedules[-1]):.0f} sensors over "
+                    "this range — so collisions bind long before it does."
                 ),
             ),
         ],

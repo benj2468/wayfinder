@@ -488,7 +488,7 @@ def showcase(run: CaptureRun, sweep: Sequence[NotifySweep]) -> Showcase:
             Chart(
                 title="Would-be joiners: packets HQ accepted",
                 x_label="who",
-                y_label="packets accepted",
+                y_label="packets",
                 series=[
                     Series(
                         "accepted",

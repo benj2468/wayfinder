@@ -425,7 +425,10 @@ def showcase(run: FailoverRun, sweep: Sequence[SweepPoint]) -> Showcase:
                 y_label="hops",
                 series=[Series("path length", hop_x, hop_y, kind="step")],
                 markers=markers,
-                caption="The gap is the outage: the team keeps forwarding to the dead relay until that path ages out.",
+                caption=(
+                    "A break in the line is a moment with no complete path. The flicker between "
+                    "lengths is near-equal routes trading places as fading moves their measured quality."
+                ),
             ),
             Chart(
                 title="Worst-case recovery vs. what it costs",
