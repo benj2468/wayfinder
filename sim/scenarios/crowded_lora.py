@@ -233,8 +233,24 @@ def collision_limited_n(i_max_s: float, loss: float = 1.0 - TARGET_DELIVERY) -> 
     return math.sqrt(load * TRICKLE_MEAN_ROUND * i_max_s / ogm_airtime_s())
 
 
-def run_sweep(counts: Sequence[int] = SENSOR_COUNTS, schedules: Sequence[float] = ADVERT_I_MAX_S) -> list[ChannelRun]:
-    return [run_point(n, i) for i in schedules for n in counts]
+SEEDS = (0, 1, 2)
+"""Near its limit the channel is chaotic — one seed collapses where its
+neighbour holds — so every point is the median-delivery run of several."""
+
+
+def median_run(n: int, i_max_s: float, seeds: Sequence[int] = SEEDS) -> ChannelRun:
+    """The run with the median delivery across `seeds`: a real run rather
+    than an average of runs, so its airtime split still adds up."""
+    runs = sorted((run_point(n, i_max_s, seed=s) for s in seeds), key=lambda r: r.delivery)
+    return runs[len(runs) // 2]
+
+
+def run_sweep(
+    counts: Sequence[int] = SENSOR_COUNTS,
+    schedules: Sequence[float] = ADVERT_I_MAX_S,
+    seeds: Sequence[int] = SEEDS,
+) -> list[ChannelRun]:
+    return [median_run(n, i, seeds) for i in schedules for n in counts]
 
 
 def capacity(runs: Sequence[ChannelRun], i_max_s: float) -> int | None:
@@ -333,7 +349,7 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
             f"per-transmission off-time for a {DUTY_CYCLE:.0%} duty cycle. Sensors are uniform over a "
             f"{RADIUS_M / 1000:g} km disc at {TX_POWER_DBM:.0f} dBm. Each point warms up for two advert rounds "
             f"and then measures one hour. Routing and data airtime are split by packet type from a "
-            "wiretap on the channel."
+            f"wiretap on the channel. Each point is the median-delivery run of {len(SEEDS)} seeds."
         ),
         charts=[
             Chart(
@@ -403,7 +419,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     wf.init_tracing()
 
-    runs = run_sweep((5, 10, 20), (60, 300)) if args.quick else run_sweep()
+    runs = run_sweep((4, 8, 14), (60, 300), seeds=(0,)) if args.quick else run_sweep()
     print_summary(runs)
     if args.export:
         print(f"wrote {write_showcase(showcase(runs), args.export)}")

@@ -24,7 +24,7 @@ from crowded_lora import (  # noqa: E402
 
 def test_a_few_sensors_deliver_and_a_crowd_does_not():
     few = run_point(4, 300.0, measure_s=1800.0)
-    busy = run_point(10, 300.0, measure_s=1800.0)
+    busy = run_point(8, 300.0, measure_s=1800.0)
     crowd = run_point(20, 300.0, measure_s=1800.0)
     assert few.delivery >= TARGET_DELIVERY
     assert crowd.delivery < 0.75
