@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+from collections import deque
 from collections.abc import Callable, Sequence
 from random import Random
 from typing import Any
@@ -30,6 +31,7 @@ from .mobility import Vec3
 from .node import Node
 from .recorder import Recorder
 from .security import Mesh
+from .traffic import Flow, decode_payload, encode_payload
 
 Probe = Callable[["Simulation"], Any]
 """A function of the running `Simulation`, sampled once per recorder tick —
@@ -53,7 +55,16 @@ class _NodeState:
     driver: wf.PyDriver
     interfaces: dict[int, Link]  # this node's interface index -> the Link on it
     tick_interval_ms: int
+    trickle: list[tuple[int, int]]
+    keepalive: list[int | None]
     keypair: wf.PyKeypair | None = None
+    up: bool = True
+    # Bumped on every reboot, so a frame already in flight to the old router
+    # is not delivered into the new one's queue as if it had just arrived.
+    boot: int = 0
+    # Payloads the router delivered locally that are not stream packets,
+    # waiting for `Simulation.poll_local`.
+    inbox: deque[bytes] = dataclasses.field(default_factory=deque)
     """This node's mesh identity, when it has one. Retained so a scenario can
     sign or re-enroll on its behalf mid-run."""
 
@@ -170,12 +181,9 @@ class Simulation:
                 mac = node.mac
             else:
                 mac = wf.PyMac(bytes((*_AUTO_MAC_OUI, idx)))
-            features = [
-                wf.PyLinkFeatures(tx_keepalive_interval_ms=ka)
-                for ka in node_keepalive[node.name]
-            ]
-            driver = wf.PyDriver(mac, node_trickle[node.name], features)
-            self._install_credential(node, driver, keypair)
+            driver = self._build_driver(
+                node, mac, node_trickle[node.name], node_keepalive[node.name], keypair
+            )
             tick_interval_ms = node.tick_interval_ms
             if tick_interval_ms is None:
                 i_mins = [t[0] for t in node_trickle[node.name]] or [node.trickle[0]]
@@ -188,14 +196,34 @@ class Simulation:
                 driver=driver,
                 interfaces=node_interfaces[node.name],
                 tick_interval_ms=tick_interval_ms,
+                trickle=node_trickle[node.name],
+                keepalive=node_keepalive[node.name],
                 keypair=keypair,
             )
 
         self._probes: dict[str, Probe] = {}
         self._recorder: Recorder | None = None
+        self._down_links: set[str] = set()
+        self._flows: list[Flow] = []
 
         for name in self._states:
             self.env.process(self._tick_proc(name))
+
+    def _build_driver(
+        self,
+        node: Node,
+        mac: wf.PyMac,
+        trickle: list[tuple[int, int]],
+        keepalive: list[int | None],
+        keypair: wf.PyKeypair | None,
+    ) -> wf.PyDriver:
+        """A fresh router for `node` — at construction, and again on every
+        reboot, which is what makes a reboot lose everything the old one
+        learned."""
+        features = [wf.PyLinkFeatures(tx_keepalive_interval_ms=ka) for ka in keepalive]
+        driver = wf.PyDriver(mac, trickle, features)
+        self._install_credential(node, driver, keypair)
+        return driver
 
     # --- identity ---------------------------------------------------------
 
@@ -414,6 +442,71 @@ class Simulation:
             self._flood_proc(src, frame, rate_hz, start_s, duration_s, link)
         )
 
+    # --- failures ---------------------------------------------------------
+
+    def fail_node(
+        self, node: str, *, at_s: float, recover_s: float | None = None
+    ) -> None:
+        """Power `node` off at `at_s` and, if `recover_s` is given, back on
+        then.
+
+        Off means off: it neither ticks nor transmits, and a frame addressed
+        to it is lost on the air. Coming back is a *reboot* rather than a
+        resume — the node gets a fresh router (same address, same credential)
+        that has to relearn the mesh from nothing, which is what a power-cycled
+        board does and what makes recovery time worth measuring at all.
+        """
+        if node not in self._states:
+            raise KeyError(node)
+        if recover_s is not None and recover_s <= at_s:
+            raise ValueError(f"recover_s={recover_s} must be after at_s={at_s}")
+        self.env.process(self._fail_node_proc(node, at_s, recover_s))
+
+    def fail_link(
+        self, link: str, *, at_s: float, recover_s: float | None = None
+    ) -> None:
+        """Cut `link` at `at_s` (every frame on it is lost) and, if
+        `recover_s` is given, restore it then. A cable pulled or a radio
+        blocked, with both ends still running."""
+        if not any(existing.name == link for existing in self._links):
+            raise KeyError(f"no link named {link!r}")
+        if recover_s is not None and recover_s <= at_s:
+            raise ValueError(f"recover_s={recover_s} must be after at_s={at_s}")
+        self.env.process(self._fail_link_proc(link, at_s, recover_s))
+
+    def is_up(self, node: str) -> bool:
+        """Whether `node` is powered on right now."""
+        return self._states[node].up
+
+    def is_link_up(self, link: str) -> bool:
+        """Whether `link` is carrying frames right now."""
+        return link not in self._down_links
+
+    # --- traffic -----------------------------------------------------------
+
+    def stream(
+        self,
+        src: str,
+        dest: str,
+        *,
+        rate_hz: float,
+        start_s: float,
+        duration_s: float,
+    ) -> Flow:
+        """Send numbered packets from `src` to `dest` at `rate_hz` for
+        `duration_s` from `start_s`, and return the `Flow` recording what
+        arrived. Stream packets are consumed by their flow and never surface
+        through `poll_local`."""
+        for name in (src, dest):
+            if name not in self._states:
+                raise KeyError(name)
+        if rate_hz <= 0:
+            raise ValueError("rate_hz must be positive")
+        flow = Flow(src=src, dest=dest, flow_id=len(self._flows))
+        self._flows.append(flow)
+        self.env.process(self._stream_proc(flow, rate_hz, start_s, duration_s))
+        return flow
+
     # --- probe-facing introspection -----------------------------------
 
     @property
@@ -561,8 +654,11 @@ class Simulation:
 
     def poll_local(self, node: str) -> bytes | None:
         """Pop the next payload delivered to `node`'s local host, if any —
-        see `wf.PyDriver.poll_local`."""
-        return self._states[node].driver.poll_local()
+        see `wf.PyDriver.poll_local`. Packets belonging to a `stream` are
+        never returned here; their `Flow` consumed them."""
+        state = self._states[node]
+        self._drain_local(state, node)
+        return state.inbox.popleft() if state.inbox else None
 
     # --- setup -----------------------------------------------------------
 
@@ -590,12 +686,32 @@ class Simulation:
 
     def _tick_node(self, name: str) -> None:
         state = self._states[name]
+        if not state.up:
+            return
         state.driver.tick(int(self.env.now))
         for iface, link in state.interfaces.items():
             frame = state.driver.poll_egress(iface)
             while frame is not None:
                 self._schedule_delivery(link, name, iface, frame)
                 frame = state.driver.poll_egress(iface)
+        self._drain_local(state, name)
+
+    def _drain_local(self, state: _NodeState, name: str) -> None:
+        """Move what the router delivered locally into `state.inbox`,
+        handing stream packets to their flow on the way."""
+        t_s = self.env.now / 1000.0
+        payload = state.driver.poll_local()
+        while payload is not None:
+            decoded = decode_payload(payload)
+            if (
+                decoded is not None
+                and decoded[0] < len(self._flows)
+                and self._flows[decoded[0]].dest == name
+            ):
+                self._flows[decoded[0]].record_received(decoded[1], t_s)
+            else:
+                state.inbox.append(payload)
+            payload = state.driver.poll_local()
 
     def _tick_proc(self, name: str):
         self._tick_node(name)
@@ -607,6 +723,8 @@ class Simulation:
     def _schedule_delivery(
         self, link: Link, src_name: str, src_iface: int, frame: bytes
     ) -> None:
+        if link.name in self._down_links or not self._states[src_name].up:
+            return
         t_s = self.env.now / 1000.0
         # Tap on transmit, not on delivery: a listener hears what went out
         # over the medium, including the frames a lossy channel then drops
@@ -620,13 +738,20 @@ class Simulation:
             if dst_name == src_name:
                 continue
             dst_state = self._states[dst_name]
+            if not dst_state.up:
+                continue
             rx_pos = dst_state.node.mobility.position(t_s)
             sample = link.channel.evaluate(tx_pos, rx_pos, t_s, self._delivery_rng)
             if self._delivery_rng.random() < sample.delivery_probability:
                 dst_iface = self._link_iface[id(link)][dst_name]
                 self.env.process(
                     self._deliver(
-                        sample.latency_ms, dst_state, dst_iface, frame, sample.metrics
+                        sample.latency_ms,
+                        dst_state,
+                        dst_state.boot,
+                        dst_iface,
+                        frame,
+                        sample.metrics,
                     )
                 )
 
@@ -634,13 +759,16 @@ class Simulation:
         self,
         latency_ms: float,
         dst_state: _NodeState,
+        boot: int,
         dst_iface: int,
         frame: bytes,
         metrics: wf.PyLinkMetrics,
     ):
         if latency_ms > 0:
             yield self.env.timeout(latency_ms)
-        dst_state.driver.push_rx(dst_iface, frame, metrics)
+        # Lost if the receiver went down (or down and back up) mid-flight.
+        if dst_state.up and dst_state.boot == boot:
+            dst_state.driver.push_rx(dst_iface, frame, metrics)
 
     def _inject_proc(self, src: str, frame: bytes, at_s: float, link: str | None):
         target_ms = at_s * 1000
@@ -680,7 +808,54 @@ class Simulation:
         if target_ms > self.env.now:
             yield self.env.timeout(target_ms - self.env.now)
         mac = wf.PyMac.BROADCAST if dest == "*" else self._states[dest].mac
-        self._states[src].driver.queue_local_send(mac, payload)
+        if self._states[src].up:
+            self._states[src].driver.queue_local_send(mac, payload)
+
+    def _wait_until(self, t_s: float):
+        target_ms = t_s * 1000
+        if target_ms > self.env.now:
+            yield self.env.timeout(target_ms - self.env.now)
+
+    def _fail_node_proc(self, node: str, at_s: float, recover_s: float | None):
+        yield from self._wait_until(at_s)
+        state = self._states[node]
+        state.up = False
+        state.inbox.clear()
+        if recover_s is None:
+            return
+        yield from self._wait_until(recover_s)
+        state.boot += 1
+        state.driver = self._build_driver(
+            state.node, state.mac, state.trickle, state.keepalive, state.keypair
+        )
+        state.up = True
+        self._tick_node(node)
+
+    def _fail_link_proc(self, link: str, at_s: float, recover_s: float | None):
+        yield from self._wait_until(at_s)
+        self._down_links.add(link)
+        if recover_s is None:
+            return
+        yield from self._wait_until(recover_s)
+        self._down_links.discard(link)
+
+    def _stream_proc(
+        self, flow: Flow, rate_hz: float, start_s: float, duration_s: float
+    ):
+        yield from self._wait_until(start_s)
+        interval_ms = 1000.0 / rate_hz
+        count = round(duration_s * rate_hz)
+        dest_mac = self._states[flow.dest].mac
+        for seq in range(count):
+            # Recorded even when the source is down: the application tried,
+            # and a packet that never left is as lost as one dropped en route.
+            flow.record_sent(seq, self.env.now / 1000.0)
+            src = self._states[flow.src]
+            if src.up:
+                src.driver.queue_local_send(
+                    dest_mac, encode_payload(flow.flow_id, seq)
+                )
+            yield self.env.timeout(interval_ms)
 
     def _sample_proc(self, interval_ms: int):
         assert self._recorder is not None
