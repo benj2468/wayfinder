@@ -109,3 +109,18 @@ def test_tx_counters_count_router_egress_and_stop_while_down():
     sim.run(until_s=6.0)
     assert sim.tx_frames("a") == frames
     assert sim.tx_frames("b") > 0
+
+
+def test_next_hop_and_route_path_follow_the_originator_tables():
+    nodes = [Node(n, trickle=FAST) for n in ("a", "b", "c")]
+    from wayfinder_sim.topology import path
+
+    sim = Simulation(nodes, path(["a", "b", "c"], PerfectWire()), seed=0)
+    assert sim.next_hop("a", "c") is None
+    assert sim.route_path("a", "c") is None
+    sim.run(until_s=4.0)
+
+    assert sim.next_hop("a", "c") == "b"
+    assert sim.next_hop("a", "b") == "b"
+    assert sim.route_path("a", "c") == ("a", "b", "c")
+    assert sim.route_path("a", "a") == ("a",)

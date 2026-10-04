@@ -576,6 +576,32 @@ class Simulation:
             return "*"
         return self._states[src].interfaces[egress.interface].name
 
+    def next_hop(self, src: str, dest: str) -> str | None:
+        """The neighbour `src` forwards toward `dest` through, by name, or
+        `None` with no usable route. On a shared segment every route leaves
+        by the same link, so this — not `route_via` — is what says which
+        relay is carrying the traffic."""
+        mac = self._states[dest].mac
+        for record in self._states[src].driver.originator_table():
+            if record.originator == mac and record.best_next_hop is not None:
+                return self.node_for_mac(record.best_next_hop)
+        return None
+
+    def route_path(self, src: str, dest: str) -> tuple[str, ...] | None:
+        """The whole path `src`'s traffic to `dest` takes right now, hop by
+        hop through each relay's *own* next-hop choice, or `None` if it breaks
+        anywhere (a hop with no route, or a forwarding loop).
+
+        Each hop's choice is that node's, not `src`'s: BATMAN routes hop by
+        hop, so this is the path a packet would actually walk."""
+        path = [src]
+        while path[-1] != dest:
+            hop = self.next_hop(path[-1], dest)
+            if hop is None or hop in path:
+                return None
+            path.append(hop)
+        return tuple(path)
+
     def link_quality(self, src: str, neighbor: str) -> float | None:
         """`src`'s own estimate of the link it hears `neighbor` on — the EWMA
         over frames received directly from it — or `None` if `src` has no
