@@ -87,6 +87,22 @@ impl BoardKind {
             BoardKind::Stm32wl55Nucleo => "STM32WL55JCIx",
         }
     }
+
+    /// The register reporting which memory this part booted from, for a part
+    /// that can boot its ROM bootloader *by accident* after a flash.
+    ///
+    /// An STM32 samples at power-on whether its flash is blank and, if so,
+    /// maps the ROM bootloader at `0`; a system reset does not re-sample. So a
+    /// board erased, power-cycled and then flashed keeps booting the bootloader
+    /// through every reset — the image is correct and never runs. `SYSCFG_MEMRMP`
+    /// is set by hardware from that decision, so it is reliable immediately
+    /// after reset, where `VTOR` is written by the bootloader some time later.
+    pub fn boot_remap_register(self) -> Option<u32> {
+        match self {
+            BoardKind::Nrf52840Dk | BoardKind::Nrf52840Dongle => None,
+            BoardKind::Stm32wl55Nucleo => Some(0x4001_0000),
+        }
+    }
 }
 
 /// One attached board, as the inventory describes it.
@@ -109,10 +125,44 @@ pub struct BoardSpec {
     pub usb: String,
 }
 
+/// What kind of radio module a [`RadioSpec`] is.
+///
+/// A radio module is not a board: it runs its vendor's firmware rather than
+/// ours, has no probe and no management API, and a test drives it over its own
+/// serial protocol. It is in the inventory so a test can find it by role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum RadioKind {
+    /// A REYAX RYLR998 LoRa module, on an AT-command UART behind a USB-serial
+    /// adapter.
+    #[serde(rename = "rylr998")]
+    Rylr998,
+}
+
+/// One attached radio module, as the inventory describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadioSpec {
+    /// The name tests ask for (`rig.radio("lora")`). Unique across boards and
+    /// radios alike.
+    pub role: String,
+    /// What kind of module it is.
+    pub kind: RadioKind,
+    /// The USB serial number of the adapter it sits behind, used to find its
+    /// `/dev/ttyUSB*` (or `/dev/ttyACM*`) node.
+    pub usb: String,
+    /// The carrier frequency, in Hz, every radio test on this rig uses.
+    ///
+    /// **Required, with no default**: which band is licence-free depends on
+    /// where the rig is, so only the operator can say. Tests both configure the
+    /// module and build the board's firmware at this value.
+    pub frequency_hz: u32,
+}
+
 /// The set of boards attached to this machine.
 #[derive(Debug, Clone, Default)]
 pub struct Inventory {
     boards: Vec<BoardSpec>,
+    radios: Vec<RadioSpec>,
     /// Where the inventory was read from, so a [`Missing`] can say what was
     /// consulted. `None` when no file existed.
     source: Option<PathBuf>,
@@ -224,6 +274,8 @@ impl std::fmt::Display for Missing {
 struct InventoryFile {
     #[serde(default)]
     board: Vec<BoardSpec>,
+    #[serde(default)]
+    radio: Vec<RadioSpec>,
 }
 
 impl Inventory {
@@ -354,9 +406,24 @@ impl Inventory {
                 });
             }
         }
+        // The same checks for radios, and into the same `seen`: one role names
+        // one device, whichever table it is in.
+        for radio in &file.radio {
+            if !seen.insert(radio.role.clone()) {
+                return Err(InventoryError::DuplicateRole {
+                    role: radio.role.clone(),
+                });
+            }
+            if radio.usb.trim().is_empty() {
+                return Err(InventoryError::EmptyUsbSerial {
+                    role: radio.role.clone(),
+                });
+            }
+        }
 
         Ok(Inventory {
             boards: file.board,
+            radios: file.radio,
             source: Some(path.to_path_buf()),
         })
     }
@@ -365,6 +432,7 @@ impl Inventory {
     pub fn empty() -> Inventory {
         Inventory {
             boards: Vec::new(),
+            radios: Vec::new(),
             source: None,
         }
     }
@@ -384,6 +452,23 @@ impl Inventory {
     /// Every board the inventory names, in file order.
     pub fn boards(&self) -> &[BoardSpec] {
         &self.boards
+    }
+
+    /// The radio module playing `role`, or why there is none.
+    pub fn radio(&self, role: &str) -> Result<&RadioSpec, Missing> {
+        self.radios
+            .iter()
+            .find(|r| r.role == role)
+            .ok_or_else(|| Missing {
+                role: role.to_string(),
+                known: self.radios.iter().map(|r| r.role.clone()).collect(),
+                source: self.source.clone(),
+            })
+    }
+
+    /// Every radio module the inventory names, in file order.
+    pub fn radios(&self) -> &[RadioSpec] {
+        &self.radios
     }
 }
 
@@ -408,6 +493,108 @@ usb  = "CD1F4A0099EE"
 
     fn parse(text: &str) -> Result<Inventory, InventoryError> {
         Inventory::parse(text, Path::new("hil.toml"))
+    }
+
+    /// A WL55 and the RYLR998 that talks to it: one board, one radio module.
+    const WL55_AND_RADIO: &str = r#"
+[[board]]
+role  = "wl55"
+kind  = "stm32wl55-nucleo"
+probe = "003900314142500E20353451"
+usb   = "003900314142500E20353451"
+
+[[radio]]
+role         = "lora"
+kind         = "rylr998"
+usb          = "0001"
+frequency_hz = 915000000
+"#;
+
+    /// A radio module is not a board — it has no firmware of ours, no probe and
+    /// no management API — so it is its own table, looked up by role the same
+    /// way.
+    #[test]
+    fn a_named_radio_resolves_to_its_module() {
+        let inv = parse(WL55_AND_RADIO).unwrap();
+
+        let radio = inv.radio("lora").unwrap();
+        assert_eq!(radio.kind, RadioKind::Rylr998);
+        assert_eq!(radio.usb, "0001");
+        assert_eq!(radio.frequency_hz, 915_000_000);
+
+        assert_eq!(inv.radios().len(), 1);
+        assert_eq!(inv.boards().len(), 1, "a radio is not counted as a board");
+    }
+
+    /// Radios and boards are looked up separately: asking for a board by a
+    /// radio's role is a skip, not a radio dressed up as a board.
+    #[test]
+    fn a_radio_role_is_not_a_board_role() {
+        let inv = parse(WL55_AND_RADIO).unwrap();
+        assert!(inv.board("lora").is_err());
+        assert!(inv.radio("wl55").is_err());
+    }
+
+    /// An absent radio is a skip that names what the file does carry, exactly
+    /// like an absent board.
+    #[test]
+    fn an_unknown_radio_is_a_skip_that_names_what_is_attached() {
+        let inv = parse(WL55_AND_RADIO).unwrap();
+        let missing = inv.radio("sx1262").unwrap_err();
+        assert_eq!(missing.role, "sx1262");
+        assert!(missing.known.contains("lora"), "{missing}");
+    }
+
+    /// **No default band.** Which frequencies are licence-free depends on where
+    /// the rig is, and a default would put some operator's radio outside their
+    /// band without a word — a RYLR998 and a WL55 both transmit as soon as a
+    /// test asks them to. So the inventory has to say.
+    #[test]
+    fn a_radio_without_a_frequency_is_refused() {
+        let text = r#"
+[[radio]]
+role = "lora"
+kind = "rylr998"
+usb  = "0001"
+"#;
+        assert!(matches!(parse(text), Err(InventoryError::Parse { .. })));
+    }
+
+    /// One role names one device, across both tables: a test that asks for
+    /// "lora" must not get a different part depending on which lookup it used.
+    #[test]
+    fn a_role_shared_by_a_board_and_a_radio_is_refused() {
+        let text = r#"
+[[board]]
+role = "lora"
+kind = "nrf52840-dongle"
+usb  = "CD1F4A0099EE"
+
+[[radio]]
+role         = "lora"
+kind         = "rylr998"
+usb          = "0001"
+frequency_hz = 915000000
+"#;
+        assert!(
+            matches!(parse(text), Err(InventoryError::DuplicateRole { role }) if role == "lora")
+        );
+    }
+
+    /// The same blank-serial hazard as a board's: an empty `usb` would match any
+    /// adapter that reports no serial.
+    #[test]
+    fn a_radio_with_an_empty_usb_serial_is_refused() {
+        let text = r#"
+[[radio]]
+role         = "lora"
+kind         = "rylr998"
+usb          = " "
+frequency_hz = 915000000
+"#;
+        assert!(
+            matches!(parse(text), Err(InventoryError::EmptyUsbSerial { role }) if role == "lora")
+        );
     }
 
     /// The ordinary case: a role the file names resolves to that board.

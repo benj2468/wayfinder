@@ -13,6 +13,12 @@ publish = false
 members = ["."]
 
 # `#[no_std]`/`#[no_main]` can't build the host `test` harness.
+[lib]
+path = "src/lib.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "wayfinder-wl55jc"
 path = "src/main.rs"
@@ -52,6 +58,10 @@ wayfinder-log = { path = "../../libs/wayfinder-log", default-features = false, f
 # which is what an on-die SX126x is (unlike the RYLR998 module `rylr998`
 # drives, which does its own addressing).
 lora-link = { path = "../../libs/lora-link" }
+# The RYLR998's on-air framing (`air`), for the HIL echo example only. No
+# default features: the `link` adapter pulls in the router, and nothing here
+# talks AT commands.
+rylr998 = { path = "../../libs/rylr998", default-features = false }
 tracing = { version = "0.1.44", default-features = false }
 
 # STM32WL55JC, Cortex-M4 core (CPU1). The CM0+ is never released — see
