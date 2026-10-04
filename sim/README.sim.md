@@ -415,6 +415,10 @@ results page (`www/sim/`, wayfndr.dev/sim) draws — see
 `www/sim/data`. Each has a `sim/tests/test_<name>.py` pinning the claims its
 page states.
 
+`mountain_relay.py` and `satellite_relay.py` take `--export DIR` too, for the
+page's range-and-terrain section; with it they write the JSON and skip their
+own charts and HTML reports.
+
 ## Topology
 
 The default is a **4-node diamond bolted onto a 5-node complete-graph mesh**,

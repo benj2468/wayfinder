@@ -907,11 +907,219 @@ def write_sweep_report_page(
     print(f"Sweep report written to {out_path}")
 
 
-def main() -> None:
+# --- results page -------------------------------------------------------------
+
+
+def showcase(results: Sequence[SweepResult[tuple[int, int]]]) -> Any:
+    """The results-page entry: the constellation geometries compared, and the
+    default shell's flight as path depth, gateway sky and distance over time."""
+    from wayfinder_sim.showcase import Chart, Headline, Series, Showcase, downsample
+
+    labels = [geometry_label(r.param) for r in results]
+    by_geometry = {r.param: r.recorder for r in results}
+    default = by_geometry.get((DEFAULT_PLANES, DEFAULT_PER_PLANE), results[-1].recorder)
+    split = [
+        g
+        for g in by_geometry
+        if g[0] > 1 and g[0] * g[1] == DEFAULT_PLANES * DEFAULT_PER_PLANE
+    ]
+    split_best = max(
+        (stats_for(by_geometry[g]).connected_fraction for g in split), default=None
+    )
+    d_stats = stats_for(default)
+    d_visible, _ = sky_stats(default)
+
+    minutes = [t / 60 for t in default.times_s]
+    hops = [len(p) - 1 if p else None for p in default.column("path")]
+    sky = [len(v) for v in default.column("visible")]
+    dist_km = [
+        pos["low"].distance_to(pos["gcsa"]) / 1000
+        for pos in default.column("positions")
+    ]
+    # Route depth against distance: one point per (25 km bucket, depth) seen,
+    # rather than every Nth sample — thinning by stride throws away exactly
+    # the rare deep routes the chart exists to show.
+    seen: dict[tuple[int, int], float] = {}
+    for d, h in zip(dist_km, hops):
+        if h is not None:
+            seen.setdefault((round(d / 25), h), d)
+    routed = sorted((d, h) for (_, h), d in seen.items())
+    # Passes over the gateway, first two hours only: over five orbits the
+    # square wave is too dense to read a single pass off.
+    early = [(m, v) for m, v in zip(minutes, sky) if m <= 120]
+    sx_, sy_ = downsample([m for m, _ in early], [v for _, v in early])
+    dx, dy = downsample(minutes, dist_km, max_points=300)
+    farthest_km = max(dist_km) if dist_km else 0.0
+
+    return Showcase(
+        slug="satellite-relay",
+        title="Relaying through orbit",
+        category="range",
+        scenario="sim/scenarios/satellite_relay.py",
+        question="An aircraft flies 9,000 km from its gateway. Can a small satellite constellation keep the mesh connected?",
+        headlines=[
+            Headline(
+                f"{d_stats.connected_fraction:.0%}",
+                "of five orbits with a route to the aircraft",
+                f"six satellites in one plane; longest gap {longest_gap_s(default) / 60:.0f} min",
+            ),
+            Headline(
+                f"{split_best:.0%}" if split_best is not None else "–",
+                "with the same six satellites split across planes",
+                "the inter-satellite ring only closes within one plane",
+            ),
+            Headline(
+                f"{max_path_hops(default)} hops",
+                "deepest route the mesh found",
+                "aircraft, satellites, gateway: routed hop by hop by BATMAN",
+            ),
+        ],
+        summary=(
+            f"An aircraft flies out along a great circle, {farthest_km:,.0f} km from its gateway by the end "
+            f"of the run, while the gateway tries "
+            f"to keep a route to it through a ring of satellites at {ALTITUDE_M / 1000:,.0f} km, "
+            f"on real Keplerian orbits ({ORBIT_PERIOD_S / 60:.0f}-minute period). Users can work a "
+            f"satellite only above {MIN_ELEVATION_DEG:.0f}° elevation, and the planet blocks any path "
+            f"that dips below its surface. The gateway has a workable satellite {d_visible:.0%} of the "
+            f"time, but the aircraft is often under a different one thousands of kilometres away, so "
+            f"the traffic has to cross the ring between satellites. With six satellites in one plane the "
+            f"mesh keeps a route {d_stats.connected_fraction:.0%} of the time, as deep as "
+            f"{max_path_hops(default)} hops."
+            + (
+                f" Split the same six across planes and that falls to {split_best:.0%}: the links "
+                f"between neighbouring satellites only close inside a plane, so splitting them breaks "
+                f"exactly the hops the long route depends on."
+                if split_best is not None
+                else ""
+            )
+        ),
+        method=(
+            "Satellites follow circular Earth orbits rendered into a local east-north-up frame; the "
+            "aircraft flies a great circle at 10 km and 250 m/s. User links are Ku-band (12 GHz) "
+            f"free-space loss at {UT_EIRP_DBM:g} dBm EIRP into a {SAT_RX_GAIN_DBI:g} dBi array, masked "
+            f"below {MIN_ELEVATION_DEG:.0f}° elevation and by the Earth itself. Inter-satellite links are "
+            f"a high-gain RF stand-in for optical links with an {ISL_MAX_RANGE_M / 1e6:.0f},000 km "
+            "acquisition range. Every node runs the real wayfinder router with 2–10 s adverts, sampled "
+            "every 5 s over five orbits per geometry."
+        ),
+        charts=[
+            Chart(
+                title="Constellation geometry: sky vs. reach",
+                x_label="planes × satellites per plane",
+                y_label="share of five orbits",
+                series=[
+                    Series(
+                        "gateway can work a satellite",
+                        labels,
+                        [sky_stats(r.recorder)[0] for r in results],
+                        kind="bar",
+                    ),
+                    Series(
+                        "route to the aircraft",
+                        labels,
+                        [stats_for(r.recorder).connected_fraction for r in results],
+                        kind="bar",
+                    ),
+                ],
+                y_range=(0.0, 1.0),
+                caption="A route can exceed the gateway's own sky: the aircraft works a satellite the gateway cannot see, and the ring carries it home.",
+            ),
+            Chart(
+                title="Longest gap with no route",
+                x_label="planes × satellites per plane",
+                y_label="minutes",
+                series=[
+                    Series(
+                        "longest gap",
+                        labels,
+                        [longest_gap_s(r.recorder) / 60 for r in results],
+                        kind="bar",
+                    )
+                ],
+            ),
+            Chart(
+                title="Route depth vs. how far away the aircraft is (six in one plane)",
+                x_label="aircraft distance from the gateway (km)",
+                y_label="hops, gateway to aircraft",
+                series=[
+                    Series(
+                        "route found",
+                        [d for d, _ in routed],
+                        [float(h) for _, h in routed],
+                        kind="scatter",
+                    )
+                ],
+                caption=(
+                    "Two hops is one satellite both ends can see. Three or more and the route is crossing "
+                    "the ring between satellites, which is what the far end of the flight depends on."
+                ),
+            ),
+            Chart(
+                title="Satellite passes over the gateway (first two hours)",
+                x_label="time (min)",
+                y_label="satellites above the mask",
+                series=[Series("workable satellites", sx_, sy_, kind="step")],
+                caption=f"Below {MIN_ELEVATION_DEG:.0f}° a user terminal will not work a satellite; each pass lasts minutes.",
+            ),
+            Chart(
+                title="How far away the aircraft is",
+                x_label="time (min)",
+                y_label="km from the gateway",
+                series=[Series("ground distance", dx, dy)],
+            ),
+        ],
+        table=[
+            [
+                "geometry",
+                "gateway sky",
+                "aircraft reachable (of sky)",
+                "route",
+                "longest gap (min)",
+                "deepest path",
+            ]
+        ]
+        + [
+            [
+                geometry_label(r.param),
+                round(sky_stats(r.recorder)[0], 3),
+                round(sky_stats(r.recorder)[1], 3),
+                round(stats_for(r.recorder).connected_fraction, 3),
+                round(longest_gap_s(r.recorder) / 60, 1),
+                max_path_hops(r.recorder),
+            ]
+            for r in results
+        ],
+        params={
+            "altitude_m": ALTITUDE_M,
+            "min_elevation_deg": MIN_ELEVATION_DEG,
+            "flight_range_km": FLIGHT_RANGE_M / 1000,
+            "geometries": [list(g) for g in CONSTELLATION_SWEEP],
+            "orbits": 5,
+        },
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
+    parser.add_argument(
+        "--export",
+        type=Path,
+        help="write the results page's JSON into this directory and skip the charts",
+    )
+    args = parser.parse_args(argv)
     wf.init_tracing()  # quiet by default; set RUST_LOG to see mesh internals
 
     out_dir = Path(__file__).parent / "output"
     results = run_constellation_sweep()
+    if args.export:
+        from wayfinder_sim.showcase import write_showcase
+
+        for result in results:
+            print_summary(result.recorder, result.param)
+        print(f"wrote {write_showcase(showcase(results), args.export)}")
+        return
     for i, result in enumerate(results):
         rec = result.recorder
         print_summary(rec, result.param)
