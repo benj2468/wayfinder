@@ -17,13 +17,25 @@
 //! Keeping it behind `InterfaceVariant` is what stops those registers leaking
 //! into anything reusable — `libs/lora-link` knows nothing about them.
 
+use embassy_futures::yield_now;
 use embassy_stm32::interrupt::InterruptExt;
 use embassy_stm32::pac;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::Duration;
+use embassy_time::Instant;
 use embedded_hal_async::delay::DelayNs;
 use lora_phy::mod_params::RadioError;
 use lora_phy::mod_traits::InterfaceVariant;
+
+/// The longest [`InterfaceVariant::wait_on_busy`] waits for the radio before
+/// reporting it stuck.
+///
+/// The slowest legitimate BUSY period in the SX126x datasheet is a few
+/// milliseconds (a full calibration, or waking with the TCXO's start-up
+/// delay). Twenty times that is still far below anything an operator would
+/// notice, and far above anything a healthy radio does.
+pub const BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Fired by the `SUBGHZ_RADIO` interrupt, awaited by [`InterfaceVariant::await_irq`].
 ///
@@ -96,13 +108,26 @@ where
         Ok(())
     }
 
-    /// Spin until `PWR.SR2.RFBUSYS` clears.
+    /// Wait until `PWR.SR2.RFBUSYS` clears, or fail with
+    /// [`RadioError::Busy`] after [`BUSY_TIMEOUT`].
     ///
-    /// A busy-wait rather than an interrupt: the radio deasserts this within
-    /// microseconds of a command, and it is read between SPI transactions
-    /// rather than across an idle period, so there is nothing to sleep for.
+    /// Polled rather than interrupt-driven: the radio deasserts this within
+    /// microseconds of most commands, and a few milliseconds after the slow
+    /// ones (calibration, TCXO start-up), so there is nothing worth sleeping
+    /// on. **But it yields between reads, and it gives up.** A plain spin here
+    /// once had neither, and on a single thread-mode executor a stuck
+    /// `RFBUSYS` (a radio fault, a lost reset) then starved every task —
+    /// the driver loop included — with the node's LED still lit (#76). The
+    /// error reaches the radio task's existing failure paths: the rx backoff
+    /// on the receive side, a failed fragment on the transmit side.
     async fn wait_on_busy(&mut self) -> Result<(), RadioError> {
-        while pac::PWR.sr2().read().rfbusys() {}
+        let deadline = Instant::now() + BUSY_TIMEOUT;
+        while pac::PWR.sr2().read().rfbusys() {
+            if Instant::now() >= deadline {
+                return Err(RadioError::Busy);
+            }
+            yield_now().await;
+        }
         Ok(())
     }
 
