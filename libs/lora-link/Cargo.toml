@@ -6,9 +6,26 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# The `LinkT` half of a raw-LoRa adapter: the side that only awaits channels,
+# so its cancel-safety is host-testable. Off by default so the framing stays
+# dependency-light; the radio-owning task stays in the board, which is the only
+# place that knows the chip.
+link = ["dep:wayfinder", "dep:embassy-sync", "dep:heapless"]
+
 [dependencies]
 interfaces.workspace = true
 tracing = { version = "0.1.44", default-features = false }
 # Shared small-MTU fragmentation/reassembly, as `rylr998`, `blue` and
 # `ieee802154` all use.
 wayfinder-link-utils = { path = "../wayfinder-link-utils" }
+wayfinder = { path = "../wayfinder", default-features = false, optional = true }
+embassy-sync = { workspace = true, optional = true }
+heapless = { workspace = true, optional = true }
+
+[dev-dependencies]
+# A host impl for `CriticalSectionRawMutex`: `LinkT` is `Send`, so the tests
+# need a `Sync` mutex, and `NoopRawMutex` is deliberately not one.
+critical-section = { version = "1.2", features = ["std"] }
+embassy-futures.workspace = true
+futures.workspace = true
