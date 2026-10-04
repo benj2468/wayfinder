@@ -455,7 +455,7 @@ mod tests {
         // would not if the foreign one had taken a slot it never releases.
         assert!(matches!(
             decode_fragment(NET, &frags[0]),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 
@@ -679,7 +679,7 @@ mod tests {
         for len in 0..HEADER_LEN + FRAG_HDR_LEN {
             let buf = vec![NET; len];
             assert!(
-                matches!(decode_fragment(NET, &buf), Err(LinkError::InvalidPacket)),
+                matches!(decode_fragment(NET, &buf), Err(LinkError::MalformedFrame)),
                 "a {len}-byte packet is too short to be a fragment"
             );
         }
@@ -699,14 +699,14 @@ mod tests {
         buf[HEADER_LEN + 1] = 0x00;
         assert!(matches!(
             decode_fragment(NET, &buf),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
 
         // index == count
         buf[HEADER_LEN + 1] = (2 << 4) | 2;
         assert!(matches!(
             decode_fragment(NET, &buf),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 
@@ -847,7 +847,7 @@ mod tests {
         assert!(decode_fragment(NET, &raw_packet(NET, 1, 0, most, FRAG_PAYLOAD)).is_ok());
         assert!(matches!(
             decode_fragment(NET, &raw_packet(NET, 1, 0, most + 1, FRAG_PAYLOAD)),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
     }
 
@@ -860,10 +860,39 @@ mod tests {
         assert!(decode_fragment(NET, &raw_packet(NET, 1, 0, 2, FRAG_PAYLOAD)).is_ok());
         assert!(matches!(
             decode_fragment(NET, &raw_packet(NET, 1, 0, 2, FRAG_PAYLOAD - 1)),
-            Err(LinkError::InvalidPacket)
+            Err(LinkError::MalformedFrame)
         ));
         // The last fragment is the one that may be short.
         assert!(decode_fragment(NET, &raw_packet(NET, 1, 1, 2, 1)).is_ok());
+    }
+
+    /// **Bytes off the air that do not parse are `MalformedFrame`, never
+    /// `InvalidPacket`.** The driver raises the interface's `LinkErrors` alarm
+    /// for every `recv` error but `MalformedFrame`, so the wrong variant lets
+    /// anyone who knows `net_id` latch that alarm with a single packet: one
+    /// complete fragment too short to hold a `LinkFrame` header.
+    #[test]
+    fn bytes_off_the_air_that_do_not_parse_are_malformed_frames() {
+        let runt = raw_packet(NET, 1, 0, 1, LINK_HEADER_LEN - 1);
+        let mut reassembler = LoraReassembler::new();
+        let mut out = [0u8; MAX_REASSEMBLED_LEN];
+        let (len, _) = accept_fragment(
+            &mut reassembler,
+            NET,
+            &runt,
+            LinkMetrics::default(),
+            &mut out,
+        )
+        .expect("a one-fragment message completes");
+
+        assert!(matches!(
+            decode_frame(&out[..len]),
+            Err(LinkError::MalformedFrame)
+        ));
+        assert!(matches!(
+            decode_fragment(OTHER_NET, &runt),
+            Err(LinkError::MalformedFrame)
+        ));
     }
 
     /// `fragment_count` at every boundary its doc calls out.
