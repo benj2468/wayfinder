@@ -1,0 +1,246 @@
+{
+ "schema": 1,
+ "slug": "battery-life",
+ "title": "Battery life of a mesh node",
+ "question": "How long will a node run on batteries, and what actually drains them?",
+ "headlines": [
+  {
+   "value": "21 days",
+   "label": "for a typical sensor on 2x AA lithium",
+   "detail": "17.6 mW average, routing for its neighbours"
+  },
+  {
+   "value": "94%",
+   "label": "of the energy is spent listening",
+   "detail": "the receiver stays open to hear every routing advert"
+  },
+  {
+   "value": "10 years",
+   "label": "for a sensor that sleeps instead of routing",
+   "detail": "same readings, no mesh duties; radio only, before battery self-discharge"
+  }
+ ],
+ "summary": "Every node in a wayfinder mesh is a router, so its receiver never sleeps: it has to hear its neighbours' routing adverts to keep its routes. An open LoRa receiver draws about 17 mW whether or not anything arrives, and that dominates everything else. A typical sensor here spends 94% of its energy listening and lasts 21 days on 2x AA lithium. Its transmissions (its readings, plus relayed adverts) barely register, which is why slowing the advert schedule hardly changes battery life (chart 2). The lever that matters is a receiver that can sleep between frames. Chart 4 prices the same measured traffic at lower listening power to show what that would be worth. A sensor that didn't route at all would last 10 years, which is the cost of being part of a mesh.",
+ "charts": [
+  {
+   "title": "Where the energy goes (per hour)",
+   "x_label": "node",
+   "y_label": "millijoules per hour",
+   "series": [
+    {
+     "name": "listen",
+     "x": [
+      "gateway",
+      "typical sensor",
+      "busiest sensor"
+     ],
+     "y": [
+      59559.5272,
+      59554.3777,
+      59572.5706
+     ],
+     "kind": "bar"
+    },
+    {
+     "name": "receive",
+     "x": [
+      "gateway",
+      "typical sensor",
+      "busiest sensor"
+     ],
+     "y": [
+      1459.2294,
+      1380.1981,
+      1327.7681
+     ],
+     "kind": "bar"
+    },
+    {
+     "name": "transmit",
+     "x": [
+      "gateway",
+      "typical sensor",
+      "busiest sensor"
+     ],
+     "y": [
+      1599.2064,
+      2341.9776,
+      2644.0704
+     ],
+     "kind": "bar"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": "Listening, with the receiver open waiting for frames, outweighs everything the radio actually sends or receives.",
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Battery life vs. advert interval",
+   "x_label": "advert interval (s)",
+   "y_label": "days on 2x AA lithium",
+   "series": [
+    {
+     "name": "typical sensor",
+     "x": [
+      60,
+      300,
+      900,
+      1800
+     ],
+     "y": [
+      20.4572,
+      21.3349,
+      21.768,
+      21.8476
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "gateway",
+     "x": [
+      60,
+      300,
+      900,
+      1800
+     ],
+     "y": [
+      20.4582,
+      21.5593,
+      21.8772,
+      21.9569
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": "Nearly flat: fewer adverts save transmit and receive energy, but listening costs the same.",
+   "x_log": true,
+   "heatmap": null
+  },
+  {
+   "title": "Battery life vs. sensors on the channel",
+   "x_label": "sensors on the channel",
+   "y_label": "days on 2x AA lithium",
+   "series": [
+    {
+     "name": "typical sensor",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10
+     ],
+     "y": [
+      21.75,
+      21.5793,
+      21.3349,
+      21.1367,
+      21.0628
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "gateway",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10
+     ],
+     "y": [
+      21.8605,
+      21.6844,
+      21.5593,
+      21.2451,
+      21.2707
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": null,
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "What a sleeping receiver would be worth (upper bound)",
+   "x_label": "average listening power (mW)",
+   "y_label": "days on 2x AA lithium",
+   "series": [
+    {
+     "name": "typical sensor",
+     "x": [
+      17.0,
+      5.0,
+      1.0,
+      0.3,
+      0.1
+     ],
+     "y": [
+      21.3349,
+      63.5648,
+      186.8415,
+      282.833,
+      331.4921
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": "17 mW is an always-open receiver, today's behaviour. Lower values re-price the same measured traffic.",
+   "x_log": true,
+   "heatmap": null
+  }
+ ],
+ "params": {
+  "sensors": 6,
+  "advert_i_max_s": 300.0,
+  "report_interval_s": 120.0,
+  "tx_mw": 150.0,
+  "rx_mw": 17.0,
+  "battery_mwh": {
+   "2x AA lithium": 9000.0,
+   "18650 Li-ion cell": 12240.0
+  }
+ },
+ "method": "The network and channel are the crowded-LoRa scenario's: SF7 at 868 MHz, 1% duty cycle, 6 sensors plus a gateway, one reading per 120 s. Every radio's transmit, receive and idle time is metered from the simulated medium over one hour after warm-up and priced for an SX1262-class radio at 3.3 V (150 mW transmit, 17 mW receive or listening). Batteries: 2x AA lithium \u2248 9 Wh. The listening-power and sleeping-leaf figures re-price measured activity and are upper bounds: wayfinder does not doze its receiver today, and a dozing receiver would miss frames this model does not account for.",
+ "table": [
+  [
+   "node",
+   "average power (mW)",
+   "days on 2x AA lithium",
+   "days on 18650",
+   "listening share"
+  ],
+  [
+   "gateway",
+   17.39,
+   21.6,
+   29.3,
+   0.951
+  ],
+  [
+   "typical sensor",
+   17.58,
+   21.3,
+   29.0,
+   0.941
+  ],
+  [
+   "busiest sensor",
+   17.65,
+   21.2,
+   28.9,
+   0.937
+  ]
+ ],
+ "category": "planning",
+ "scenario": "sim/scenarios/battery_life.py"
+}

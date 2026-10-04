@@ -19,6 +19,7 @@ reconsider — not before.
 | `styles.css`                | All styling, driven by the token block at the top.                                                    |
 | `mesh.js`                   | The hero diagram, plus two small page behaviours. No dependencies.                                    |
 | `og.html`                   | 1200×630 source for the social card. **Not published** — the build script deletes it from the output. |
+| `sim/`                      | The simulation lab (`/sim/`): `index.html`, `lab.css`, `lab.js`, and `data/*.json` exported by the scenarios. |
 | `_headers`                  | Cloudflare Pages security headers + cache policy.                                                     |
 | `robots.txt`, `sitemap.xml` | Standard.                                                                                             |
 
@@ -172,6 +173,30 @@ commands.
 Rollback is instant and needs none of the above: _Pages project → Deployments →
 ⋯ → Rollback_ on any previous deployment.
 
+## The simulation lab (`/sim/`)
+
+An engineering-forward page of results from the physics simulator
+(`sim/`): failover, a captured radio, jammers, relay coverage, battery life, a
+crowded LoRa channel and scale. Every chart is drawn by `sim/lab.js` from
+`sim/data/<slug>.json`, which the scenario scripts write
+(`wayfinder_sim.showcase`); nothing on the page is typed in by hand.
+
+- **Refreshing the numbers** is re-running the scenarios: `just sim-export`
+  (several minutes). It reinstalls the compiled router first, because the sim's
+  Python extension does not rebuild itself and a stale one silently shows the
+  last build's behaviour.
+- **The data ships as a script, not a fetch.** The CSP is `connect-src 'none'`,
+  so `build-site.sh` concatenates `data/*.json` into `/sim/data.js`
+  (`window.WF_SIM`). The JSON files are published as well — each section links
+  its raw results — but nothing fetches them.
+- **The schema is versioned** (`schema: 1`); `lab.js` ignores files it does not
+  understand rather than mis-drawing them. Chart kinds: line, step, scatter,
+  bar, plus a heatmap with an overlay.
+- **Chart colour** is the simulator's validated palette
+  (`sim/src/wayfinder_sim/palette.py`), checked against the chart surface with
+  the dataviz validator. Two of its hues are under 3:1 there, which is why
+  every multi-series chart has a legend and every chart a data table.
+
 ## Content that will need revisiting
 
 The page points people at the **open-source repository**
@@ -181,7 +206,10 @@ link there. A few things should be changed deliberately, not left to rot:
 - **`info@wayfndr.dev`** appears in two places in `index.html` (the closing
   card and the footer). It needs a mailbox behind it; Cloudflare Email Routing will
   forward it to a real address without hosting mail.
-- **No claims carry numbers.** Every technical statement on the page is
+- **No claims on the landing page carry numbers.** (The simulation lab does,
+  because each comes with its model, parameters and the command that
+  reproduces it — and is labelled as simulation, not field measurement.)
+  Every technical statement on the landing page is
   qualitative (`no_std`, "zero allocation on the packet path") because those are
   verifiable from the repo. Adding a throughput, range or latency figure means
   having a measurement to point at — the benchmarks in `libs/wayfinder-bench`

@@ -366,6 +366,17 @@ site-serve: site-build
     @echo "wayfndr.dev preview -> http://127.0.0.1:8899"
     cd dist/site && python3 -m http.server 8899
 
+# The simulation lab (`www/sim/`) draws JSON the scenario scripts export, so
+# refreshing its numbers is re-running them — never hand-editing the data. The
+# sim's compiled router does not rebuild itself (it is a Python extension), so
+# reinstall it first or the page will show the last build's behaviour.
+[doc("Re-run every showcase scenario and refresh www/sim/data (several minutes).")]
+sim-export:
+    uv sync --group sim --reinstall-package wayfinder-py
+    for s in failover captured_device coverage_per_relay crowded_lora battery_life jammer_map scale; do \
+        uv run --group sim python sim/scenarios/$s.py --export www/sim/data || exit 1; \
+    done
+
 [doc("Deploy the landing page to Cloudflare Pages (needs CLOUDFLARE_API_TOKEN).")]
 site-deploy branch="main": site-build
     npx --yes wrangler@4 pages deploy dist/site \

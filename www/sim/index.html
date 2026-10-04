@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Simulation lab — Wayfinder</title>
+    <meta
+      name="description"
+      content="Failover, captured radios, jammers, crowded LoRa channels, battery life and scale — measured by running the real Wayfinder router inside a physics simulation."
+    />
+    <link rel="canonical" href="https://wayfndr.dev/sim/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Wayfinder" />
+    <meta property="og:url" content="https://wayfndr.dev/sim/" />
+    <meta property="og:title" content="Wayfinder simulation lab" />
+    <meta
+      property="og:description"
+      content="What the mesh does when relays die, radios are stolen, jammers switch on and channels fill up — measured on the real router."
+    />
+    <meta property="og:image" content="https://wayfndr.dev/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#E9E7E2" />
+
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/sim/lab.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <!-- ============================================================ nav -- -->
+    <header class="nav" id="nav">
+      <div class="wrap nav__inner">
+        <a class="nav__brand" href="/" aria-label="Wayfinder home">
+          <img
+            src="/wayfinder-mark.svg"
+            alt=""
+            width="66"
+            height="45"
+            class="nav__mark"
+          />
+          <span class="nav__word">Wayfinder</span>
+        </a>
+        <nav class="nav__links" aria-label="Primary">
+          <a href="#resilience">Resilience</a>
+          <a href="#security">Security</a>
+          <a href="#planning">Planning</a>
+          <a href="#capacity">Capacity</a>
+          <a href="#found">What it found</a>
+        </nav>
+        <a
+          class="btn btn--sm btn--primary nav__cta"
+          href="https://github.com/benj2468/wayfinder/tree/main/sim"
+          >Source</a
+        >
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- =========================================================== hero -- -->
+      <section class="lab-hero">
+        <div class="wrap">
+          <p class="eyebrow">Simulation lab</p>
+          <h1 class="lab-hero__title">Measured, not claimed.</h1>
+          <p class="lede">
+            What happens when a relay dies, a radio is stolen, a jammer switches
+            on or a LoRa channel fills up? Every number on this page comes from
+            the real Wayfinder router &mdash; the same Rust that runs on the
+            boards &mdash; compiled into a discrete-event simulator and run
+            against models of radios, terrain, interference and failure.
+          </p>
+          <ol class="lab-how" aria-label="How a result is produced">
+            <li>
+              <span class="lab-how__k">Router</span>
+              One real routing engine per node, compiled from this repository,
+              stepped on a virtual clock.
+            </li>
+            <li>
+              <span class="lab-how__k">Physics</span>
+              Free-space and terrain-diffraction path loss, LoRa time-on-air,
+              collisions with capture, half-duplex radios, duty-cycle limits,
+              jammers.
+            </li>
+            <li>
+              <span class="lab-how__k">Measurement</span>
+              Results are read off delivered packets and metered airtime, never
+              off a routing table's opinion of itself.
+            </li>
+          </ol>
+          <p class="lab-hero__note">
+            These are simulations, not field trials: each section states its
+            model and parameters, and every chart can be reproduced with one
+            command from the
+            <a
+              href="https://github.com/benj2468/wayfinder/tree/main/sim/scenarios"
+              >scenario scripts</a
+            >.
+          </p>
+        </div>
+      </section>
+
+      <div id="lab-scenarios" aria-live="polite">
+        <noscript>
+          <div class="wrap lab-noscript">
+            The charts on this page are drawn by a small script. The raw results
+            are in
+            <a
+              href="https://github.com/benj2468/wayfinder/tree/main/www/sim/data"
+              >www/sim/data</a
+            >.
+          </div>
+        </noscript>
+      </div>
+
+      <!-- ===================================================== found bugs -- -->
+      <section class="section section--ink" id="found">
+        <div class="wrap">
+          <p class="eyebrow">What it found</p>
+          <h2 class="section__title">
+            A simulator earns its keep by being wrong about you.
+          </h2>
+          <p class="section__lede">
+            Building these scenarios turned up problems no unit test had: the
+            tests drove one router at a time, or wired nodes through an ideal
+            switch. Each is fixed in the router, with a test that fails without
+            the fix &mdash; except the last, which is open.
+          </p>
+          <div class="found">
+            <article class="found__item">
+              <p class="found__k">Fixed &middot; router</p>
+              <h3 class="found__title">A unicast storm on shared radios</h3>
+              <p>
+                A LoRa or Bluetooth radio hears every frame in range, including
+                ones addressed to a neighbour. An open mesh relayed those
+                overheard frames, and on a shared channel one packet multiplied
+                until its hop limit ran out &mdash; forty copies across three
+                nodes in a fifth of a second.
+              </p>
+            </article>
+            <article class="found__item">
+              <p class="found__k">Fixed &middot; timing</p>
+              <h3 class="found__title">
+                Advert jitter that stopped at 4.3 seconds
+              </h3>
+              <p>
+                Routing adverts are spread at random across each interval so
+                neighbours don't transmit together. The randomness was a 32-bit
+                count of nanoseconds, so for any interval longer than about nine
+                seconds every advert bunched at the start of its window.
+              </p>
+            </article>
+            <article class="found__item">
+              <p class="found__k">Fixed &middot; convergence</p>
+              <h3 class="found__title">
+                New nodes too busy listening to speak
+              </h3>
+              <p>
+                Each newly discovered neighbour rescheduled a node's own advert.
+                Joining a hundred-node mesh, a node kept postponing its
+                introduction until discovery settled: 33 seconds to become
+                reachable, now 2.
+              </p>
+            </article>
+            <article class="found__item found__item--open">
+              <p class="found__k">Open &middot; scale</p>
+              <h3 class="found__title">A full routing table becomes a storm</h3>
+              <p>
+                Past the default router's 128-node table, evicted nodes are
+                re-learned a moment later, each re-learning resets every
+                router's advert timer, and the mesh drowns in its own adverts.
+                The &ldquo;Growing the mesh&rdquo; result above shows the cliff.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="start" id="reproduce">
+        <div class="wrap start__inner">
+          <div>
+            <p class="eyebrow">Reproduce it</p>
+            <h2 class="start__title">Every chart is one command.</h2>
+            <p class="lede">
+              The scenarios are plain Python scripts over the
+              <code>wayfinder-sim</code> package. Each writes the JSON this page
+              draws.
+            </p>
+          </div>
+          <div class="start__card">
+            <p class="start__card-k">From a checkout</p>
+            <pre class="lab-cmd"><code>uv sync --group sim
+uv run --group sim python \
+  sim/scenarios/failover.py \
+  --export www/sim/data</code></pre>
+            <p class="start__card-fine">
+              Or <code>just sim-export</code> to regenerate every result on this
+              page.
+            </p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ========================================================= footer -- -->
+    <footer class="foot">
+      <div class="wrap foot__inner">
+        <div class="foot__brand">
+          <span class="foot__mark" role="img" aria-label="Wayfinder"></span>
+          <p class="foot__tag">Mesh routing for the edge of the network.</p>
+        </div>
+        <nav class="foot__links" aria-label="Footer">
+          <a href="/">Home</a>
+          <a href="/sim/">Simulation lab</a>
+          <a href="https://github.com/benj2468/wayfinder">GitHub</a>
+          <a href="mailto:info@wayfndr.dev">Contact</a>
+        </nav>
+      </div>
+    </footer>
+
+    <div class="lab-tip" id="lab-tip" role="status" hidden></div>
+    <script src="/sim/data.js" defer></script>
+    <script src="/sim/lab.js" defer></script>
+  </body>
+</html>

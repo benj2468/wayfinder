@@ -21,6 +21,11 @@
 /mesh.js
   Cache-Control: public, max-age=3600, must-revalidate
 
+# The simulation lab's page, script and bundled results change only when the
+# scenarios are re-exported — a deploy like any other.
+/sim/*
+  Cache-Control: public, max-age=3600, must-revalidate
+
 # The logo is versioned by the repo, not the URL, and changes about never.
 /*.svg
   Cache-Control: public, max-age=86400
