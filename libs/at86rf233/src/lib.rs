@@ -308,6 +308,12 @@ where
     IRQ: Wait + Send,
     RST: OutputPin + Send,
 {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
+    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+        wayfinder::link::BROADCAST_FAN_OUT
+    }
+
     /// Fragment `data` and transmit every fragment, returning the total
     /// on-air bytes.
     ///

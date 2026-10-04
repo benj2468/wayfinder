@@ -109,11 +109,12 @@ log ring — design 25 §4.7).
    silently suppresses routing through the radio rather than looking wrong
    anywhere — see `LinkMetrics::quality`'s own docs. There is no
    datasheet-pinned mapping for a LoRa RSSI/SNR pair, so do not invent one.
-6. Do **not** override `fan_out`. No radio driver here does, and a broadcast
-   LoRa send arguably fits its `Some(1)` case — but that method is a design-17
-   seam nothing currently reads, so diverging alone would change egress
-   behaviour for no benefit. If it is ever settled, settle it for `rylr998`,
-   `blue`, `ieee802154` and this crate together.
+6. Declare `fan_out` as `wayfinder::link::BROADCAST_FAN_OUT`. Every send
+   is a broadcast, which is exactly what the declaration claims, and the
+   multicast fan-out collapse (design 17 §4.5) reads it to merge terminal
+   peers into one transmission. Two rather than one because a merge swaps the
+   pairwise tag for a signature — see the constant's docs. Every broadcast
+   radio here declares the same value; keep them together.
 
 ### `recv` must be cancel-safe, and awaiting the radio directly is not
 

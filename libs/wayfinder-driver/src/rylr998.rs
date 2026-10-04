@@ -274,6 +274,15 @@ impl<C: Rylr998Connector> ReconnectingRylr998Link<C> {
 }
 
 impl<C: Rylr998Connector> LinkT for ReconnectingRylr998Link<C> {
+    /// The medium's declaration, not the inner client's: the driver reads
+    /// this once at construction, usually before the first connect.
+    ///
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
+    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+        wayfinder::link::BROADCAST_FAN_OUT
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let client = self.ensure_connected().await?;
         let result = client.send(origin, data).await;

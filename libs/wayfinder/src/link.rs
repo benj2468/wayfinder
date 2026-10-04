@@ -122,10 +122,10 @@ pub trait LinkT: Send {
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError>;
 }
 
-/// The [`LinkT::fan_out`] every broadcast radio in this repo declares: a LoRa
-/// module or raw LoRa PHY, an 802.15.4 frame to `0xffff`, a BLE advertisement.
-/// One `send` reaches every neighbor on each of those, whatever `data.dst`
-/// says.
+/// The [`LinkT::fan_out`] every broadcast medium in this repo declares: a LoRa
+/// module or raw LoRa PHY, an 802.15.4 frame to `0xffff`, a BLE
+/// advertisement, and a raw L2 segment (whose merged frame goes to the
+/// broadcast MAC). One `send` reaches every neighbor on each of those.
 ///
 /// **Two, not one**, although one directed copy costs a broadcast radio
 /// exactly what a flood does. The collapse it gates (design 17 §4.5) swaps the
