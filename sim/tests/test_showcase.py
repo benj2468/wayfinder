@@ -66,3 +66,30 @@ def test_downsample_leaves_short_series_alone():
     from wayfinder_sim.showcase import downsample
 
     assert downsample([1.0, 2.0], [3, 4]) == ([1.0, 2.0], [3, 4])
+
+
+def test_a_chart_can_carry_a_heatmap(tmp_path):
+    from wayfinder_sim.showcase import Heatmap
+
+    showcase = _showcase()
+    showcase.charts.append(
+        Chart(
+            title="Jammer map",
+            x_label="east (m)",
+            y_label="north (m)",
+            series=[],
+            heatmap=Heatmap(xs=[0.0, 100.0], ys=[0.0, 50.0, 100.0], values=[[1.0, 0.5], [0.2, 0.0], [None, 1.0]], label="delivery"),
+        )
+    )
+    data = json.loads(write_showcase(showcase, tmp_path).read_text())
+    heat = data["charts"][-1]["heatmap"]
+    assert heat["values"][1] == [0.2, 0.0]
+    assert heat["label"] == "delivery"
+
+
+def test_heatmap_shape_must_match_its_axes():
+    import pytest
+    from wayfinder_sim.showcase import Heatmap
+
+    with pytest.raises(ValueError):
+        Heatmap(xs=[0.0, 1.0], ys=[0.0], values=[[1.0]], label="x")

@@ -27,6 +27,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "Chart",
     "Headline",
+    "Heatmap",
     "Marker",
     "Series",
     "Showcase",
@@ -70,6 +71,25 @@ class Marker:
 
 
 @dataclasses.dataclass
+class Heatmap:
+    """A value per grid cell: `values[row][col]` sits at `(xs[col], ys[row])`.
+    `None` marks a cell with no data. `label` names what the colour encodes;
+    `value_range` pins the colour scale (a ratio is `(0, 1)`)."""
+
+    xs: list[float]
+    ys: list[float]
+    values: list[list[float | None]]
+    label: str
+    value_range: tuple[float, float] | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.values) != len(self.ys) or any(len(row) != len(self.xs) for row in self.values):
+            raise ValueError(
+                f"heatmap {self.label!r}: values must be {len(self.ys)} rows of {len(self.xs)}"
+            )
+
+
+@dataclasses.dataclass
 class Chart:
     """One chart: axes, the series drawn on them, and any event markers.
     `y_range`, when given, pins the y axis (a ratio is always `(0, 1)`)."""
@@ -82,6 +102,9 @@ class Chart:
     y_range: tuple[float, float] | None = None
     caption: str | None = None
     x_log: bool = False
+    heatmap: Heatmap | None = None
+    """A grid drawn beneath the series — a coverage or interference map —
+    with any `series` (tracks, sites) plotted over it."""
 
 
 @dataclasses.dataclass
