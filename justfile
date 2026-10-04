@@ -373,7 +373,7 @@ site-serve: site-build
 [doc("Re-run every showcase scenario and refresh www/sim/data (several minutes).")]
 sim-export:
     uv sync --group sim --reinstall-package wayfinder-py
-    for s in failover captured_device coverage_per_relay crowded_lora battery_life jammer_map scale; do \
+    for s in failover captured_device mountain_relay satellite_relay coverage_per_relay crowded_lora battery_life jammer_map scale; do \
         uv run --group sim python sim/scenarios/$s.py --export www/sim/data || exit 1; \
     done
 

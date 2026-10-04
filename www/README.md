@@ -176,8 +176,9 @@ Rollback is instant and needs none of the above: _Pages project → Deployments 
 ## The simulation lab (`/sim/`)
 
 An engineering-forward page of results from the physics simulator
-(`sim/`): failover, a captured radio, jammers, relay coverage, battery life, a
-crowded LoRa channel and scale. Every chart is drawn by `sim/lab.js` from
+(`sim/`): failover, a captured radio, jammers, relays in mountain terrain, a
+satellite constellation, relay coverage, battery life, a crowded LoRa channel
+and scale. Every chart is drawn by `sim/lab.js` from
 `sim/data/<slug>.json`, which the scenario scripts write
 (`wayfinder_sim.showcase`); nothing on the page is typed in by hand.
 

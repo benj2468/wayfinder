@@ -29,6 +29,8 @@
     "failover",
     "captured-device",
     "jammer-map",
+    "mountain-relay",
+    "satellite-relay",
     "coverage-per-relay",
     "battery-life",
     "crowded-lora",
@@ -37,6 +39,7 @@
   const CATEGORY = {
     resilience: "Resilience",
     security: "Security",
+    range: "Range & terrain",
     planning: "Planning",
     capacity: "Capacity",
   };
@@ -152,6 +155,18 @@
       }
     }
     return out;
+  }
+
+  // A heatmap's colour domain: its declared `value_range`, or the data's own
+  // extent when it declares none. Values read as percentages only when the
+  // range is declared and is a share (within 0..1) — an elevation map must not.
+  function heatRange(heat) {
+    if (heat.value_range) {
+      const [lo, hi] = heat.value_range;
+      return [lo, hi, lo >= 0 && hi <= 1];
+    }
+    const vals = heat.values.flat().filter(isNum);
+    return [Math.min(...vals), Math.max(...vals), false];
   }
 
   function seqColor(t) {
@@ -282,10 +297,7 @@
 
     // Heatmap cells first, beneath everything.
     if (heat) {
-      const [v0, v1] = heat.value_range || [
-        Math.min(...heat.values.flat().filter(isNum)),
-        Math.max(...heat.values.flat().filter(isNum)),
-      ];
+      const [v0, v1, heatPct] = heatRange(heat);
       const cw =
         heat.xs.length > 1 ? Math.abs(sx(heat.xs[1]) - sx(heat.xs[0])) : innerW;
       const ch =
@@ -303,7 +315,7 @@
           cell.addEventListener("pointermove", (e) =>
             showTip(e, [
               el("div", { text: `${fmt(heat.xs[i])}, ${fmt(heat.ys[j])} m` }),
-              tipRow(null, `${heat.label}:`, fmt(v, v1 <= 1)),
+              tipRow(null, `${heat.label}:`, fmt(v, heatPct)),
             ]),
           );
           cell.addEventListener("pointerleave", hideTip);
@@ -643,8 +655,7 @@
   function scaleFor(chart) {
     const heat = chart.heatmap;
     if (!heat) return null;
-    const [v0, v1] = heat.value_range || [0, 1];
-    const pct = v1 <= 1;
+    const [v0, v1, pct] = heatRange(heat);
     return el("div", { class: "lab-scale" }, [
       el("span", { text: fmt(v0, pct) }),
       el("span", {
@@ -678,7 +689,7 @@
             el("td", { text: fmt(h.ys[j]) }),
             ...row.map((v) =>
               el("td", {
-                text: fmt(v, h.value_range && h.value_range[1] <= 1),
+                text: fmt(v, heatRange(h)[2]),
               }),
             ),
           ]),
