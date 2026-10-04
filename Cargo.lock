@@ -2734,7 +2734,6 @@ dependencies = [
  "interfaces",
  "tracing",
  "wayfinder-link-utils",
- "zerocopy",
 ]
 
 [[package]]
@@ -5531,6 +5530,7 @@ dependencies = [
  "heapless",
  "tracing",
  "wayfinder",
+ "zerocopy",
 ]
 
 [[package]]

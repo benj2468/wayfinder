@@ -1,3 +1,135 @@
+//! The `[dst][src][protocol][payload]` frame every small-MTU link fragments,
+//! and the arithmetic for cutting it — the parts that do not depend on a
+//! medium's own header. A medium crate (`ieee802154`, `lora-link`) adds only
+//! its header encode/decode around these.
+
+use wayfinder::interfaces::frame::LinkFrame;
+use wayfinder::interfaces::frame::LinkFrameData;
+use wayfinder::interfaces::frame::Mac;
+use wayfinder::interfaces::link::LinkError;
+use zerocopy::FromBytes;
+
+use crate::MAX_FRAGMENTS;
+
+/// Length of the `[dst][src][protocol]` header prefixing every [`LinkFrame`]
+/// (6 + 6 + 2 bytes).
+pub const LINK_HEADER_LEN: usize = 14;
+
+/// `LINK_HEADER_LEN` is written as a literal because it is quoted in wire
+/// format docs; this is what keeps it honest if [`Mac`] ever changes width,
+/// where `assemble_frame` would otherwise write the payload at the wrong
+/// offset and `decode_frame` would still parse the result.
+const _: () = assert!(LINK_HEADER_LEN == 2 * size_of::<Mac>() + size_of::<u16>());
+
+/// The 16-bit short identity a node transmits under on a medium whose header
+/// carries one: the low two bytes of its mesh [`Mac`], big-endian.
+///
+/// Shared so every link on one node derives the same short identity. Two
+/// nodes whose `Mac`s share their low two bytes spoil each other's
+/// reassembly, so a deployment must keep them distinct.
+pub fn short_address_of(mac: Mac) -> u16 {
+    u16::from_be_bytes([mac.0[4], mac.0[5]])
+}
+
+/// Reinterpret reassembled bytes as a [`LinkFrame`].
+///
+/// Returns [`LinkError::MalformedFrame`] if they are too short to hold a
+/// [`LinkFrame`] header — which a corrupted reassembly or a stranger's runt
+/// can produce. `MalformedFrame` because the bytes came off the medium.
+pub fn decode_frame(bytes: &[u8]) -> Result<&LinkFrame, LinkError> {
+    LinkFrame::ref_from_bytes(bytes).map_err(|_| LinkError::MalformedFrame)
+}
+
+/// Frame assembly and fragment cutting for a medium carrying `FRAG_PAYLOAD`
+/// frame-content bytes per fragment and reassembling frames of up to
+/// `MAX_REASSEMBLED_LEN` bytes — the same two constants its
+/// [`Reassembler`](crate::Reassembler) is instantiated with.
+///
+/// A medium crate names its instantiation once (`type Framing =
+/// wayfinder_link_utils::Framing<FRAG_PAYLOAD, MAX_REASSEMBLED_LEN>`) and
+/// wraps these with its own header.
+pub struct Framing<const FRAG_PAYLOAD: usize, const MAX_REASSEMBLED_LEN: usize>;
+
+impl<const FRAG_PAYLOAD: usize, const MAX_REASSEMBLED_LEN: usize>
+    Framing<FRAG_PAYLOAD, MAX_REASSEMBLED_LEN>
+{
+    /// Largest mesh-frame payload [`Self::assemble_frame`] will accept:
+    /// `MAX_REASSEMBLED_LEN` minus the [`LinkFrame`] header.
+    pub const MAX_PAYLOAD_LEN: usize = MAX_REASSEMBLED_LEN - LINK_HEADER_LEN;
+
+    /// Write the `[dst][src][protocol][payload]` frame bytes for `data` sent
+    /// from `origin` into `out`, returning the length written.
+    ///
+    /// This is the input to fragmentation, not something that goes on air by
+    /// itself: the caller cuts the returned prefix of `out` with
+    /// [`Self::fragment_count`] and [`Self::fragment_body`].
+    ///
+    /// Returns [`LinkError::BufferFull`] if `data.payload` exceeds
+    /// [`Self::MAX_PAYLOAD_LEN`] or `out` is too small. **Never truncates** —
+    /// a short frame parses and lies.
+    pub fn assemble_frame(
+        origin: Mac,
+        data: &LinkFrameData<'_>,
+        out: &mut [u8],
+    ) -> Result<usize, LinkError> {
+        if data.payload.len() > Self::MAX_PAYLOAD_LEN {
+            return Err(LinkError::BufferFull);
+        }
+        let total = LINK_HEADER_LEN + data.payload.len();
+        if out.len() < total {
+            return Err(LinkError::BufferFull);
+        }
+
+        out[..6].copy_from_slice(&data.dst.0);
+        out[6..12].copy_from_slice(&origin.0);
+        // Big-endian, matching `LinkFrame`'s EtherType-style protocol field.
+        out[12..14].copy_from_slice(&data.protocol.to_be_bytes());
+        out[14..total].copy_from_slice(data.payload);
+        Ok(total)
+    }
+
+    /// Number of fragments a `frame_len`-byte frame splits into, or
+    /// [`LinkError::BufferFull`] past [`MAX_FRAGMENTS`] — the wire format's
+    /// 4-bit `count` field ceiling.
+    pub fn fragment_count(frame_len: usize) -> Result<usize, LinkError> {
+        // `.max(1)`: `pack_header` debug-asserts `count >= 1`, so an empty
+        // slice gets a valid single fragment rather than a debug panic.
+        let count = frame_len.div_ceil(FRAG_PAYLOAD).max(1);
+        if count > MAX_FRAGMENTS {
+            return Err(LinkError::BufferFull);
+        }
+        Ok(count)
+    }
+
+    /// The slice of `frame` that fragment `index` of `count` carries.
+    ///
+    /// `frame` is [`Self::assemble_frame`]'s output truncated to its returned
+    /// length, not the full backing array: every fragment past the real
+    /// content would otherwise carry zero padding.
+    ///
+    /// Returns [`LinkError::InvalidPacket`] for a spec that could not
+    /// describe a real fragment of *this* frame: `count` outside
+    /// `1..=MAX_FRAGMENTS`, `index` not below `count`, or a `count` other
+    /// than [`Self::fragment_count`]'s. Checked here rather than left to
+    /// `pack_header`'s `debug_assert!`s, which are compiled out of the
+    /// release firmware that ships — a transposed index/count packs a nibble
+    /// pair every receiver rejects, and a short count sends a prefix the
+    /// receiver completes as a whole, truncated frame.
+    pub fn fragment_body(frame: &[u8], index: usize, count: usize) -> Result<&[u8], LinkError> {
+        if !(1..=MAX_FRAGMENTS).contains(&count) || index >= count {
+            return Err(LinkError::InvalidPacket);
+        }
+        if count != Self::fragment_count(frame.len())? {
+            return Err(LinkError::InvalidPacket);
+        }
+        // `index < count <= MAX_FRAGMENTS`, so neither can overflow, and a
+        // count that matches the frame puts `start` inside it.
+        let start = index * FRAG_PAYLOAD;
+        let end = (start + FRAG_PAYLOAD).min(frame.len());
+        Ok(&frame[start..end])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use wayfinder::interfaces::frame::LinkFrameData;

@@ -203,26 +203,24 @@ where
     /// `out` and drop the entry, returning `(len, metrics)` — `metrics` from
     /// whichever fragment completed the message. Otherwise `None`.
     ///
-    /// A malformed header (`count == 0`, `index >= count`, `count >
-    /// MAX_FRAGMENTS`, an oversized body, or an offset past the reassembly
-    /// buffer) is rejected without touching the table. A header decoded via
-    /// [`parse_fragment`] already has `count` bounded to `0..=15` by the
-    /// wire format's 4-bit field, so `count > MAX_FRAGMENTS` cannot occur
-    /// through that path today — but `FragHeader`'s fields are public and
-    /// `accept` takes one directly, so a hand-constructed header (as tests
-    /// do) could otherwise smuggle in an oversized `count` and overflow the
-    /// `1u16 << count` shift in `Reassembly::is_complete`; checked here
-    /// rather than trusted. `index`/`count` otherwise come straight off the
-    /// wire, and nothing stops a crafted or corrupted fragment from
-    /// declaring an `index` that is individually `< count` yet still lands
-    /// `index * FRAG_PAYLOAD` past `MAX_REASSEMBLED_LEN` (only `send()`'s own
-    /// fragments respect that relationship), so the offset is
-    /// bounds-checked explicitly rather than trusted. A duplicate index for
-    /// an already-buffered message is
-    /// silently ignored — the first copy wins. A key whose declared `count`
-    /// differs from what's already buffered is treated as a fresh message
-    /// reusing that key (e.g. after `msg_id` wraps) and resets the slot
-    /// rather than merging.
+    /// A fragment no conforming sender produces is rejected without touching
+    /// the table, so it cannot occupy a slot and evict a real message:
+    ///
+    /// - `count == 0` or `index >= count`;
+    /// - a `count` above `MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD)` — the
+    ///   most any frame this table can hold needs. The wire's 4-bit field
+    ///   allows 15, so a larger claim would open a slot that never completes.
+    ///   This also bounds the `1u16 << count` shift in
+    ///   `Reassembly::is_complete` for a hand-constructed `FragHeader`;
+    /// - a body over `FRAG_PAYLOAD`, or a *non-final* body under it — every
+    ///   fragment but the last is full, and a short one would leave a
+    ///   zero-filled hole in a frame of plausible length;
+    /// - an offset whose body would land past `MAX_REASSEMBLED_LEN`.
+    ///
+    /// A duplicate index for an already-buffered message is silently ignored
+    /// — the first copy wins. A key whose declared `count` differs from
+    /// what's already buffered is treated as a fresh message reusing that key
+    /// (e.g. after `msg_id` wraps) and resets the slot rather than merging.
     pub fn accept(
         &mut self,
         key: FragKey<A>,
@@ -232,10 +230,12 @@ where
         out: &mut [u8],
     ) -> Option<(usize, LinkMetrics)> {
         let off = hdr.index as usize * FRAG_PAYLOAD;
+        let is_final = hdr.index + 1 == hdr.count;
         if hdr.count == 0
             || hdr.index >= hdr.count
-            || hdr.count as usize > MAX_FRAGMENTS
+            || hdr.count as usize > MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD)
             || body.len() > FRAG_PAYLOAD
+            || (!is_final && body.len() != FRAG_PAYLOAD)
             || off + body.len() > MAX_REASSEMBLED_LEN
         {
             trace!(

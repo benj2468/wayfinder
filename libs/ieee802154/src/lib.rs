@@ -4,7 +4,7 @@
 //! Hardware-agnostic framing for IEEE 802.15.4 mesh interfaces.
 //!
 //! This crate handles only the on-air frame shape: cutting a Wayfinder
-//! [`LinkFrame`] into fragments, each wrapped in a minimal IEEE 802.15.4 MAC
+//! [`LinkFrame`](interfaces::frame::LinkFrame) into fragments, each wrapped in a minimal IEEE 802.15.4 MAC
 //! header, and reassembling them on receive. It has no opinion about which
 //! radio chip or HAL drives the actual transmit/receive — a `LinkT` impl for a
 //! specific radio (`nrf-ieee802154`, `at86rf233`) is built on top of the
@@ -13,7 +13,7 @@
 //! Like the RYLR998 LoRa link, IEEE 802.15.4 is treated as a shared broadcast
 //! medium: every fragment is addressed to the 802.15.4 broadcast PAN and
 //! destination address, and the mesh layer filters on the 6-byte [`Mac`]
-//! embedded in the reassembled [`LinkFrame`] rather than on 802.15.4-level
+//! embedded in the reassembled [`LinkFrame`](interfaces::frame::LinkFrame) rather than on 802.15.4-level
 //! addressing.
 //!
 //! # Why fragmentation
@@ -41,11 +41,10 @@
 //! other's reassembly**, the same deployment constraint `rylr998` documents
 //! for its configured `AT+ADDRESS`. It costs dropped frames, never
 //! misattributed ones: the authenticated mesh `Mac` travels *inside* the
-//! reassembled [`LinkFrame`], so a corrupted reassembly fails the
+//! reassembled [`LinkFrame`](interfaces::frame::LinkFrame), so a corrupted reassembly fails the
 //! `LinkFrame` parse or the signature check rather than arriving under the
 //! wrong sender. See `docs/design/implemented/19-ieee802154-nrf-link.md` §5.3.
 
-use interfaces::frame::LinkFrame;
 use interfaces::frame::LinkFrameData;
 use interfaces::frame::Mac;
 use interfaces::link::LinkError;
@@ -54,7 +53,6 @@ use tracing::trace;
 use wayfinder_link_utils::FRAG_HDR_LEN;
 use wayfinder_link_utils::FragHeader;
 use wayfinder_link_utils::FragKey;
-use wayfinder_link_utils::MAX_FRAGMENTS;
 use wayfinder_link_utils::Reassembler;
 use wayfinder_link_utils::pack_header;
 use zerocopy::FromBytes;
@@ -134,9 +132,9 @@ const FCS_LEN: usize = 2;
 /// accept: `aMaxPHYPacketSize` minus the hardware-handled FCS.
 pub const MAX_FRAME_LEN: usize = MAX_PHY_PACKET_SIZE - FCS_LEN;
 
-/// Length of the `[dst][src][protocol]` header that prefixes every
-/// [`LinkFrame`] (6 + 6 + 2 bytes).
-pub const LINK_HEADER_LEN: usize = 14;
+pub use wayfinder_link_utils::LINK_HEADER_LEN;
+pub use wayfinder_link_utils::decode_frame;
+pub use wayfinder_link_utils::short_address_of;
 
 /// Frame-content bytes one fragment carries, once the MAC header and the
 /// fragment header are subtracted: `125 - 9 - 2`.
@@ -157,22 +155,16 @@ pub const MAX_REASSEMBLED_LEN: usize = 512;
 pub const MAX_REASSEMBLIES: usize = 4;
 
 /// Largest mesh-frame payload [`assemble_frame`] will accept:
-/// [`MAX_REASSEMBLED_LEN`] minus the [`LinkFrame`] header.
-pub const MAX_PAYLOAD_LEN: usize = MAX_REASSEMBLED_LEN - LINK_HEADER_LEN;
+/// [`MAX_REASSEMBLED_LEN`] minus the [`LinkFrame`](interfaces::frame::LinkFrame) header.
+pub const MAX_PAYLOAD_LEN: usize = Framing::MAX_PAYLOAD_LEN;
 
 /// The reassembly table an 802.15.4 `LinkT` adapter owns, keyed on the
 /// 16-bit short source address. See the module docs for why that is the key.
 pub type Ieee802154Reassembler =
     Reassembler<u16, MAX_REASSEMBLIES, FRAG_PAYLOAD, MAX_REASSEMBLED_LEN>;
 
-/// The 16-bit short source address a node transmits under: the low two bytes
-/// of its mesh [`Mac`], big-endian.
-///
-/// Shared so a board's 802.15.4 and LoRa links derive the same short identity
-/// from the same `Mac` rather than each rolling their own.
-pub fn short_address_of(mac: Mac) -> u16 {
-    u16::from_be_bytes([mac.0[4], mac.0[5]])
-}
+/// Frame assembly and fragment cutting at this medium's sizes.
+type Framing = wayfinder_link_utils::Framing<FRAG_PAYLOAD, MAX_REASSEMBLED_LEN>;
 
 /// Which fragment of which message [`build_fragment`] should cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +183,7 @@ pub struct FragmentSpec {
     pub count: usize,
 }
 
-/// Write the `[dst][src][protocol][payload]` [`LinkFrame`] bytes for `data`
+/// Write the `[dst][src][protocol][payload]` [`LinkFrame`](interfaces::frame::LinkFrame) bytes for `data`
 /// sent from `origin` into `out`, returning the number of bytes written.
 ///
 /// This is the input to fragmentation, not something that goes on air by
@@ -205,38 +197,14 @@ pub fn assemble_frame(
     data: &LinkFrameData<'_>,
     out: &mut [u8],
 ) -> Result<usize, LinkError> {
-    if data.payload.len() > MAX_PAYLOAD_LEN {
-        return Err(LinkError::BufferFull);
-    }
-    let total = LINK_HEADER_LEN + data.payload.len();
-    if out.len() < total {
-        return Err(LinkError::BufferFull);
-    }
-
-    out[..6].copy_from_slice(&data.dst.0);
-    out[6..12].copy_from_slice(&origin.0);
-    out[12..14].copy_from_slice(&data.protocol.to_be_bytes());
-    out[14..total].copy_from_slice(data.payload);
-    Ok(total)
+    Framing::assemble_frame(origin, data, out)
 }
 
-/// Number of fragments a `frame_len`-byte frame splits into, or
-/// [`LinkError::BufferFull`] past [`MAX_FRAGMENTS`] — the wire format's 4-bit
-/// `count` field ceiling.
-///
-/// Unreachable past `MAX_FRAGMENTS` under today's [`MAX_REASSEMBLED_LEN`]
-/// (512 bytes is five fragments), but checked so a change to either constant
-/// fails loudly instead of corrupting the packed nibble.
+/// Number of fragments a `frame_len`-byte frame splits into at this
+/// medium's [`FRAG_PAYLOAD`]; see
+/// [`wayfinder_link_utils::Framing::fragment_count`].
 pub fn fragment_count(frame_len: usize) -> Result<usize, LinkError> {
-    // `.max(1)`: a zero-length frame is not something `assemble_frame` can
-    // produce, but `pack_header` debug-asserts `count >= 1`, so a caller
-    // computing a count for an empty slice gets a valid single fragment
-    // rather than a debug panic.
-    let count = frame_len.div_ceil(FRAG_PAYLOAD).max(1);
-    if count > MAX_FRAGMENTS {
-        return Err(LinkError::BufferFull);
-    }
-    Ok(count)
+    Framing::fragment_count(frame_len)
 }
 
 /// Build the fragment `spec` names — an [`Ieee802154Header`], a packed
@@ -248,51 +216,17 @@ pub fn fragment_count(frame_len: usize) -> Result<usize, LinkError> {
 /// otherwise carry zero padding.
 ///
 /// Returns [`LinkError::InvalidPacket`] for a spec that could not describe a
-/// real fragment — `count` outside `1..=MAX_FRAGMENTS`, or `index` not below
-/// `count`. Those are checked here rather than left to `pack_header`'s
-/// `debug_assert!`s, which are compiled out of the release firmware that
-/// ships: a transposed index/count otherwise packs a nibble pair every
-/// receiver rejects, so the sender spends airtime and nothing is ever
-/// reassembled.
-///
-/// Returns [`LinkError::BufferFull`] if `spec.index` addresses a slice
-/// starting past the end of `frame`, or if `out` is too small (it never is
-/// for a `[u8; MAX_FRAME_LEN]`, which one full fragment exactly fills).
+/// real fragment of `frame` (see
+/// [`wayfinder_link_utils::Framing::fragment_body`]), and
+/// [`LinkError::BufferFull`] if `out` is too small (it never is for a
+/// `[u8; MAX_FRAME_LEN]`, which one full fragment exactly fills).
 pub fn build_fragment(
     frame: &[u8],
     spec: FragmentSpec,
     out: &mut [u8],
 ) -> Result<usize, LinkError> {
-    // `pack_header`'s own `index`/`count` checks are `debug_assert!`, so they
-    // are compiled out of the release firmware that actually ships. Checked
-    // here instead: a transposed index/count packs a nibble pair every
-    // receiver rejects, which presents as a link that transmits, reports
-    // bytes sent, and delivers nothing — on a board with no probe attached.
-    if !(1..=MAX_FRAGMENTS).contains(&spec.count) || spec.index >= spec.count {
-        return Err(LinkError::InvalidPacket);
-    }
-
-    // `checked_*` rather than plain arithmetic: on a 32-bit target a huge
-    // `index` would wrap to a small *valid-looking* offset and cut the wrong
-    // slice, which is worse than refusing. Unreachable through
-    // `fragment_count`, but this is a `pub` entry point third-party drivers
-    // are told to call with a spec they built themselves.
-    let start = spec
-        .index
-        .checked_mul(FRAG_PAYLOAD)
-        .ok_or(LinkError::InvalidPacket)?;
-    let end = core::cmp::min(
-        start
-            .checked_add(FRAG_PAYLOAD)
-            .ok_or(LinkError::InvalidPacket)?,
-        frame.len(),
-    );
-    // `end` saturates at the frame's length, so an `index` addressing a slice
-    // that starts past the frame would underflow `end - start` below.
-    if start > end {
-        return Err(LinkError::BufferFull);
-    }
-    let total = HEADER_LEN + FRAG_HDR_LEN + (end - start);
+    let chunk = Framing::fragment_body(frame, spec.index, spec.count)?;
+    let total = HEADER_LEN + FRAG_HDR_LEN + chunk.len();
     if out.len() < total {
         return Err(LinkError::BufferFull);
     }
@@ -310,7 +244,7 @@ pub fn build_fragment(
         spec.index,
         spec.count,
     ));
-    out[HEADER_LEN + FRAG_HDR_LEN..total].copy_from_slice(&frame[start..end]);
+    out[HEADER_LEN + FRAG_HDR_LEN..total].copy_from_slice(chunk);
     Ok(total)
 }
 
@@ -386,17 +320,10 @@ pub fn accept_fragment(
     )
 }
 
-/// Reinterpret reassembled bytes as a [`LinkFrame`].
-///
-/// Returns [`LinkError::MalformedFrame`] if they are too short to hold a
-/// [`LinkFrame`] header — which a corrupted reassembly (see the module docs
-/// on colliding short addresses) can produce.
-pub fn decode_frame(bytes: &[u8]) -> Result<&LinkFrame, LinkError> {
-    LinkFrame::ref_from_bytes(bytes).map_err(|_| LinkError::MalformedFrame)
-}
-
 #[cfg(test)]
 mod tests {
+    use wayfinder_link_utils::MAX_FRAGMENTS;
+
     use super::*;
 
     fn mac(n: u8) -> Mac {
@@ -937,7 +864,8 @@ mod tests {
     }
 
     /// A fragment index addressing a slice that starts past the end of the
-    /// frame is refused rather than producing a zero-padded fragment.
+    /// frame is refused rather than producing a zero-padded fragment. Its
+    /// `count` cannot match a one-fragment frame, so it is an impossible spec.
     #[test]
     fn build_fragment_rejects_an_index_past_the_frame() {
         let (frame, len) = frame_of(mac(1), &[0xaa]);
@@ -954,7 +882,7 @@ mod tests {
                 },
                 &mut air,
             ),
-            Err(LinkError::BufferFull)
+            Err(LinkError::InvalidPacket)
         ));
     }
 }

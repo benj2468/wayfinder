@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 heapless.workspace = true
 tracing = { version = "0.1.44", default-features = false }
+zerocopy.workspace = true
 
 # Depended on by path (not workspace inheritance) so `default-features = false`
 # keeps `LinkMetrics` available without pulling `alloc`/`std`.

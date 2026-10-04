@@ -391,7 +391,10 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   `rylr998`**, deliberately.
 - **libs/wayfinder-link-utils** — shared small-MTU fragmentation/reassembly
   for `LinkT` drivers whose medium caps payload well below
-  `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`, `ieee802154`, `lora-link`).
+  `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`, `ieee802154`, `lora-link`),
+  plus the frame assembly and fragment cutting (`Framing`) the 802.15.4 and
+  raw-LoRa formats share. A rule about what a valid fragment is goes here, so
+  every medium gets it.
 
 **Identity & management API**
 - **libs/wayfinder-auth** → crypto identity/membership. A mesh is optionally

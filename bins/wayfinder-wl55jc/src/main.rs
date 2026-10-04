@@ -328,7 +328,7 @@ async fn main(spawner: Spawner) {
     };
     spawner.spawn(task);
 
-    let link = LoraLink::new(LORA_NET_ID, short_address_of(NODE_MAC));
+    let link = LoraLink::new(LORA_NET_ID, lora_link::short_address_of(NODE_MAC));
 
     led.set_high();
 
@@ -343,14 +343,4 @@ async fn main(spawner: Spawner) {
 
     info!(lora = true, "wayfinder started");
     driver.run().await
-}
-
-/// The 16-bit short identity this node transmits under: the low two bytes of
-/// its [`Mac`], big-endian.
-///
-/// The same derivation `ieee802154::short_address_of` uses, so a node's radios
-/// agree — written out here rather than depending on the 802.15.4 crate for two
-/// lines of arithmetic on a board that has no 802.15.4 radio.
-fn short_address_of(mac: Mac) -> u16 {
-    u16::from_be_bytes([mac.0[4], mac.0[5]])
 }

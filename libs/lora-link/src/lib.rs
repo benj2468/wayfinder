@@ -2,13 +2,17 @@
 //! a payload and nothing else. `no_std`, and with no opinion about the radio
 //! chip.
 //!
+//! What this crate owns is the 3-byte header a raw PHY needs and a RYLR998
+//! module supplies itself: a `net_id` filter and a 16-bit `src_id` to key
+//! reassembly on. Frame assembly, fragment cutting and reassembly are
+//! [`wayfinder_link_utils`]'s, shared with `ieee802154`.
+//!
 //! See `docs/design/25-stm32wl55-subghz-node.md`, and this crate's `CLAUDE.md`
 //! for the rules a `LinkT` adapter over it has to follow.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use interfaces::frame::LinkFrame;
 use interfaces::frame::LinkFrameData;
 use interfaces::frame::Mac;
 use interfaces::link::LinkError;
@@ -17,10 +21,11 @@ use tracing::trace;
 use wayfinder_link_utils::FRAG_HDR_LEN;
 use wayfinder_link_utils::FragHeader;
 use wayfinder_link_utils::FragKey;
-use wayfinder_link_utils::MAX_FRAGMENTS;
+pub use wayfinder_link_utils::LINK_HEADER_LEN;
 use wayfinder_link_utils::Reassembler;
+pub use wayfinder_link_utils::decode_frame;
 use wayfinder_link_utils::pack_header;
-use zerocopy::FromBytes;
+pub use wayfinder_link_utils::short_address_of;
 
 /// Largest LoRa PHY payload an SX126x-class radio will carry, and so the
 /// largest buffer [`build_fragment`] writes or [`decode_fragment`] accepts.
@@ -31,23 +36,16 @@ use zerocopy::FromBytes;
 pub const MAX_FRAME_LEN: usize = 255;
 
 /// Bytes of this crate's own header ahead of each fragment: `net_id` plus a
-/// big-endian `src_id`.
-///
-/// Small on purpose. It is spent on *every* fragment, and the medium carries
-/// roughly 5 kbps.
-pub const HEADER_LEN: usize = 3;
-
-/// Length of the `[dst][src][protocol]` header prefixing every [`LinkFrame`]
-/// (6 + 6 + 2 bytes).
-pub const LINK_HEADER_LEN: usize = 14;
+/// big-endian `src_id`. Small on purpose: it is spent on *every* fragment,
+/// and the medium carries roughly 5 kbps.
+pub const HEADER_LEN: usize = 1 + size_of::<u16>();
 
 /// Frame-content bytes one fragment carries, once both headers are
 /// subtracted: `255 - 3 - 2`.
 ///
 /// A **compile-time property of the format, never carried on the wire** —
 /// [`Reassembler`] places a fragment's bytes at `index * FRAG_PAYLOAD`, so
-/// both ends must already agree on the budget. Changing it is a wire-format
-/// break.
+/// both ends must already agree on it. Changing it is a wire-format break.
 pub const FRAG_PAYLOAD: usize = MAX_FRAME_LEN - HEADER_LEN - FRAG_HDR_LEN;
 
 /// Largest frame this link can reassemble.
@@ -55,39 +53,20 @@ pub const FRAG_PAYLOAD: usize = MAX_FRAME_LEN - HEADER_LEN - FRAG_HDR_LEN;
 /// **Must equal the board capacity profile's `max_frame_len`.** Below it the
 /// router silently drops frames this link was willing to carry — principally
 /// authenticated OGMs, so the node looks healthy and routes nothing. The board
-/// crate pins the two with a `const` assertion, as `wayfinder-nrf` does for
-/// 802.15.4. 512 is also what `rylr998` and `ieee802154` use: it is sized for
-/// a ~260-byte authenticated OGM plus revocation TVLVs, so a smaller value
-/// does not cost throughput, it costs authenticated OGMs.
+/// crate pins the two with a `const` assertion. 512 matches `rylr998` and
+/// `ieee802154`.
 pub const MAX_REASSEMBLED_LEN: usize = 512;
 
 /// Concurrent in-flight reassemblies tracked, matching `rylr998` and
-/// `ieee802154`. A fifth sender evicts the oldest incomplete message rather
-/// than failing; each slot costs a full [`MAX_REASSEMBLED_LEN`] buffer.
+/// `ieee802154`. A fifth sender evicts the oldest incomplete message; each
+/// slot costs a full [`MAX_REASSEMBLED_LEN`] buffer.
 pub const MAX_REASSEMBLIES: usize = 4;
 
-/// Largest mesh-frame payload [`assemble_frame`] will accept:
-/// [`MAX_REASSEMBLED_LEN`] minus the [`LinkFrame`] header.
-pub const MAX_PAYLOAD_LEN: usize = MAX_REASSEMBLED_LEN - LINK_HEADER_LEN;
+/// Frame assembly and fragment cutting at this medium's sizes.
+type Framing = wayfinder_link_utils::Framing<FRAG_PAYLOAD, MAX_REASSEMBLED_LEN>;
 
-/// The most fragments one reassembled frame can need: 3 at this crate's
-/// sizes. The wire's 4-bit count allows up to `MAX_FRAGMENTS` (15), so a
-/// larger claim can only come from a sender that is not following this
-/// format, and [`decode_fragment`] refuses it.
-pub const MAX_FRAGMENTS_PER_FRAME: usize = MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD);
-
-/// `HEADER_LEN` must match the fields it claims to cover. Not tautological:
-/// the constant is written as a literal (it is quoted in the wire-format
-/// documentation), so a field added to the header without updating it would
-/// otherwise place every fragment body one byte off — on both ends, so the
-/// framing would look self-consistent and interoperate with nothing.
-const _: () = assert!(HEADER_LEN == 1 + size_of::<u16>());
-
-/// `LINK_HEADER_LEN` must match [`LinkFrame`]'s real header. Also a literal
-/// here and in `ieee802154`, and the one that silently breaks if [`Mac`] ever
-/// changes width: `assemble_frame` would write the payload at the wrong offset
-/// and `decode_frame` would still parse the result.
-const _: () = assert!(LINK_HEADER_LEN == 2 * size_of::<Mac>() + size_of::<u16>());
+/// Largest mesh-frame payload [`assemble_frame`] will accept.
+pub const MAX_PAYLOAD_LEN: usize = Framing::MAX_PAYLOAD_LEN;
 
 /// The reassembly table a raw-LoRa `LinkT` adapter owns, keyed on the 16-bit
 /// `src_id` the sender puts in each fragment. See this crate's `CLAUDE.md` for
@@ -95,87 +74,41 @@ const _: () = assert!(LINK_HEADER_LEN == 2 * size_of::<Mac>() + size_of::<u16>()
 pub type LoraReassembler = Reassembler<u16, MAX_REASSEMBLIES, FRAG_PAYLOAD, MAX_REASSEMBLED_LEN>;
 
 /// Which fragment of which message [`build_fragment`] should cut.
-///
-/// `msg_id` is per *frame* — every fragment of one frame shares it, and it is
-/// half the reassembly key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentSpec {
-    /// The sender-chosen message id, shared by every fragment of this frame.
+    /// The sender-chosen message id, shared by every fragment of one frame
+    /// and half the reassembly key.
     pub msg_id: u8,
     /// This fragment's index, `0..count`.
     pub index: usize,
-    /// Total fragments in this frame, `1..=MAX_FRAGMENTS`.
+    /// Total fragments in this frame, from [`fragment_count`].
     pub count: usize,
 }
 
-/// Write the Ethernet-shaped `[dst][src][protocol][payload]` frame bytes into
-/// `out`, returning the length written.
-///
-/// This is the input to fragmentation, not something that goes on air by
-/// itself: the caller fragments the returned prefix of `out` with
-/// [`fragment_count`] and [`build_fragment`].
-///
-/// Returns [`LinkError::BufferFull`] if `data.payload` exceeds
-/// [`MAX_PAYLOAD_LEN`] or `out` is too small to hold the frame. **Never
-/// truncates** — a short frame parses and lies.
+/// Write the `[dst][src][protocol][payload]` frame bytes into `out`; see
+/// [`wayfinder_link_utils::Framing::assemble_frame`].
 pub fn assemble_frame(
     origin: Mac,
     data: &LinkFrameData<'_>,
     out: &mut [u8],
 ) -> Result<usize, LinkError> {
-    if data.payload.len() > MAX_PAYLOAD_LEN {
-        return Err(LinkError::BufferFull);
-    }
-    let total = LINK_HEADER_LEN + data.payload.len();
-    if out.len() < total {
-        return Err(LinkError::BufferFull);
-    }
-
-    out[..6].copy_from_slice(&data.dst.0);
-    out[6..12].copy_from_slice(&origin.0);
-    // Big-endian, matching `LinkFrame`'s EtherType-style protocol field.
-    out[12..14].copy_from_slice(&data.protocol.to_be_bytes());
-    out[14..total].copy_from_slice(data.payload);
-    Ok(total)
+    Framing::assemble_frame(origin, data, out)
 }
 
-/// Number of fragments a `frame_len`-byte frame splits into, or
-/// [`LinkError::BufferFull`] past [`MAX_FRAGMENTS`] — the wire format's 4-bit
-/// `count` field ceiling.
-///
-/// Unreachable past `MAX_FRAGMENTS` under today's constants (512 bytes is
-/// three fragments of 250), but checked so a change to either fails loudly
-/// instead of corrupting the packed nibble.
+/// Number of fragments a `frame_len`-byte frame splits into; see
+/// [`wayfinder_link_utils::Framing::fragment_count`].
 pub fn fragment_count(frame_len: usize) -> Result<usize, LinkError> {
-    // `.max(1)`: a zero-length frame is not something `assemble_frame` can
-    // produce, but `pack_header` debug-asserts `count >= 1`, so a caller
-    // computing a count for an empty slice gets a valid single fragment
-    // rather than a debug panic.
-    let count = frame_len.div_ceil(FRAG_PAYLOAD).max(1);
-    if count > MAX_FRAGMENTS {
-        return Err(LinkError::BufferFull);
-    }
-    Ok(count)
+    Framing::fragment_count(frame_len)
 }
 
 /// Build one on-air packet — `[net_id][src_id][frag_hdr][content]` — into
 /// `out`, returning the bytes written.
 ///
-/// `frame` is [`assemble_frame`]'s output truncated to its returned length,
-/// not the full backing array: every fragment past the real content would
-/// otherwise carry zero padding.
-///
 /// Returns [`LinkError::InvalidPacket`] for a spec that could not describe a
-/// real fragment — `count` outside `1..=MAX_FRAGMENTS`, or `index` not below
-/// `count`. Checked here rather than left to [`pack_header`]'s
-/// `debug_assert!`s, which are compiled out of the release firmware that
-/// ships: a transposed index/count otherwise packs a nibble pair every
-/// receiver rejects, which presents as a link that transmits, reports bytes
-/// sent, and delivers nothing.
-///
-/// Returns [`LinkError::BufferFull`] if `spec.index` addresses a slice
-/// starting past the end of `frame`, or if `out` is too small (it never is for
-/// a `[u8; MAX_FRAME_LEN]`, which one full fragment exactly fills).
+/// real fragment of `frame` (see
+/// [`wayfinder_link_utils::Framing::fragment_body`]), and
+/// [`LinkError::BufferFull`] if `out` is too small (it never is for a
+/// `[u8; MAX_FRAME_LEN]`, which one full fragment exactly fills).
 pub fn build_fragment(
     net_id: u8,
     src_id: u16,
@@ -183,28 +116,14 @@ pub fn build_fragment(
     spec: FragmentSpec,
     out: &mut [u8],
 ) -> Result<usize, LinkError> {
-    if !(1..=MAX_FRAGMENTS).contains(&spec.count) || spec.index >= spec.count {
-        return Err(LinkError::InvalidPacket);
-    }
-    // The count has to be *this frame's*: a smaller one sends a prefix the
-    // receiver completes as a whole frame, a larger one an empty tail.
-    if spec.count != fragment_count(frame.len())? {
-        return Err(LinkError::InvalidPacket);
-    }
-    let start = spec.index * FRAG_PAYLOAD;
-    if start > frame.len() {
-        return Err(LinkError::BufferFull);
-    }
-    let end = (start + FRAG_PAYLOAD).min(frame.len());
-    let chunk = &frame[start..end];
-
+    let chunk = Framing::fragment_body(frame, spec.index, spec.count)?;
     let total = HEADER_LEN + FRAG_HDR_LEN + chunk.len();
     if out.len() < total {
         return Err(LinkError::BufferFull);
     }
 
     out[0] = net_id;
-    out[1..3].copy_from_slice(&src_id.to_be_bytes());
+    out[1..HEADER_LEN].copy_from_slice(&src_id.to_be_bytes());
     out[HEADER_LEN..HEADER_LEN + FRAG_HDR_LEN].copy_from_slice(&pack_header(
         spec.msg_id,
         spec.index,
@@ -217,12 +136,9 @@ pub fn build_fragment(
 /// Parse one received packet into `(src_id, fragment header, content)`.
 ///
 /// Returns [`LinkError::MalformedFrame`] if it is too short, carries a
-/// different `net_id` than `net_id`, or has a fragment header that could not
-/// describe a real fragment of *this* format: a `count` above
-/// [`MAX_FRAGMENTS_PER_FRAME`], or a non-final fragment whose body is not
-/// exactly [`FRAG_PAYLOAD`]. [`build_fragment`] produces neither, and each
-/// would otherwise reach the table — the first opening a slot that can never
-/// complete, the second a frame of plausible length with a zero-filled hole.
+/// different `net_id`, or has a malformed fragment header. Fragments a
+/// conforming sender never produces (an impossible `count`, a short non-final
+/// body) are refused one step later, by [`Reassembler::accept`].
 ///
 /// **The `net_id` check happens before anything touches the reassembly
 /// table**, which is the whole point of the field: another mesh on the same
@@ -230,32 +146,21 @@ pub fn build_fragment(
 /// evict a real message. It is a filter and not a security boundary — mesh
 /// membership is `wayfinder-auth`'s, verified above `LinkT`.
 pub fn decode_fragment(net_id: u8, buf: &[u8]) -> Result<(u16, FragHeader, &[u8]), LinkError> {
-    if buf.len() < HEADER_LEN + FRAG_HDR_LEN {
-        return Err(LinkError::MalformedFrame);
-    }
-    if buf[0] != net_id {
+    if buf.len() < HEADER_LEN + FRAG_HDR_LEN || buf[0] != net_id {
         return Err(LinkError::MalformedFrame);
     }
     let src_id = u16::from_be_bytes([buf[1], buf[2]]);
     let (hdr, body) = wayfinder_link_utils::parse_fragment(&buf[HEADER_LEN..])
         .ok_or(LinkError::MalformedFrame)?;
-    let (index, count) = (usize::from(hdr.index), usize::from(hdr.count));
-    if count > MAX_FRAGMENTS_PER_FRAME {
-        return Err(LinkError::MalformedFrame);
-    }
-    if index + 1 < count && body.len() != FRAG_PAYLOAD {
-        return Err(LinkError::MalformedFrame);
-    }
     Ok((src_id, hdr, body))
 }
 
 /// Feed one received packet to `reassembler`. On completion, copy the
 /// assembled frame into `out` and return `(len, metrics)`; otherwise `None`.
 ///
-/// The bridge between [`decode_fragment`] and [`Reassembler::accept`], here
-/// rather than in each adapter so every one builds the [`FragKey`] the same
-/// way. A packet that does not parse is dropped at `trace!` — it is reachable
-/// from arbitrary peer input and must not flood the logs.
+/// Here rather than in each adapter so every one builds the [`FragKey`] the
+/// same way. A packet that does not parse is dropped at `trace!` — it is
+/// reachable from arbitrary peer input and must not flood the logs.
 pub fn accept_fragment(
     reassembler: &mut LoraReassembler,
     net_id: u8,
@@ -263,12 +168,9 @@ pub fn accept_fragment(
     metrics: LinkMetrics,
     out: &mut [u8],
 ) -> Option<(usize, LinkMetrics)> {
-    let (src_id, hdr, body) = match decode_fragment(net_id, buf) {
-        Ok(parsed) => parsed,
-        Err(_) => {
-            trace!(len = buf.len(), "drop: malformed lora fragment");
-            return None;
-        }
+    let Ok((src_id, hdr, body)) = decode_fragment(net_id, buf) else {
+        trace!(len = buf.len(), "drop: malformed lora fragment");
+        return None;
     };
     reassembler.accept(
         FragKey {
@@ -280,15 +182,6 @@ pub fn accept_fragment(
         metrics,
         out,
     )
-}
-
-/// Reinterpret reassembled bytes as a [`LinkFrame`].
-///
-/// Returns [`LinkError::MalformedFrame`] if they are too short to hold a
-/// [`LinkFrame`] header — which a corrupted reassembly (see this crate's
-/// `CLAUDE.md` on colliding `src_id`s) can produce.
-pub fn decode_frame(bytes: &[u8]) -> Result<&LinkFrame, LinkError> {
-    LinkFrame::ref_from_bytes(bytes).map_err(|_| LinkError::MalformedFrame)
 }
 
 #[cfg(test)]
@@ -546,132 +439,6 @@ mod tests {
         }
     }
 
-    /// A payload past what fragmentation can carry is refused at assembly,
-    /// never silently truncated — a truncated frame parses and lies.
-    #[test]
-    fn a_frame_larger_than_the_reassembly_ceiling_is_refused() {
-        let payload = vec![0u8; MAX_PAYLOAD_LEN + 1];
-        let mut buf = [0u8; MAX_REASSEMBLED_LEN];
-        assert!(matches!(
-            assemble_frame(
-                mac(1),
-                &LinkFrameData {
-                    dst: mac(2),
-                    protocol: 0x4305,
-                    payload: &payload,
-                },
-                &mut buf,
-            ),
-            Err(LinkError::BufferFull)
-        ));
-
-        // ...and the largest legal payload is accepted, so the bound is off
-        // by nothing.
-        let payload = vec![0u8; MAX_PAYLOAD_LEN];
-        assert_eq!(
-            assemble_frame(
-                mac(1),
-                &LinkFrameData {
-                    dst: mac(2),
-                    protocol: 0x4305,
-                    payload: &payload,
-                },
-                &mut buf,
-            )
-            .unwrap(),
-            MAX_REASSEMBLED_LEN
-        );
-    }
-
-    /// A fifth concurrent sender evicts the oldest incomplete message rather
-    /// than being refused — capacity pressure costs completion rate, not
-    /// correctness (§6.2), and the newest sender is always served.
-    #[test]
-    fn reassembly_exhaustion_evicts_the_oldest_sender() {
-        let payload: Vec<u8> = (0..(FRAG_PAYLOAD + 10) as u16).map(|i| i as u8).collect();
-        let (frame, n) = frame_of(mac(1), &payload);
-
-        let mut reassembler = LoraReassembler::new();
-        let mut out = [0u8; MAX_REASSEMBLED_LEN];
-
-        // Open MAX_REASSEMBLIES messages, each from a distinct sender, each
-        // missing its tail.
-        let opened: Vec<Vec<Vec<u8>>> = (0..MAX_REASSEMBLIES)
-            .map(|i| fragments_of(NET, 0x1000 + i as u16, 1, &frame[..n]))
-            .collect();
-        for frags in &opened {
-            assert!(
-                accept_fragment(
-                    &mut reassembler,
-                    NET,
-                    &frags[0],
-                    LinkMetrics::default(),
-                    &mut out
-                )
-                .is_none()
-            );
-        }
-
-        // A fifth sender arrives and is served.
-        let newest = fragments_of(NET, 0x2000, 1, &frame[..n]);
-        assert!(
-            accept_fragment(
-                &mut reassembler,
-                NET,
-                &newest[0],
-                LinkMetrics::default(),
-                &mut out
-            )
-            .is_none()
-        );
-        let (len, _) = accept_fragment(
-            &mut reassembler,
-            NET,
-            &newest[1],
-            LinkMetrics::default(),
-            &mut out,
-        )
-        .expect("the newest sender completes");
-        assert_eq!(&out[..len], &frame[..n]);
-
-        // The oldest was the one evicted: its tail no longer completes.
-        assert!(
-            accept_fragment(
-                &mut reassembler,
-                NET,
-                &opened[0][1],
-                LinkMetrics::default(),
-                &mut out
-            )
-            .is_none(),
-            "the oldest in-flight message should have been evicted"
-        );
-    }
-
-    /// RSSI/SNR reach the caller exactly as the radio reported them, with
-    /// `quality` left `None` so the engine derives the score. A driver that
-    /// filled `quality` in would be committing to an LQI scale it has no
-    /// datasheet mapping for.
-    #[test]
-    fn metrics_pass_through_unscaled_with_no_quality() {
-        let (frame, n) = frame_of(mac(1), &[1, 2, 3]);
-        let frags = fragments_of(NET, 1, 0, &frame[..n]);
-        let reported = LinkMetrics {
-            rssi_dbm: Some(-97),
-            snr_db: Some(-4),
-            quality: None,
-        };
-
-        let mut reassembler = LoraReassembler::new();
-        let mut out = [0u8; MAX_REASSEMBLED_LEN];
-        let (_, metrics) =
-            accept_fragment(&mut reassembler, NET, &frags[0], reported, &mut out).unwrap();
-
-        assert_eq!(metrics.rssi_dbm, Some(-97));
-        assert_eq!(metrics.snr_db, Some(-4));
-        assert_eq!(metrics.quality, None);
-    }
-
     /// A truncated or garbage packet is refused rather than panicking. This is
     /// the outermost air-facing boundary, reachable by anyone in radio range.
     #[test]
@@ -710,43 +477,6 @@ mod tests {
         ));
     }
 
-    /// `build_fragment` refuses a spec that could not describe a real
-    /// fragment. Checked in the function rather than left to `pack_header`'s
-    /// `debug_assert!`s, which are compiled out of the release firmware that
-    /// ships — a transposed index/count otherwise packs a nibble pair every
-    /// receiver rejects, so the sender spends airtime and nothing arrives.
-    #[test]
-    fn build_fragment_refuses_an_impossible_spec() {
-        let (frame, n) = frame_of(mac(1), &[1, 2, 3]);
-        let mut out = [0u8; MAX_FRAME_LEN];
-
-        for spec in [
-            FragmentSpec {
-                msg_id: 0,
-                index: 0,
-                count: 0,
-            },
-            FragmentSpec {
-                msg_id: 0,
-                index: 2,
-                count: 2,
-            },
-            FragmentSpec {
-                msg_id: 0,
-                index: 0,
-                count: MAX_FRAGMENTS + 1,
-            },
-        ] {
-            assert!(
-                matches!(
-                    build_fragment(NET, 1, &frame[..n], spec, &mut out),
-                    Err(LinkError::InvalidPacket)
-                ),
-                "{spec:?} should be refused"
-            );
-        }
-    }
-
     /// A hand-built packet: `count`/`index` as given and a body of `body_len`
     /// bytes, for the headers a well-behaved sender never produces.
     fn raw_packet(net_id: u8, src_id: u16, index: usize, count: usize, body_len: usize) -> Vec<u8> {
@@ -755,34 +485,6 @@ mod tests {
         buf.extend_from_slice(&pack_header(0, index, count));
         buf.extend(core::iter::repeat_n(0xAB, body_len));
         buf
-    }
-
-    /// `build_fragment` refuses a `count` that does not match the frame, in
-    /// either direction. Too small a count is the dangerous one: `count: 1` on
-    /// a two-fragment frame sends a single fragment the receiver completes —
-    /// a truncated frame that parses, which is exactly what `assemble_frame`'s
-    /// docs promise never happens.
-    #[test]
-    fn build_fragment_refuses_a_count_that_does_not_match_the_frame() {
-        let payload: Vec<u8> = (0..(FRAG_PAYLOAD + 10) as u16).map(|i| i as u8).collect();
-        let (frame, n) = frame_of(mac(1), &payload);
-        assert_eq!(fragment_count(n).unwrap(), 2);
-        let mut out = [0u8; MAX_FRAME_LEN];
-
-        for count in [1, 3] {
-            let spec = FragmentSpec {
-                msg_id: 0,
-                index: 0,
-                count,
-            };
-            assert!(
-                matches!(
-                    build_fragment(NET, 1, &frame[..n], spec, &mut out),
-                    Err(LinkError::InvalidPacket)
-                ),
-                "count {count} on a two-fragment frame should be refused"
-            );
-        }
     }
 
     /// **Foreign fragments never occupy a reassembly slot**, checked through
@@ -836,36 +538,6 @@ mod tests {
         assert_eq!(&out[..len], &frame[..n]);
     }
 
-    /// A header claiming more fragments than a reassembled frame can hold is
-    /// refused at decode. The wire's 4-bit count allows 15, but only
-    /// `fragment_count(MAX_REASSEMBLED_LEN)` (3) fit: a larger count opens a
-    /// slot that can never complete, which is a free eviction for anyone in
-    /// radio range.
-    #[test]
-    fn a_count_no_frame_could_need_is_refused() {
-        let most = fragment_count(MAX_REASSEMBLED_LEN).unwrap();
-        assert!(decode_fragment(NET, &raw_packet(NET, 1, 0, most, FRAG_PAYLOAD)).is_ok());
-        assert!(matches!(
-            decode_fragment(NET, &raw_packet(NET, 1, 0, most + 1, FRAG_PAYLOAD)),
-            Err(LinkError::MalformedFrame)
-        ));
-    }
-
-    /// Every fragment but the last carries exactly `FRAG_PAYLOAD` bytes —
-    /// `build_fragment` cannot produce anything else — so a short non-final
-    /// fragment is refused rather than leaving a zero-filled gap in a frame
-    /// of plausible length.
-    #[test]
-    fn a_short_non_final_fragment_is_refused() {
-        assert!(decode_fragment(NET, &raw_packet(NET, 1, 0, 2, FRAG_PAYLOAD)).is_ok());
-        assert!(matches!(
-            decode_fragment(NET, &raw_packet(NET, 1, 0, 2, FRAG_PAYLOAD - 1)),
-            Err(LinkError::MalformedFrame)
-        ));
-        // The last fragment is the one that may be short.
-        assert!(decode_fragment(NET, &raw_packet(NET, 1, 1, 2, 1)).is_ok());
-    }
-
     /// **Bytes off the air that do not parse are `MalformedFrame`, never
     /// `InvalidPacket`.** The driver raises the interface's `LinkErrors` alarm
     /// for every `recv` error but `MalformedFrame`, so the wrong variant lets
@@ -892,27 +564,6 @@ mod tests {
         assert!(matches!(
             decode_fragment(OTHER_NET, &runt),
             Err(LinkError::MalformedFrame)
-        ));
-    }
-
-    /// `fragment_count` at every boundary its doc calls out.
-    #[test]
-    fn fragment_count_boundaries() {
-        for (len, want) in [
-            (0, 1),
-            (1, 1),
-            (FRAG_PAYLOAD, 1),
-            (FRAG_PAYLOAD + 1, 2),
-            (2 * FRAG_PAYLOAD, 2),
-            (2 * FRAG_PAYLOAD + 1, 3),
-            (MAX_REASSEMBLED_LEN, 3),
-            (MAX_FRAGMENTS * FRAG_PAYLOAD, MAX_FRAGMENTS),
-        ] {
-            assert_eq!(fragment_count(len).unwrap(), want, "len {len}");
-        }
-        assert!(matches!(
-            fragment_count(MAX_FRAGMENTS * FRAG_PAYLOAD + 1),
-            Err(LinkError::BufferFull)
         ));
     }
 }

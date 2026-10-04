@@ -327,9 +327,10 @@ set itself comes from **`lora-phy` 3.0.1** (embassy-rs's own crate, same org as
   board-specific seam.
 
 **Where the seam goes, and why it is not just tidiness.** `libs/lora-link`
-carries only the framing — `assemble_frame`, `fragment_count`,
-`build_fragment`, `decode_fragment`, `accept_fragment`, `decode_frame` and the
-constants tying them together — and depends on no radio crate. The `LinkT`
+carries only the framing — its 3-byte header in `build_fragment` and
+`decode_fragment`, plus thin wrappers over `wayfinder-link-utils`'s `Framing`
+and `Reassembler` (the same ones `ieee802154` wraps) at this medium's sizes —
+and depends on no radio crate. The `LinkT`
 implementation, and with it `lora-phy`, live in the board crate. Three reasons,
 in order of weight:
 
@@ -831,8 +832,8 @@ Tests 1-8 are framing and need nothing but byte slices; test 9 belongs with the
    name as `libs/ieee802154`'s, because it is the same property: two `Mac`s
    sharing their low two bytes spoil each other's reassembly, and the result is
    a dropped frame rather than one attributed to the wrong sender (§5.2). The
-   derivation itself matches `ieee802154::short_address_of`, so a node's radios
-   agree on its short identity.
+   derivation is `wayfinder_link_utils::short_address_of`, the one
+   `ieee802154` uses, so a node's radios agree on its short identity.
 2. **A frame larger than one LoRa payload splits, and reassembles
    byte-identical** through the `wayfinder-link-utils` adapter.
 3. **A fragment with a foreign `net_id` is dropped** and does not enter the
@@ -868,12 +869,13 @@ Recorded as the design is built, per `docs/design/README.md`.
   a refactor. The `LoraRadio` trait is gone with it: an abstraction over one
   implementation is a guess at where the next radio differs.
 
-- **`src_id` is passed in, not derived.** §4.4 says the derivation matches
-  `ieee802154::short_address_of`, and the first instinct was to call it. Design
-  19 §11 had already settled where that function lives and why, and the
-  STM32F411 already derives its RYLR998 address inline — so the board
-  computes it and `lora-link` takes a `u16`, rather than a LoRa crate depending
-  on an 802.15.4 crate for two lines of arithmetic.
+- **`src_id` is passed in, not derived.** The board computes it once with
+  `short_address_of` and `lora-link` takes a `u16`. That function first lived
+  in `ieee802154`, and a LoRa crate depending on an 802.15.4 crate for it was
+  wrong; it now lives in `wayfinder-link-utils` with the rest of the framing
+  the two media share. Before that move, `lora-link` was a copy of
+  `ieee802154`'s framing, and the copies drifted within two weeks — one
+  received `MalformedFrame` for air-side errors and the other did not.
 
 - **Four hardware facts were wrong in the proposal and are corrected in the
   code.** Each is the kind that links cleanly and fails at runtime, which is

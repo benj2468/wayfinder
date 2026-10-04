@@ -8,8 +8,12 @@ in `at86rf233`/`nrf-ieee802154`. See
 
 The send path is `assemble_frame` → `fragment_count` → `build_fragment` per
 fragment; the receive path is `accept_fragment` per packet → `decode_frame`
-once one completes. Fragmentation reuses `wayfinder-link-utils`, as `rylr998`,
-`blue` and `ieee802154` do.
+once one completes. Everything but the 3-byte `[net_id][src_id]` header is
+`wayfinder-link-utils`'s: frame assembly and fragment cutting (`Framing`,
+shared with `ieee802154`) and reassembly (`Reassembler`, shared with `rylr998`
+and `blue` too). The functions here are thin wrappers at this medium's sizes;
+a rule about *what a valid fragment is* belongs in `link-utils`, where every
+medium gets it, not here.
 
 ## Why this is not `rylr998`, which is also LoRa
 
@@ -53,14 +57,10 @@ though that content's Ethernet header already carries the full 6-byte source
 `Mac` at bytes 6..12. That copy is only available once reassembly *finishes*,
 and the key is what decides which reassembly a fragment belongs to.
 
-`src_id` is the low 16 bits of the sender's `Mac`, which is
-`ieee802154::short_address_of`'s derivation — deliberately the same, so a
-node's two radios agree on its short identity. This crate does **not** call
-that function or depend on that crate: the adapter passes `src_id` in, the way
-the STM32F411 board already computes its RYLR998 address inline
-(`bins/wayfinder-stm32f411/src/main.rs`). Keep it that way; a LoRa crate depending on
-an 802.15.4 crate for two lines of arithmetic is worse than the duplication it
-avoids.
+`src_id` is `short_address_of` the sender's `Mac` (its low 16 bits), the
+same `wayfinder-link-utils` function `ieee802154` re-exports, so a node's
+radios agree on its short identity. The adapter passes `src_id` in rather
+than this crate deriving it per fragment.
 
 Worth contrasting with `libs/blue`, whose key *is* an embedded 6-byte `Mac`:
 BLE draws a fresh random advertiser address per advertising-set registration,
