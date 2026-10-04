@@ -3156,6 +3156,7 @@ fn cert_fetch_round_trip_with_real_responder() {
     }
 
     let m1 = harness.get_machine("machine1").ident; // A, the real responder
+    let m2 = harness.get_machine("machine2").ident; // X, the relay between them
     let m3 = harness.get_machine("machine3").ident; // B, the requester
 
     let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
@@ -3166,7 +3167,10 @@ fn cert_fetch_round_trip_with_real_responder() {
     // timing): a signed OGM from B, fed straight to A's router. This node
     // never leaves this process, so nothing about the fetch mechanism under
     // test is bypassed — only the unrelated question of when Trickle would
-    // have delivered this on its own.
+    // have delivered this on its own. It arrives as X's relay of it, not as
+    // if B were adjacent: A's reply is addressed to its next hop, and a
+    // reply addressed to B would cross a segment B is not on, where X only
+    // overhears it and must not relay it.
     let b_ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
     let mut b_ogm_buf = vec![0u8; 512];
     let b_ogm = BatmanOgmPacket {
@@ -3193,7 +3197,7 @@ fn cert_fetch_round_trip_with_real_responder() {
         Duration::from_secs(1),
         0,
         &build_frame(
-            m3,
+            m2,
             Mac::BROADCAST,
             DEFAULT_BATMAN_ETHER_TYPE,
             &b_ogm_buf[..b_ogm_len],

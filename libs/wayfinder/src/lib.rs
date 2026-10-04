@@ -1525,6 +1525,35 @@ impl<
         // 2. Demux by Protocol ID
         match frame.protocol.get() {
             DEFAULT_BATMAN_ETHER_TYPE => {
+                // An overheard frame, not a received one. A shared medium (a
+                // LoRa module at its broadcast address, BLE advertising) hands
+                // up every frame in range whatever its link `dst`, so a unicast
+                // naming another hop reaches this node too. Acting on it is a
+                // storm, not redundancy: relaying re-transmits on the same
+                // segment, every other member overhears that copy as well, and
+                // the frame multiplies until its TTL runs out. The link-quality
+                // and rx accounting above has already taken what an overheard
+                // frame is good for.
+                //
+                // An authenticated mesh drops these a layer up
+                // (`strip_directed`, "directed frame addressed to another
+                // hop"); this is the same rule for an open one.
+                //
+                // Flood sub-types are exempt: an OGM, keep-alive or broadcast
+                // is meant for every node that hears it and re-floods under
+                // the engine's seqno high-water mark, so its link `dst` carries
+                // no meaning to honour.
+                let flood = matches!(
+                    packet_type,
+                    Some(BatmanPacketType::Ogm)
+                        | Some(BatmanPacketType::Keepalive)
+                        | Some(BatmanPacketType::Bcast)
+                );
+                if !flood && !dst.is_multicast() && dst != self.batman.self_ident {
+                    trace!("drop: unicast addressed to another hop");
+                    return RxOutcome::empty();
+                }
+
                 // Per-link receive gating: drop a traffic class this link is
                 // configured not to accept before it can touch the routing
                 // tables, be delivered, or generate a re-flood.  The rx-rate
