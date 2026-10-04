@@ -319,7 +319,7 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
             Headline(
                 f"{cap_slow if cap_slow is not None else 0}" + ("+" if cap_slow == counts[-1] else ""),
                 f"sensors at {label(slow)}",
-                "slower adverts free the duty-cycle budget for data",
+                "capacity grows only with the square root of the advert interval",
             ),
             Headline(
                 f"{_median_amp(runs):.1f}x",
