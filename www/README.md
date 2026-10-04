@@ -192,6 +192,12 @@ crowded LoRa channel and scale. Every chart is drawn by `sim/lab.js` from
 - **The schema is versioned** (`schema: 1`); `lab.js` ignores files it does not
   understand rather than mis-drawing them. Chart kinds: line, step, scatter,
   bar, plus a heatmap with an overlay.
+- **No inline styles.** The CSP has no `'unsafe-inline'` for `style-src`, so a
+  `style="…"` attribute is silently dropped in production — and only there,
+  because `just site-serve` sends no headers. `lab.js` sets per-element colour
+  through the CSSOM (`el.style.setProperty`), which the CSP does not restrict.
+  Check a change on a `just site-deploy <branch>` preview, where `_headers`
+  applies, before trusting a local look.
 - **Chart colour** is the simulator's validated palette
   (`sim/src/wayfinder_sim/palette.py`), checked against the chart surface with
   the dataviz validator. Two of its hues are under 3:1 there, which is why

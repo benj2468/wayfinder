@@ -70,10 +70,26 @@
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v === null || v === undefined || v === false) continue;
       if (k === "text") node.textContent = v;
+      else if (k === "style") setStyle(node, v);
       else node.setAttribute(k, v);
     }
     for (const child of children || []) if (child) node.append(child);
     return node;
+  }
+
+  // The site's CSP has no 'unsafe-inline' for styles, so a `style="…"`
+  // attribute is dropped on the deployed site (and only there — a local
+  // preview serves no headers). Properties set through the CSSOM are not
+  // subject to it, so per-element colours go in that way.
+  function setStyle(node, css) {
+    for (const decl of css.split(";")) {
+      const at = decl.indexOf(":");
+      if (at > 0)
+        node.style.setProperty(
+          decl.slice(0, at).trim(),
+          decl.slice(at + 1).trim(),
+        );
+    }
   }
 
   function svg(tag, attrs) {
@@ -190,7 +206,9 @@
       Array.isArray(chart.y_range) &&
       chart.y_range[0] === 0 &&
       chart.y_range[1] === 1;
-    const m = { l: 46, r: 14, t: 26, b: 40 };
+    // Categorical labels may wrap onto a second line; leave room for it above
+    // the axis title.
+    const m = { l: 46, r: 14, t: 26, b: categorical ? 54 : 40 };
     const innerW = width - m.l - m.r;
 
     // Domains.
