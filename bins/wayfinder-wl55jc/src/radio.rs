@@ -368,10 +368,11 @@ impl LinkT for LoraLink {
             )?;
             let packet = Packet::from_slice(&out[..n]).map_err(|_| LinkError::BufferFull)?;
 
-            // Depth-1 queue plus the wait below means this never blocks on a
-            // previous fragment of our own.
-            TX_QUEUE.send(packet).await;
+            // Cleared before queueing, so the verdict awaited below can only
+            // be this fragment's. Depth-1 queue plus that wait means `send`
+            // never blocks on a previous fragment of our own.
             TX_DONE.reset();
+            TX_QUEUE.send(packet).await;
             if !TX_DONE.wait().await {
                 // **Abandon the whole frame.** A receiver cannot complete a
                 // reassembly that is missing a fragment, so the remaining
