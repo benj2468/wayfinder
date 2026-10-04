@@ -13,6 +13,9 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+#[cfg(feature = "link")]
+pub mod link;
+
 use interfaces::frame::LinkFrameData;
 use interfaces::frame::Mac;
 use interfaces::link::LinkError;
