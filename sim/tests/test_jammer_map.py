@@ -13,7 +13,7 @@ pytest.importorskip("simpy")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scenarios"))
 
-from jammer_map import run_position  # noqa: E402
+from jammer_map import run_position
 
 
 def test_no_jammer_delivers():

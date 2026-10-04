@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import itertools
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -50,7 +51,7 @@ from wayfinder_sim.terrain import Terrain, TerrainFollowing, peak_sites, valley_
 from wayfinder_sim.topology import shared_lan
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import mountain_relay as world  # noqa: E402  — the same range, flight and radios
+import mountain_relay as world
 
 MAX_RELAYS = 6
 PROBE_RATE_HZ = 2.0
@@ -117,7 +118,9 @@ def coverage_matrix(terrain: Terrain, sites: Sequence[Vec3]) -> list[list[bool]]
     base = model.base
     track = flight(terrain)
     duration = world.flight_duration_s()
-    points = [track.position(duration * i / (PLAN_SAMPLES - 1)) for i in range(PLAN_SAMPLES)]
+    points = [
+        track.position(duration * i / (PLAN_SAMPLES - 1)) for i in range(PLAN_SAMPLES)
+    ]
     matrix = []
     for site in sites:
         row = []
@@ -126,13 +129,20 @@ def coverage_matrix(terrain: Terrain, sites: Sequence[Vec3]) -> list[list[bool]]
             if base.max_range_m is not None and d > base.max_range_m:
                 row.append(False)
                 continue
-            rssi = base.tx_power_dbm + base.rx_gain_dbi - base.path_loss_db(d) - model.excess_loss_db(p, site)
+            rssi = (
+                base.tx_power_dbm
+                + base.rx_gain_dbi
+                - base.path_loss_db(d)
+                - model.excess_loss_db(p, site)
+            )
             row.append(base.delivery_probability(rssi) >= 0.5)
         matrix.append(row)
     return matrix
 
 
-def greedy_layouts(terrain: Terrain, max_relays: int = MAX_RELAYS) -> list[tuple[list[Vec3], float]]:
+def greedy_layouts(
+    terrain: Terrain, max_relays: int = MAX_RELAYS
+) -> list[tuple[list[Vec3], float]]:
     """For N = 1..max_relays, the greedy layout and its planned coverage
     share. Greedy is within (1 - 1/e) of optimal for a coverage objective,
     and — unlike re-optimising from scratch for each N — it describes a
@@ -158,17 +168,31 @@ def greedy_layouts(terrain: Terrain, max_relays: int = MAX_RELAYS) -> list[tuple
     return layouts
 
 
-def build_simulation(terrain: Terrain, sites: Sequence[Vec3], seed: int = 0) -> Simulation:
+def build_simulation(
+    terrain: Terrain, sites: Sequence[Vec3], seed: int = 0
+) -> Simulation:
     """The drone and `sites`' relays on one terrain-masked channel."""
     names = [f"r{i + 1}" for i in range(len(sites))]
     nodes = [
-        Node("drone", mobility=flight(terrain), trickle=world.TRICKLE_MS, tx_keepalive_interval_ms=world.KEEPALIVE_MS),
+        Node(
+            "drone",
+            mobility=flight(terrain),
+            trickle=world.TRICKLE_MS,
+            tx_keepalive_interval_ms=world.KEEPALIVE_MS,
+        ),
         *(
-            Node(n, mobility=Static(site), trickle=world.TRICKLE_MS, tx_keepalive_interval_ms=world.KEEPALIVE_MS)
+            Node(
+                n,
+                mobility=Static(site),
+                trickle=world.TRICKLE_MS,
+                tx_keepalive_interval_ms=world.KEEPALIVE_MS,
+            )
             for n, site in zip(names, sites)
         ),
     ]
-    sim = Simulation(nodes, shared_lan([n.name for n in nodes], radio(terrain)), seed=seed)
+    sim = Simulation(
+        nodes, shared_lan([n.name for n in nodes], radio(terrain)), seed=seed
+    )
     sim.record("reachable", lambda s: s.reachable("drone", names))
     return sim
 
@@ -212,7 +236,9 @@ class LayoutResult:
         return sum(self.routed) / len(self.routed)
 
 
-def run_layouts(seeds: Sequence[int] = SEEDS, max_relays: int = MAX_RELAYS) -> list[LayoutResult]:
+def run_layouts(
+    seeds: Sequence[int] = SEEDS, max_relays: int = MAX_RELAYS
+) -> list[LayoutResult]:
     terrain = world.build_terrain()
     duration = world.flight_duration_s()
     results = []
@@ -221,7 +247,13 @@ def run_layouts(seeds: Sequence[int] = SEEDS, max_relays: int = MAX_RELAYS) -> l
         for seed in seeds:
             sim = build_simulation(terrain, sites, seed)
             flows = [
-                sim.stream("drone", f"r{i + 1}", rate_hz=PROBE_RATE_HZ, start_s=0.0, duration_s=duration)
+                sim.stream(
+                    "drone",
+                    f"r{i + 1}",
+                    rate_hz=PROBE_RATE_HZ,
+                    start_s=0.0,
+                    duration_s=duration,
+                )
                 for i in range(len(sites))
             ]
             rec = sim.run(until_s=duration, sample_interval_ms=world.SAMPLE_INTERVAL_MS)
@@ -229,7 +261,9 @@ def run_layouts(seeds: Sequence[int] = SEEDS, max_relays: int = MAX_RELAYS) -> l
             measured.append(delivered_coverage(flows, duration))
             routed.append(stats.connected_fraction)
             longest.append(_longest_dark_s(flows, duration))
-        results.append(LayoutResult(len(sites), sites, planned, measured, routed, longest))
+        results.append(
+            LayoutResult(len(sites), sites, planned, measured, routed, longest)
+        )
     return results
 
 
@@ -251,7 +285,7 @@ def _longest_dark_s(flows, duration_s: float, bin_s: float = 1.0) -> float:
 
 def knee(results: Sequence[LayoutResult]) -> LayoutResult:
     """The smallest layout past which one more relay adds under `KNEE_GAIN`."""
-    for here, after in zip(results, results[1:]):
+    for here, after in itertools.pairwise(results):
         if after.measured_mean - here.measured_mean < KNEE_GAIN:
             return here
     return results[-1]
@@ -268,7 +302,9 @@ def print_summary(results: Sequence[LayoutResult]) -> None:
         )
         prev = r.measured_mean
     k = knee(results)
-    print(f"  knee: {k.relays} relays ({k.measured_mean:.1%}); the next adds < {KNEE_GAIN:.0%}")
+    print(
+        f"  knee: {k.relays} relays ({k.measured_mean:.1%}); the next adds < {KNEE_GAIN:.0%}"
+    )
 
 
 def showcase(results: Sequence[LayoutResult]) -> Showcase:
@@ -276,7 +312,7 @@ def showcase(results: Sequence[LayoutResult]) -> Showcase:
     k = knee(results)
     ns = [r.relays for r in results]
     marginal = [results[0].measured_mean] + [
-        b.measured_mean - a.measured_mean for a, b in zip(results, results[1:])
+        b.measured_mean - a.measured_mean for a, b in itertools.pairwise(results)
     ]
     terrain = world.build_terrain()
     track = flight(terrain)
@@ -336,9 +372,21 @@ def showcase(results: Sequence[LayoutResult]) -> Showcase:
                 x_label="relays deployed",
                 y_label="share of flight",
                 series=[
-                    Series("planned (geometry)", ns, [r.planned for r in results], kind="line"),
-                    Series("delivered (real router)", ns, [r.measured_mean for r in results], kind="line"),
-                    Series("route held", ns, [r.routed_mean for r in results], kind="line"),
+                    Series(
+                        "planned (geometry)",
+                        ns,
+                        [r.planned for r in results],
+                        kind="line",
+                    ),
+                    Series(
+                        "delivered (real router)",
+                        ns,
+                        [r.measured_mean for r in results],
+                        kind="line",
+                    ),
+                    Series(
+                        "route held", ns, [r.routed_mean for r in results], kind="line"
+                    ),
                 ],
                 y_range=(0.0, 1.0),
             ),
@@ -346,14 +394,25 @@ def showcase(results: Sequence[LayoutResult]) -> Showcase:
                 title="What each extra relay adds",
                 x_label="relay number",
                 y_label="added share of flight",
-                series=[Series("marginal coverage", [str(n) for n in ns], marginal, kind="bar")],
+                series=[
+                    Series(
+                        "marginal coverage", [str(n) for n in ns], marginal, kind="bar"
+                    )
+                ],
                 caption=f"Past the knee at {k.relays}, each relay buys less than {KNEE_GAIN:.0%} of the flight.",
             ),
             Chart(
                 title="Longest blackout",
                 x_label="relays deployed",
                 y_label="seconds",
-                series=[Series("worst outage over seeds", ns, [max(r.longest_outage_s) for r in results], kind="line")],
+                series=[
+                    Series(
+                        "worst outage over seeds",
+                        ns,
+                        [max(r.longest_outage_s) for r in results],
+                        kind="line",
+                    )
+                ],
                 caption="Coverage share hides how the gaps are spread; this is the single longest one.",
             ),
             Chart(
@@ -361,7 +420,12 @@ def showcase(results: Sequence[LayoutResult]) -> Showcase:
                 x_label="east (m)",
                 y_label="north (m)",
                 series=[
-                    Series("flight track", [p.x for p in track_pts], [p.y for p in track_pts], kind="line"),
+                    Series(
+                        "flight track",
+                        [p.x for p in track_pts],
+                        [p.y for p in track_pts],
+                        kind="line",
+                    ),
                     Series(
                         "relay sites, in order added",
                         [s.x for s in final],
@@ -372,7 +436,15 @@ def showcase(results: Sequence[LayoutResult]) -> Showcase:
             ),
         ],
         table=[["relays", "planned", "measured", "longest gap (s)"]]
-        + [[r.relays, round(r.planned, 3), round(r.measured_mean, 3), round(max(r.longest_outage_s), 1)] for r in results],
+        + [
+            [
+                r.relays,
+                round(r.planned, 3),
+                round(r.measured_mean, 3),
+                round(max(r.longest_outage_s), 1),
+            ]
+            for r in results
+        ],
         params={
             "max_relays": MAX_RELAYS,
             "freq_mhz": world.FREQ_HZ / 1e6,
@@ -385,8 +457,12 @@ def showcase(results: Sequence[LayoutResult]) -> Showcase:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
-    parser.add_argument("--export", type=Path, help="write showcase JSON into this directory")
-    parser.add_argument("--quick", action="store_true", help="one seed, up to four relays")
+    parser.add_argument(
+        "--export", type=Path, help="write showcase JSON into this directory"
+    )
+    parser.add_argument(
+        "--quick", action="store_true", help="one seed, up to four relays"
+    )
     args = parser.parse_args(argv)
     wf.init_tracing()
 

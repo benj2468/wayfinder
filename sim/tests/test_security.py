@@ -252,7 +252,10 @@ def test_a_revocation_pushed_to_one_member_floods_to_the_rest():
     mesh = _mesh()
     names = ["hq", "r1", "r2", "far", "rogue"]
     nodes = [Node(n, credential=Credential()) for n in names]
-    links = [*path(["hq", "r1", "r2", "far"], PerfectWire()), pair("r1", "rogue", PerfectWire())]
+    links = [
+        *path(["hq", "r1", "r2", "far"], PerfectWire()),
+        pair("r1", "rogue", PerfectWire()),
+    ]
     sim = Simulation(nodes, links, mesh=mesh)
     sim.run(until_s=20.0)
     assert not sim.knows_revoked("far", "rogue")
@@ -307,4 +310,6 @@ def test_an_honest_node_honours_its_own_revocation():
     sim.run(until_s=20.0)
     sim.revoke("rogue", notify=["a"])
     sim.run(until_s=60.0)
-    assert sim.driver("rogue").auth_locked, "it went inert on hearing its own revocation"
+    assert sim.driver("rogue").auth_locked, (
+        "it went inert on hearing its own revocation"
+    )

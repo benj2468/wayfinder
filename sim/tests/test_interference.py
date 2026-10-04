@@ -39,7 +39,12 @@ def test_a_nearby_jammer_silences_a_link_while_active():
     sim = _pair_sim()
     flow = sim.stream("a", "b", rate_hz=10, start_s=3.0, duration_s=12.0)
     sim.add_jammer(
-        Jammer("j", mobility=Static(Vec3(210.0, 0.0, 0.0)), power_dbm=20.0, active=(6.0, 10.0))
+        Jammer(
+            "j",
+            mobility=Static(Vec3(210.0, 0.0, 0.0)),
+            power_dbm=20.0,
+            active=(6.0, 10.0),
+        )
     )
     sim.run(until_s=16.0)
 
@@ -52,7 +57,9 @@ def test_a_nearby_jammer_silences_a_link_while_active():
 def test_a_distant_jammer_does_nothing():
     sim = _pair_sim()
     flow = sim.stream("a", "b", rate_hz=10, start_s=3.0, duration_s=5.0)
-    sim.add_jammer(Jammer("j", mobility=Static(Vec3(50_000.0, 0.0, 0.0)), power_dbm=20.0))
+    sim.add_jammer(
+        Jammer("j", mobility=Static(Vec3(50_000.0, 0.0, 0.0)), power_dbm=20.0)
+    )
     sim.run(until_s=9.0)
     assert flow.delivery_ratio() == 1.0
 
@@ -60,7 +67,14 @@ def test_a_distant_jammer_does_nothing():
 def test_a_jammer_adds_to_collisions_on_a_contended_medium():
     sim = _pair_sim(Medium(phy=FixedRate(bitrate_bps=50_000)))
     flow = sim.stream("a", "b", rate_hz=10, start_s=3.0, duration_s=6.0)
-    sim.add_jammer(Jammer("j", mobility=Static(Vec3(210.0, 0.0, 0.0)), power_dbm=20.0, active=(5.0, 7.0)))
+    sim.add_jammer(
+        Jammer(
+            "j",
+            mobility=Static(Vec3(210.0, 0.0, 0.0)),
+            power_dbm=20.0,
+            active=(5.0, 7.0),
+        )
+    )
     sim.run(until_s=10.0)
     assert flow.delivery_ratio(5.5, 6.9) == 0.0
     assert sim.radio_stats("b").jammed > 0
@@ -74,7 +88,11 @@ def test_a_jammer_scoped_to_one_link_leaves_the_others_alone():
     links = [pair("a", "b", RADIO), pair("a", "b", PerfectWire())]
     links[1].name = "wire"
     sim = Simulation(nodes, links, seed=0)
-    sim.add_jammer(Jammer("j", mobility=Static(Vec3(210.0, 0.0, 0.0)), power_dbm=30.0, links=("a-b",)))
+    sim.add_jammer(
+        Jammer(
+            "j", mobility=Static(Vec3(210.0, 0.0, 0.0)), power_dbm=30.0, links=("a-b",)
+        )
+    )
     flow = sim.stream("a", "b", rate_hz=10, start_s=5.0, duration_s=5.0)
     sim.run(until_s=11.0)
     # The radio is jammed; the wire carries everything.
@@ -85,7 +103,9 @@ def test_a_jammer_scoped_to_one_link_leaves_the_others_alone():
 def test_unknown_link_in_scope_is_refused():
     sim = _pair_sim()
     with pytest.raises(KeyError):
-        sim.add_jammer(Jammer("j", mobility=Static(Vec3()), power_dbm=10.0, links=("nope",)))
+        sim.add_jammer(
+            Jammer("j", mobility=Static(Vec3()), power_dbm=10.0, links=("nope",))
+        )
 
 
 def test_interference_at_reports_total_jammer_power():

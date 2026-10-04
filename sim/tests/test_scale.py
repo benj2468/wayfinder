@@ -14,7 +14,7 @@ pytest.importorskip("simpy")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scenarios"))
 
-from scale import run_size  # noqa: E402
+from scale import run_size
 
 
 def test_a_mesh_inside_the_table_converges_fast_and_delivers_both_ways():

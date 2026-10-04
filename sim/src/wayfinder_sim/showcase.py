@@ -83,7 +83,9 @@ class Heatmap:
     value_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
-        if len(self.values) != len(self.ys) or any(len(row) != len(self.xs) for row in self.values):
+        if len(self.values) != len(self.ys) or any(
+            len(row) != len(self.xs) for row in self.values
+        ):
             raise ValueError(
                 f"heatmap {self.label!r}: values must be {len(self.ys)} rows of {len(self.xs)}"
             )

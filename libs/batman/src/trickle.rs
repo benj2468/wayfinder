@@ -339,6 +339,9 @@ mod tests {
         assert!(t.time_until(now) >= I_MIN, "backed off well past i_min");
         t.reset(now);
         let until = t.time_until(now);
-        assert!(until >= I_MIN / 2 && until < I_MIN, "post-reset fire {until:?}");
+        assert!(
+            until >= I_MIN / 2 && until < I_MIN,
+            "post-reset fire {until:?}"
+        );
     }
 }

@@ -27,8 +27,8 @@ import wayfinder_py as wf
 
 from . import NoLinkError
 from .adversary import Wiretap
-from .link import Link
 from .interference import DEFAULT_CAPTURE_DB, Jammer, sum_dbm
+from .link import Link
 from .medium import EnergyModel, RadioStats
 from .mobility import Static, Vec3
 from .node import Node
@@ -252,7 +252,9 @@ class Simulation:
         self._radios: dict[tuple[str, str], _Radio] = {}
         self._jammers: list[Jammer] = []
         self._receivers: dict[tuple[int, str], tuple[str, ...]] = {}
-        self._radio_stats: dict[str, RadioStats] = {name: RadioStats() for name in names}
+        self._radio_stats: dict[str, RadioStats] = {
+            name: RadioStats() for name in names
+        }
         self._compromised: set[str] = set()
         # Wire bytes of every revocation issued, keyed by the revoked node's
         # name — what a compromised node's firmware watches for and discards.
@@ -935,7 +937,10 @@ class Simulation:
             rssi = sample.metrics.rssi_dbm
             if self._jammers and rssi is not None:
                 jam_mw = self._jamming_mw(link, rx_pos, t_s, t_s)
-                if jam_mw > 0.0 and rssi - 10.0 * math.log10(jam_mw) < DEFAULT_CAPTURE_DB:
+                if (
+                    jam_mw > 0.0
+                    and rssi - 10.0 * math.log10(jam_mw) < DEFAULT_CAPTURE_DB
+                ):
                     self._radio_stats[dst_name].jammed += 1
                     continue
             if self._delivery_rng.random() < sample.delivery_probability:
@@ -1003,7 +1008,9 @@ class Simulation:
         others = [n for n in link.endpoints if n != src]
         max_range = getattr(link.channel, "max_range_m", None)
         if max_range is None:
-            max_range = getattr(getattr(link.channel, "base", None), "max_range_m", None)
+            max_range = getattr(
+                getattr(link.channel, "base", None), "max_range_m", None
+            )
         src_mob = self._states[src].node.mobility
         if max_range is not None and isinstance(src_mob, Static):
             src_pos = src_mob.position(0.0)
@@ -1011,7 +1018,8 @@ class Simulation:
                 n
                 for n in others
                 if not isinstance(self._states[n].node.mobility, Static)
-                or src_pos.distance_to(self._states[n].node.mobility.position(0.0)) <= max_range
+                or src_pos.distance_to(self._states[n].node.mobility.position(0.0))
+                <= max_range
             ]
         result = tuple(others)
         self._receivers[key] = result
@@ -1062,7 +1070,7 @@ class Simulation:
                 if not radio.queue:
                     break
                 pending = radio.queue.popleft()
-            iface, frame = pending
+            _, frame = pending
             pending = None
             if not state.up or link.name in self._down_links:
                 # Powered off or cut with frames still queued: they die with it.
@@ -1073,7 +1081,9 @@ class Simulation:
             stats.tx_frames += 1
             stats.tx_airtime_s += airtime_ms / 1000.0
             yield self.env.timeout(airtime_ms)
-            radio.off_until_ms = self.env.now + medium.off_time_s(airtime_ms / 1000.0) * 1000.0
+            radio.off_until_ms = (
+                self.env.now + medium.off_time_s(airtime_ms / 1000.0) * 1000.0
+            )
         radio.sending = False
 
     def _transmit(self, link: Link, src: str, frame: bytes, airtime_ms: float) -> None:
@@ -1133,7 +1143,9 @@ class Simulation:
         overlap_mw = sum(
             10.0 ** (other.rssi_dbm / 10.0)
             for other in radio.receptions
-            if other is not rec and other.start_ms < rec.end_ms and other.end_ms > rec.start_ms
+            if other is not rec
+            and other.start_ms < rec.end_ms
+            and other.end_ms > rec.start_ms
         )
         jam_mw = 0.0
         if self._jammers:
@@ -1245,9 +1257,7 @@ class Simulation:
             flow.record_sent(seq, self.env.now / 1000.0)
             src = self._states[flow.src]
             if src.up:
-                src.driver.queue_local_send(
-                    dest_mac, encode_payload(flow.flow_id, seq)
-                )
+                src.driver.queue_local_send(dest_mac, encode_payload(flow.flow_id, seq))
             yield self.env.timeout(interval_ms)
 
     def _sample_proc(self, interval_ms: int, recorder: Recorder):

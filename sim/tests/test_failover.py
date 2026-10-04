@@ -17,7 +17,7 @@ pytest.importorskip("simpy")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scenarios"))
 
-from failover import (  # noqa: E402
+from failover import (
     DEFAULT_TRICKLE,
     FAIL_AT_S,
     run_failover,
@@ -44,7 +44,11 @@ def test_keepalives_shorten_the_worst_case():
     ]
     with_ka = [
         run_failover(
-            s, DEFAULT_TRICKLE, keepalive_ms=250, recover_at_s=None, duration_s=FAIL_AT_S + 60
+            s,
+            DEFAULT_TRICKLE,
+            keepalive_ms=250,
+            recover_at_s=None,
+            duration_s=FAIL_AT_S + 60,
         ).recovered_s
         for s in seeds
     ]

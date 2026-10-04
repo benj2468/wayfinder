@@ -13,7 +13,7 @@ pytest.importorskip("simpy")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scenarios"))
 
-from battery_life import RADIO, listen_share, median_sensor, run_network  # noqa: E402
+from battery_life import RADIO, listen_share, median_sensor, run_network
 
 
 def test_listening_dominates_a_routing_nodes_energy():

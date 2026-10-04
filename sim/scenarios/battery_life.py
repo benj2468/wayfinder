@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import random
-import statistics
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -51,7 +50,7 @@ from wayfinder_sim.showcase import Chart, Headline, Series, Showcase, write_show
 from wayfinder_sim.topology import shared_lan
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import crowded_lora as lora  # noqa: E402 — the same channel and sensors
+import crowded_lora as lora
 
 RADIO = EnergyModel(tx_mw=150.0, rx_mw=17.0, idle_mw=17.0)
 """A mesh router's radio: its receiver is always open, so idle *is* receive."""
@@ -74,7 +73,12 @@ MEASURE_S = 3600.0
 
 
 def _delta(after: RadioStats, before: RadioStats) -> RadioStats:
-    return RadioStats(**{f.name: getattr(after, f.name) - getattr(before, f.name) for f in dataclasses.fields(RadioStats)})
+    return RadioStats(
+        **{
+            f.name: getattr(after, f.name) - getattr(before, f.name)
+            for f in dataclasses.fields(RadioStats)
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -92,7 +96,9 @@ class NodeEnergy:
     def breakdown_mj_per_h(self, model: EnergyModel = RADIO) -> dict[str, float]:
         """Energy per hour by radio state."""
         scale = 3600.0 / self.window_s
-        idle_s = max(0.0, self.window_s - self.stats.tx_airtime_s - self.stats.rx_airtime_s)
+        idle_s = max(
+            0.0, self.window_s - self.stats.tx_airtime_s - self.stats.rx_airtime_s
+        )
         return {
             "transmit": self.stats.tx_airtime_s * model.tx_mw * scale,
             "receive": self.stats.rx_airtime_s * model.rx_mw * scale,
@@ -100,31 +106,60 @@ class NodeEnergy:
         }
 
     def life_days(self, model: EnergyModel = RADIO, battery: str = PRIMARY) -> float:
-        return EnergyModel.battery_life_h(BATTERIES_MWH[battery], self.power_mw(model)) / 24.0
+        return (
+            EnergyModel.battery_life_h(BATTERIES_MWH[battery], self.power_mw(model))
+            / 24.0
+        )
 
 
-def run_network(sensors: int = SENSORS, i_max_s: float = DEFAULT_I_MAX_S, *, seed: int = lora.SEED, measure_s: float = MEASURE_S) -> list[NodeEnergy]:
+def run_network(
+    sensors: int = SENSORS,
+    i_max_s: float = DEFAULT_I_MAX_S,
+    *,
+    seed: int = lora.SEED,
+    measure_s: float = MEASURE_S,
+) -> list[NodeEnergy]:
     """Warm up, then meter every radio over `measure_s` of normal reporting."""
     trickle = lora.trickle_for(i_max_s)
     names = [f"s{i + 1}" for i in range(sensors)]
     nodes = [Node(lora.GATEWAY, mobility=Static(Vec3(0.0, 0.0, 10.0)), trickle=trickle)]
-    nodes += [Node(n, mobility=Static(p), trickle=trickle) for n, p in zip(names, lora.sensor_sites(sensors, seed))]
-    sim = Simulation(nodes, shared_lan([x.name for x in nodes], lora.lora_radio(), medium=lora.medium()), seed=seed)
+    nodes += [
+        Node(n, mobility=Static(p), trickle=trickle)
+        for n, p in zip(names, lora.sensor_sites(sensors, seed))
+    ]
+    sim = Simulation(
+        nodes,
+        shared_lan([x.name for x in nodes], lora.lora_radio(), medium=lora.medium()),
+        seed=seed,
+    )
     warmup_s = 2 * i_max_s + 60.0
     rng = random.Random(seed + 1)
     for n in names:
-        sim.stream(n, lora.GATEWAY, rate_hz=1.0 / lora.REPORT_S, start_s=warmup_s + rng.random() * lora.REPORT_S, duration_s=measure_s)
+        sim.stream(
+            n,
+            lora.GATEWAY,
+            rate_hz=1.0 / lora.REPORT_S,
+            start_s=warmup_s + rng.random() * lora.REPORT_S,
+            duration_s=measure_s,
+        )
     sim.run(until_s=warmup_s)
     before = {x.name: dataclasses.replace(sim.radio_stats(x.name)) for x in nodes}
     sim.run(until_s=warmup_s + measure_s)
     return [
-        NodeEnergy(x.name, "gateway" if x.name == lora.GATEWAY else "sensor", _delta(sim.radio_stats(x.name), before[x.name]), measure_s)
+        NodeEnergy(
+            x.name,
+            "gateway" if x.name == lora.GATEWAY else "sensor",
+            _delta(sim.radio_stats(x.name), before[x.name]),
+            measure_s,
+        )
         for x in nodes
     ]
 
 
 def median_sensor(nodes: Sequence[NodeEnergy]) -> NodeEnergy:
-    sensors = sorted((n for n in nodes if n.role == "sensor"), key=lambda n: n.power_mw())
+    sensors = sorted(
+        (n for n in nodes if n.role == "sensor"), key=lambda n: n.power_mw()
+    )
     return sensors[len(sensors) // 2]
 
 
@@ -169,17 +204,23 @@ def listen_share(node: NodeEnergy) -> float:
 
 def print_summary(study: Study) -> None:
     gw, med = gateway(study.base), median_sensor(study.base)
-    print(f"Battery life — {SENSORS} sensors + gateway, adverts every {DEFAULT_I_MAX_S:.0f} s, one reading per {lora.REPORT_S:.0f} s")
+    print(
+        f"Battery life — {SENSORS} sensors + gateway, adverts every {DEFAULT_I_MAX_S:.0f} s, one reading per {lora.REPORT_S:.0f} s"
+    )
     for node in (gw, med, busiest_sensor(study.base)):
         b = node.breakdown_mj_per_h()
         print(
             f"  {node.name:<4} {node.role:<8} {node.power_mw():6.2f} mW  life {node.life_days():6.1f} days on {PRIMARY}"
             f"   listen {b['listen']:8.0f}  rx {b['receive']:6.0f}  tx {b['transmit']:6.0f} mJ/h  ({listen_share(node):.1%} listening)"
         )
-    print(f"  a sleeping, non-routing leaf: {leaf_power_mw(med):.3f} mW → {EnergyModel.battery_life_h(BATTERIES_MWH[PRIMARY], leaf_power_mw(med)) / 24 / 365:.1f} years")
+    print(
+        f"  a sleeping, non-routing leaf: {leaf_power_mw(med):.3f} mW → {EnergyModel.battery_life_h(BATTERIES_MWH[PRIMARY], leaf_power_mw(med)) / 24 / 365:.1f} years"
+    )
     print("  advert interval → median sensor life (days)")
     for i, nodes in study.by_schedule.items():
-        print(f"    {i:>5.0f} s  {median_sensor(nodes).life_days():6.1f}   gateway {gateway(nodes).life_days():6.1f}")
+        print(
+            f"    {i:>5.0f} s  {median_sensor(nodes).life_days():6.1f}   gateway {gateway(nodes).life_days():6.1f}"
+        )
     print("  listen power → median sensor life (days, upper bound)")
     for mw in LISTEN_MW:
         model = dataclasses.replace(RADIO, idle_mw=mw)
@@ -187,9 +228,17 @@ def print_summary(study: Study) -> None:
 
 
 def showcase(study: Study) -> Showcase:
-    gw, med, busy = gateway(study.base), median_sensor(study.base), busiest_sensor(study.base)
+    gw, med, busy = (
+        gateway(study.base),
+        median_sensor(study.base),
+        busiest_sensor(study.base),
+    )
     roles = [("gateway", gw), ("typical sensor", med), ("busiest sensor", busy)]
-    leaf_years = EnergyModel.battery_life_h(BATTERIES_MWH[PRIMARY], leaf_power_mw(med)) / 24 / 365
+    leaf_years = (
+        EnergyModel.battery_life_h(BATTERIES_MWH[PRIMARY], leaf_power_mw(med))
+        / 24
+        / 365
+    )
     schedules = sorted(study.by_schedule)
     counts = sorted(study.by_count)
     return Showcase(
@@ -243,7 +292,12 @@ def showcase(study: Study) -> Showcase:
                 x_label="node",
                 y_label="millijoules per hour",
                 series=[
-                    Series(state, [label for label, _ in roles], [n.breakdown_mj_per_h()[state] for _, n in roles], kind="bar")
+                    Series(
+                        state,
+                        [label for label, _ in roles],
+                        [n.breakdown_mj_per_h()[state] for _, n in roles],
+                        kind="bar",
+                    )
                     for state in ("listen", "receive", "transmit")
                 ],
                 caption="Listening, with the receiver open waiting for frames, outweighs everything the radio actually sends or receives.",
@@ -253,8 +307,19 @@ def showcase(study: Study) -> Showcase:
                 x_label="advert interval (s)",
                 y_label=f"days on {PRIMARY}",
                 series=[
-                    Series("typical sensor", schedules, [median_sensor(study.by_schedule[i]).life_days() for i in schedules]),
-                    Series("gateway", schedules, [gateway(study.by_schedule[i]).life_days() for i in schedules]),
+                    Series(
+                        "typical sensor",
+                        schedules,
+                        [
+                            median_sensor(study.by_schedule[i]).life_days()
+                            for i in schedules
+                        ],
+                    ),
+                    Series(
+                        "gateway",
+                        schedules,
+                        [gateway(study.by_schedule[i]).life_days() for i in schedules],
+                    ),
                 ],
                 x_log=True,
                 caption="Nearly flat: fewer adverts save transmit and receive energy, but listening costs the same.",
@@ -264,21 +329,55 @@ def showcase(study: Study) -> Showcase:
                 x_label="sensors on the channel",
                 y_label=f"days on {PRIMARY}",
                 series=[
-                    Series("typical sensor", counts, [median_sensor(study.by_count[n]).life_days() for n in counts]),
-                    Series("gateway", counts, [gateway(study.by_count[n]).life_days() for n in counts]),
+                    Series(
+                        "typical sensor",
+                        counts,
+                        [median_sensor(study.by_count[n]).life_days() for n in counts],
+                    ),
+                    Series(
+                        "gateway",
+                        counts,
+                        [gateway(study.by_count[n]).life_days() for n in counts],
+                    ),
                 ],
             ),
             Chart(
                 title="What a sleeping receiver would be worth (upper bound)",
                 x_label="average listening power (mW)",
                 y_label=f"days on {PRIMARY}",
-                series=[Series("typical sensor", list(LISTEN_MW), [med.life_days(dataclasses.replace(RADIO, idle_mw=mw)) for mw in LISTEN_MW])],
+                series=[
+                    Series(
+                        "typical sensor",
+                        list(LISTEN_MW),
+                        [
+                            med.life_days(dataclasses.replace(RADIO, idle_mw=mw))
+                            for mw in LISTEN_MW
+                        ],
+                    )
+                ],
                 x_log=True,
                 caption=f"{RADIO.rx_mw:g} mW is an always-open receiver, today's behaviour. Lower values re-price the same measured traffic.",
             ),
         ],
-        table=[["node", "average power (mW)", f"days on {PRIMARY}", "days on 18650", "listening share"]]
-        + [[label, round(n.power_mw(), 2), round(n.life_days(), 1), round(n.life_days(battery="18650 Li-ion cell"), 1), round(listen_share(n), 3)] for label, n in roles],
+        table=[
+            [
+                "node",
+                "average power (mW)",
+                f"days on {PRIMARY}",
+                "days on 18650",
+                "listening share",
+            ]
+        ]
+        + [
+            [
+                label,
+                round(n.power_mw(), 2),
+                round(n.life_days(), 1),
+                round(n.life_days(battery="18650 Li-ion cell"), 1),
+                round(listen_share(n), 3),
+            ]
+            for label, n in roles
+        ],
         params={
             "sensors": SENSORS,
             "advert_i_max_s": DEFAULT_I_MAX_S,
@@ -292,7 +391,9 @@ def showcase(study: Study) -> Showcase:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
-    parser.add_argument("--export", type=Path, help="write showcase JSON into this directory")
+    parser.add_argument(
+        "--export", type=Path, help="write showcase JSON into this directory"
+    )
     parser.add_argument("--quick", action="store_true", help="fewer sweep points")
     args = parser.parse_args(argv)
     wf.init_tracing()

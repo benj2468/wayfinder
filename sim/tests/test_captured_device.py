@@ -14,7 +14,7 @@ pytest.importorskip("simpy")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scenarios"))
 
-from captured_device import NEWCOMER, OUTSIDERS, run_capture  # noqa: E402
+from captured_device import NEWCOMER, OUTSIDERS, run_capture
 
 
 @pytest.fixture(scope="module")

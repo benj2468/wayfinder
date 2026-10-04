@@ -14,7 +14,7 @@ pytest.importorskip("simpy")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scenarios"))
 
-from crowded_lora import (  # noqa: E402
+from crowded_lora import (
     TARGET_DELIVERY,
     collision_limited_n,
     duty_limited_n,

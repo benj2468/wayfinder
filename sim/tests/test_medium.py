@@ -34,7 +34,9 @@ def test_lora_time_on_air_matches_the_semtech_formula():
     assert LoRaPhy(sf=7, bw_hz=125e3).airtime_s(10) == pytest.approx(0.041216, abs=1e-6)
     assert LoRaPhy(sf=9, bw_hz=125e3).airtime_s(20) == pytest.approx(0.185344, abs=1e-6)
     # SF12 at 125 kHz turns on low-data-rate optimisation.
-    assert LoRaPhy(sf=12, bw_hz=125e3).airtime_s(10) == pytest.approx(0.991232, abs=1e-6)
+    assert LoRaPhy(sf=12, bw_hz=125e3).airtime_s(10) == pytest.approx(
+        0.991232, abs=1e-6
+    )
 
 
 def test_lora_fragments_frames_longer_than_its_payload_limit():
@@ -45,9 +47,9 @@ def test_lora_fragments_frames_longer_than_its_payload_limit():
 
 
 def test_fixed_rate_airtime_is_bits_over_rate():
-    assert FixedRate(bitrate_bps=250_000, overhead_bytes=6).airtime_s(19) == pytest.approx(
-        25 * 8 / 250_000
-    )
+    assert FixedRate(bitrate_bps=250_000, overhead_bytes=6).airtime_s(
+        19
+    ) == pytest.approx(25 * 8 / 250_000)
 
 
 # --- delivery, collisions, half-duplex --------------------------------------
@@ -60,7 +62,9 @@ def _three(medium: Medium, *, c_x: float = 100.0) -> Simulation:
         Node("b", mobility=Static(Vec3(0.0, 0.0, 0.0)), trickle=(60_000, 60_000)),
         Node("c", mobility=Static(Vec3(c_x, 0.0, 0.0)), trickle=(60_000, 60_000)),
     ]
-    radio = FreeSpacePathLoss(tx_power_dbm=14.0, noise_sigma_db=0.0, delivery_steepness=5.0)
+    radio = FreeSpacePathLoss(
+        tx_power_dbm=14.0, noise_sigma_db=0.0, delivery_steepness=5.0
+    )
     return Simulation(nodes, [Link(("a", "b", "c"), radio, medium=medium)], seed=0)
 
 
@@ -72,7 +76,9 @@ def test_a_frame_arrives_one_airtime_after_it_is_sent():
     assert sim.radio_stats("b").rx_frames == 0
     sim.run(until_s=6.0)
     assert sim.radio_stats("b").rx_frames == 1
-    assert sim.radio_stats("a").tx_airtime_s == pytest.approx(medium.phy.airtime_s(len(_garbage())))
+    assert sim.radio_stats("a").tx_airtime_s == pytest.approx(
+        medium.phy.airtime_s(len(_garbage()))
+    )
 
 
 def test_overlapping_equal_power_frames_collide():
@@ -148,7 +154,11 @@ def test_duty_cycle_bounds_airtime_share():
 def test_routers_converge_over_a_lora_medium():
     phy = LoRaPhy(sf=7, bw_hz=125e3)
     nodes = [Node(n, trickle=(2000, 20_000)) for n in ("a", "b", "c")]
-    sim = Simulation(nodes, shared_lan(["a", "b", "c"], PerfectWire(), medium=Medium(phy=phy)), seed=0)
+    sim = Simulation(
+        nodes,
+        shared_lan(["a", "b", "c"], PerfectWire(), medium=Medium(phy=phy)),
+        seed=0,
+    )
     sim.run(until_s=60.0)
     assert sim.has_route("a", "c")
     assert sim.radio_stats("a").tx_airtime_s > 0.0
@@ -174,7 +184,9 @@ def test_energy_charges_tx_rx_and_idle_time_at_their_own_power():
 
 def test_battery_life_is_capacity_over_average_power():
     model = EnergyModel(tx_mw=100.0, rx_mw=10.0, idle_mw=1.0)
-    assert model.battery_life_h(capacity_mwh=1000.0, average_power_mw=2.0) == pytest.approx(500.0)
+    assert model.battery_life_h(
+        capacity_mwh=1000.0, average_power_mw=2.0
+    ) == pytest.approx(500.0)
 
 
 def test_nodes_on_slow_schedules_do_not_transmit_in_lockstep():

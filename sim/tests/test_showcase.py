@@ -29,7 +29,9 @@ def test_write_showcase_round_trips(tmp_path):
     assert path == tmp_path / "failover.json"
     data = json.loads(path.read_text())
     assert data["slug"] == "failover"
-    assert data["headlines"] == [{"value": "2.1 s", "label": "to reroute", "detail": None}]
+    assert data["headlines"] == [
+        {"value": "2.1 s", "label": "to reroute", "detail": None}
+    ]
     assert data["charts"][0]["series"][0]["kind"] == "line"
     assert data["params"] == {"rate_hz": 20}
     assert data["schema"] == 1
@@ -78,7 +80,12 @@ def test_a_chart_can_carry_a_heatmap(tmp_path):
             x_label="east (m)",
             y_label="north (m)",
             series=[],
-            heatmap=Heatmap(xs=[0.0, 100.0], ys=[0.0, 50.0, 100.0], values=[[1.0, 0.5], [0.2, 0.0], [None, 1.0]], label="delivery"),
+            heatmap=Heatmap(
+                xs=[0.0, 100.0],
+                ys=[0.0, 50.0, 100.0],
+                values=[[1.0, 0.5], [0.2, 0.0], [None, 1.0]],
+                label="delivery",
+            ),
         )
     )
     data = json.loads(write_showcase(showcase, tmp_path).read_text())

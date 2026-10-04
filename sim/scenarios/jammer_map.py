@@ -36,10 +36,17 @@ from pathlib import Path
 import wayfinder_py as wf
 from wayfinder_sim.interference import Jammer
 from wayfinder_sim.mobility import Static, Vec3
-from wayfinder_sim.showcase import Chart, Headline, Heatmap, Series, Showcase, write_showcase
+from wayfinder_sim.showcase import (
+    Chart,
+    Headline,
+    Heatmap,
+    Series,
+    Showcase,
+    write_showcase,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import failover as field  # noqa: E402 — the same twelve-radio grid
+import failover as field
 
 RATE_HZ = 2.0
 JAM_ON_S = 30.0
@@ -81,13 +88,21 @@ class JamRun:
     """The same share in the equal stretch before it switched on."""
 
 
-def run_position(x: float | None, y: float | None, power_dbm: float, *, seed: int = SEED) -> JamRun:
+def run_position(
+    x: float | None, y: float | None, power_dbm: float, *, seed: int = SEED
+) -> JamRun:
     """Converge, stream every node → HQ, switch on a jammer at `(x, y)` (or
     none when `x` is `None`), and measure delivery before and during."""
     sim = field.build_simulation(seed)
     senders = [n for n in sim.node_names if n != field.HQ]
     flows = [
-        sim.stream(n, field.HQ, rate_hz=RATE_HZ, start_s=JAM_ON_S - JAM_FOR_S, duration_s=2 * JAM_FOR_S)
+        sim.stream(
+            n,
+            field.HQ,
+            rate_hz=RATE_HZ,
+            start_s=JAM_ON_S - JAM_FOR_S,
+            duration_s=2 * JAM_FOR_S,
+        )
         for n in senders
     ]
     if x is not None and y is not None:
@@ -152,7 +167,9 @@ def denial_radius_m(runs: Sequence[JamRun], threshold: float = 0.5) -> float:
 
 
 def print_summary(baseline: JamRun, maps: dict[float, list[JamRun]]) -> None:
-    print(f"Jammer map — {len(node_sites())} radios, every node streaming to HQ at {RATE_HZ:g}/s")
+    print(
+        f"Jammer map — {len(node_sites())} radios, every node streaming to HQ at {RATE_HZ:g}/s"
+    )
     print(f"  no jammer: {baseline.delivered:.1%} delivered")
     for power, runs in maps.items():
         worst = min(runs, key=lambda r: r.delivered)
@@ -163,18 +180,27 @@ def print_summary(baseline: JamRun, maps: dict[float, list[JamRun]]) -> None:
         )
 
 
-def showcase(baseline: JamRun, maps: dict[float, list[JamRun]], step_m: float = STEP_M) -> Showcase:
+def showcase(
+    baseline: JamRun, maps: dict[float, list[JamRun]], step_m: float = STEP_M
+) -> Showcase:
     sites = node_sites()
     weak, strong = min(maps), max(maps)
     node_series = [
-        Series("radios", [p.x for p in sites.values()], [p.y for p in sites.values()], kind="scatter"),
+        Series(
+            "radios",
+            [p.x for p in sites.values()],
+            [p.y for p in sites.values()],
+            kind="scatter",
+        ),
         Series("HQ", [0.0], [0.0], kind="scatter"),
     ]
 
     def by_distance(runs: Sequence[JamRun]) -> tuple[list[float], list[float]]:
         buckets: dict[float, list[float]] = {}
         for r in runs:
-            buckets.setdefault(round(hq_distance(r) / step_m) * step_m, []).append(r.delivered)
+            buckets.setdefault(round(hq_distance(r) / step_m) * step_m, []).append(
+                r.delivered
+            )
         keys = sorted(buckets)
         return keys, [statistics.median(buckets[k]) for k in keys]
 
@@ -269,7 +295,9 @@ def showcase(baseline: JamRun, maps: dict[float, list[JamRun]], step_m: float = 
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
-    parser.add_argument("--export", type=Path, help="write showcase JSON into this directory")
+    parser.add_argument(
+        "--export", type=Path, help="write showcase JSON into this directory"
+    )
     parser.add_argument("--quick", action="store_true", help="coarse 300 m grid")
     args = parser.parse_args(argv)
     wf.init_tracing()

@@ -49,7 +49,9 @@ class Jammer:
 
     def overlaps(self, start_s: float, end_s: float) -> bool:
         """Whether it transmits at any point in `[start_s, end_s]`."""
-        return self.active is None or (self.active[0] < end_s and self.active[1] > start_s)
+        return self.active is None or (
+            self.active[0] < end_s and self.active[1] > start_s
+        )
 
     def reaches(self, link: str) -> bool:
         """Whether it targets `link`."""
@@ -58,7 +60,9 @@ class Jammer:
     def received_dbm(self, rx: Vec3, t_s: float) -> float:
         """Its power arriving at `rx`, ignoring whether it is active."""
         distance = self.mobility.position(t_s).distance_to(rx)
-        return self.power_dbm - FreeSpacePathLoss(freq_hz=self.freq_hz).path_loss_db(distance)
+        return self.power_dbm - FreeSpacePathLoss(freq_hz=self.freq_hz).path_loss_db(
+            distance
+        )
 
 
 def sum_dbm(levels_dbm) -> float | None:

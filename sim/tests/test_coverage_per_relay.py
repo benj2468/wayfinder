@@ -4,6 +4,7 @@ plan agrees with what traffic actually got through the real router."""
 
 from __future__ import annotations
 
+import itertools
 import sys
 from pathlib import Path
 
@@ -13,8 +14,8 @@ pytest.importorskip("simpy")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scenarios"))
 
-import mountain_relay as world  # noqa: E402
-from coverage_per_relay import greedy_layouts, knee, run_layouts  # noqa: E402
+import mountain_relay as world
+from coverage_per_relay import greedy_layouts, knee, run_layouts
 
 
 def test_greedy_planned_coverage_grows_with_diminishing_returns():
@@ -24,7 +25,7 @@ def test_greedy_planned_coverage_grows_with_diminishing_returns():
     gains = [b - a for a, b in zip([0.0, *planned], planned)]
     assert gains[0] >= gains[-1]
     # Each layout extends the previous one: a deployment grows, never moves.
-    for (small, _), (big, _) in zip(layouts, layouts[1:]):
+    for (small, _), (big, _) in itertools.pairwise(layouts):
         assert big[: len(small)] == small
 
 

@@ -140,16 +140,28 @@ class ChannelRun:
         one means contention is making the routers advertise faster: a lost
         advert reads as a changed next hop or a lost route, either of which
         resets Trickle to its fastest interval."""
-        steady = steady_routing_airtime_s(self.sensors + 1, self.i_max_s, self.measure_s)
+        steady = steady_routing_airtime_s(
+            self.sensors + 1, self.i_max_s, self.measure_s
+        )
         return self.routing_airtime_s / steady if steady else 0.0
 
 
-def run_point(n: int, i_max_s: float, *, seed: int = SEED, measure_s: float = MEASURE_S, duty_cycle: float = DUTY_CYCLE) -> ChannelRun:
+def run_point(
+    n: int,
+    i_max_s: float,
+    *,
+    seed: int = SEED,
+    measure_s: float = MEASURE_S,
+    duty_cycle: float = DUTY_CYCLE,
+) -> ChannelRun:
     """Warm up for two advert rounds, then measure `measure_s` of readings."""
     trickle = trickle_for(i_max_s)
     nodes = [Node(GATEWAY, mobility=Static(Vec3(0.0, 0.0, 10.0)), trickle=trickle)]
     names = [f"s{i + 1}" for i in range(n)]
-    nodes += [Node(name, mobility=Static(site), trickle=trickle) for name, site in zip(names, sensor_sites(n, seed))]
+    nodes += [
+        Node(name, mobility=Static(site), trickle=trickle)
+        for name, site in zip(names, sensor_sites(n, seed))
+    ]
     link = shared_lan([x.name for x in nodes], lora_radio(), medium=medium(duty_cycle))
     sim = Simulation(nodes, link, seed=seed)
     tap = sim.wiretap(link[0].name or "")
@@ -168,7 +180,14 @@ def run_point(n: int, i_max_s: float, *, seed: int = SEED, measure_s: float = ME
     ]
     sim.run(until_s=warmup_s)
     tap.reset()
-    before = {x.name: (sim.radio_stats(x.name).tx_airtime_s, sim.radio_stats(x.name).queue_drops, sim.radio_stats(x.name).collisions) for x in nodes}
+    before = {
+        x.name: (
+            sim.radio_stats(x.name).tx_airtime_s,
+            sim.radio_stats(x.name).queue_drops,
+            sim.radio_stats(x.name).collisions,
+        )
+        for x in nodes
+    }
     sim.run(until_s=warmup_s + measure_s)
 
     sent = sum(len(f.sent) for f in flows)
@@ -183,7 +202,10 @@ def run_point(n: int, i_max_s: float, *, seed: int = SEED, measure_s: float = ME
             data += airtime
         else:
             other += airtime
-    duties = [(sim.radio_stats(x.name).tx_airtime_s - before[x.name][0]) / measure_s for x in nodes]
+    duties = [
+        (sim.radio_stats(x.name).tx_airtime_s - before[x.name][0]) / measure_s
+        for x in nodes
+    ]
     return ChannelRun(
         sensors=n,
         i_max_s=i_max_s,
@@ -193,8 +215,12 @@ def run_point(n: int, i_max_s: float, *, seed: int = SEED, measure_s: float = ME
         data_airtime_s=data,
         other_airtime_s=other,
         busiest_duty=max(duties),
-        queue_drops=sum(sim.radio_stats(x.name).queue_drops - before[x.name][1] for x in nodes),
-        collisions=sum(sim.radio_stats(x.name).collisions - before[x.name][2] for x in nodes),
+        queue_drops=sum(
+            sim.radio_stats(x.name).queue_drops - before[x.name][1] for x in nodes
+        ),
+        collisions=sum(
+            sim.radio_stats(x.name).collisions - before[x.name][2] for x in nodes
+        ),
         measure_s=measure_s,
     )
 
@@ -210,7 +236,9 @@ def ogm_airtime_s() -> float:
     return PHY.airtime_s(OGM_FRAME_LEN)
 
 
-def steady_routing_airtime_s(nodes: int, i_max_s: float, window_s: float = MEASURE_S) -> float:
+def steady_routing_airtime_s(
+    nodes: int, i_max_s: float, window_s: float = MEASURE_S
+) -> float:
     """Advert airtime over `window_s` on a quiet channel in steady state:
     `nodes²` adverts per mean Trickle round of `0.75·I`."""
     return nodes**2 * (window_s / (TRICKLE_MEAN_ROUND * i_max_s)) * ogm_airtime_s()
@@ -241,7 +269,9 @@ neighbour holds — so every point is the median-delivery run of several."""
 def median_run(n: int, i_max_s: float, seeds: Sequence[int] = SEEDS) -> ChannelRun:
     """The run with the median delivery across `seeds`: a real run rather
     than an average of runs, so its airtime split still adds up."""
-    runs = sorted((run_point(n, i_max_s, seed=s) for s in seeds), key=lambda r: r.delivery)
+    runs = sorted(
+        (run_point(n, i_max_s, seed=s) for s in seeds), key=lambda r: r.delivery
+    )
     return runs[len(runs) // 2]
 
 
@@ -265,9 +295,13 @@ def capacity(runs: Sequence[ChannelRun], i_max_s: float) -> int | None:
 
 
 def print_summary(runs: Sequence[ChannelRun]) -> None:
-    print(f"Crowded LoRa — SF7/125 kHz, {DUTY_CYCLE:.0%} duty cycle, one reading per {REPORT_S:.0f} s")
+    print(
+        f"Crowded LoRa — SF7/125 kHz, {DUTY_CYCLE:.0%} duty cycle, one reading per {REPORT_S:.0f} s"
+    )
     print(f"  one advert = {ogm_airtime_s() * 1000:.0f} ms on air")
-    print("  adverts  sensors  delivered  channel  busiest radio  routing share  advert amp.  queue drops")
+    print(
+        "  adverts  sensors  delivered  channel  busiest radio  routing share  advert amp.  queue drops"
+    )
     for r in runs:
         total = r.routing_airtime_s + r.data_airtime_s + r.other_airtime_s
         share = r.routing_airtime_s / total if total else 0.0
@@ -298,7 +332,11 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
 
     def per_schedule(metric):
         return [
-            Series(label(i), [r.sensors for r in runs if r.i_max_s == i], [metric(r) for r in runs if r.i_max_s == i])
+            Series(
+                label(i),
+                [r.sensors for r in runs if r.i_max_s == i],
+                [metric(r) for r in runs if r.i_max_s == i],
+            )
             for i in schedules
         ]
 
@@ -317,7 +355,8 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
                 f"most that still deliver ≥{TARGET_DELIVERY:.0%} of readings",
             ),
             Headline(
-                f"{cap_slow if cap_slow is not None else 0}" + ("+" if cap_slow == counts[-1] else ""),
+                f"{cap_slow if cap_slow is not None else 0}"
+                + ("+" if cap_slow == counts[-1] else ""),
                 f"sensors at {label(slow)}",
                 "capacity grows only with the square root of the advert interval",
             ),
@@ -371,8 +410,18 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
                 x_label="sensors on the channel",
                 y_label="seconds on air per hour",
                 series=[
-                    Series("routing adverts", [r.sensors for r in runs if r.i_max_s == fast], [r.routing_airtime_s for r in runs if r.i_max_s == fast], kind="bar"),
-                    Series("sensor readings", [r.sensors for r in runs if r.i_max_s == fast], [r.data_airtime_s for r in runs if r.i_max_s == fast], kind="bar"),
+                    Series(
+                        "routing adverts",
+                        [r.sensors for r in runs if r.i_max_s == fast],
+                        [r.routing_airtime_s for r in runs if r.i_max_s == fast],
+                        kind="bar",
+                    ),
+                    Series(
+                        "sensor readings",
+                        [r.sensors for r in runs if r.i_max_s == fast],
+                        [r.data_airtime_s for r in runs if r.i_max_s == fast],
+                        kind="bar",
+                    ),
                 ],
             ),
             Chart(
@@ -387,8 +436,18 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
                 x_label="advert interval (s)",
                 y_label="sensors",
                 series=[
-                    Series("simulated (≥95% delivered)", schedules, [float(capacity(runs, i) or 0) for i in schedules], kind="line"),
-                    Series("collision ceiling √(0.025·0.75I/T)", schedules, [collision_limited_n(i) for i in schedules], kind="line"),
+                    Series(
+                        "simulated (≥95% delivered)",
+                        schedules,
+                        [float(capacity(runs, i) or 0) for i in schedules],
+                        kind="line",
+                    ),
+                    Series(
+                        "collision ceiling √(0.025·0.75I/T)",
+                        schedules,
+                        [collision_limited_n(i) for i in schedules],
+                        kind="line",
+                    ),
                 ],
                 x_log=True,
                 caption=(
@@ -399,8 +458,29 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
                 ),
             ),
         ],
-        table=[["advert interval (s)", "sensors", "delivered", "busiest radio duty", "routing airtime (s/h)", "data airtime (s/h)", "queue drops"]]
-        + [[r.i_max_s, r.sensors, round(r.delivery, 3), round(r.busiest_duty, 4), round(r.routing_airtime_s, 1), round(r.data_airtime_s, 1), r.queue_drops] for r in runs],
+        table=[
+            [
+                "advert interval (s)",
+                "sensors",
+                "delivered",
+                "busiest radio duty",
+                "routing airtime (s/h)",
+                "data airtime (s/h)",
+                "queue drops",
+            ]
+        ]
+        + [
+            [
+                r.i_max_s,
+                r.sensors,
+                round(r.delivery, 3),
+                round(r.busiest_duty, 4),
+                round(r.routing_airtime_s, 1),
+                round(r.data_airtime_s, 1),
+                r.queue_drops,
+            ]
+            for r in runs
+        ],
         params={
             "phy": "LoRa SF7/125kHz CR4/5",
             "duty_cycle": DUTY_CYCLE,
@@ -414,7 +494,9 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
-    parser.add_argument("--export", type=Path, help="write showcase JSON into this directory")
+    parser.add_argument(
+        "--export", type=Path, help="write showcase JSON into this directory"
+    )
     parser.add_argument("--quick", action="store_true", help="fewer points")
     args = parser.parse_args(argv)
     wf.init_tracing()

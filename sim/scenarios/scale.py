@@ -70,10 +70,16 @@ def build_simulation(n: int, seed: int = SEED) -> tuple[Simulation, list[str]]:
     side = math.ceil(math.sqrt(n))
     names = [HQ] + [f"n{i}" for i in range(1, n)]
     nodes = [
-        Node(name, mobility=Static(Vec3((i % side) * SPACING_M, (i // side) * SPACING_M, 2.0)), trickle=TRICKLE)
+        Node(
+            name,
+            mobility=Static(Vec3((i % side) * SPACING_M, (i // side) * SPACING_M, 2.0)),
+            trickle=TRICKLE,
+        )
         for i, name in enumerate(names)
     ]
-    radio = FreeSpacePathLoss(tx_power_dbm=24.0, max_range_m=700.0, delivery_steepness=1.0)
+    radio = FreeSpacePathLoss(
+        tx_power_dbm=24.0, max_range_m=700.0, delivery_steepness=1.0
+    )
     return Simulation(nodes, shared_lan(names, radio), seed=seed), names
 
 
@@ -99,11 +105,19 @@ class ScaleRun:
 def run_size(n: int, seed: int = SEED) -> ScaleRun:
     sim, names = build_simulation(n, seed)
     others = names[1:]
-    to_hq = [sim.stream(m, HQ, rate_hz=STREAM_HZ, start_s=WARMUP_S, duration_s=MEASURE_S) for m in others]
-    from_hq = [sim.stream(HQ, m, rate_hz=STREAM_HZ, start_s=WARMUP_S, duration_s=MEASURE_S) for m in others]
+    to_hq = [
+        sim.stream(m, HQ, rate_hz=STREAM_HZ, start_s=WARMUP_S, duration_s=MEASURE_S)
+        for m in others
+    ]
+    from_hq = [
+        sim.stream(HQ, m, rate_hz=STREAM_HZ, start_s=WARMUP_S, duration_s=MEASURE_S)
+        for m in others
+    ]
     sim.record("all_to_hq", lambda s: all(s.has_route(m, HQ) for m in others))
     rec = sim.run(until_s=WARMUP_S, sample_interval_ms=500)
-    converged = next((t for t, ok in zip(rec.times_s, rec.column("all_to_hq")) if ok), None)
+    converged = next(
+        (t for t, ok in zip(rec.times_s, rec.column("all_to_hq")) if ok), None
+    )
     frames_before = sum(sim.tx_frames(m) for m in names)
     sim.run(until_s=WARMUP_S + MEASURE_S + 2.0, sample_interval_ms=5000)
     frames = sum(sim.tx_frames(m) for m in names) - frames_before
@@ -130,8 +144,12 @@ def run_size(n: int, seed: int = SEED) -> ScaleRun:
 
 
 def print_summary(runs: Sequence[ScaleRun]) -> None:
-    print(f"Scale — square grids, {SPACING_M:.0f} m spacing, adverts {TRICKLE[0]}–{TRICKLE[1]} ms")
-    print("  nodes  converged  →HQ     HQ→     HQ routes to  frames/s/node  HQ table  hops (mean/max)")
+    print(
+        f"Scale — square grids, {SPACING_M:.0f} m spacing, adverts {TRICKLE[0]}–{TRICKLE[1]} ms"
+    )
+    print(
+        "  nodes  converged  →HQ     HQ→     HQ routes to  frames/s/node  HQ table  hops (mean/max)"
+    )
     for r in runs:
         conv = "never" if r.converged_s is None else f"{r.converged_s:.1f} s"
         print(
@@ -161,13 +179,19 @@ def showcase(runs: Sequence[ScaleRun]) -> Showcase:
             ),
             Headline(
                 f"{worst.to_hq:.0%}" if worst else "–",
-                f"delivered past the edge ({worst.nodes} nodes)" if worst else "past the edge",
+                f"delivered past the edge ({worst.nodes} nodes)"
+                if worst
+                else "past the edge",
                 "a full routing table triggers an advert storm",
             ),
             Headline(
-                f"{past.frames_per_node_s / edge.frames_per_node_s:.0f}x" if past else "–",
+                f"{past.frames_per_node_s / edge.frames_per_node_s:.0f}x"
+                if past
+                else "–",
                 "jump in control traffic one step past the edge",
-                f"{edge.frames_per_node_s:.0f} → {past.frames_per_node_s:.0f} frames/s per node" if past else "",
+                f"{edge.frames_per_node_s:.0f} → {past.frames_per_node_s:.0f} frames/s per node"
+                if past
+                else "",
             ),
         ],
         summary=(
@@ -179,8 +203,12 @@ def showcase(runs: Sequence[ScaleRun]) -> Showcase:
             f"nodes, and past that the mesh doesn't degrade gracefully. Routers start evicting nodes and "
             f"hearing them again a moment later. Each re-learned node counts as a topology change and "
             f"resets every router to its fastest advertising rate, so control traffic "
-            + (f"jumps {past.frames_per_node_s / edge.frames_per_node_s:.0f}x and delivery falls to "
-               f"{worst.to_hq:.0%}. " if past and worst else ". ")
+            + (
+                f"jumps {past.frames_per_node_s / edge.frames_per_node_s:.0f}x and delivery falls to "
+                f"{worst.to_hq:.0%}. "
+                if past and worst
+                else ". "
+            )
             + f"The default profile is therefore a hard ceiling. A larger mesh needs the host profile "
             f"({HOST_TABLE_CAPACITY:,} nodes) on every router, and the storm itself is worth fixing in the "
             f"router."
@@ -218,19 +246,49 @@ def showcase(runs: Sequence[ScaleRun]) -> Showcase:
                 title="Control traffic per node",
                 x_label="nodes in the mesh",
                 y_label="frames / s / node",
-                series=[Series("adverts relayed and sent", ns, [r.frames_per_node_s for r in runs])],
+                series=[
+                    Series(
+                        "adverts relayed and sent",
+                        ns,
+                        [r.frames_per_node_s for r in runs],
+                    )
+                ],
                 caption="Linear per node below the edge; past it, eviction churn pins every router at its fastest advert rate.",
             ),
             Chart(
                 title="Time to a usable mesh",
                 x_label="nodes in the mesh",
                 y_label="seconds from power-on",
-                series=[Series("every node has a route to HQ", ns, [r.converged_s for r in runs])],
+                series=[
+                    Series(
+                        "every node has a route to HQ",
+                        ns,
+                        [r.converged_s for r in runs],
+                    )
+                ],
             ),
         ],
-        table=[["nodes", "converged (s)", "→HQ", "HQ→", "HQ table", "frames/s/node", "max hops"]]
+        table=[
+            [
+                "nodes",
+                "converged (s)",
+                "→HQ",
+                "HQ→",
+                "HQ table",
+                "frames/s/node",
+                "max hops",
+            ]
+        ]
         + [
-            [r.nodes, r.converged_s, round(r.to_hq, 3), round(r.from_hq, 3), r.hq_table, round(r.frames_per_node_s, 1), r.max_hops]
+            [
+                r.nodes,
+                r.converged_s,
+                round(r.to_hq, 3),
+                round(r.from_hq, 3),
+                r.hq_table,
+                round(r.frames_per_node_s, 1),
+                r.max_hops,
+            ]
             for r in runs
         ],
         params={
@@ -245,7 +303,9 @@ def showcase(runs: Sequence[ScaleRun]) -> Showcase:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
-    parser.add_argument("--export", type=Path, help="write showcase JSON into this directory")
+    parser.add_argument(
+        "--export", type=Path, help="write showcase JSON into this directory"
+    )
     parser.add_argument("--quick", action="store_true", help="up to 100 nodes")
     args = parser.parse_args(argv)
     wf.init_tracing()

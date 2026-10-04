@@ -101,7 +101,9 @@ class LoRaPhy:
         de = 1 if ts > 0.016 else 0
         ih = 0 if self.explicit_header else 1
         numerator = 8 * payload - 4 * self.sf + 28 + 16 * int(self.crc) - 20 * ih
-        symbols = 8 + max(math.ceil(numerator / (4 * (self.sf - 2 * de))) * (self.cr + 4), 0)
+        symbols = 8 + max(
+            math.ceil(numerator / (4 * (self.sf - 2 * de))) * (self.cr + 4), 0
+        )
         return (self.preamble + 4.25) * ts + symbols * ts
 
     def airtime_s(self, frame_len: int) -> float:

@@ -182,7 +182,9 @@ def run_failover(
     sim.run(until_s=fail_at_s)
     path_before = sim.route_path(TEAM, HQ)
     if path_before is None or len(path_before) < 3:
-        raise RuntimeError(f"no multi-hop route to fail before t={fail_at_s}s: {path_before}")
+        raise RuntimeError(
+            f"no multi-hop route to fail before t={fail_at_s}s: {path_before}"
+        )
     victim = path_before[1]
 
     sim.fail_node(victim, at_s=fail_at_s, recover_s=recover_at_s)
@@ -190,7 +192,9 @@ def run_failover(
     # of the relay rather than of HQ, because HQ can keep a stale record of a
     # dead neighbour for a while; the relay reboots empty, so its table
     # cannot claim anything it has not relearned.
-    sim.record("victim_reachable", lambda s: s.is_up(victim) and s.has_route(victim, HQ))
+    sim.record(
+        "victim_reachable", lambda s: s.is_up(victim) and s.has_route(victim, HQ)
+    )
     rec = sim.run(until_s=duration_s)
 
     restored_s = flow.restored_after(fail_at_s)
@@ -232,7 +236,9 @@ def run_failover(
         flow=flow,
         times_s=list(rec.times_s),
         hops=[_hops(p) for p in paths],
-        victim_reachable=[bool(v) if v is not None else False for v in rec.column("victim_reachable")],
+        victim_reachable=[
+            bool(v) if v is not None else False for v in rec.column("victim_reachable")
+        ],
     )
 
 
@@ -253,7 +259,9 @@ def _hops(path: tuple[str, ...] | None) -> int | None:
     return None if path is None else len(path) - 1
 
 
-def delivery_timeline(flow: Flow, bin_s: float = 1.0) -> tuple[list[float], list[float | None]]:
+def delivery_timeline(
+    flow: Flow, bin_s: float = 1.0
+) -> tuple[list[float], list[float | None]]:
     """Per-bin delivery ratio of `flow`, binned on send time."""
     if not flow.sent:
         return [], []
@@ -286,7 +294,10 @@ class SweepPoint:
     def recoveries_s(self) -> list[float]:
         # A run that never healed inside its window counts at the window's
         # end — an underestimate, said so in the method note; none do here.
-        return [r.recovered_s if r.recovered_s is not None else float("inf") for r in self.runs]
+        return [
+            r.recovered_s if r.recovered_s is not None else float("inf")
+            for r in self.runs
+        ]
 
     @property
     def median_s(self) -> float:
@@ -339,7 +350,9 @@ def run_sweep(seeds: Sequence[int] = SWEEP_SEEDS) -> list[SweepPoint]:
 def print_summary(run: FailoverRun, sweep: Sequence[SweepPoint]) -> None:
     print("Failover — one relay powered off mid-stream, then rebooted")
     print(f"  path before : {' → '.join(run.path_before or ())}")
-    print(f"  victim      : {run.victim} (off at {FAIL_AT_S:.0f}s, on at {RECOVER_AT_S:.0f}s)")
+    print(
+        f"  victim      : {run.victim} (off at {FAIL_AT_S:.0f}s, on at {RECOVER_AT_S:.0f}s)"
+    )
     print(f"  path after  : {' → '.join(run.path_after or ()) or 'none'}")
     print(f"  rerouted in : {_fmt_s(run.recovered_s)}, {run.lost} packets lost")
     print(f"  rejoined in : {_fmt_s(run.rejoin_s)} after reboot")
@@ -444,8 +457,18 @@ def showcase(run: FailoverRun, sweep: Sequence[SweepPoint]) -> Showcase:
                 x_label="control frames / s / node",
                 y_label="worst time to reroute (s)",
                 series=[
-                    Series("faster routing adverts", [p.overhead_fps for p in ogm], [p.worst_s for p in ogm], kind="line"),
-                    Series("default adverts + keep-alive", [p.overhead_fps for p in ka], [p.worst_s for p in ka], kind="line"),
+                    Series(
+                        "faster routing adverts",
+                        [p.overhead_fps for p in ogm],
+                        [p.worst_s for p in ogm],
+                        kind="line",
+                    ),
+                    Series(
+                        "default adverts + keep-alive",
+                        [p.overhead_fps for p in ka],
+                        [p.worst_s for p in ka],
+                        kind="line",
+                    ),
                 ],
                 caption=(
                     "Lower-left is better. Each point is ten failures; keep-alives buy a short "
@@ -477,9 +500,23 @@ def showcase(run: FailoverRun, sweep: Sequence[SweepPoint]) -> Showcase:
                 ),
             ),
         ],
-        table=[["detection", "frames/s/node", "median reroute (s)", "worst reroute (s)", "median packets lost"]]
+        table=[
+            [
+                "detection",
+                "frames/s/node",
+                "median reroute (s)",
+                "worst reroute (s)",
+                "median packets lost",
+            ]
+        ]
         + [
-            [_label(p), round(p.overhead_fps, 2), round(p.median_s, 1), round(p.worst_s, 1), p.median_lost]
+            [
+                _label(p),
+                round(p.overhead_fps, 2),
+                round(p.median_s, 1),
+                round(p.worst_s, 1),
+                p.median_lost,
+            ]
             for p in sweep
         ],
         params={
@@ -498,8 +535,12 @@ def showcase(run: FailoverRun, sweep: Sequence[SweepPoint]) -> Showcase:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
-    parser.add_argument("--export", type=Path, help="write showcase JSON into this directory")
-    parser.add_argument("--quick", action="store_true", help="three seeds per sweep point")
+    parser.add_argument(
+        "--export", type=Path, help="write showcase JSON into this directory"
+    )
+    parser.add_argument(
+        "--quick", action="store_true", help="three seeds per sweep point"
+    )
     args = parser.parse_args(argv)
     wf.init_tracing()
 
