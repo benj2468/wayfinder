@@ -761,10 +761,11 @@ class Simulation:
     def run(self, until_s: float, *, sample_interval_ms: int = 50) -> Recorder:
         """Run the simulation from wherever it currently is up to `until_s`,
         sampling every registered probe every `sample_interval_ms`."""
-        self._recorder = Recorder(interval_ms=sample_interval_ms)
-        self.env.process(self._sample_proc(sample_interval_ms))
+        recorder = Recorder(interval_ms=sample_interval_ms)
+        self._recorder = recorder
+        self.env.process(self._sample_proc(sample_interval_ms, recorder))
         self.env.run(until=until_s * 1000)
-        return self._recorder
+        return recorder
 
     # --- internal SimPy processes ------------------------------------------
 
@@ -949,10 +950,12 @@ class Simulation:
                 )
             yield self.env.timeout(interval_ms)
 
-    def _sample_proc(self, interval_ms: int):
-        assert self._recorder is not None
-        while True:
+    def _sample_proc(self, interval_ms: int, recorder: Recorder):
+        # Each `run` starts its own sampler for its own recorder; one left over
+        # from an earlier `run` stops the moment a newer one takes over, or a
+        # scenario run in segments would sample every instant once per segment.
+        while self._recorder is recorder:
             t_s = self.env.now / 1000.0
             values = {name: probe(self) for name, probe in self._probes.items()}
-            self._recorder.append(t_s, values)
+            recorder.append(t_s, values)
             yield self.env.timeout(interval_ms)

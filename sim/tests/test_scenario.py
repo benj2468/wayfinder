@@ -425,3 +425,18 @@ def test_tq_to_rejects_an_unknown_node():
     sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
     with pytest.raises(KeyError):
         sim.tq_to("a", "ghost")
+
+
+def test_running_in_segments_samples_each_instant_once():
+    """A scenario that runs to one instant, acts, and runs on must get one
+    sample per interval — not one per earlier `run` call still sampling."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+    sim.record("t", lambda s: s.env.now)
+    sim.run(until_s=1.0, sample_interval_ms=100)
+    sim.run(until_s=2.0, sample_interval_ms=100)
+    rec = sim.run(until_s=3.0, sample_interval_ms=100)
+
+    assert len(rec.times_s) == len(set(rec.times_s))
+    assert rec.times_s[0] == 2.0
+    assert len(rec.times_s) == 10
