@@ -112,12 +112,22 @@ impl TrickleTimer {
         self.interval = (self.interval * 2).min(self.i_max);
     }
 
-    /// Reset to the most aggressive interval after an inconsistency and
-    /// reschedule the next fire within `[i_min/2, i_min)` after `now`.
+    /// Reset to the most aggressive interval after an inconsistency and, if
+    /// the next fire is further out than `i_min`, reschedule it within
+    /// `[i_min/2, i_min)` after `now`.
+    ///
+    /// A fire already due within `i_min` is kept. That is RFC 6206 §4.2's "if
+    /// I is already Imin, do nothing", and it is load-bearing: re-drawing the
+    /// fire on every reset pushes it out each time, so a node meeting a large
+    /// mesh — a new originator every few hundred milliseconds — would never
+    /// emit its own advert until discovery settled. The backoff still restarts
+    /// from `i_min`.
     pub fn reset(&mut self, now: Duration) {
         self.interval = self.i_min;
-        let wait = self.jittered(self.i_min);
-        self.next_fire = now + wait;
+        if self.next_fire > now + self.i_min {
+            let wait = self.jittered(self.i_min);
+            self.next_fire = now + wait;
+        }
     }
 
     /// Time remaining until the next scheduled emission, saturating at zero once
@@ -204,15 +214,17 @@ mod tests {
         assert_eq!(t.interval(), I_MAX);
     }
 
-    /// `reset` collapses a grown interval back to `i_min` and reschedules the
-    /// next fire into the aggressive window.
+    /// `reset` collapses a grown interval back to `i_min` and reschedules a
+    /// backed-off next fire into the aggressive window. (Reset just after an
+    /// emission, while that fire is far out — one already due is kept; see
+    /// `repeated_resets_do_not_postpone_a_fire_already_due_within_i_min`.)
     #[test]
     fn reset_returns_to_i_min() {
         let mut t = TrickleTimer::new(I_MIN, I_MAX, Duration::ZERO, 11);
         let mut now = Duration::ZERO;
         for _ in 0..6 {
-            t.on_emit(now);
             now = t.next_fire;
+            t.on_emit(now);
         }
         assert!(t.interval() > I_MIN, "interval should have grown");
 
