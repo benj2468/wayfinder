@@ -1,0 +1,160 @@
+"""The results a scenario publishes to the website, as plain JSON.
+
+`report.py` renders a whole run into one self-contained page for whoever ran
+it. This is the other audience: the public results page on wayfndr.dev
+(`www/sim/`), which has no build step and no Python, and so cannot take a
+matplotlib figure or a `Recorder`. What it takes instead is the *answer* —
+a few headline numbers, the prose saying what they mean, and the series
+behind each chart — which its own small script draws in the site's palette.
+
+Keeping the contract this narrow is the point. A scenario decides what is
+worth showing; the page decides how it looks; neither has to change when the
+other does, and a re-run of a scenario is a data refresh, not a site edit.
+
+`schema` is bumped whenever a field changes meaning, so a page reading an
+old file can tell rather than mis-draw it.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, Literal
+
+__all__ = [
+    "SCHEMA_VERSION",
+    "Chart",
+    "Headline",
+    "Marker",
+    "Series",
+    "Showcase",
+    "write_showcase",
+]
+
+SCHEMA_VERSION = 1
+
+_DECIMALS = 4
+"""Floats are rounded to this many places on export: the page draws them a
+few hundred pixels wide, and full float precision would multiply the size of
+every data file for digits no one can see."""
+
+SeriesKind = Literal["line", "step", "bar", "scatter", "area"]
+
+
+@dataclasses.dataclass
+class Series:
+    """One named sequence of points. `kind` is a drawing hint: `step` for a
+    signal that holds its value between samples (delivered / not), `bar` for
+    a categorical comparison, `scatter` for samples with no order."""
+
+    name: str
+    x: list[Any]
+    y: list[float | None]
+    kind: SeriesKind = "line"
+
+    def __post_init__(self) -> None:
+        if len(self.x) != len(self.y):
+            raise ValueError(
+                f"series {self.name!r}: {len(self.x)} x values but {len(self.y)} y"
+            )
+
+
+@dataclasses.dataclass
+class Marker:
+    """A vertical rule on a chart at `x`, labelled — "relay powered off"."""
+
+    x: float
+    label: str
+
+
+@dataclasses.dataclass
+class Chart:
+    """One chart: axes, the series drawn on them, and any event markers.
+    `y_range`, when given, pins the y axis (a ratio is always `(0, 1)`)."""
+
+    title: str
+    x_label: str
+    y_label: str
+    series: list[Series]
+    markers: list[Marker] = dataclasses.field(default_factory=list)
+    y_range: tuple[float, float] | None = None
+    caption: str | None = None
+    x_log: bool = False
+
+
+@dataclasses.dataclass
+class Headline:
+    """A number worth putting in large type, with what it counts. `detail`
+    is the qualifier a careful reader needs ("median of 9 failures")."""
+
+    value: str
+    label: str
+    detail: str | None = None
+
+
+@dataclasses.dataclass
+class Showcase:
+    """Everything the results page shows for one scenario.
+
+    `slug` names the data file (`<slug>.json`) and the page anchor. `question`
+    is the one-sentence question the scenario answers, in a customer's words;
+    `summary` is the paragraph answering it. `method` says how the number was
+    produced, so a reader can judge it; `params` are the knobs it was produced
+    with. `table` is an optional grid (first row the header).
+    """
+
+    slug: str
+    title: str
+    question: str
+    headlines: list[Headline]
+    summary: str
+    charts: list[Chart]
+    params: dict[str, Any] = dataclasses.field(default_factory=dict)
+    method: str | None = None
+    table: list[list[Any]] | None = None
+    category: str = "resilience"
+    scenario: str | None = None
+    """Path of the script that produced this, relative to the repo root."""
+
+
+def _rounded(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, _DECIMALS)
+    if isinstance(value, dict):
+        return {k: _rounded(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_rounded(v) for v in value]
+    return value
+
+
+def showcase_dict(showcase: Showcase) -> dict[str, Any]:
+    """`showcase` as the JSON-ready dict `write_showcase` serialises."""
+    return {"schema": SCHEMA_VERSION, **_rounded(dataclasses.asdict(showcase))}
+
+
+def write_showcase(showcase: Showcase, out_dir: Path) -> Path:
+    """Write `showcase` to `out_dir/<slug>.json` and return the path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{showcase.slug}.json"
+    path.write_text(json.dumps(showcase_dict(showcase), indent=1) + "\n")
+    return path
+
+
+def downsample(
+    x: Sequence[float], y: Sequence[Any], max_points: int = 600
+) -> tuple[list[float], list[Any]]:
+    """Thin a long time series to at most `max_points`, keeping every point
+    where the value *changes* first — so a step signal keeps its edges
+    exactly, and only flat stretches lose samples."""
+    if len(x) <= max_points:
+        return list(x), list(y)
+    keep = {0, len(x) - 1}
+    keep.update(i for i in range(1, len(y)) if y[i] != y[i - 1])
+    keep.update(i - 1 for i in list(keep) if i > 0)
+    if len(keep) < max_points:
+        stride = max(1, len(x) // (max_points - len(keep)))
+        keep.update(range(0, len(x), stride))
+    idx = sorted(keep)
+    return [x[i] for i in idx], [y[i] for i in idx]

@@ -65,6 +65,8 @@ class _NodeState:
     # Payloads the router delivered locally that are not stream packets,
     # waiting for `Simulation.poll_local`.
     inbox: deque[bytes] = dataclasses.field(default_factory=deque)
+    tx_frames: int = 0
+    tx_bytes: int = 0
     """This node's mesh identity, when it has one. Retained so a scenario can
     sign or re-enroll on its behalf mid-run."""
 
@@ -478,6 +480,17 @@ class Simulation:
         """Whether `node` is powered on right now."""
         return self._states[node].up
 
+    def tx_frames(self, node: str) -> int:
+        """Frames `node`'s router has put on the air so far, across every
+        interface — control and data alike. Survives a reboot (it counts the
+        node's radio, not one router's lifetime); injected frames are not
+        counted, since no router sent them."""
+        return self._states[node].tx_frames
+
+    def tx_bytes(self, node: str) -> int:
+        """Total size of the frames counted by `tx_frames`."""
+        return self._states[node].tx_bytes
+
     def is_link_up(self, link: str) -> bool:
         """Whether `link` is carrying frames right now."""
         return link not in self._down_links
@@ -692,6 +705,8 @@ class Simulation:
         for iface, link in state.interfaces.items():
             frame = state.driver.poll_egress(iface)
             while frame is not None:
+                state.tx_frames += 1
+                state.tx_bytes += len(frame)
                 self._schedule_delivery(link, name, iface, frame)
                 frame = state.driver.poll_egress(iface)
         self._drain_local(state, name)

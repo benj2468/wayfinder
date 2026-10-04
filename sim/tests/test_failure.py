@@ -95,3 +95,17 @@ def test_recover_before_fail_is_refused():
         sim.fail_node("b", at_s=5.0, recover_s=4.0)
     with pytest.raises(ValueError):
         sim.fail_link("a-b", at_s=5.0, recover_s=5.0)
+
+
+def test_tx_counters_count_router_egress_and_stop_while_down():
+    nodes = [Node(n, trickle=FAST) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+    sim.run(until_s=3.0)
+    frames, octets = sim.tx_frames("a"), sim.tx_bytes("a")
+    assert frames > 0
+    assert octets > frames  # every frame carries more than one byte
+
+    sim.fail_node("a", at_s=3.0)
+    sim.run(until_s=6.0)
+    assert sim.tx_frames("a") == frames
+    assert sim.tx_frames("b") > 0
