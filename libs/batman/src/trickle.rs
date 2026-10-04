@@ -253,4 +253,26 @@ mod tests {
         assert_eq!(clamped.i_min(), I_MAX);
         assert_eq!(clamped.i_max(), I_MAX);
     }
+
+    /// RFC 6206 spreads each fire uniformly over `[interval/2, interval)`, and
+    /// that spread is what keeps neighbours from keying up together on a
+    /// shared medium. A long interval must get the whole window, not the first
+    /// few seconds of it: a 32-bit random word taken modulo a nanosecond width
+    /// covers at most ~4.3 s, so for every interval above ~8.6 s the fires
+    /// bunched at the window's start.
+    #[test]
+    fn jitter_covers_the_whole_window_of_a_long_interval() {
+        let span = Duration::from_secs(60);
+        let mut late = 0;
+        for seed in 1..=200u32 {
+            let t = TrickleTimer::new(span, span, Duration::ZERO, seed);
+            let until = t.time_until(Duration::ZERO);
+            assert!(until >= span / 2 && until < span, "fire {until:?}");
+            if until >= span * 3 / 4 {
+                late += 1;
+            }
+        }
+        // Uniform over [30 s, 60 s): about half land in the back half.
+        assert!(late > 60, "only {late}/200 fires in [45 s, 60 s)");
+    }
 }
