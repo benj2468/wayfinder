@@ -12,3 +12,9 @@ workspace = true
 # dependency-free. `build.rs` shells out to `git` through `std::process`, which
 # is the build script's own environment and never the target's.
 [dependencies]
+
+[features]
+# Lets `build()` take the identity from the process environment, which is how
+# Nix stamps a package without recompiling it (see `nix/default.nix`). Host
+# binaries only: a board has no environment, and `no_std` stays the default.
+std = []

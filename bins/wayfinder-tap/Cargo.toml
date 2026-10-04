@@ -7,7 +7,7 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-wayfinder-version.workspace = true
+wayfinder-version = { workspace = true, features = ["std"] }
 wayfinder.workspace = true
 wayfinder-alarm.workspace = true
 wayfinder-driver.workspace = true

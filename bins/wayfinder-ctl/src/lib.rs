@@ -58,7 +58,7 @@ use crate::output::OutputFormat;
     // The build identity, not `CARGO_PKG_VERSION` (which is pinned at 0.1.0
     // workspace-wide and says nothing). This identifies the operator's own
     // tooling, a separate question from what a node reports over the API.
-    version = wayfinder_version::VERSION,
+    version = wayfinder_version::build().version,
     about = "Command-line client for the Wayfinder management API"
 )]
 pub struct Cli {
@@ -870,7 +870,7 @@ mod tests {
 
         assert_eq!(
             Cli::command().get_version(),
-            Some(wayfinder_version::VERSION)
+            Some(wayfinder_version::build().version)
         );
     }
 
