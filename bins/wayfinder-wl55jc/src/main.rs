@@ -234,9 +234,8 @@ async fn main(spawner: Spawner) {
     };
     spawner.spawn(task);
 
-    // Spawned after the radio so a radio bring-up that faults never races a
-    // half-configured watchdog; spawned before the driver so a driver that
-    // never schedules again is reset rather than left lit and silent.
+    // Spawning only queues the task: it starts the IWDG on its first poll,
+    // after `main` yields to the driver, so bring-up above can never trip it.
     let Ok(task) = wayfinder_wl55jc::watchdog_task(p.IWDG) else {
         error!("could not spawn the watchdog task; halting");
         halt();
