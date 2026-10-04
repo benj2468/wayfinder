@@ -24,7 +24,15 @@ RUN rustup component add clippy
 
 # Bare-metal target for the embedded (`no_std`) crates (see build-embedded in
 # .github/workflows/ci.yml) — Tier 2 with prebuilt core/alloc, so no nightly required.
+# Cortex-M4F: the nRF52840 boards and the STM32F411.
 RUN rustup target add thumbv7em-none-eabihf
+
+# The **soft-float** sibling, for bins/wayfinder-wl55jc. The STM32WL55's
+# Cortex-M4 has no FPU, so this is a genuinely different target rather than a
+# variant of the one above — that board built against `eabihf` produces an image
+# that links and then HardFaults on its first float. Kept in step with
+# `bareMetalSoftFloatTarget` in flake.nix.
+RUN rustup target add thumbv7em-none-eabi
 
 # Browser target for `bins/wayfinder-web`: cargo-leptos builds that crate twice,
 # once for the host (the axum server) and once for wasm (the hydration bundle).

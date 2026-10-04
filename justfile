@@ -402,10 +402,10 @@ clean-py:
 # dependency — e.g. one pulled in by a workspace default feature.
 
 [doc("Build every board, plus the drivers no board links.")]
-build-embedded: build-nrf52840 build-nrf52840-dongle build-stm32f411 build-loose-drivers
+build-embedded: build-nrf52840 build-nrf52840-dongle build-stm32f411 build-wl55jc build-loose-drivers
 
 [doc("Lint every board, plus the drivers no board links.")]
-clippy-embedded: clippy-nrf52840 clippy-nrf52840-dongle clippy-stm32f411 clippy-loose-drivers
+clippy-embedded: clippy-nrf52840 clippy-nrf52840-dongle clippy-stm32f411 clippy-wl55jc clippy-loose-drivers
 
 # Reads the linked ELF, so it depends on the build rather than on clippy (which
 # never links). Mirrors CI's `build-stack-budget`; see `scripts/stack-budget.py`
@@ -423,7 +423,7 @@ clippy-embedded: clippy-nrf52840 clippy-nrf52840-dongle clippy-stm32f411 clippy-
 # decisions generally; `opt-level` is what moves a frame between a transient
 # call and a permanent reservation.
 [doc("Check every board image fits the stack the linker left it.")]
-stack-budget: stack-budget-nrf52840 stack-budget-nrf52840-dongle stack-budget-stm32f411
+stack-budget: stack-budget-nrf52840 stack-budget-nrf52840-dongle stack-budget-stm32f411 stack-budget-wl55jc
 
 # 18% rather than the default 8%, and the reason is structural rather than a
 # concession. The 8% share models a task poll frame as *overhead* sitting on
@@ -470,6 +470,18 @@ stack-budget-stm32f411: build-stm32f411
     cd bins/wayfinder-stm32f411 && python3 ../../scripts/stack-budget.py \
         target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x
 
+# `--task-poll-pct 12` rather than the 8% default, from measurements: this
+# board's stack region (37,968 bytes) is under a quarter of the nRF52840's, so
+# 8% would leave the `main` task's 2,788-byte poll only 249 bytes of room. 12%
+# leaves room for ordinary growth while still catching a regression like the
+# 6,820-byte poll this board once had. The node-lifetime polls plus the deepest
+# transient chain peak near 17.5 KB, ~54% margin. Keep CI's step in step.
+[doc("Static stack-budget check for the NUCLEO-WL55JC firmware.")]
+stack-budget-wl55jc: build-wl55jc
+    cd bins/wayfinder-wl55jc && python3 ../../scripts/stack-budget.py \
+        target/thumbv7em-none-eabi/release/wayfinder-wl55jc --memory-x memory.x \
+        --task-poll-pct 12
+
 # The loose drivers build into the root target directory, so `clean-workspace`
 # already covers them.
 [doc("Remove every board workspace's target directory.")]
@@ -477,6 +489,7 @@ clean-embedded:
     cd bins/wayfinder-nrf52840 && cargo clean
     cd bins/wayfinder-nrf52840-dongle && cargo clean
     cd bins/wayfinder-stm32f411 && cargo clean
+    cd bins/wayfinder-wl55jc && cargo clean
 
 [doc("Build the nRF52840-DK (PCA10056) firmware.")]
 build-nrf52840:
@@ -517,6 +530,18 @@ build-stm32f411:
 [doc("Lint the NUCLEO-F411RE firmware.")]
 clippy-stm32f411:
     cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings
+
+# `--release` is not optional here either, for a sharper reason than the F411's:
+# `opt-level = "z"` with fat LTO is what keeps this image inside 256 KB of flash
+# at all (design 25 4.1, where the unoptimized figure is 333 KB). A debug build
+# is not a smaller version of what ships.
+[doc("Build the NUCLEO-WL55JC firmware.")]
+build-wl55jc:
+    cd bins/wayfinder-wl55jc && cargo build --release --locked
+
+[doc("Lint the NUCLEO-WL55JC firmware.")]
+clippy-wl55jc:
+    cd bins/wayfinder-wl55jc && cargo clippy --release --locked -- -D warnings
 
 # `blue`'s nRF backend is unwired: both nRF boards moved to 802.15.4, which
 # contends with BLE for the same RADIO peripheral, so nothing links

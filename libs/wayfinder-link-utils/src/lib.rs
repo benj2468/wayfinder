@@ -24,6 +24,13 @@
 use tracing::trace;
 use wayfinder::interfaces::link::LinkMetrics;
 
+mod framing;
+
+pub use framing::Framing;
+pub use framing::LINK_HEADER_LEN;
+pub use framing::decode_frame;
+pub use framing::short_address_of;
+
 /// Bytes of fragment header prefixed to each on-air fragment's frame-content
 /// bytes.
 pub const FRAG_HDR_LEN: usize = 2;
@@ -196,26 +203,24 @@ where
     /// `out` and drop the entry, returning `(len, metrics)` — `metrics` from
     /// whichever fragment completed the message. Otherwise `None`.
     ///
-    /// A malformed header (`count == 0`, `index >= count`, `count >
-    /// MAX_FRAGMENTS`, an oversized body, or an offset past the reassembly
-    /// buffer) is rejected without touching the table. A header decoded via
-    /// [`parse_fragment`] already has `count` bounded to `0..=15` by the
-    /// wire format's 4-bit field, so `count > MAX_FRAGMENTS` cannot occur
-    /// through that path today — but `FragHeader`'s fields are public and
-    /// `accept` takes one directly, so a hand-constructed header (as tests
-    /// do) could otherwise smuggle in an oversized `count` and overflow the
-    /// `1u16 << count` shift in `Reassembly::is_complete`; checked here
-    /// rather than trusted. `index`/`count` otherwise come straight off the
-    /// wire, and nothing stops a crafted or corrupted fragment from
-    /// declaring an `index` that is individually `< count` yet still lands
-    /// `index * FRAG_PAYLOAD` past `MAX_REASSEMBLED_LEN` (only `send()`'s own
-    /// fragments respect that relationship), so the offset is
-    /// bounds-checked explicitly rather than trusted. A duplicate index for
-    /// an already-buffered message is
-    /// silently ignored — the first copy wins. A key whose declared `count`
-    /// differs from what's already buffered is treated as a fresh message
-    /// reusing that key (e.g. after `msg_id` wraps) and resets the slot
-    /// rather than merging.
+    /// A fragment no conforming sender produces is rejected without touching
+    /// the table, so it cannot occupy a slot and evict a real message:
+    ///
+    /// - `count == 0` or `index >= count`;
+    /// - a `count` above `MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD)` — the
+    ///   most any frame this table can hold needs. The wire's 4-bit field
+    ///   allows 15, so a larger claim would open a slot that never completes.
+    ///   This also bounds the `1u16 << count` shift in
+    ///   `Reassembly::is_complete` for a hand-constructed `FragHeader`;
+    /// - a body over `FRAG_PAYLOAD`, or a *non-final* body under it — every
+    ///   fragment but the last is full, and a short one would leave a
+    ///   zero-filled hole in a frame of plausible length;
+    /// - an offset whose body would land past `MAX_REASSEMBLED_LEN`.
+    ///
+    /// A duplicate index for an already-buffered message is silently ignored
+    /// — the first copy wins. A key whose declared `count` differs from
+    /// what's already buffered is treated as a fresh message reusing that key
+    /// (e.g. after `msg_id` wraps) and resets the slot rather than merging.
     pub fn accept(
         &mut self,
         key: FragKey<A>,
@@ -225,10 +230,12 @@ where
         out: &mut [u8],
     ) -> Option<(usize, LinkMetrics)> {
         let off = hdr.index as usize * FRAG_PAYLOAD;
+        let is_final = hdr.index + 1 == hdr.count;
         if hdr.count == 0
             || hdr.index >= hdr.count
-            || hdr.count as usize > MAX_FRAGMENTS
+            || hdr.count as usize > MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD)
             || body.len() > FRAG_PAYLOAD
+            || (!is_final && body.len() != FRAG_PAYLOAD)
             || off + body.len() > MAX_REASSEMBLED_LEN
         {
             trace!(
@@ -566,14 +573,16 @@ mod tests {
             count: 2,
         };
 
+        let first = [1u8; FRAG_PAYLOAD];
+
         // Fill the table with MAX_REASSEMBLIES (4) distinct, incomplete messages.
         for addr in 0..4u16 {
-            r.accept(key(addr, 0), &hdr0, &[1], metrics(0), &mut out);
+            r.accept(key(addr, 0), &hdr0, &first, metrics(0), &mut out);
         }
         assert_eq!(r.entries.len(), 4);
 
         // A 5th distinct key evicts the oldest (addr 0).
-        r.accept(key(4, 0), &hdr0, &[1], metrics(0), &mut out);
+        r.accept(key(4, 0), &hdr0, &first, metrics(0), &mut out);
         assert_eq!(r.entries.len(), 4);
 
         // addr 0's second fragment now completes nothing: its prior state
@@ -611,6 +620,82 @@ mod tests {
         );
     }
 
+    /// A `count` no frame of `MAX_REASSEMBLED_LEN` bytes could need is
+    /// refused before it takes a slot. The wire's 4-bit field allows 15, but
+    /// only `MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD)` (3 here) can ever
+    /// complete, so a larger claim opens a slot that never does — a free
+    /// eviction of a real message for anyone in range.
+    #[test]
+    fn accept_rejects_a_count_no_frame_could_need() {
+        let mut r = TestReassembler::new();
+        let mut out = [0u8; MAX_REASSEMBLED_LEN];
+        let most = MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD) as u8;
+        let body = [0u8; FRAG_PAYLOAD];
+
+        let too_many = FragHeader {
+            msg_id: 0,
+            index: 0,
+            count: most + 1,
+        };
+        assert_eq!(
+            r.accept(key(1, 0), &too_many, &body, metrics(0), &mut out),
+            None
+        );
+        assert!(
+            r.entries.is_empty(),
+            "an impossible count must not create a table entry"
+        );
+
+        let largest = FragHeader {
+            msg_id: 0,
+            index: 0,
+            count: most,
+        };
+        r.accept(key(1, 0), &largest, &body, metrics(0), &mut out);
+        assert_eq!(r.entries.len(), 1, "the largest real count is accepted");
+    }
+
+    /// Every fragment but the last carries exactly `FRAG_PAYLOAD` bytes — the
+    /// offset arithmetic depends on it — so a short non-final fragment is
+    /// refused rather than leaving a zero-filled hole in a frame of plausible
+    /// length. The final fragment may be short.
+    #[test]
+    fn accept_rejects_a_short_non_final_fragment() {
+        let mut r = TestReassembler::new();
+        let mut out = [0u8; MAX_REASSEMBLED_LEN];
+        let hdr0 = FragHeader {
+            msg_id: 0,
+            index: 0,
+            count: 2,
+        };
+        let hdr1 = FragHeader {
+            msg_id: 0,
+            index: 1,
+            count: 2,
+        };
+
+        assert_eq!(
+            r.accept(
+                key(1, 0),
+                &hdr0,
+                &[0u8; FRAG_PAYLOAD - 1],
+                metrics(0),
+                &mut out
+            ),
+            None
+        );
+        assert!(
+            r.entries.is_empty(),
+            "a short non-final fragment must not create a table entry"
+        );
+
+        assert_eq!(r.accept(key(1, 0), &hdr1, &[7], metrics(0), &mut out), None);
+        let (len, _) = r
+            .accept(key(1, 0), &hdr0, &[0u8; FRAG_PAYLOAD], metrics(0), &mut out)
+            .expect("full first fragment plus a short tail completes");
+        assert_eq!(len, FRAG_PAYLOAD + 1);
+    }
+
     #[test]
     fn accept_mismatched_count_resets_slot() {
         let mut r = TestReassembler::new();
@@ -623,7 +708,13 @@ mod tests {
             count: 3,
         };
         assert_eq!(
-            r.accept(key(1, 0), &stale_hdr, &[1, 2, 3], metrics(0), &mut out),
+            r.accept(
+                key(1, 0),
+                &stale_hdr,
+                &[1u8; FRAG_PAYLOAD],
+                metrics(0),
+                &mut out
+            ),
             None
         );
 

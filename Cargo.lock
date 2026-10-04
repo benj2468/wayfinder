@@ -2728,6 +2728,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lora-link"
+version = "0.1.0"
+dependencies = [
+ "interfaces",
+ "tracing",
+ "wayfinder-link-utils",
+]
+
+[[package]]
 name = "lru"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5521,6 +5530,7 @@ dependencies = [
  "heapless",
  "tracing",
  "wayfinder",
+ "zerocopy",
 ]
 
 [[package]]

@@ -297,13 +297,21 @@
           ...
         }:
         let
-          # Bare-metal target for the embedded (`no_std`) crates — currently
-          # the nRF52840 (Cortex-M4F) that `libs/nrf-ieee802154` builds
-          # against. Combined (not `withComponents`-ed) onto the host
-          # toolchain below so `cargo build --target thumbv7em-none-eabihf`
-          # picks up its prebuilt `core`/`alloc` without needing nightly's
-          # `-Z build-std`.
+          # Bare-metal target for the embedded (`no_std`) crates with an FPU —
+          # the nRF52840 and STM32F411 (both Cortex-M4F), and what
+          # `libs/nrf-ieee802154` builds against. Combined (not
+          # `withComponents`-ed) onto the host toolchain below so `cargo build
+          # --target thumbv7em-none-eabihf` picks up its prebuilt
+          # `core`/`alloc` without needing nightly's `-Z build-std`.
           bareMetalTarget = "thumbv7em-none-eabihf";
+
+          # The **soft-float** sibling, for `bins/wayfinder-wl55jc`. The
+          # STM32WL55's Cortex-M4 has no FPU, so it is a genuinely different
+          # target and not a variant of the one above — building that board
+          # against `eabihf` yields an image that links and then HardFaults on
+          # its first float. Both `embassy-stm32` and `stm32-metapac` map
+          # `stm32wl.*` to this triple.
+          bareMetalSoftFloatTarget = "thumbv7em-none-eabi";
 
           # Browser target for `bins/wayfinder-web`. `cargo-leptos` builds that
           # crate twice — the axum server for the host and a hydration bundle
@@ -321,6 +329,7 @@
               "llvm-tools-preview"
             ])
             pkgs.fenix.targets.${bareMetalTarget}.latest.rust-std
+            pkgs.fenix.targets.${bareMetalSoftFloatTarget}.latest.rust-std
             pkgs.fenix.targets.${wasmTarget}.latest.rust-std
           ];
 

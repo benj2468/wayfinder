@@ -1,0 +1,106 @@
+[package]
+name = "wayfinder-wl55jc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent workspace (like the nRF and F411 firmwares): cross-compiles to a
+# bare-metal target with its own linker script and panic handler, which must not
+# leak into the main workspace's host builds. It also carries the one `defmt`
+# dependency in the repo (see `defmt_logger`), which must not reach the host
+# graph at all — a host test binary has no `global_logger` to link against.
+[workspace]
+members = ["."]
+
+# `#[no_std]`/`#[no_main]` can't build the host `test` harness.
+[[bin]]
+name = "wayfinder-wl55jc"
+path = "src/main.rs"
+test = false
+doc = false
+bench = false
+
+# `opt-level = "z"` and fat LTO are **required on this part, not tuning**: at
+# default settings this image is ~333 KiB against 256 KiB of flash. See
+# `docs/design/25-stm32wl55-subghz-node.md` §4.1 for the measured table.
+# `panic = "abort"` matches every other board — nothing bare-metal can unwind.
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"
+opt-level = "z"
+
+[dependencies]
+wayfinder = { path = "../../libs/wayfinder", default-features = false }
+# The *same* HAL-agnostic embedded driver the nRF boards run.
+wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
+# The build identity this firmware logs at bring-up.
+wayfinder-version = { path = "../../libs/wayfinder-version" }
+# The RTT `tracing` subscriber -- and, deliberately, *not* the `GetLogs` record
+# ring. The relay has no management port, so nothing can ever read the ring;
+# it would still be written on every record and cost a ~16 KiB `static` on a
+# part with 64 KB of RAM. The STM32F411's posture, for the same reason. The
+# management-port build turns `ring` back on, sized per design 25 §4.7.
+wayfinder-log = { path = "../../libs/wayfinder-log", default-features = false, features = [
+    "sink-rtt",
+] }
+# This board's wire format: framing and fragmentation over a raw LoRa PHY,
+# which is what an on-die SX126x is (unlike the RYLR998 module `rylr998`
+# drives, which does its own addressing).
+lora-link = { path = "../../libs/lora-link" }
+tracing = { version = "0.1.44", default-features = false }
+
+# STM32WL55JC, Cortex-M4 core (CPU1). The CM0+ is never released — see
+# `main.rs`, and note the RAM budget in `memory.x` depends on it.
+#
+# `unstable-pac` is not optional: the radio's reset, busy and chip-select lines
+# are `RCC`/`PWR` register bits rather than pins on this part, so `iv.rs`
+# cannot reach them any other way.
+embassy-stm32 = { version = "0.6", features = [
+    "stm32wl55jc-cm4",
+    "time-driver-any",
+    "exti",
+    "unstable-pac",
+] }
+# 0.10 rather than the F411's 0.9: it is what `embassy-stm32` 0.6 itself
+# depends on, so the image links one executor instead of two.
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+] }
+embassy-time = "0.5.1"
+# The channel that makes `LinkT::recv` cancel-safe, and the signal the radio
+# IRQ fires. See `radio.rs` — this is load-bearing, not convenience.
+embassy-sync = "0.8"
+embassy-futures = "0.1.2"
+
+# The SX126x command set. `lora-phy` has the `Stm32wl` variant this part needs;
+# what it does not have is a usable `InterfaceVariant` for it (its generic one
+# takes GPIO pins, and here none of those three signals is a pin) — hence
+# `iv.rs`.
+lora-phy = "3.0.1"
+# **Not a logging choice.** `lora-phy` depends on `defmt` non-optionally and
+# calls its macros, so `defmt` must link; this repo logs through `tracing` over
+# the RTT channel `wayfinder-log` owns, and linking `defmt-rtt` would put a
+# second RTT implementation in the image fighting for the control block. The
+# board therefore supplies a no-op `global_logger` (`defmt_logger.rs`), which
+# discards `lora-phy`'s six records. Design 25 §4.6.
+defmt = "0.3"
+
+embedded-hal-async = "1.0"
+# `OutputPin`, for the antenna-switch pins `iv.rs` is generic over.
+embedded-hal = "1.0"
+# The owned on-air packet that crosses the radio task's channels. Pinned to the
+# root workspace's version so the image links one `heapless`, not two -- this
+# board reaches it again through `lora-link`.
+heapless = "0.9.3"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+# `tracing-core` does an unconditional `extern crate alloc;`, so any binary
+# linking this dependency graph needs a real allocator.
+embedded-alloc = "0.6"
