@@ -756,58 +756,47 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
   reassembly ceiling (§4.2). RAM is found in the log ring instead.
 - **The CM0+ is never released** (§4.8), because the RAM budget spends its bank.
 - **A no-op `defmt` logger**, rather than `defmt-rtt` or a bridge (§4.6).
-- **`fan_out` is not overridden**, matching all three existing radio drivers
+- *(Superseded by #95; see "Genuinely open".)* **`fan_out` is not overridden**, matching all three existing radio drivers
   (§4.4).
 
 ### Genuinely open
 
+Status as of 2026-10-03. Each item that has since been resolved names the
+change that resolved it; the reasoning that used to stand here is in that
+change's PR.
+
 - ~~**The SWD failure (§2.3).**~~ Resolved 2026-10-03: the board's factory
-  firmware, not the VMware passthrough, the hub or the probe's firmware, all of
-  which were suspected. §2.3 now carries the bring-up procedure. The relay
-  boots and its radio enters receive; over-the-air exchange still needs a
-  second board.
-- **`fan_out` across all four radio drivers.** A broadcast radio send looks
-  like the `Some(1)` case, none of them declares it, and the method's own docs
-  say it is dead weight until design 17 lands. Worth settling once, for all of
-  them, rather than per driver.
-- **How to fit the management port in 256 KB of flash — #75**, with
-  #71 (the `flt2dec` waste below), #72 (routing core), #73 (crypto) and #74
-  (async platform) under it. The single largest open question, since without
-  the port this board cannot be reached by `libs/wayfinder-hil`, cannot be
-  enrolled, cannot renew (design 24), and has no observability without a
-  debug probe attached — RTT at a compile-time log level is all there is.
-
-  The gap is 28.8 KiB and splits into a bounded half and a decision:
-
-  - **~13 KiB is recoverable waste** with a known cause and fix (#71).
-    Necessary, and on its own not sufficient.
-  - **The remaining ~16 KiB is a decision.** The cost is the protobuf
-    dispatch — `handle_router` 13.3 KiB, `wayfinder_protos` 22.6 KiB, `prost`
-    11.9 KiB — and trimming which request kinds a constrained board answers
-    cuts against `rpc_table!`'s declare-once contract, where a kind missing
-    from the table does not compile *deliberately*, so that a request cannot
-    become silently unanswerable. Changing that is a change to a shipped
-    crate's central invariant and **wants its own design doc**; #75 records it
-    as unfiled.
-
-- **What the durable store costs.** Design 22's flash A/B store plus identity
-  persistence is the other thing this board needs to be a real mesh member
-  (§4.10), and its footprint is **not measured**. Given the budget above, it
-  should be measured before it is promised.
-
-- **`flt2dec` in a router image** (~11 KiB of visible `.text`, plus more in the
-  tail, plus 1.7 KiB of `<u128>::_fmt_inner`). **Cause now known**, and it is
-  not a stray call site: `tracing_core::field::Visit` is used as `dyn Visit`,
-  so the trait's *default* `record_f64`/`record_i128`/`record_u128` — which
-  format via `Debug` — are in the vtable and cannot be stripped even though
-  nothing in this firmware logs a float. `wayfinder-log` implements only
-  `record_debug` and relies on those defaults (its `rtt.rs:172` comment says
-  exactly that). Overriding the three on bare metal with integer-only
-  rendering should reclaim it, and would shrink both nRF images too. Its own
-  small MR, since it touches a crate every target links. **#71.**
-- **Whether `stack-budget.py` should validate `memory.x` against the chip**
-  (§4.1). It passed on an image whose stack top was past the end of RAM. This
-  design wants that gate, and it is arguably its own small MR.
+  firmware, not the VMware passthrough, the hub or the probe's firmware, all
+  of which were suspected. §2.3 now carries the bring-up procedure.
+  Over-the-air exchange is pinned against a RYLR998 by
+  `libs/wayfinder-hil/tests/reyax_interop.rs` (#91).
+- ~~**`fan_out` across all four radio drivers.**~~ Settled for every broadcast
+  medium together, as this item asked, in #95. The premise had gone stale:
+  design 17 had landed, and its collapse reads the declaration. Each radio
+  declares `FanOut::broadcast(cap)`, with a threshold of 2 and its real frame
+  cap. The cap was added after review found a merged frame could outgrow a
+  small radio. §4.4's "not overridden" is superseded by it.
+- **How to fit the management port in 256 KB of flash: #75.** Re-measured
+  against the current relay and given its own doc, **design 28**. The port is
+  now 42.1 KiB over, not 28.8, because the durable store and the log ring are
+  counted. Trimming request kinds measures at 8.1 KiB, which rules it out as
+  the lever. The protobuf layer is 37.7 KiB, and design 28 recommends a codec
+  spike against it.
+- ~~**What the durable store costs.**~~ Measured and shipped in #94: +10.2 KiB
+  of code, 4 KiB of A/B pages and +132 B of statics. The relay now mints a
+  per-board seed instead of sharing a compile-time `Mac`, which collided
+  between boards flashed from one build.
+- ~~**`flt2dec` in a router image.**~~ Fixed by #71 (`wayfinder-log` overrides
+  `record_f64`/`record_i128`/`record_u128` on bare metal).
+- ~~**Whether `stack-budget.py` should validate `memory.x` against the
+  chip.**~~ It does, as of #92: `--chip` per board, checked against real
+  flash/RAM before anything is measured, and `_stack_start` checked against
+  real RAM.
+- ~~**A radio fault can freeze the node.**~~ Not on the original list; found in
+  review. Fixed in #93: a transmit deadline, a bounded `wait_on_busy` and an
+  IWDG backstop, each fault-injected on the board.
+- **`opt-level="z"` stays mandatory** (above), and §6.3's airtime governor is
+  still unbuilt. Neither is a defect; both are standing constraints.
 
 ## 10. File map
 
@@ -957,11 +946,17 @@ Recorded as the design is built, per `docs/design/README.md`.
   for a board-support crate, which §4.3 argues should wait for a second STM32WL
   board.
 
-- **Test 9 (cancel-safety) is not written.** §10 puts it with the `LinkT` impl,
-  which lives in the board crate — and that crate cannot be host-tested
-  (`test = false`, no linkable harness). So the property §4.5 exists to protect
-  is currently held by construction and by documentation, not by a test. That
-  is a real gap: it is the one defect in this board that would present as poor
-  RF rather than as a failure. The honest options are an `embedded-test` target
-  (design 21's Tier A, unbuilt) or moving the `LinkT` into a library crate —
-  the same extraction the stack-budget deviation above wants.
+- **Test 9 (cancel-safety) is not written.** *Since written (#96):* the
+  board's `LoraLink` moved into `lora-link` as `ChannelLink`, the chip-free
+  half of the adapter, and `a_recv_dropped_mid_frame_loses_nothing` pins the
+  property there. A mutant that keeps reassembly state in the future fails it.
+  This was the "moving the `LinkT` into a library crate" option below. The
+  board-support-crate extraction the stack-budget deviation wanted is still
+  separate.
+
+  The original note, for the record: §10 put the test with the `LinkT` impl,
+  which lived in the board crate, and that crate cannot be host-tested
+  (`test = false`, no linkable harness). So the property §4.5 exists to
+  protect was held by construction and by documentation, not by a test. The
+  options were an `embedded-test` target (design 21's Tier A, unbuilt) or
+  moving the `LinkT` into a library crate.
