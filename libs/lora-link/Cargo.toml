@@ -7,10 +7,13 @@ edition = "2024"
 workspace = true
 
 [features]
+# On by default for the same reason as `rylr998`'s: the workspace test run only
+# exercises default features, and the `link` tests are design 25's test 9.
+default = ["link"]
 # The `LinkT` half of a raw-LoRa adapter: the side that only awaits channels,
-# so its cancel-safety is host-testable. Off by default so the framing stays
-# dependency-light; the radio-owning task stays in the board, which is the only
-# place that knows the chip.
+# so its cancel-safety is host-testable. The radio-owning task stays in the
+# board, which is the only place that knows the chip. Framing-only users turn
+# it off with `default-features = false`.
 link = ["dep:wayfinder", "dep:embassy-sync", "dep:heapless"]
 
 [dependencies]

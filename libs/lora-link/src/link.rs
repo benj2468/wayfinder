@@ -18,6 +18,7 @@ use interfaces::frame::LinkFrameData;
 use interfaces::frame::Mac;
 use interfaces::link::LinkError;
 use interfaces::link::LinkMetrics;
+use tracing::trace;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 
@@ -83,12 +84,70 @@ impl<'a, M: RawMutex, const RX: usize> ChannelLink<'a, M, RX> {
 }
 
 impl<M: RawMutex + Sync, const RX: usize> LinkT for ChannelLink<'_, M, RX> {
-    async fn send(&mut self, _origin: Mac, _data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
-        Err(LinkError::Io)
+    async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
+        let mut frame = [0u8; MAX_REASSEMBLED_LEN];
+        let frame_len = crate::assemble_frame(origin, data, &mut frame)?;
+        let count = crate::fragment_count(frame_len)?;
+
+        let msg_id = self.msg_id;
+        self.msg_id = self.msg_id.wrapping_add(1);
+
+        for index in 0..count {
+            let mut out = [0u8; MAX_FRAME_LEN];
+            let n = crate::build_fragment(
+                self.net_id,
+                self.src_id,
+                &frame[..frame_len],
+                crate::FragmentSpec {
+                    msg_id,
+                    index,
+                    count,
+                },
+                &mut out,
+            )?;
+            let packet = Packet::from_slice(&out[..n]).map_err(|_| LinkError::BufferFull)?;
+
+            // Cleared before queueing, so the verdict awaited below can only
+            // be this fragment's. The depth-1 queue plus that wait means `send`
+            // never blocks on a previous fragment of its own.
+            self.port.tx_done.reset();
+            self.port.tx.send(packet).await;
+            if !self.port.tx_done.wait().await {
+                // **Abandon the whole frame.** A receiver cannot complete a
+                // reassembly that is missing a fragment, so the remaining
+                // airtime would be spent for nothing.
+                trace!(
+                    index,
+                    count, "drop: abandoning frame after a failed fragment"
+                );
+                return Err(LinkError::TransmitFailed);
+            }
+        }
+        Ok(frame_len)
     }
 
     async fn recv<'b>(&'b mut self) -> Result<Received<'b>, LinkError> {
-        Err(LinkError::Io)
+        // **Loop.** A lone fragment buffers and the loop continues; only a
+        // completed frame returns. The driver's receive arm expects a whole
+        // frame or nothing, never a short one.
+        //
+        // And the only `.await` is the channel. Everything a half-received
+        // frame needs lives in `self.reassembler`, not in this future, which
+        // is what lets the driver drop this future at any await point and
+        // lose nothing (`a_recv_dropped_mid_frame_loses_nothing`).
+        loop {
+            let packet = self.port.rx.receive().await;
+            if let Some((len, metrics)) = crate::accept_fragment(
+                &mut self.reassembler,
+                self.net_id,
+                &packet.bytes,
+                packet.metrics,
+                &mut self.frame,
+            ) {
+                let frame = crate::decode_frame(&self.frame[..len])?;
+                return Ok(Received { frame, metrics });
+            }
+        }
     }
 }
 
@@ -189,7 +248,15 @@ mod tests {
         );
 
         rx_q.try_send(rx(second)).ok().unwrap();
-        let received = futures::executor::block_on(link.recv()).unwrap();
+        // One poll, not `block_on`: with the second fragment queued a correct
+        // `recv` completes immediately, and one that lost the first fragment
+        // with the dropped future would otherwise wait forever, a hang rather
+        // than a failure.
+        let fut = pin!(link.recv());
+        let Poll::Ready(received) = embassy_futures::poll_once(fut) else {
+            panic!("the first fragment was lost with the dropped recv");
+        };
+        let received = received.unwrap();
         assert_eq!(received.frame.src, mac(2));
         assert_eq!(&received.frame.payload, &payload[..]);
     }
