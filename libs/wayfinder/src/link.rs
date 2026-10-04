@@ -122,6 +122,21 @@ pub trait LinkT: Send {
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError>;
 }
 
+/// The [`LinkT::fan_out`] every broadcast radio in this repo declares: a LoRa
+/// module or raw LoRa PHY, an 802.15.4 frame to `0xffff`, a BLE advertisement.
+/// One `send` reaches every neighbor on each of those, whatever `data.dst`
+/// says.
+///
+/// **Two, not one**, although one directed copy costs a broadcast radio
+/// exactly what a flood does. The collapse it gates (design 17 §4.5) swaps the
+/// frame's pairwise tag for a signature, since one transmission cannot carry a
+/// tag per recipient. With a single terminal destination that swap saves no
+/// transmission and only makes the frame longer, which on a duty-cycled
+/// medium is airtime spent for nothing. From two destinations up it saves a
+/// whole transmission per extra peer. The host's multicast UDP links declare
+/// the same threshold for the same reason.
+pub const BROADCAST_FAN_OUT: Option<core::num::NonZeroU8> = core::num::NonZeroU8::new(2);
+
 /// A dynamically dispatched [`LinkT`] trait object.
 ///
 /// Gated behind the `std` feature: it aliases the `dynosaur`-generated wrapper

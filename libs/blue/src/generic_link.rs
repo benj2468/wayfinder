@@ -866,4 +866,11 @@ mod tests {
 
         assert!(matches!(link.recv().await, Err(LinkError::ReceiveFailed)));
     }
+
+    /// A non-connectable advertisement is heard by every scanner in range.
+    #[test]
+    fn declares_broadcast_fan_out() {
+        let (link, _sink) = BleLink::new(FakeAdvertiser::default(), BleSendMode::Legacy);
+        assert_eq!(link.fan_out(), wayfinder::link::BROADCAST_FAN_OUT);
+    }
 }

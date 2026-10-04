@@ -639,4 +639,12 @@ mod tests {
             Err(LinkError::MalformedFrame)
         ));
     }
+
+    /// `AT+SEND=0` is the module's broadcast address, so every send reaches
+    /// every module on the network id: a broadcast medium, declared as one.
+    #[test]
+    fn declares_broadcast_fan_out() {
+        let client = RylrClient::new(FakeSerial::new(b"")).unwrap();
+        assert_eq!(client.fan_out(), wayfinder::link::BROADCAST_FAN_OUT);
+    }
 }

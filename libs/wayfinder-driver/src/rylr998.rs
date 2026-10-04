@@ -829,4 +829,25 @@ mod tests {
         assert!(link.ensure_connected().await.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
+
+    /// The driver reads `fan_out` once, when it is built, and a reconnecting
+    /// link is usually not connected yet then — so the declaration must be
+    /// the medium's, not delegated to an inner client that may not exist.
+    #[test]
+    fn declares_broadcast_fan_out_before_it_has_connected() {
+        let link = ReconnectingRylr998Link {
+            connector: SimConnector::default(),
+            name: "test".into(),
+            address: 42,
+            network_id: 7,
+            spreading_factor: SpreadingFactory::Sf9,
+            bandwidth: Bandwidth::Khz250,
+            coding_rate: CodingRate::Cr46,
+            preamble: 8,
+            inner: None,
+            broken: false,
+            backoff: Backoff::with_bounds(Duration::from_millis(5), Duration::from_millis(20)),
+        };
+        assert_eq!(link.fan_out(), wayfinder::link::BROADCAST_FAN_OUT);
+    }
 }
