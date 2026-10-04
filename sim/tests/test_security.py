@@ -274,3 +274,37 @@ def test_revoke_notify_rejects_unknown_and_revoked_nodes():
         sim.revoke("b", notify=["zz"])
     with pytest.raises(ValueError):
         sim.revoke("b", notify=["b"])
+
+
+def test_a_compromised_node_ignores_its_own_revocation_and_is_still_excluded():
+    """An attacker holding a captured radio runs firmware that discards the
+    order revoking it. It stays up and keeps talking — and the members, who
+    do honour the record, shut it out anyway."""
+    mesh = _mesh()
+    nodes = [Node(n, credential=Credential()) for n in ("a", "b", "rogue")]
+    links = [
+        pair("a", "b", PerfectWire()),
+        pair("a", "rogue", PerfectWire()),
+        pair("b", "rogue", PerfectWire()),
+    ]
+    sim = Simulation(nodes, links, mesh=mesh)
+    sim.compromise("rogue")
+    sim.run(until_s=20.0)
+
+    sim.revoke("rogue", notify=["a"])
+    sim.run(until_s=60.0)
+
+    assert not sim.knows_revoked("rogue", "rogue"), "its firmware discarded the order"
+    assert not sim.driver("rogue").auth_locked, "so it never went inert"
+    assert "rogue" not in sim.admitted("a")
+    assert "rogue" not in sim.admitted("b")
+
+
+def test_an_honest_node_honours_its_own_revocation():
+    mesh = _mesh()
+    nodes = [Node(n, credential=Credential()) for n in ("a", "rogue")]
+    sim = Simulation(nodes, [pair("a", "rogue", PerfectWire())], mesh=mesh)
+    sim.run(until_s=20.0)
+    sim.revoke("rogue", notify=["a"])
+    sim.run(until_s=60.0)
+    assert sim.driver("rogue").auth_locked, "it went inert on hearing its own revocation"

@@ -206,6 +206,10 @@ class Simulation:
         self._probes: dict[str, Probe] = {}
         self._recorder: Recorder | None = None
         self._down_links: set[str] = set()
+        self._compromised: set[str] = set()
+        # Wire bytes of every revocation issued, keyed by the revoked node's
+        # name — what a compromised node's firmware watches for and discards.
+        self._revocation_bytes: dict[str, list[bytes]] = {}
         self._flows: list[Flow] = []
 
         for name in self._states:
@@ -309,8 +313,29 @@ class Simulation:
                     raise ValueError(f"cannot notify {node!r} of its own revocation")
             targets = list(notify)
         record = self._mesh.revoke(self.mac(node), effective_s=effective_s)
+        self._revocation_bytes.setdefault(node, []).append(bytes(record))
         for name in targets:
             self._states[name].driver.ingest_revocation(record)
+
+    def compromise(self, node: str) -> None:
+        """Hand `node` to an attacker: from now on it runs firmware that
+        discards any frame carrying a revocation of itself, so it never goes
+        inert and keeps relaying and sending under its still-valid key.
+
+        This is the captured-radio threat. An honest node that hears its own
+        revocation stops (`auth_locked`); a stolen one has no reason to, and a
+        scenario that let it would credit the mesh for an exclusion the
+        attacker performed on themselves. Exclusion then has to come from the
+        members alone, which is the claim worth measuring.
+
+        The filter matches the record's exact wire bytes, which every frame
+        re-flooding that record carries verbatim — so it needs no knowledge of
+        the TVLV layout, and drops the whole frame the way firmware that
+        refused to parse it would.
+        """
+        if node not in self._states:
+            raise KeyError(node)
+        self._compromised.add(node)
 
     def knows_revoked(self, node: str, target: str) -> bool:
         """Whether `node` holds a revocation naming `target` right now."""
@@ -828,8 +853,14 @@ class Simulation:
         if latency_ms > 0:
             yield self.env.timeout(latency_ms)
         # Lost if the receiver went down (or down and back up) mid-flight.
-        if dst_state.up and dst_state.boot == boot:
-            dst_state.driver.push_rx(dst_iface, frame, metrics)
+        if not dst_state.up or dst_state.boot != boot:
+            return
+        name = dst_state.node.name
+        if name in self._compromised and any(
+            record in frame for record in self._revocation_bytes.get(name, ())
+        ):
+            return
+        dst_state.driver.push_rx(dst_iface, frame, metrics)
 
     def _inject_proc(self, src: str, frame: bytes, at_s: float, link: str | None):
         target_ms = at_s * 1000
