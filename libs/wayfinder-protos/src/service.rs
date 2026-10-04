@@ -1899,7 +1899,8 @@ impl From<wayfinder_version::BuildSource> for BuildSource {
 
 /// The build identity of the binary answering this request.
 ///
-/// Read from a const compiled in by `wayfinder-version`'s build script rather
+/// Read from `wayfinder-version` (the compiled-in identity, or the one the
+/// process was started with when the binary enables its `std` feature) rather
 /// than from a [`RouterReads`] method, because it describes the *binary*, not the
 /// router: a provider method would oblige every impl — the mocks included — to
 /// return this same const, and would let a node be built that reports nothing.
@@ -1908,7 +1909,7 @@ impl From<wayfinder_version::BuildSource> for BuildSource {
 /// Worth being precise about rather than calling it free: the dongle answers
 /// this from a 32 KiB heap.
 fn build_info() -> BuildInfo {
-    build_info_from(wayfinder_version::BUILD)
+    build_info_from(wayfinder_version::build())
 }
 
 /// Project a resolved build identity onto the wire message.
@@ -4213,9 +4214,10 @@ mod tests {
             ResponseKind::NodeInfo(info) => {
                 let build = info.build_info.expect("every node reports its build");
 
-                assert_eq!(build.version, wayfinder_version::VERSION);
-                assert_eq!(build.commit, wayfinder_version::COMMIT);
-                assert_eq!(build.dirty, wayfinder_version::DIRTY);
+                let expected = wayfinder_version::build();
+                assert_eq!(build.version, expected.version);
+                assert_eq!(build.commit, expected.commit);
+                assert_eq!(build.dirty, expected.dirty);
                 // Never the zero value: that means "a node too old to say",
                 // which a node carrying the field must not claim about itself.
                 assert_ne!(build.source, BuildSource::Unspecified as i32);

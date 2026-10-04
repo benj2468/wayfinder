@@ -419,14 +419,15 @@ async fn node_info_query_reports_the_servers_build() {
         .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
 
-    assert_eq!(parsed["build_info"]["version"], wayfinder_version::VERSION);
-    assert_eq!(parsed["build_info"]["commit"], wayfinder_version::COMMIT);
-    assert_eq!(parsed["build_info"]["dirty"], wayfinder_version::DIRTY);
+    let build = wayfinder_version::build();
+    assert_eq!(parsed["build_info"]["version"], build.version);
+    assert_eq!(parsed["build_info"]["commit"], build.commit);
+    assert_eq!(parsed["build_info"]["dirty"], build.dirty);
 
     let human = run_query(Command::NodeInfo, &endpoint, OutputFormat::Human)
         .await
         .unwrap();
-    assert!(human.contains(wayfinder_version::VERSION), "got: {human}");
+    assert!(human.contains(build.version), "got: {human}");
 }
 
 #[tokio::test]

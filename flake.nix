@@ -112,16 +112,19 @@
         };
 
       # What every deployment and every published package is built with: the
-      # commit baked in, so a running node can say which build it is.
+      # commit stamped on, so a running node can say which build it is. The
+      # stamp is a wrapper over the unstamped compile (`stamp` in
+      # `nix/default.nix`), so these come from CI's cache whenever the Rust
+      # sources match a build it has made.
       overlay = mkOverlay { inherit buildVersion buildCommit; };
 
       # The same packages with no build identity, for what CI builds: the NixOS
-      # tests. The stamp is an env var on each binary's final derivation, so it
-      # changes the Rust packages' hashes on *every* commit — a change to
-      # nothing but a test script still recompiled wayfinder-tap, -ctl and -tui,
-      # minutes a job, and never came from the cache. Without it the test
-      # closure changes only when the filtered Rust/proto/web source does. No
-      # test asserts on the version; the binaries report "unknown".
+      # tests. These are the compiled derivations the stamped packages wrap, so
+      # CI's build of them is what a deployment substitutes. Without the
+      # wrapper, the test closure changes only when the filtered Rust/proto/web
+      # source does, and a test result stays cached across commits that leave
+      # it alone. No test asserts on the version; the binaries report
+      # "unknown".
       unstampedOverlay = mkOverlay {
         buildVersion = null;
         buildCommit = null;

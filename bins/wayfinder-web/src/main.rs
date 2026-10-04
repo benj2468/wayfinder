@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     #[command(
         about = "Web dashboard for the Wayfinder management API",
         long_about = None,
-        version = wayfinder_version::VERSION,
+        version = wayfinder_version::build().version,
     )]
     struct Args {
         /// Address to serve the dashboard on.

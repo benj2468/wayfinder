@@ -102,7 +102,7 @@ fn ensure_links_fit<R: wayfinder::router_ops::RouterOps>(links: usize) -> anyhow
 // `--version` reports the build this node is running, which is the same answer
 // `GetNodeInfo` gives over the management API — useful before the node is up, or
 // when there is no client to hand.
-#[command(version = wayfinder_version::VERSION)]
+#[command(version = wayfinder_version::build().version)]
 pub struct Args {
     /// Path to the YAML configuration file.
     #[clap(short, long, default_value = "var/conf/install.yml")]
@@ -430,11 +430,12 @@ async fn main() -> anyhow::Result<()> {
     // Logged at startup as well as served over `GetNodeInfo`, so the build is
     // in the record even for a node nobody queried — and is readable through
     // `GetLogs` on one that cannot be reached any other way.
+    let build = wayfinder_version::build();
     tracing::info!(
-        version = wayfinder_version::VERSION,
-        commit = wayfinder_version::COMMIT,
-        dirty = wayfinder_version::DIRTY,
-        source = ?wayfinder_version::SOURCE,
+        version = build.version,
+        commit = build.commit,
+        dirty = build.dirty,
+        source = ?build.source,
         "build",
     );
     // The config can carry sensitive material (enrollment tokens, seed paths),

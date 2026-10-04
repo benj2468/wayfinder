@@ -41,7 +41,7 @@ use wayfinder_tui::ui;
     long_about = None,
     // The dashboard's own build. The node's is on the Overview pane, and the
     // two can differ — a mismatch is worth being able to see.
-    version = wayfinder_version::VERSION,
+    version = wayfinder_version::build().version,
 )]
 struct Args {
     /// How to reach the node: address, credentials, or a serial port.
@@ -722,7 +722,7 @@ mod tests {
 
         assert_eq!(
             Args::command().get_version(),
-            Some(wayfinder_version::VERSION)
+            Some(wayfinder_version::build().version)
         );
     }
 }

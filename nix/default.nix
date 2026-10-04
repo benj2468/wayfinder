@@ -1,10 +1,10 @@
 {
   pkgs,
   src,
-  # The build identity to bake into each binary, from flake metadata. Optional
-  # so a plain `callPackage ./nix {}` still works: `null` leaves
-  # `wayfinder-version`'s build script to fall back on its own (which, with no
-  # `.git` in the store source, means it reports "unknown").
+  # The build identity to stamp on each binary, from flake metadata. Optional
+  # so a plain `callPackage ./nix {}` still works: `null` stamps nothing, and
+  # the binaries report what `wayfinder-version`'s build script found (with no
+  # `.git` in the store source, "unknown").
   buildVersion ? null,
   # The full commit, alongside the above — see `flake.nix` for why both.
   buildCommit ? null,
@@ -39,30 +39,59 @@ let
 
   cargoArtifacts = buildDepsOnly commonArgs;
 
-  # Deliberately *not* part of `commonArgs`: `cargoArtifacts` above is the
-  # `buildDepsOnly` shared by the plain-cargo packages (`wayfinder-web` builds
-  # its own, further down), and a revision-dependent variable there would change
-  # its derivation hash on every commit, throwing away the dependency cache each
-  # time. Workspace crates are compiled by `buildPackage` anyway, which is the
-  # only stage that needs this.
-  buildVersionEnv =
-    pkgs.lib.optionalAttrs (buildVersion != null) {
-      WAYFINDER_BUILD_VERSION = buildVersion;
-    }
-    // pkgs.lib.optionalAttrs (buildCommit != null) {
-      WAYFINDER_BUILD_COMMIT = buildCommit;
-    };
+  # The build identity goes on at runtime, never into a compile. A
+  # revision-dependent variable on any cargo derivation changes its hash on
+  # every commit, so CI's binary cache never has the package and every
+  # deployment recompiles the workspace crates. Instead each binary is compiled
+  # with no identity — the same derivation on every commit that leaves the
+  # filtered source alone — and `stamp` wraps it to start with the variables
+  # set, which `wayfinder_version::build()` reads (the binaries enable its `std`
+  # feature for this). Wrapping is a few symlinks and a tiny launcher, so a new
+  # commit costs seconds rather than a recompile.
+  buildVersionFlags = pkgs.lib.escapeShellArgs (
+    pkgs.lib.optionals (buildVersion != null) [
+      "--set"
+      "WAYFINDER_BUILD_VERSION"
+      buildVersion
+    ]
+    ++ pkgs.lib.optionals (buildCommit != null) [
+      "--set"
+      "WAYFINDER_BUILD_COMMIT"
+      buildCommit
+    ]
+  );
+
+  # With no identity this is the compiled package itself, so the unstamped set
+  # the NixOS tests use (`flake.nix`) is exactly the derivation a stamped
+  # package wraps, and CI's build of it is what a deployment substitutes.
+  stamp =
+    pkg:
+    if buildVersion == null && buildCommit == null then
+      pkg
+    else
+      pkgs.symlinkJoin {
+        inherit (pkg) name meta;
+        paths = [ pkg ];
+        nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
+        passthru.unwrapped = pkg;
+        postBuild = ''
+          for bin in $out/bin/*; do
+            wrapProgram "$bin" ${buildVersionFlags}
+          done
+        '';
+      };
 
   mkWayfinderPkg =
     pname:
-    buildPackage (
-      commonArgs
-      // buildVersionEnv
-      // {
-        inherit cargoArtifacts pname;
-        cargoExtraArgs = "-p ${pname}";
-        doCheck = false;
-      }
+    stamp (
+      buildPackage (
+        commonArgs
+        // {
+          inherit cargoArtifacts pname;
+          cargoExtraArgs = "-p ${pname}";
+          doCheck = false;
+        }
+      )
     );
 
   wayfinder-tap = mkWayfinderPkg "wayfinder-tap";
@@ -173,62 +202,63 @@ let
   ];
   craneLibWeb = pkgs.craneLib.overrideToolchain webToolchain;
 
-  wayfinder-web = craneLibWeb.buildPackage (
-    commonArgs
-    // buildVersionEnv
-    // {
-      pname = "wayfinder-web";
-      # Deliberately not sharing `cargoArtifacts`: those were built by a
-      # different toolchain and for the host target only, so they are of no use
-      # to the wasm half and cannot be reused across toolchains anyway.
-      cargoArtifacts = craneLibWeb.buildDepsOnly (
-        commonArgs
-        // {
-          pname = "wayfinder-web-deps";
-          cargoExtraArgs = "-p wayfinder-web --features ssr";
-        }
-      );
-      doCheck = false;
+  wayfinder-web = stamp (
+    craneLibWeb.buildPackage (
+      commonArgs
+      // {
+        pname = "wayfinder-web";
+        # Deliberately not sharing `cargoArtifacts`: those were built by a
+        # different toolchain and for the host target only, so they are of no use
+        # to the wasm half and cannot be reused across toolchains anyway.
+        cargoArtifacts = craneLibWeb.buildDepsOnly (
+          commonArgs
+          // {
+            pname = "wayfinder-web-deps";
+            cargoExtraArgs = "-p wayfinder-web --features ssr";
+          }
+        );
+        doCheck = false;
 
-      # `buildPhaseCargoCommand` below runs `cargo leptos build`, not plain
-      # `cargo build --message-format json-render-diagnostics`, so crane's
-      # `installFromCargoBuildLogHook` has no `$cargoBuildLog` to work from.
-      # Installation is handled explicitly by `installPhaseCommand` instead.
-      doNotPostBuildInstallCargoBinaries = true;
+        # `buildPhaseCargoCommand` below runs `cargo leptos build`, not plain
+        # `cargo build --message-format json-render-diagnostics`, so crane's
+        # `installFromCargoBuildLogHook` has no `$cargoBuildLog` to work from.
+        # Installation is handled explicitly by `installPhaseCommand` instead.
+        doNotPostBuildInstallCargoBinaries = true;
 
-      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
-        pkgs.cargo-leptos
-        # Generates the JS glue. Pinned to match the `wasm-bindgen` crate pin in
-        # `bins/wayfinder-web/Cargo.toml`; wasm-bindgen refuses to run on a
-        # version mismatch, so the two move together.
-        pkgs.wasm-bindgen-cli_0_2_126
-        # `wasm-opt`, which cargo-leptos shells out to for release bundles.
-        pkgs.binaryen
-        pkgs.makeWrapper
-      ];
+        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
+          pkgs.cargo-leptos
+          # Generates the JS glue. Pinned to match the `wasm-bindgen` crate pin in
+          # `bins/wayfinder-web/Cargo.toml`; wasm-bindgen refuses to run on a
+          # version mismatch, so the two move together.
+          pkgs.wasm-bindgen-cli_0_2_126
+          # `wasm-opt`, which cargo-leptos shells out to for release bundles.
+          pkgs.binaryen
+          pkgs.makeWrapper
+        ];
 
-      # cargo-leptos writes caches under $HOME, which the sandbox does not set.
-      buildPhaseCargoCommand = ''
-        export HOME=$TMPDIR
-        cargo leptos build --release
-      '';
+        # cargo-leptos writes caches under $HOME, which the sandbox does not set.
+        buildPhaseCargoCommand = ''
+          export HOME=$TMPDIR
+          cargo leptos build --release
+        '';
 
-      # The binary alone is not runnable: it serves a bundle cargo-leptos emits
-      # under `target/site` and locates at runtime through the `LEPTOS_*`
-      # environment. Installing the bundle and baking those paths into a wrapper
-      # is what makes the package self-contained — `wayfinder-web` on a PATH just
-      # works, with no environment for the caller to get right.
-      installPhaseCommand = ''
-        mkdir -p $out/bin $out/share/wayfinder-web
-        cp -r target/site $out/share/wayfinder-web/site
+        # The binary alone is not runnable: it serves a bundle cargo-leptos emits
+        # under `target/site` and locates at runtime through the `LEPTOS_*`
+        # environment. Installing the bundle and baking those paths into a wrapper
+        # is what makes the package self-contained — `wayfinder-web` on a PATH just
+        # works, with no environment for the caller to get right.
+        installPhaseCommand = ''
+          mkdir -p $out/bin $out/share/wayfinder-web
+          cp -r target/site $out/share/wayfinder-web/site
 
-        install -Dm755 target/release/wayfinder-web $out/bin/.wayfinder-web-unwrapped
-        makeWrapper $out/bin/.wayfinder-web-unwrapped $out/bin/wayfinder-web \
-          --set-default LEPTOS_SITE_ROOT "$out/share/wayfinder-web/site" \
-          --set-default LEPTOS_SITE_PKG_DIR "pkg" \
-          --set-default LEPTOS_OUTPUT_NAME "wayfinder-web"
-      '';
-    }
+          install -Dm755 target/release/wayfinder-web $out/bin/.wayfinder-web-unwrapped
+          makeWrapper $out/bin/.wayfinder-web-unwrapped $out/bin/wayfinder-web \
+            --set-default LEPTOS_SITE_ROOT "$out/share/wayfinder-web/site" \
+            --set-default LEPTOS_SITE_PKG_DIR "pkg" \
+            --set-default LEPTOS_OUTPUT_NAME "wayfinder-web"
+        '';
+      }
+    )
   );
 in
 {

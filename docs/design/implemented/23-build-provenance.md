@@ -94,7 +94,7 @@ Resolution is a strict three-tier fallthrough:
 
 | Tier | Source | When it fires | Trust |
 | --- | --- | --- | --- |
-| 1 | `$WAYFINDER_BUILD_VERSION` + `$WAYFINDER_BUILD_COMMIT` | Nix, container, CI | Exact by construction |
+| 1 | `$WAYFINDER_BUILD_VERSION` + `$WAYFINDER_BUILD_COMMIT` | Nix (at runtime, §6.4), container, CI | Exact by construction |
 | 2 | `git describe` / `git rev-parse` in the source tree | A developer tree | Best-effort (see §6.1) |
 | 3 | Neither | A source archive | Reports `unknown` |
 
@@ -262,17 +262,29 @@ Neither is fixable inside `wayfinder-version`, because both are cases where the
   operator sees; wiring compose `args:` is deliberately left out, since compose
   has no commit to pass.
 
-### 6.4 The Nix dependency cache must not be invalidated
+### 6.4 The Nix build cache must not be invalidated
 
-`nix/default.nix` builds one shared `cargoArtifacts = buildDepsOnly commonArgs`
-for every package. A revision-dependent environment variable there would change
-its hash on every commit and throw the whole dependency cache away each time.
+A revision-dependent environment variable on any cargo derivation changes its
+hash on every commit. As first implemented, the variable sat on the
+`buildPackage` args only (never on the shared `buildDepsOnly`), which kept the
+dependency cache but still recompiled the workspace crates for every commit and
+dirty tree. CI built only the unstamped packages its NixOS tests use, so no
+deployment's `wayfinder-tap`/`-ctl`/`-tui`/`-web` ever came from the binary
+cache.
 
-So the variable is set on the `buildPackage` args only — `mkWayfinderPkg` and
-`wayfinder-web` — never on `commonArgs`. Workspace crates compile in
-`buildPackage` anyway, so this is both correct and free. Confirmed against the
-derivations: the final package carries `WAYFINDER_BUILD_VERSION` and
-`wayfinder-workspace-deps` does not.
+So Nix no longer injects at compile time. Each package compiles with no
+identity, and `stamp` in `nix/default.nix` wraps it (`symlinkJoin` plus
+`wrapProgram --set`) so the binary *starts* with `$WAYFINDER_BUILD_VERSION` and
+`$WAYFINDER_BUILD_COMMIT` set. The host binaries enable `wayfinder-version`'s
+`std` feature, whose `build()` lets a runtime identity override the compiled
+one (`with_runtime`), with the same tier-1 rules applied. The feature unifies
+across the build, so `wayfinder-protos` answers `GetNodeInfo` with it too.
+Boards never enable `std` and are unchanged. The container build still
+injects at compile time, through the consts.
+
+The stamped package's `passthru.unwrapped` is the same derivation the NixOS
+tests' unstamped overlay builds, so a deployment substitutes CI's build, and
+only the wrapper is built per commit.
 
 The container build has a related constraint, and the `Dockerfile` already
 carries a comment about the same trade-off for `LEPTOS_OUTPUT_NAME`: the version
@@ -465,7 +477,7 @@ rule that an alarm system must not become the flood it reports applies.
 - `bins/wayfinder-tui/src/ui.rs` — `build_identity`, `render_overview`
 - `bins/wayfinder-web/src/components/overview.rs` — `build_identity`, Node panel
 - `libs/wayfinder-hil/src/diagnostics.rs`, `libs/wayfinder-hil/tests/smoke.rs`
-- `flake.nix` (`buildVersion`), `nix/default.nix` (`buildVersionEnv`)
+- `flake.nix` (`buildVersion`), `nix/default.nix` (`stamp`), `libs/wayfinder-version` (`build`, `with_runtime`)
 - `containers/Dockerfile` (`ARG` + both `cargo build` invocations),
   `.github/workflows/ci.yml` (`deploy`)
 - Startup logs: `bins/wayfinder-tap/src/main.rs`,

@@ -18,7 +18,7 @@ path = "src/lib.rs"
 wayfinder-client = { workspace = true, features = ["cli"] }
 wayfinder.workspace = true
 wayfinder-protos = { workspace = true, features = ["serde"] }
-wayfinder-version.workspace = true
+wayfinder-version = { workspace = true, features = ["std"] }
 wayfinder-auth = { workspace = true, features = ["std"] }
 interfaces.workspace = true
 clap = { workspace = true, features = ["env"] }

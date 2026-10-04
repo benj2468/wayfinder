@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 wayfinder-protos.workspace = true
-wayfinder-version.workspace = true
+wayfinder-version = { workspace = true, features = ["std"] }
 wayfinder-client = { workspace = true, features = ["cli"] }
 wayfinder-auth.workspace = true
 tokio.workspace = true
