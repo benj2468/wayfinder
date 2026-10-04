@@ -11,6 +11,7 @@ from collections.abc import Callable, Sequence
 
 from .channel import Channel
 from .link import Link
+from .medium import Medium
 
 ChannelLike = Channel | Callable[[str, str], Channel]
 """Either one `Channel` instance shared by every edge a builder creates
@@ -32,6 +33,7 @@ def pair(
     *,
     trickle: tuple[int, int] | None = None,
     tx_keepalive_interval_ms: int | None = None,
+    medium: Medium | None = None,
 ) -> Link:
     """A single point-to-point link between `a` and `b`."""
     return Link(
@@ -39,6 +41,7 @@ def pair(
         _resolve(channel, a, b),
         trickle=trickle,
         tx_keepalive_interval_ms=tx_keepalive_interval_ms,
+        medium=medium,
     )
 
 
@@ -56,11 +59,14 @@ def complete_graph(names: Sequence[str], channel: ChannelLike) -> list[Link]:
     return [pair(a, b, channel) for i, a in enumerate(names) for b in names[i + 1 :]]
 
 
-def shared_lan(names: Sequence[str], channel: Channel) -> list[Link]:
+def shared_lan(
+    names: Sequence[str], channel: Channel, *, medium: Medium | None = None
+) -> list[Link]:
     """One segment shared by all `names` (a single multi-access link) — every
     member hears every other, with per-pair metrics still evaluated from
-    `channel` at delivery time."""
-    return [Link(tuple(names), channel)]
+    `channel` at delivery time. `medium` makes it a contended radio channel
+    (airtime, collisions, duty cycle)."""
+    return [Link(tuple(names), channel, medium=medium)]
 
 
 def diamond(a: str, b: str, c: str, d: str, channel: ChannelLike) -> list[Link]:

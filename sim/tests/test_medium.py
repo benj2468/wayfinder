@@ -22,7 +22,7 @@ FAST = (50, 500)
 def _garbage(n: int = 20) -> bytes:
     """A broadcast frame the routers will drop as malformed — enough to
     occupy the air, which is all the medium cares about."""
-    return bytes(wf.PyMac.BROADCAST.bytes()) + bytes(6) + b"\xff\xff" + bytes(n)
+    return bytes(wf.PyMac.BROADCAST.bytes) + bytes(6) + b"\xff\xff" + bytes(n)
 
 
 # --- airtime ---------------------------------------------------------------

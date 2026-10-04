@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import math
 from collections import deque
 from collections.abc import Callable, Sequence
 from random import Random
@@ -27,6 +28,7 @@ import wayfinder_py as wf
 from . import NoLinkError
 from .adversary import Wiretap
 from .link import Link
+from .medium import EnergyModel, RadioStats
 from .mobility import Vec3
 from .node import Node
 from .recorder import Recorder
@@ -46,6 +48,39 @@ _AUTO_MAC_OUI = (0x02, 0x00, 0x00, 0x00, 0x00)
 # enough to resolve that node's own timer, no finer.
 _MIN_TICK_INTERVAL_MS = 10
 _TICK_INTERVAL_DIVISOR = 4
+
+
+@dataclasses.dataclass
+class _Reception:
+    """One frame arriving at one receiver's radio over a contended medium."""
+
+    src: str
+    start_ms: float
+    end_ms: float
+    rssi_dbm: float
+    frame: bytes
+    metrics: wf.PyLinkMetrics
+    delivery_probability: float
+    iface: int
+    boot: int
+    latency_ms: float
+
+
+@dataclasses.dataclass
+class _Radio:
+    """One node's radio on one contended link."""
+
+    queue: deque[tuple[int, bytes]] = dataclasses.field(default_factory=deque)
+    sending: bool = False
+    off_until_ms: float = 0.0
+    tx_intervals: list[tuple[float, float]] = dataclasses.field(default_factory=list)
+    receptions: list[_Reception] = dataclasses.field(default_factory=list)
+    rx_busy_until_ms: float = 0.0
+
+
+_HISTORY_MS = 60_000.0
+"""How long a radio remembers past transmissions and receptions, for judging
+overlap with ones still in progress. Far longer than any single airtime."""
 
 
 @dataclasses.dataclass
@@ -206,6 +241,8 @@ class Simulation:
         self._probes: dict[str, Probe] = {}
         self._recorder: Recorder | None = None
         self._down_links: set[str] = set()
+        self._radios: dict[tuple[str, str], _Radio] = {}
+        self._radio_stats: dict[str, RadioStats] = {name: RadioStats() for name in names}
         self._compromised: set[str] = set()
         # Wire bytes of every revocation issued, keyed by the revoked node's
         # name — what a compromised node's firmware watches for and discards.
@@ -536,6 +573,22 @@ class Simulation:
         """Total size of the frames counted by `tx_frames`."""
         return self._states[node].tx_bytes
 
+    def radio_stats(self, node: str) -> RadioStats:
+        """What `node`'s radios have done on contended (`Link.medium`) links:
+        airtime, frames, and every way a reception was lost. All zero for a
+        node with no such link."""
+        return self._radio_stats[node]
+
+    def energy_mj(self, node: str, model: EnergyModel) -> float:
+        """Energy `node`'s radios have used so far under `model`, from its
+        transmit, receive and idle time on contended links."""
+        return model.energy_mj(self.env.now / 1000.0, self._radio_stats[node])
+
+    def average_power_mw(self, node: str, model: EnergyModel) -> float:
+        """`energy_mj` averaged over the time simulated so far."""
+        elapsed_s = self.env.now / 1000.0
+        return self.energy_mj(node, model) / elapsed_s if elapsed_s > 0 else 0.0
+
     def is_link_up(self, link: str) -> bool:
         """Whether `link` is carrying frames right now."""
         return link not in self._down_links
@@ -812,6 +865,9 @@ class Simulation:
     ) -> None:
         if link.name in self._down_links or not self._states[src_name].up:
             return
+        if link.medium is not None:
+            self._enqueue(link, src_name, src_iface, frame)
+            return
         t_s = self.env.now / 1000.0
         # Tap on transmit, not on delivery: a listener hears what went out
         # over the medium, including the frames a lossy channel then drops
@@ -856,12 +912,161 @@ class Simulation:
         # Lost if the receiver went down (or down and back up) mid-flight.
         if not dst_state.up or dst_state.boot != boot:
             return
+        self._push_rx(dst_state, dst_iface, frame, metrics)
+
+    def _push_rx(
+        self,
+        dst_state: _NodeState,
+        dst_iface: int,
+        frame: bytes,
+        metrics: wf.PyLinkMetrics,
+    ) -> None:
+        """Hand a frame that survived the air to `dst_state`'s router —
+        unless that node is compromised and the frame carries its own
+        revocation, which its firmware discards."""
         name = dst_state.node.name
         if name in self._compromised and any(
             record in frame for record in self._revocation_bytes.get(name, ())
         ):
             return
         dst_state.driver.push_rx(dst_iface, frame, metrics)
+
+    # --- contended medium ---------------------------------------------------
+
+    def _radio(self, node: str, link: Link) -> _Radio:
+        key = (node, link.name or "")
+        radio = self._radios.get(key)
+        if radio is None:
+            radio = self._radios[key] = _Radio()
+        return radio
+
+    def _enqueue(self, link: Link, src: str, iface: int, frame: bytes) -> None:
+        """Put `frame` on `src`'s radio for `link`: straight onto the air if
+        the radio is idle and owes no off-time, into its queue otherwise."""
+        assert link.medium is not None
+        radio = self._radio(src, link)
+        if not radio.sending:
+            radio.sending = True
+            first = None
+            if radio.off_until_ms <= self.env.now:
+                first = (iface, frame)
+            else:
+                radio.queue.append((iface, frame))
+            self.env.process(self._radio_proc(link, src, radio, first))
+            return
+        if len(radio.queue) >= link.medium.queue_limit:
+            self._radio_stats[src].queue_drops += 1
+            return
+        radio.queue.append((iface, frame))
+
+    def _radio_proc(
+        self, link: Link, src: str, radio: _Radio, first: tuple[int, bytes] | None
+    ):
+        assert link.medium is not None
+        medium = link.medium
+        stats = self._radio_stats[src]
+        state = self._states[src]
+        pending = first
+        while True:
+            if pending is None:
+                if not radio.queue:
+                    break
+                wait_ms = radio.off_until_ms - self.env.now
+                if wait_ms > 0:
+                    stats.duty_wait_s += wait_ms / 1000.0
+                    yield self.env.timeout(wait_ms)
+                if not radio.queue:
+                    break
+                pending = radio.queue.popleft()
+            iface, frame = pending
+            pending = None
+            if not state.up or link.name in self._down_links:
+                # Powered off or cut with frames still queued: they die with it.
+                radio.queue.clear()
+                break
+            airtime_ms = medium.phy.airtime_s(len(frame)) * 1000.0
+            self._transmit(link, src, frame, airtime_ms)
+            stats.tx_frames += 1
+            stats.tx_airtime_s += airtime_ms / 1000.0
+            yield self.env.timeout(airtime_ms)
+            radio.off_until_ms = self.env.now + medium.off_time_s(airtime_ms / 1000.0) * 1000.0
+        radio.sending = False
+
+    def _transmit(self, link: Link, src: str, frame: bytes, airtime_ms: float) -> None:
+        """Start `frame` on the air from `src`: record the transmission (for
+        half-duplex), let wiretaps hear it, and open a reception at every
+        receiver the signal reaches."""
+        now = self.env.now
+        end = now + airtime_ms
+        tx_radio = self._radio(src, link)
+        _prune(tx_radio, now)
+        tx_radio.tx_intervals.append((now, end))
+        t_s = now / 1000.0
+        for tap in self._taps.get(link.name or "", ()):
+            tap.capture(t_s, frame)
+        tx_pos = self._states[src].node.mobility.position(t_s)
+        for dst in link.endpoints:
+            if dst == src:
+                continue
+            dst_state = self._states[dst]
+            if not dst_state.up:
+                continue
+            sample = link.channel.evaluate(
+                tx_pos, dst_state.node.mobility.position(t_s), t_s, self._delivery_rng
+            )
+            rssi = sample.metrics.rssi_dbm
+            if sample.delivery_probability == 0.0 and rssi is None:
+                continue  # beyond any reach: no signal, no interference
+            rx_radio = self._radio(dst, link)
+            _prune(rx_radio, now)
+            reception = _Reception(
+                src=src,
+                start_ms=now,
+                end_ms=end,
+                rssi_dbm=0.0 if rssi is None else float(rssi),
+                frame=frame,
+                metrics=sample.metrics,
+                delivery_probability=sample.delivery_probability,
+                iface=self._link_iface[id(link)][dst],
+                boot=dst_state.boot,
+                latency_ms=sample.latency_ms,
+            )
+            rx_radio.receptions.append(reception)
+            busy_from = max(now, rx_radio.rx_busy_until_ms)
+            if end > busy_from:
+                self._radio_stats[dst].rx_airtime_s += (end - busy_from) / 1000.0
+                rx_radio.rx_busy_until_ms = end
+            self.env.process(self._reception_proc(link, dst, rx_radio, reception))
+
+    def _reception_proc(self, link: Link, dst: str, radio: _Radio, rec: _Reception):
+        assert link.medium is not None
+        yield self.env.timeout(rec.end_ms - self.env.now)
+        dst_state = self._states[dst]
+        if not dst_state.up or dst_state.boot != rec.boot:
+            return
+        stats = self._radio_stats[dst]
+        if any(s < rec.end_ms and e > rec.start_ms for s, e in radio.tx_intervals):
+            stats.half_duplex_losses += 1
+            return
+        interference_mw = sum(
+            10.0 ** (other.rssi_dbm / 10.0)
+            for other in radio.receptions
+            if other is not rec and other.start_ms < rec.end_ms and other.end_ms > rec.start_ms
+        )
+        if interference_mw > 0.0:
+            sir_db = rec.rssi_dbm - 10.0 * math.log10(interference_mw)
+            if sir_db < link.medium.capture_db:
+                stats.collisions += 1
+                return
+        if self._delivery_rng.random() >= rec.delivery_probability:
+            stats.noise_losses += 1
+            return
+        stats.rx_frames += 1
+        if rec.latency_ms > 0:
+            yield self.env.timeout(rec.latency_ms)
+            if not dst_state.up or dst_state.boot != rec.boot:
+                return
+        self._push_rx(dst_state, rec.iface, rec.frame, rec.metrics)
 
     def _inject_proc(self, src: str, frame: bytes, at_s: float, link: str | None):
         target_ms = at_s * 1000
@@ -959,3 +1164,13 @@ class Simulation:
             values = {name: probe(self) for name, probe in self._probes.items()}
             recorder.append(t_s, values)
             yield self.env.timeout(interval_ms)
+
+
+def _prune(radio: _Radio, now_ms: float) -> None:
+    """Forget transmissions and receptions too old to overlap anything still
+    on the air."""
+    horizon = now_ms - _HISTORY_MS
+    if radio.tx_intervals and radio.tx_intervals[0][1] < horizon:
+        radio.tx_intervals = [iv for iv in radio.tx_intervals if iv[1] >= horizon]
+    if radio.receptions and radio.receptions[0].end_ms < horizon:
+        radio.receptions = [r for r in radio.receptions if r.end_ms >= horizon]
