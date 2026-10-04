@@ -70,6 +70,13 @@ beside the recipe. The `24-100` and `29,060` figures quoted above are
 `debug`-image measurements from before the gate read `--release`; treat them as
 history rather than as what this prints today.
 
+**Every number above is a share of the region `memory.x` declares**, so the
+gate first checks `memory.x` against the part itself (`--chip`, looked up in
+`CHIPS`) and the linked `_stack_start` against the part's real RAM. Without
+that it once printed OK on the STM32F411 image while reporting a stack top of
+`0x20040000` — the nRF52840's map, 128 KiB past the end of the F411's RAM
+(design 25 §2.2).
+
 What this does not replace: a worst-case call-graph sum (`cargo-call-stack`),
 which needs nightly and resolves the executor's indirect task dispatch badly,
 and the board's own `stack::report()` high-water, which is the ground truth but
@@ -92,10 +99,100 @@ import sys
 # unmeasured. `scripts/tests/test_stack_budget.py` pins each form.
 FRAME_RE = re.compile(r"\bsubw?(?:\.w)?\s+sp, (?:sp, )?#(0x[0-9a-f]+|\d+)\b")
 SYMBOL_RE = re.compile(r"^[0-9a-f]+ <(.+)>:$")
-ORIGIN_RE = re.compile(r"^\s*RAM\s*:\s*ORIGIN\s*=\s*([^,]+),\s*LENGTH", re.MULTILINE)
 
 # `TaskStorage::<F>::poll`, in the v0 mangling embassy-executor is built with.
 TASK_POLL_RE = re.compile(r"TaskStorage.*4poll")
+
+
+# Each part's real memory, as `(origin, length)`: the independent fact a
+# `memory.x` is checked against. Cross-checked against `probe-rs chip info`
+# (which reads the vendor's CMSIS pack) as well as the datasheets; add a part
+# here when a board for it is added, from those sources and not from another
+# board's `memory.x`, which is how the F411 got the nRF52840's map.
+CHIPS = {
+    # nRF52840: 1 MiB flash at 0, 256 KiB RAM at 0x20000000 (both nRF boards).
+    "nrf52840": {"FLASH": (0x0000_0000, 1024 * 1024), "RAM": (0x2000_0000, 256 * 1024)},
+    # STM32F411RE: 512 KiB flash at 0x08000000 (0x0 is only a boot alias,
+    # which probe-rs will not program), 128 KiB RAM.
+    "stm32f411re": {
+        "FLASH": (0x0800_0000, 512 * 1024),
+        "RAM": (0x2000_0000, 128 * 1024),
+    },
+    # STM32WL55JC: 256 KiB flash; RAM is SRAM1 + SRAM2, two contiguous 32 KiB
+    # banks — all 64 KiB is the CM4's only while the CM0+ is never released.
+    "stm32wl55jc": {
+        "FLASH": (0x0800_0000, 256 * 1024),
+        "RAM": (0x2000_0000, 64 * 1024),
+    },
+}
+
+# One `NAME : ORIGIN = <expr>, LENGTH = <expr>` line of a `MEMORY` block.
+REGION_RE = re.compile(
+    r"^\s*(\w+)\s*(?:\([a-z!]*\))?\s*:\s*ORIGIN\s*=\s*([^,]+),\s*LENGTH\s*=\s*([^\n/]+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def parse_size(expr):
+    """A linker-script size or address expression: hex/decimal literals with
+    optional `K`/`M` suffixes, joined by `+ - *` (e.g. `256K - 8`).
+
+    Evaluated only after a whitelist check, so a `memory.x` cannot run
+    anything; an expression outside that grammar is an error, not a guess.
+    """
+    expr = expr.strip()
+    if not re.fullmatch(r"[0-9a-fxkm+\-*\s]+", expr, re.IGNORECASE):
+        raise ValueError(f"unsupported size expression {expr!r}")
+
+    def literal(m):
+        value, suffix = m.group(1), m.group(2).upper()
+        return str(int(value, 0) * {"": 1, "K": 1024, "M": 1024 * 1024}[suffix])
+
+    return eval(
+        re.sub(r"\b(0x[0-9a-f]+|\d+)([KM]?)\b", literal, expr, flags=re.IGNORECASE)
+    )
+
+
+def memory_regions(text):
+    """Every region of a `memory.x`'s `MEMORY` block, as `{name: (origin, length)}`."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return {
+        m.group(1): (parse_size(m.group(2)), parse_size(m.group(3)))
+        for m in REGION_RE.finditer(text)
+    }
+
+
+def region_errors(name, region, chip):
+    """Why `memory.x`'s `region` is not inside the chip's `chip` range, if it
+    is not. Empty when it fits."""
+    origin, length = region
+    chip_origin, chip_length = chip
+    end, chip_end = origin + length, chip_origin + chip_length
+    if origin < chip_origin or end > chip_end:
+        return [
+            (
+                f"memory.x {name} is 0x{origin:08x}..0x{end:08x}, outside the chip's "
+                f"0x{chip_origin:08x}..0x{chip_end:08x}"
+            )
+        ]
+    return []
+
+
+def stack_top_errors(top, chip_ram):
+    """Why the image's `_stack_start` is not inside the chip's RAM, if it is not.
+
+    Asked of the linked image as well as of `memory.x`, since the image is what
+    actually runs: a stack top past real RAM faults on the first push.
+    """
+    chip_origin, chip_length = chip_ram
+    if not chip_origin < top <= chip_origin + chip_length:
+        return [
+            (
+                f"stack top 0x{top:08x} is outside the chip's RAM "
+                f"0x{chip_origin:08x}..0x{chip_origin + chip_length:08x}"
+            )
+        ]
+    return []
 
 
 def ram_origin(memory_x):
@@ -107,13 +204,10 @@ def ram_origin(memory_x):
     `wayfinder_nrf::stack::paint` takes the floor as an argument.
     """
     with open(memory_x) as f:
-        match = ORIGIN_RE.search(f.read())
-    if not match:
-        sys.exit(f"{memory_x}: no RAM ORIGIN found")
-    expr = match.group(1).strip()
-    if not re.fullmatch(r"[0-9a-fx+\-*\s]+", expr, re.IGNORECASE):
-        sys.exit(f"{memory_x}: unexpected RAM ORIGIN expression {expr!r}")
-    return eval(expr)
+        regions = memory_regions(f.read())
+    if "RAM" not in regions:
+        sys.exit(f"{memory_x}: no RAM region found")
+    return regions["RAM"][0]
 
 
 def find_tool(name):
@@ -219,6 +313,12 @@ def main():
         default=8.0,
         help="share of the stack one task's poll frame may reserve (percent)",
     )
+    ap.add_argument(
+        "--chip",
+        required=True,
+        choices=sorted(CHIPS),
+        help="the part this image is for; memory.x is checked against its real memory",
+    )
     ap.add_argument("--top", type=int, default=5)
     args = ap.parse_args()
     # cargo-binutils shims resolve a relative path against the workspace root,
@@ -227,7 +327,27 @@ def main():
     objdump = args.objdump or find_tool("objdump")
     nm = args.nm or find_tool("nm")
 
+    # Before anything is measured: every number below is a share of the region
+    # memory.x declares, so a memory.x that does not describe this part makes
+    # them all wrong while still printing OK.
+    chip = CHIPS[args.chip]
+    with open(args.memory_x) as f:
+        regions = memory_regions(f.read())
+    errors = []
+    for name, chip_region in chip.items():
+        if name not in regions:
+            errors.append(f"{args.memory_x}: no {name} region")
+        else:
+            errors += region_errors(name, regions[name], chip_region)
+
     top, region, layout = stack_region(nm, args.elf, args.memory_x)
+    errors += stack_top_errors(top, chip["RAM"])
+    if errors:
+        print("FAIL: memory.x does not describe this chip:")
+        for error in errors:
+            print(f"  {error}")
+        return 1
+
     budget = int(region * args.task_poll_pct / 100)
     ranked = frames(objdump, args.elf)
     task_polls = [(sym, n) for sym, n in ranked if TASK_POLL_RE.search(sym)]
