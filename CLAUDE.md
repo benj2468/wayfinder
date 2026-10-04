@@ -390,8 +390,9 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   **raw LoRa PHY** — a radio that hands over a payload and nothing else, which
   is what an on-die SX126x is. Owns a wire format because of that: unlike the
   RYLR998 module `rylr998` drives, a raw PHY supplies no sender address, no
-  network filtering and no addressed send. Framing only, no `LinkT` — the same
-  split `ieee802154` has with its adapters. **Not interoperable with
+  network filtering and no addressed send. Framing, plus `ChannelLink`: the
+  chip-free half of a `LinkT` that awaits only channels to the board's radio
+  task, so its cancel-safety is a host test rather than a claim. **Not interoperable with
   `rylr998`**, deliberately.
 - **libs/wayfinder-link-utils** — shared small-MTU fragmentation/reassembly
   for `LinkT` drivers whose medium caps payload well below

@@ -1,9 +1,11 @@
 # libs/lora-link
 
 Framing and fragmentation for a **raw LoRa PHY** — a radio that hands over a
-payload and nothing else. `no_std`, no opinion about the radio chip, and **no
-`LinkT` impl**: that lives in the adapter, exactly as `libs/ieee802154`'s does
-in `at86rf233`/`nrf-ieee802154`. See
+payload and nothing else. `no_std` and no opinion about the radio chip. The
+`link` feature (on by default) adds `ChannelLink`, the **chip-free half** of a
+`LinkT` adapter: framing over channels to a task that owns the radio. The task
+itself stays in the board, the only place that knows the chip
+(`bins/wayfinder-wl55jc/src/radio.rs`). See
 `docs/design/25-stm32wl55-subghz-node.md`.
 
 The send path is `assemble_frame` → `fragment_count` → `build_fragment` per
@@ -92,6 +94,10 @@ log ring — design 25 §4.7).
 
 ## Implementing a `LinkT` adapter over a real radio
 
+**For a raw-LoRa radio, reuse `ChannelLink` and write only the radio task**;
+the steps below are what `ChannelLink` already does, kept as the contract it
+holds.
+
 1. Implement `LinkT` (`libs/wayfinder/src/link.rs`) for your device.
 2. `send`: `assemble_frame` into a scratch buffer, then `build_fragment` and
    transmit each of `fragment_count`'s fragments. **Abandon the frame if one
@@ -123,7 +129,9 @@ local is torn down routinely — on every timer tick, and on every frame from an
 other link.
 
 The shape that survives it: **a never-cancelled task owning the radio, with
-`recv` awaiting only a channel.** `nrf-ieee802154`'s `radio_task`,
+`recv` awaiting only a channel.** `ChannelLink` is that `recv`, and
+`a_recv_dropped_mid_frame_loses_nothing` pins it (design 25's test 9). A new
+raw-LoRa board should reuse it and write only the radio task. `nrf-ieee802154`'s `radio_task`,
 `wayfinder_nrf::usb_link` and `blue`'s `ReportQueue` are all this, for this
 reason.
 

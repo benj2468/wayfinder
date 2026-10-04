@@ -267,7 +267,7 @@ fn build_node(
     // differ between boards, which a seed per board (or, failing that, the
     // factory id) guarantees and a shared constant did not.
     let identity = identity::resolve(flash, rng);
-    let link = LoraLink::new(LORA_NET_ID, lora_link::short_address_of(identity.mac));
+    let link = radio::lora_link(LORA_NET_ID, lora_link::short_address_of(identity.mac));
 
     let trickle = [TrickleParams {
         i_min: core::time::Duration::from_secs(5),
