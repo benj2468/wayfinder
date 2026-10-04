@@ -26,39 +26,18 @@ use crate::sync::Lock;
 /// lengths, seqnos, never payload bytes.
 pub const MESSAGE_CAP: usize = 160;
 
-// `RING_CAPACITY_CONFIGURED`, resolved by `build.rs` from
-// `WAYFINDER_LOG_RING_CAPACITY` or the per-target default. Generated rather
-// than written here because a board has to be able to choose it; see
-// `build.rs` for why it is an environment variable and not a feature. Only
-// read when there is a ring to size.
-#[cfg(feature = "ring")]
-include!(concat!(env!("OUT_DIR"), "/ring_capacity.rs"));
-
 /// Records retained before the oldest is evicted.
 ///
-/// Whether a board has a ring at all is the `ring` feature; how many records
-/// it holds is this. The constraint differs by orders of magnitude between
-/// targets: on a board this is a `static` competing with the router for the
-/// part's whole SRAM (at 256 bytes a record, 64 of them is 16,416 B — fine
-/// against the nRF52840's 256 KiB, a quarter of all memory on an STM32WL55's
-/// 64 KiB), while a host node has no such pressure and benefits from surviving
-/// a longer client absence.
-///
-/// So the value is **chosen per board**, by setting
-/// `WAYFINDER_LOG_RING_CAPACITY` in that board's `.cargo/config.toml`. It
-/// defaults to 64 on a bare-metal target and 512 on a host, which is what this
-/// crate used before the override existed — an unconfigured build is
-/// unaffected.
-#[cfg(feature = "ring")]
-pub const RING_CAPACITY: usize = RING_CAPACITY_CONFIGURED;
-
-/// A zero-capacity ring would accept `push` and return nothing from
-/// `GetLogs` while reporting no drops. `build.rs` refuses it too; this is the
-/// backstop for the defaults themselves. A board that wants no ring turns the
-/// `ring` feature off instead.
-#[cfg(feature = "ring")]
-const _: () = assert!(RING_CAPACITY > 0);
-
+/// Sized per target, since the constraint differs by two orders of magnitude:
+/// on a board this is a `static` competing with the router for the whole part
+/// (256 KiB on an nRF52840, 128 KB on an STM32F411, 192 KB of DRAM on an
+/// ESP32); at 256 bytes a record, 64 of them is 16,416 B, while a host node has
+/// no such pressure and benefits from surviving a longer client absence.
+#[cfg(all(feature = "ring", target_os = "none"))]
+pub const RING_CAPACITY: usize = 64;
+/// Records retained before the oldest is evicted. See the bare-metal definition.
+#[cfg(all(feature = "ring", not(target_os = "none")))]
+pub const RING_CAPACITY: usize = 512;
 /// Records retained before the oldest is evicted — none, in a build without
 /// the `ring` feature.
 ///

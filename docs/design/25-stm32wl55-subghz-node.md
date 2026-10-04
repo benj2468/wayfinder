@@ -37,7 +37,7 @@ one gate that needed a per-board threshold.
   durable store, the `lora-phy`-backed `LinkT`, and the management
   arm that makes it reachable from `libs/wayfinder-hil`.
 - **`libs/wayfinder-log`** — `RING_CAPACITY` becomes per-board rather than
-  per-`target_os`. §4.7.
+  per-`target_os`, with the management port. §4.7.
 - **`libs/wayfinder-hil`** — a `BoardKind` for this part, and the first board
   whose probe and management port share one USB serial. §4.9.
 
@@ -487,6 +487,11 @@ still implement the full `Logger` contract
 
 ### 4.7 The log ring is sized for a part four times this size
 
+> **Deferred to the management port (#75).** The milestone-1 relay builds
+> without the `ring` feature (nothing can read it without a management port),
+> so there is no ring to size yet. The override below shipped briefly with the
+> relay and was removed as unused; it lands with the port that needs it.
+
 `wayfinder_log::ring::RING_CAPACITY` is a `cfg(target_os = "none")` constant of
 64 records, ~240 bytes each, ~16 KiB — and its own doc comment reasons about
 "256 KiB of RAM". That was right for the nRF and is a **quarter of all RAM** on
@@ -812,8 +817,8 @@ documents, and there is no datasheet-pinned mapping to justify one yet.
 | `libs/lora-link/CLAUDE.md` | **new** — the driver-authoring guide, mirroring `libs/ieee802154/CLAUDE.md`, carrying §4.5's cancel-safety rule |
 | `libs/lora-link/fuzz/` | **new** — `accept_fragment` over the air-facing boundary, mirroring `libs/ieee802154/fuzz` |
 | `bins/wayfinder-wl55jc/` | **new workspace** — `memory.x`, `.cargo/config.toml`, profile, RF front-end, the `LinkT` over `lora-phy` + `Stm32wlInterfaceVariant`, the no-op `defmt` logger, the receive task (§4.5), mgmt arm, `FlashStore` |
-| `libs/wayfinder-log/build.rs` | **new** — `WAYFINDER_LOG_RING_CAPACITY` (§4.7) |
-| `libs/wayfinder-log/src/ring.rs` | `RING_CAPACITY` from the build script |
+| `libs/wayfinder-log/build.rs` | **new**, with the management port — `WAYFINDER_LOG_RING_CAPACITY` (§4.7) |
+| `libs/wayfinder-log/src/ring.rs` | `RING_CAPACITY` from the build script, with the management port |
 | `libs/wayfinder-hil/src/inventory.rs` | `BoardKind::Stm32wl55Nucleo`, `chip()`, `has_probe()` |
 | `example.hil.toml` | a WL55 entry; correct the shared-serial comment (§4.9) |
 | `justfile` | `build-wl55jc`, `clippy-wl55jc`, `stack-budget-wl55jc`, wired into `build-embedded` / `clippy-embedded` / `stack-budget` / `clean-embedded` |

@@ -42,10 +42,9 @@ wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
 wayfinder-version = { path = "../../libs/wayfinder-version" }
 # The RTT `tracing` subscriber -- and, deliberately, *not* the `GetLogs` record
 # ring. The relay has no management port, so nothing can ever read the ring;
-# it would still be written on every record and cost a `static` (4,128 bytes at
-# this board's 16 records) on a part with 64 KB of RAM. The STM32F411's
-# posture, for the same reason. The management-port build turns `ring` back on,
-# and `WAYFINDER_LOG_RING_CAPACITY` in `.cargo/config.toml` then sizes it.
+# it would still be written on every record and cost a ~16 KiB `static` on a
+# part with 64 KB of RAM. The STM32F411's posture, for the same reason. The
+# management-port build turns `ring` back on, sized per design 25 §4.7.
 wayfinder-log = { path = "../../libs/wayfinder-log", default-features = false, features = [
     "sink-rtt",
 ] }
