@@ -24,6 +24,13 @@
 use tracing::trace;
 use wayfinder::interfaces::link::LinkMetrics;
 
+mod framing;
+
+pub use framing::Framing;
+pub use framing::LINK_HEADER_LEN;
+pub use framing::decode_frame;
+pub use framing::short_address_of;
+
 /// Bytes of fragment header prefixed to each on-air fragment's frame-content
 /// bytes.
 pub const FRAG_HDR_LEN: usize = 2;
@@ -566,14 +573,16 @@ mod tests {
             count: 2,
         };
 
+        let first = [1u8; FRAG_PAYLOAD];
+
         // Fill the table with MAX_REASSEMBLIES (4) distinct, incomplete messages.
         for addr in 0..4u16 {
-            r.accept(key(addr, 0), &hdr0, &[1], metrics(0), &mut out);
+            r.accept(key(addr, 0), &hdr0, &first, metrics(0), &mut out);
         }
         assert_eq!(r.entries.len(), 4);
 
         // A 5th distinct key evicts the oldest (addr 0).
-        r.accept(key(4, 0), &hdr0, &[1], metrics(0), &mut out);
+        r.accept(key(4, 0), &hdr0, &first, metrics(0), &mut out);
         assert_eq!(r.entries.len(), 4);
 
         // addr 0's second fragment now completes nothing: its prior state
@@ -611,6 +620,82 @@ mod tests {
         );
     }
 
+    /// A `count` no frame of `MAX_REASSEMBLED_LEN` bytes could need is
+    /// refused before it takes a slot. The wire's 4-bit field allows 15, but
+    /// only `MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD)` (3 here) can ever
+    /// complete, so a larger claim opens a slot that never does — a free
+    /// eviction of a real message for anyone in range.
+    #[test]
+    fn accept_rejects_a_count_no_frame_could_need() {
+        let mut r = TestReassembler::new();
+        let mut out = [0u8; MAX_REASSEMBLED_LEN];
+        let most = MAX_REASSEMBLED_LEN.div_ceil(FRAG_PAYLOAD) as u8;
+        let body = [0u8; FRAG_PAYLOAD];
+
+        let too_many = FragHeader {
+            msg_id: 0,
+            index: 0,
+            count: most + 1,
+        };
+        assert_eq!(
+            r.accept(key(1, 0), &too_many, &body, metrics(0), &mut out),
+            None
+        );
+        assert!(
+            r.entries.is_empty(),
+            "an impossible count must not create a table entry"
+        );
+
+        let largest = FragHeader {
+            msg_id: 0,
+            index: 0,
+            count: most,
+        };
+        r.accept(key(1, 0), &largest, &body, metrics(0), &mut out);
+        assert_eq!(r.entries.len(), 1, "the largest real count is accepted");
+    }
+
+    /// Every fragment but the last carries exactly `FRAG_PAYLOAD` bytes — the
+    /// offset arithmetic depends on it — so a short non-final fragment is
+    /// refused rather than leaving a zero-filled hole in a frame of plausible
+    /// length. The final fragment may be short.
+    #[test]
+    fn accept_rejects_a_short_non_final_fragment() {
+        let mut r = TestReassembler::new();
+        let mut out = [0u8; MAX_REASSEMBLED_LEN];
+        let hdr0 = FragHeader {
+            msg_id: 0,
+            index: 0,
+            count: 2,
+        };
+        let hdr1 = FragHeader {
+            msg_id: 0,
+            index: 1,
+            count: 2,
+        };
+
+        assert_eq!(
+            r.accept(
+                key(1, 0),
+                &hdr0,
+                &[0u8; FRAG_PAYLOAD - 1],
+                metrics(0),
+                &mut out
+            ),
+            None
+        );
+        assert!(
+            r.entries.is_empty(),
+            "a short non-final fragment must not create a table entry"
+        );
+
+        assert_eq!(r.accept(key(1, 0), &hdr1, &[7], metrics(0), &mut out), None);
+        let (len, _) = r
+            .accept(key(1, 0), &hdr0, &[0u8; FRAG_PAYLOAD], metrics(0), &mut out)
+            .expect("full first fragment plus a short tail completes");
+        assert_eq!(len, FRAG_PAYLOAD + 1);
+    }
+
     #[test]
     fn accept_mismatched_count_resets_slot() {
         let mut r = TestReassembler::new();
@@ -623,7 +708,13 @@ mod tests {
             count: 3,
         };
         assert_eq!(
-            r.accept(key(1, 0), &stale_hdr, &[1, 2, 3], metrics(0), &mut out),
+            r.accept(
+                key(1, 0),
+                &stale_hdr,
+                &[1u8; FRAG_PAYLOAD],
+                metrics(0),
+                &mut out
+            ),
             None
         );
 
