@@ -84,9 +84,11 @@ where
     S: Read + Write + Send,
 {
     /// A broadcast medium: every `send` reaches every neighbor, whatever
-    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
-    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
-        wayfinder::link::BROADCAST_FAN_OUT
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(
+            crate::frag::MAX_REASSEMBLED_LEN,
+        ))
     }
 
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
@@ -651,6 +653,11 @@ mod tests {
     #[test]
     fn declares_broadcast_fan_out() {
         let client = RylrClient::new(FakeSerial::new(b"")).unwrap();
-        assert_eq!(client.fan_out(), wayfinder::link::BROADCAST_FAN_OUT);
+        assert_eq!(
+            client.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(
+                crate::frag::MAX_REASSEMBLED_LEN
+            ))
+        );
     }
 }

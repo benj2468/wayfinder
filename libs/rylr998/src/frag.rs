@@ -34,7 +34,7 @@ pub(crate) const FRAG_PAYLOAD: usize = MAX_FRAME_LEN - FRAG_HDR_LEN;
 /// `MAX_REASSEMBLED_LEN <= MAX_FRAGMENTS * FRAG_PAYLOAD` relationship this
 /// implies is checked inside `Reassembler::new()` itself, not re-asserted
 /// here.)
-pub(crate) const MAX_REASSEMBLED_LEN: usize = 512;
+pub const MAX_REASSEMBLED_LEN: usize = 512;
 
 /// Largest number of concurrent in-flight (incomplete) messages the
 /// reassembler tracks. Not derived from a hard protocol limit — LoRa's low
