@@ -167,6 +167,9 @@ class RadioStats:
     rx_airtime_s: float = 0.0
     collisions: int = 0
     """Receptions lost to overlap with other transmissions or interference."""
+    jammed: int = 0
+    """Receptions lost to a `Jammer`'s interference (counted here on any
+    link, contended or not)."""
     half_duplex_losses: int = 0
     """Receptions lost because this radio was transmitting at the time."""
     noise_losses: int = 0

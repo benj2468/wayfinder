@@ -28,6 +28,7 @@ import wayfinder_py as wf
 from . import NoLinkError
 from .adversary import Wiretap
 from .link import Link
+from .interference import DEFAULT_CAPTURE_DB, Jammer, sum_dbm
 from .medium import EnergyModel, RadioStats
 from .mobility import Vec3
 from .node import Node
@@ -242,6 +243,7 @@ class Simulation:
         self._recorder: Recorder | None = None
         self._down_links: set[str] = set()
         self._radios: dict[tuple[str, str], _Radio] = {}
+        self._jammers: list[Jammer] = []
         self._radio_stats: dict[str, RadioStats] = {name: RadioStats() for name in names}
         self._compromised: set[str] = set()
         # Wire bytes of every revocation issued, keyed by the revoked node's
@@ -573,6 +575,38 @@ class Simulation:
         """Total size of the frames counted by `tx_frames`."""
         return self._states[node].tx_bytes
 
+    def add_jammer(self, jammer: Jammer) -> None:
+        """Switch on `jammer` (see `interference.py`): from now on every
+        reception on the links it reaches must beat its power by the capture
+        margin."""
+        if jammer.links is not None:
+            known = {link.name for link in self._links}
+            for name in jammer.links:
+                if name not in known:
+                    raise KeyError(f"no link named {name!r}")
+        self._jammers.append(jammer)
+
+    def interference_dbm(self, node: str) -> float | None:
+        """Total power of the jammers active right now at `node`'s position,
+        on any of its links, or `None` when none is."""
+        t_s = self.env.now / 1000.0
+        pos = self.position(node)
+        names = {link.name for link in self._states[node].interfaces.values()}
+        return sum_dbm(
+            j.received_dbm(pos, t_s)
+            for j in self._jammers
+            if j.is_active(t_s) and any(j.reaches(n or "") for n in names)
+        )
+
+    def _jamming_mw(self, link: Link, rx: Vec3, start_s: float, end_s: float) -> float:
+        """Summed power, in mW, of jammers reaching `link` and transmitting
+        at some point in `[start_s, end_s]`, arriving at `rx`."""
+        return sum(
+            10.0 ** (j.received_dbm(rx, start_s) / 10.0)
+            for j in self._jammers
+            if j.reaches(link.name or "") and j.overlaps(start_s, end_s)
+        )
+
     def radio_stats(self, node: str) -> RadioStats:
         """What `node`'s radios have done on contended (`Link.medium`) links:
         airtime, frames, and every way a reception was lost. All zero for a
@@ -885,6 +919,12 @@ class Simulation:
                 continue
             rx_pos = dst_state.node.mobility.position(t_s)
             sample = link.channel.evaluate(tx_pos, rx_pos, t_s, self._delivery_rng)
+            rssi = sample.metrics.rssi_dbm
+            if self._jammers and rssi is not None:
+                jam_mw = self._jamming_mw(link, rx_pos, t_s, t_s)
+                if jam_mw > 0.0 and rssi - 10.0 * math.log10(jam_mw) < DEFAULT_CAPTURE_DB:
+                    self._radio_stats[dst_name].jammed += 1
+                    continue
             if self._delivery_rng.random() < sample.delivery_probability:
                 dst_iface = self._link_iface[id(link)][dst_name]
                 self.env.process(
@@ -1048,15 +1088,28 @@ class Simulation:
         if any(s < rec.end_ms and e > rec.start_ms for s, e in radio.tx_intervals):
             stats.half_duplex_losses += 1
             return
-        interference_mw = sum(
+        overlap_mw = sum(
             10.0 ** (other.rssi_dbm / 10.0)
             for other in radio.receptions
             if other is not rec and other.start_ms < rec.end_ms and other.end_ms > rec.start_ms
         )
+        jam_mw = 0.0
+        if self._jammers:
+            jam_mw = self._jamming_mw(
+                link,
+                dst_state.node.mobility.position(rec.start_ms / 1000.0),
+                rec.start_ms / 1000.0,
+                rec.end_ms / 1000.0,
+            )
+        interference_mw = overlap_mw + jam_mw
         if interference_mw > 0.0:
             sir_db = rec.rssi_dbm - 10.0 * math.log10(interference_mw)
             if sir_db < link.medium.capture_db:
-                stats.collisions += 1
+                # Blame whichever contributed more of the interference.
+                if jam_mw >= overlap_mw:
+                    stats.jammed += 1
+                else:
+                    stats.collisions += 1
                 return
         if self._delivery_rng.random() >= rec.delivery_probability:
             stats.noise_losses += 1
