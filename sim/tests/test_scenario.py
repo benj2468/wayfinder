@@ -440,3 +440,30 @@ def test_running_in_segments_samples_each_instant_once():
     assert len(rec.times_s) == len(set(rec.times_s))
     assert rec.times_s[0] == 2.0
     assert len(rec.times_s) == 10
+
+
+def test_static_receivers_beyond_a_hard_range_are_never_evaluated():
+    """On a large shared segment most members are out of range of any one
+    transmitter; for static nodes behind a hard cutoff that is known up front,
+    and asking the channel about each of them per frame is pure cost."""
+    from wayfinder_sim.channel import FreeSpacePathLoss
+    from wayfinder_sim.mobility import Static, Vec3
+    from wayfinder_sim.topology import shared_lan
+
+    calls = []
+
+    class Counting(FreeSpacePathLoss):
+        def evaluate(self, tx, rx, t_s, rng):
+            calls.append((tx.x, rx.x))
+            return super().evaluate(tx, rx, t_s, rng)
+
+    radio = Counting(max_range_m=150.0)
+    nodes = [
+        Node(n, mobility=Static(Vec3(x, 0.0, 0.0)), trickle=(50, 500))
+        for n, x in (("a", 0.0), ("b", 100.0), ("far", 10_000.0))
+    ]
+    sim = Simulation(nodes, shared_lan(["a", "b", "far"], radio), seed=0)
+    sim.run(until_s=3.0)
+
+    assert sim.has_route("a", "b")
+    assert not any(10_000.0 in pair for pair in calls)

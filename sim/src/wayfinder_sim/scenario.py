@@ -30,7 +30,7 @@ from .adversary import Wiretap
 from .link import Link
 from .interference import DEFAULT_CAPTURE_DB, Jammer, sum_dbm
 from .medium import EnergyModel, RadioStats
-from .mobility import Vec3
+from .mobility import Static, Vec3
 from .node import Node
 from .recorder import Recorder
 from .security import Mesh
@@ -244,6 +244,7 @@ class Simulation:
         self._down_links: set[str] = set()
         self._radios: dict[tuple[str, str], _Radio] = {}
         self._jammers: list[Jammer] = []
+        self._receivers: dict[tuple[int, str], tuple[str, ...]] = {}
         self._radio_stats: dict[str, RadioStats] = {name: RadioStats() for name in names}
         self._compromised: set[str] = set()
         # Wire bytes of every revocation issued, keyed by the revoked node's
@@ -911,9 +912,7 @@ class Simulation:
         for tap in self._taps.get(link.name or "", ()):
             tap.capture(t_s, frame)
         tx_pos = self._states[src_name].node.mobility.position(t_s)
-        for dst_name in link.endpoints:
-            if dst_name == src_name:
-                continue
+        for dst_name in self._receivers_for(link, src_name):
             dst_state = self._states[dst_name]
             if not dst_state.up:
                 continue
@@ -972,6 +971,37 @@ class Simulation:
         dst_state.driver.push_rx(dst_iface, frame, metrics)
 
     # --- contended medium ---------------------------------------------------
+
+    def _receivers_for(self, link: Link, src: str) -> tuple[str, ...]:
+        """The members of `link` worth evaluating a frame from `src` at.
+
+        Everyone but `src`, except that where `src` and a receiver are both
+        `Static` and the channel has a hard range cutoff (`max_range_m`, on it
+        or on the model it wraps), a receiver beyond that range is dropped once
+        and for all. On a large segment that is most of it, and asking the
+        channel per frame for an answer fixed at construction is the dominant
+        cost of a big simulation.
+        """
+        key = (id(link), src)
+        cached = self._receivers.get(key)
+        if cached is not None:
+            return cached
+        others = [n for n in link.endpoints if n != src]
+        max_range = getattr(link.channel, "max_range_m", None)
+        if max_range is None:
+            max_range = getattr(getattr(link.channel, "base", None), "max_range_m", None)
+        src_mob = self._states[src].node.mobility
+        if max_range is not None and isinstance(src_mob, Static):
+            src_pos = src_mob.position(0.0)
+            others = [
+                n
+                for n in others
+                if not isinstance(self._states[n].node.mobility, Static)
+                or src_pos.distance_to(self._states[n].node.mobility.position(0.0)) <= max_range
+            ]
+        result = tuple(others)
+        self._receivers[key] = result
+        return result
 
     def _radio(self, node: str, link: Link) -> _Radio:
         key = (node, link.name or "")
@@ -1045,9 +1075,7 @@ class Simulation:
         for tap in self._taps.get(link.name or "", ()):
             tap.capture(t_s, frame)
         tx_pos = self._states[src].node.mobility.position(t_s)
-        for dst in link.endpoints:
-            if dst == src:
-                continue
+        for dst in self._receivers_for(link, src):
             dst_state = self._states[dst]
             if not dst_state.up:
                 continue
