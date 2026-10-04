@@ -48,7 +48,12 @@ _AUTO_MAC_OUI = (0x02, 0x00, 0x00, 0x00, 0x00)
 # Trickle i_min when `Node.tick_interval_ms` isn't set explicitly: fine
 # enough to resolve that node's own timer, no finer.
 _MIN_TICK_INTERVAL_MS = 10
+_MAX_TICK_INTERVAL_MS = 1000
 _TICK_INTERVAL_DIVISOR = 4
+"""A derived tick is `i_min / 4`, clamped to `[10, 1000]` ms. The ceiling
+matters on slow schedules: a node's timers only fire on its ticks, so an
+18-second tick for a 75-second `i_min` quantises every emission onto a coarse
+grid — and with every node on the same grid, onto the same instants."""
 
 
 @dataclasses.dataclass
@@ -140,6 +145,7 @@ class Simulation:
         # simulated drops (deterministic given `seed`), `_probe_rng` backs
         # `sample_channel` so charting/inspecting a channel never perturbs
         # the delivery outcome by consuming from the same stream.
+        self._seed = seed
         self._delivery_rng = Random(seed)
         self._probe_rng = Random(seed)
 
@@ -225,8 +231,9 @@ class Simulation:
             tick_interval_ms = node.tick_interval_ms
             if tick_interval_ms is None:
                 i_mins = [t[0] for t in node_trickle[node.name]] or [node.trickle[0]]
-                tick_interval_ms = max(
-                    _MIN_TICK_INTERVAL_MS, min(i_mins) // _TICK_INTERVAL_DIVISOR
+                tick_interval_ms = min(
+                    _MAX_TICK_INTERVAL_MS,
+                    max(_MIN_TICK_INTERVAL_MS, min(i_mins) // _TICK_INTERVAL_DIVISOR),
                 )
             self._states[node.name] = _NodeState(
                 node=node,
@@ -891,6 +898,13 @@ class Simulation:
     def _tick_proc(self, name: str):
         self._tick_node(name)
         state = self._states[name]
+        # Every node runs its own clock: after booting, its tick grid starts
+        # at a phase of its own (seeded by name, so runs stay reproducible).
+        # A shared grid would key every node's timers to the same instants,
+        # and on a half-duplex medium nodes in lockstep never hear each other.
+        phase_ms = Random(f"{self._seed}:{name}").uniform(0.0, state.tick_interval_ms)
+        yield self.env.timeout(phase_ms)
+        self._tick_node(name)
         while True:
             yield self.env.timeout(state.tick_interval_ms)
             self._tick_node(name)

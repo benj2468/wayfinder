@@ -175,3 +175,20 @@ def test_energy_charges_tx_rx_and_idle_time_at_their_own_power():
 def test_battery_life_is_capacity_over_average_power():
     model = EnergyModel(tx_mw=100.0, rx_mw=10.0, idle_mw=1.0)
     assert model.battery_life_h(capacity_mwh=1000.0, average_power_mw=2.0) == pytest.approx(500.0)
+
+
+def test_nodes_on_slow_schedules_do_not_transmit_in_lockstep():
+    """Nodes that boot together must not end up keyed to the same instants:
+    real radios run on independent clocks, and a simulation that ticks every
+    node on one shared grid synchronises their adverts into permanent
+    half-duplex collisions that no deployment would see."""
+    tr = (75_000, 600_000)
+    sim = Simulation(
+        [Node("a", trickle=tr), Node("b", trickle=tr)],
+        shared_lan(["a", "b"], PerfectWire(), medium=Medium(phy=LoRaPhy(sf=7))),
+        seed=0,
+    )
+    sim.run(until_s=400.0)
+    assert sim.radio_stats("a").rx_frames > 0
+    assert sim.radio_stats("b").rx_frames > 0
+    assert sim.has_route("a", "b")
