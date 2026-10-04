@@ -911,8 +911,11 @@ dependencies = [
 name = "lora-link"
 version = "0.1.0"
 dependencies = [
+ "embassy-sync",
+ "heapless",
  "interfaces",
  "tracing",
+ "wayfinder",
  "wayfinder-link-utils",
 ]
 
@@ -1703,7 +1706,6 @@ dependencies = [
  "embedded-alloc",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
- "heapless",
  "lora-link",
  "lora-modulation",
  "lora-phy",

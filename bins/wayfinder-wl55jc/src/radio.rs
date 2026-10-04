@@ -12,7 +12,7 @@
 //! argument; `at86rf233` is the driver in this repo that still has the bug.
 //!
 //! So [`radio_task`] owns the radio for its whole life and is never cancelled,
-//! and [`LoraLink::recv`] awaits only a channel.
+//! and `LoraLink::recv` awaits only a channel.
 //!
 //! # Why the task owns *transmit* too
 //!
@@ -23,7 +23,7 @@
 //! cancelling `lora-phy`'s `rx` future *inside* the task, which is safe
 //! because the task then re-enters RX itself rather than being destroyed.
 //!
-//! [`LoraLink::send`] therefore hands one fragment to the queue and waits for
+//! `LoraLink::send` therefore hands one fragment to the queue and waits for
 //! the task to report back. `send` is awaited to completion by its caller and
 //! is not raced, so blocking there is fine.
 
@@ -37,6 +37,10 @@ use embassy_time::Duration;
 use embassy_time::TimeoutError;
 use embassy_time::Timer;
 use embassy_time::with_timeout;
+use lora_link::link::ChannelLink;
+use lora_link::link::Packet;
+use lora_link::link::RadioPort;
+use lora_link::link::RxPacket;
 use lora_modulation::BaseBandModulationParams;
 use lora_phy::LoRa;
 use lora_phy::RxMode;
@@ -49,12 +53,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::trace;
 use tracing::warn;
-use wayfinder::interfaces::frame::LinkFrameData;
-use wayfinder::interfaces::frame::Mac;
-use wayfinder::interfaces::link::LinkError;
 use wayfinder::interfaces::link::LinkMetrics;
-use wayfinder::link::LinkT;
-use wayfinder::link::Received;
 
 use wayfinder_wl55jc::PREAMBLE_SYMBOLS;
 use wayfinder_wl55jc::iv::Stm32wlInterfaceVariant;
@@ -71,11 +70,6 @@ pub type BoardRadio = Sx126x<
 /// The `lora-phy` handle, as this board instantiates it.
 pub type BoardLoRa = LoRa<BoardRadio, Delay>;
 
-/// One on-air packet, owned so it can cross a channel.
-///
-/// Sized to the PHY's own ceiling, which is also exactly one full fragment.
-pub type Packet = heapless::Vec<u8, { lora_link::MAX_FRAME_LEN }>;
-
 /// Received packets the task has not yet handed to `recv`.
 ///
 /// Four is enough to absorb the burst of fragments one multi-fragment frame
@@ -84,7 +78,7 @@ pub type Packet = heapless::Vec<u8, { lora_link::MAX_FRAME_LEN }>;
 /// of a 64 KiB part.
 const RX_DEPTH: usize = 4;
 
-/// Packets received but not yet collected by [`LoraLink::recv`].
+/// Packets received but not yet collected by `LoraLink::recv`.
 static RX_QUEUE: Channel<CriticalSectionRawMutex, RxPacket, RX_DEPTH> = Channel::new();
 
 /// One fragment waiting to go out. Depth one: `send` hands over a fragment and
@@ -93,12 +87,6 @@ static TX_QUEUE: Channel<CriticalSectionRawMutex, Packet, 1> = Channel::new();
 
 /// Whether the fragment [`TX_QUEUE`] last carried made it onto the air.
 static TX_DONE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
-
-/// A received packet with the physical-layer measurements for it.
-struct RxPacket {
-    bytes: Packet,
-    metrics: LinkMetrics,
-}
 
 /// The radio settings every node on this mesh must agree on.
 ///
@@ -125,7 +113,7 @@ pub struct RadioConfig {
 }
 
 /// Own the radio for the life of the node: receive continuously, and interrupt
-/// that to transmit whenever [`LoraLink::send`] queues a fragment.
+/// that to transmit whenever `LoraLink::send` queues a fragment.
 ///
 /// Never returns, and **must never be cancelled** — see the module docs.
 #[embassy_executor::task]
@@ -375,7 +363,7 @@ async fn transmit(
 /// Give up on the radio without taking the node down with it.
 ///
 /// **Parked still serves the transmit queue**, failing every packet at once.
-/// [`LoraLink::send`] hands each fragment to this task and awaits a verdict,
+/// `LoraLink::send` hands each fragment to this task and awaits a verdict,
 /// so a task that simply stopped would hold that `send` — and with it the
 /// whole driver loop, since the driver awaits `send` outside its `select` —
 /// forever. `recv` just stays pending, which is correct for a dead link.
@@ -391,97 +379,25 @@ async fn park() -> ! {
     }
 }
 
-/// The mesh interface over this board's radio.
+/// The mesh interface over this board's radio: `lora-link`'s channel-side
+/// `LinkT`, wired to this module's statics.
 ///
-/// Holds only the framing state — the radio itself belongs to
-/// [`radio_task`].
-pub struct LoraLink {
-    /// This mesh's discriminator, checked on every received packet.
-    net_id: u8,
-    /// This node's 16-bit short identity, stamped into every fragment.
-    src_id: u16,
-    /// Per-frame message id, incremented once per `send` and allowed to wrap.
-    msg_id: u8,
-    reassembler: lora_link::LoraReassembler,
-    /// Where a completed frame is assembled, and what [`Received::frame`]
-    /// borrows until the next `recv`.
-    frame: [u8; lora_link::MAX_REASSEMBLED_LEN],
-}
+/// The framing and the cancel-safety it depends on live in `lora-link`, where
+/// they are host-tested (`a_recv_dropped_mid_frame_loses_nothing` is design
+/// 25's test 9); this module keeps only what knows the chip.
+pub type LoraLink = ChannelLink<'static, CriticalSectionRawMutex, RX_DEPTH>;
 
-impl LoraLink {
-    /// Build the link. `src_id` is `lora_link::short_address_of` the node's
-    /// `Mac`, and **must differ between physical nodes**, or their fragments
-    /// spoil each other's reassembly.
-    pub fn new(net_id: u8, src_id: u16) -> Self {
-        Self {
-            net_id,
-            src_id,
-            msg_id: 0,
-            reassembler: lora_link::LoraReassembler::new(),
-            frame: [0u8; lora_link::MAX_REASSEMBLED_LEN],
-        }
-    }
-}
-
-impl LinkT for LoraLink {
-    async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
-        let mut frame = [0u8; lora_link::MAX_REASSEMBLED_LEN];
-        let frame_len = lora_link::assemble_frame(origin, data, &mut frame)?;
-        let count = lora_link::fragment_count(frame_len)?;
-
-        let msg_id = self.msg_id;
-        self.msg_id = self.msg_id.wrapping_add(1);
-
-        for index in 0..count {
-            let mut out = [0u8; lora_link::MAX_FRAME_LEN];
-            let n = lora_link::build_fragment(
-                self.net_id,
-                self.src_id,
-                &frame[..frame_len],
-                lora_link::FragmentSpec {
-                    msg_id,
-                    index,
-                    count,
-                },
-                &mut out,
-            )?;
-            let packet = Packet::from_slice(&out[..n]).map_err(|_| LinkError::BufferFull)?;
-
-            // Cleared before queueing, so the verdict awaited below can only
-            // be this fragment's. Depth-1 queue plus that wait means `send`
-            // never blocks on a previous fragment of our own.
-            TX_DONE.reset();
-            TX_QUEUE.send(packet).await;
-            if !TX_DONE.wait().await {
-                // **Abandon the whole frame.** A receiver cannot complete a
-                // reassembly that is missing a fragment, so the remaining
-                // airtime would be spent for nothing.
-                trace!(
-                    index,
-                    count, "drop: abandoning frame after a failed fragment"
-                );
-                return Err(LinkError::TransmitFailed);
-            }
-        }
-        Ok(frame_len)
-    }
-
-    async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError> {
-        // **Loop.** A lone fragment buffers and the loop continues; only a
-        // completed frame returns. The driver's receive arm expects a whole
-        // frame or nothing, never a short one.
-        loop {
-            let packet = RX_QUEUE.receive().await;
-            if let Some((len, metrics)) = lora_link::accept_fragment(
-                &mut self.reassembler,
-                self.net_id,
-                &packet.bytes,
-                packet.metrics,
-                &mut self.frame,
-            ) {
-                let frame = lora_link::decode_frame(&self.frame[..len])?;
-                return Ok(Received { frame, metrics });
-            }
-        }
-    }
+/// Build the link over this board's radio task. `src_id` is
+/// `lora_link::short_address_of` the node's `Mac`, and **must differ between
+/// physical nodes**, or their fragments spoil each other's reassembly.
+pub fn lora_link(net_id: u8, src_id: u16) -> LoraLink {
+    ChannelLink::new(
+        RadioPort {
+            rx: &RX_QUEUE,
+            tx: &TX_QUEUE,
+            tx_done: &TX_DONE,
+        },
+        net_id,
+        src_id,
+    )
 }
