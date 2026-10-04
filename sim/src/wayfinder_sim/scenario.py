@@ -279,22 +279,42 @@ class Simulation:
         """`node`'s mesh identity, or `None` if it has none."""
         return self._states[node].keypair
 
-    def revoke(self, node: str, *, effective_s: float = 0.0) -> None:
+    def revoke(
+        self,
+        node: str,
+        *,
+        effective_s: float = 0.0,
+        notify: Sequence[str] | None = None,
+    ) -> None:
         """Have the mesh root purge `node`, and hand the signed record to
-        every other member.
+        every other member — or, with `notify`, only to those members.
 
         Delivering it to each member directly models an operator pushing the
         revocation over the management API — which is what a real deployment
         does, because a node that has just been revoked is precisely the one
         you cannot rely on to flood the order that revokes it. Members
-        re-flood it on their own OGMs from there.
+        re-flood it on their own OGMs from there, so `notify=["gateway"]`
+        models the common case of an operator who can reach one node and
+        leaves the mesh to carry the order to the rest; `knows_revoked` then
+        says how far it has got.
         """
         if self._mesh is None:
             raise ValueError("no mesh: nothing to revoke against")
+        targets = [name for name in self._states if name != node]
+        if notify is not None:
+            for name in notify:
+                if name not in self._states:
+                    raise KeyError(name)
+                if name == node:
+                    raise ValueError(f"cannot notify {node!r} of its own revocation")
+            targets = list(notify)
         record = self._mesh.revoke(self.mac(node), effective_s=effective_s)
-        for name, state in self._states.items():
-            if name != node:
-                state.driver.ingest_revocation(record)
+        for name in targets:
+            self._states[name].driver.ingest_revocation(record)
+
+    def knows_revoked(self, node: str, target: str) -> bool:
+        """Whether `node` holds a revocation naming `target` right now."""
+        return self._states[target].mac in self._states[node].driver.revoked_macs()
 
     def admitted(
         self, node: str, targets: Sequence[str] | None = None

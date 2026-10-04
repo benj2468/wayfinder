@@ -242,3 +242,35 @@ def test_a_certificate_naming_a_mac_its_key_does_not_derive_is_refused():
     assert sim.mac("imposter") not in admitted, (
         "the imposter should be admitted at no address at all"
     )
+
+
+def test_a_revocation_pushed_to_one_member_floods_to_the_rest():
+    """An operator reaches one node (the gateway); the mesh carries the
+    signed order the rest of the way, hop by hop, on its own OGMs."""
+    from wayfinder_sim.topology import path
+
+    mesh = _mesh()
+    names = ["hq", "r1", "r2", "far", "rogue"]
+    nodes = [Node(n, credential=Credential()) for n in names]
+    links = [*path(["hq", "r1", "r2", "far"], PerfectWire()), pair("r1", "rogue", PerfectWire())]
+    sim = Simulation(nodes, links, mesh=mesh)
+    sim.run(until_s=20.0)
+    assert not sim.knows_revoked("far", "rogue")
+
+    sim.revoke("rogue", notify=["hq"])
+    assert sim.knows_revoked("hq", "rogue")
+    assert not sim.knows_revoked("far", "rogue"), "only hq was told directly"
+
+    sim.run(until_s=60.0)
+    assert sim.knows_revoked("far", "rogue")
+    assert "rogue" not in sim.admitted("r1")
+
+
+def test_revoke_notify_rejects_unknown_and_revoked_nodes():
+    mesh = _mesh()
+    nodes = [Node(n, credential=Credential()) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], mesh=mesh)
+    with pytest.raises(KeyError):
+        sim.revoke("b", notify=["zz"])
+    with pytest.raises(ValueError):
+        sim.revoke("b", notify=["b"])
