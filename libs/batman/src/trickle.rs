@@ -43,6 +43,17 @@ pub struct TrickleTimer {
     rng: u32,
 }
 
+/// murmur3's 32-bit finaliser: every input bit flips each output bit with
+/// probability ~1/2, so seeds a few bits apart start unrelated streams.
+const fn fmix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h
+}
+
 impl TrickleTimer {
     /// Build a timer with the given bounds, seeded for jitter, scheduling its
     /// first emission within `[i_min/2, i_min)` after `now`.  `i_max` is clamped
@@ -51,9 +62,13 @@ impl TrickleTimer {
     pub fn new(i_min: Duration, i_max: Duration, now: Duration, seed: u32) -> Self {
         let i_min = i_min.max(Duration::from_nanos(1));
         let i_max = i_max.max(i_min);
-        // A zero seed would make xorshift stick at zero forever; fold in a
-        // non-zero constant so any node identity yields a usable stream.
-        let rng = seed ^ 0x9E37_79B9;
+        // Seeds are node identities, and neighbouring ones differ in a few low
+        // bits (sequential MACs). xorshift's first outputs from such seeds
+        // share their high bits, and the jitter reads the high bits, so the
+        // seed is avalanched first (murmur3's 32-bit finaliser). A zero seed
+        // would make xorshift stick at zero forever; the constant keeps any
+        // identity usable.
+        let rng = fmix32(seed ^ 0x9E37_79B9);
         let mut timer = Self {
             i_min,
             i_max,
@@ -79,10 +94,14 @@ impl TrickleTimer {
     fn jittered(&mut self, span: Duration) -> Duration {
         let span_ns = span.as_nanos() as u64;
         let half = span_ns / 2;
-        // Width of the half-open window; at least 1 ns so the modulo is defined.
+        // Width of the half-open window, at least 1 ns.
         let width = (span_ns - half).max(1);
-        let offset = half + (self.next_rand() as u64) % width;
-        Duration::from_nanos(offset)
+        // Scale the 32-bit word onto the window (multiply-shift) rather than
+        // taking it modulo the width: a u32 counts at most ~4.3 s of
+        // nanoseconds, so a modulo leaves every window longer than that
+        // bunched at its start — exactly the lockstep jitter exists to break.
+        let scaled = ((self.next_rand() as u128 * width as u128) >> 32) as u64;
+        Duration::from_nanos(half + scaled)
     }
 
     /// Record that an emission just happened at `now`: schedule the next fire
