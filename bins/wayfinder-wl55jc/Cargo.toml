@@ -44,6 +44,10 @@ opt-level = "z"
 wayfinder = { path = "../../libs/wayfinder", default-features = false }
 # The *same* HAL-agnostic embedded driver the nRF boards run.
 wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
+# The A/B flash store the node's identity record lives in (`identity.rs`).
+wayfinder-storage = { path = "../../libs/wayfinder-storage", default-features = false, features = [
+    "flash",
+] }
 # The build identity this firmware logs at bring-up.
 wayfinder-version = { path = "../../libs/wayfinder-version" }
 # The RTT `tracing` subscriber -- and, deliberately, *not* the `GetLogs` record
