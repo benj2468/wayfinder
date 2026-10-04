@@ -1680,6 +1680,7 @@ dependencies = [
 name = "wayfinder-storage"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "tracing",
 ]
 
@@ -1712,6 +1713,7 @@ dependencies = [
  "wayfinder",
  "wayfinder-embedded-driver",
  "wayfinder-log",
+ "wayfinder-storage",
  "wayfinder-version",
 ]
 

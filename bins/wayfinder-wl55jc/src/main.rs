@@ -20,13 +20,15 @@
 //!   budget.
 //!
 //! Milestone 1 is a radio relay: one LoRa interface, no host device, no
-//! management port and no durable store yet — so like `wayfinder-stm32f411`
-//! this board's `Mac` is a compile-time constant. The management port is what
-//! would make it reachable from `libs/wayfinder-hil`, and is the next step.
+//! management port. Its identity is durable: a seed minted once from the TRNG
+//! and kept in flash, with the mesh address derived from it (`identity.rs`).
+//! The management port is what would make it reachable from
+//! `libs/wayfinder-hil`, and is the next step.
 
 #![no_std]
 #![no_main]
 
+mod identity;
 mod radio;
 
 use embassy_executor::Spawner;
@@ -34,6 +36,7 @@ use embassy_stm32::bind_interrupts;
 use embassy_stm32::gpio::Level;
 use embassy_stm32::gpio::Output;
 use embassy_stm32::gpio::Speed;
+use embassy_stm32::rng::Rng;
 use embassy_stm32::spi::Spi;
 use embassy_time::Duration as EmbassyDuration;
 use embassy_time::Instant;
@@ -45,9 +48,9 @@ use lora_phy::mod_params::SpreadingFactor;
 use panic_halt as _;
 use tracing::error;
 use tracing::info;
-use wayfinder::interfaces::frame::Mac;
 use wayfinder_embedded_driver::Clock;
 use wayfinder_embedded_driver::Driver;
+use wayfinder_embedded_driver::Restored;
 use wayfinder_embedded_driver::TrickleParams;
 
 use crate::radio::LoraLink;
@@ -66,14 +69,6 @@ static HEAP: Heap = Heap::empty();
 /// for that. Grow it when the port lands, not before: on a 64 KiB part this is
 /// RAM taken from the stack.
 const HEAP_SIZE_BYTES: usize = 2 * 1024;
-
-/// This node's mesh identity. **Must be distinct per physical node**, and in
-/// particular its low two bytes must be: that is the `src_id` every fragment
-/// carries, and two nodes sharing it spoil each other's reassembly.
-///
-/// A compile-time constant only until this board has a durable store; see the
-/// module docs.
-const NODE_MAC: Mac = Mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]);
 
 /// The mesh discriminator carried in every fragment. A filter that keeps a
 /// co-located mesh out of this one's reassembly table — **not** a security
@@ -147,6 +142,7 @@ bind_interrupts!(struct Irqs {
     // have to be bound or `Spi::new_subghz` will not accept `Irqs`.
     DMA1_CHANNEL1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
     DMA1_CHANNEL2 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH2>;
+    RNG => embassy_stm32::rng::InterruptHandler<embassy_stm32::peripherals::RNG>;
 });
 
 /// An `embassy-time`-backed [`Clock`] for the embedded driver.
@@ -242,9 +238,36 @@ async fn main(spawner: Spawner) {
     };
     spawner.spawn(task);
 
-    let link = LoraLink::new(LORA_NET_ID, lora_link::short_address_of(NODE_MAC));
-
+    let mut driver = build_node(p.FLASH, Rng::new(p.RNG, Irqs));
     led.set_high();
+
+    info!(lora = true, "wayfinder started");
+    driver.run().await
+}
+
+/// The driver this board runs, at its own capacity profile.
+type Node = wayfinder_embedded_driver::driver_for!(LoraLink, EmbassyClock, 1, crate::wl55jc);
+
+/// Resolve this node's identity, then build its driver and restore it from
+/// the durable record.
+///
+/// **Out of line on purpose.** Called from `main`'s task, whose poll frame is
+/// reserved for the life of the node: inlined there, the identity record and
+/// its read buffer (~1.5 KiB between them) stayed reserved under the run loop
+/// forever, and `just stack-budget-wl55jc` measured the poll at 4,252 bytes
+/// against 2,788. Here they are a transient frame, gone before `run` starts;
+/// the driver itself is returned straight into `main`'s future.
+#[inline(never)]
+fn build_node(
+    flash: embassy_stm32::Peri<'static, embassy_stm32::peripherals::FLASH>,
+    rng: Rng<'static, embassy_stm32::peripherals::RNG>,
+) -> Node {
+    // The mesh address the link and the router both key on comes out of this.
+    // Its low two bytes are the `src_id` every fragment carries, so it must
+    // differ between boards, which a seed per board (or, failing that, the
+    // factory id) guarantees and a shared constant did not.
+    let identity = identity::resolve(flash, rng);
+    let link = LoraLink::new(LORA_NET_ID, lora_link::short_address_of(identity.mac));
 
     let trickle = [TrickleParams {
         i_min: core::time::Duration::from_secs(5),
@@ -252,9 +275,21 @@ async fn main(spawner: Spawner) {
     }];
 
     // Built at this board's capacities rather than the host defaults.
-    let mut driver: wayfinder_embedded_driver::driver_for!(_, _, 1, crate::wl55jc) =
-        Driver::with_capacities(NODE_MAC, [link], EmbassyClock, &trickle, &[], &["lora"]);
+    let mut driver: Node =
+        Driver::with_capacities(identity.mac, [link], EmbassyClock, &trickle, &[], &["lora"]);
 
-    info!(lora = true, "wayfinder started");
-    driver.run().await
+    // Before anything is emitted, so a stored credential signs this node's
+    // first OGM rather than its second. Only the outcome is logged: with no
+    // management port, nothing on this board can act on a refusal but an
+    // operator reading the log.
+    if let Some(record) = &identity.record {
+        match driver.restore(record) {
+            Restored::Authenticated => info!("restored membership credential from flash"),
+            Restored::Unauthenticated => {}
+            Restored::Refused(why) => {
+                error!(?why, "stored credential refused; routing unauthenticated")
+            }
+        }
+    }
+    driver
 }

@@ -12,10 +12,14 @@ MEMORY
    * reports: NVM 0x08000000..0x08040000, RAM 0x20000000..0x20008000 and
    * 0x20008000..0x20010000.
    *
+   * FLASH stops 4 KiB short of the part: the top two 2 KiB pages
+   * (0x0803F000..0x08040000) are the durable identity store's A/B pair, whose
+   * base `identity.rs` names as DURABLE_STORE_BASE. Keep the two in sync.
+   *
    * Note this part's Cortex-M4 has **no FPU**, so the target is
    * `thumbv7em-none-eabi` and not the `eabihf` the nRF52840 and STM32F411
    * boards use. See `.cargo/config.toml`.
    */
-  FLASH : ORIGIN = 0x08000000, LENGTH = 256K
+  FLASH : ORIGIN = 0x08000000, LENGTH = 252K
   RAM : ORIGIN = 0x20000000, LENGTH = 64K
 }
