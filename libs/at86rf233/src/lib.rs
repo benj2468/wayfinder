@@ -806,4 +806,15 @@ mod tests {
 
         assert!(matches!(radio.recv().await, Err(LinkError::MalformedFrame)));
     }
+
+    /// Every frame goes to the 802.15.4 broadcast address, so one send
+    /// reaches every radio on the channel.
+    #[tokio::test]
+    async fn declares_broadcast_fan_out() {
+        let chip = Arc::new(Mutex::new(FakeChip::new()));
+        let radio = At86Rf233::new(FakeSpi(chip), FakeIrq, FakeReset, 11)
+            .await
+            .unwrap();
+        assert_eq!(radio.fan_out(), wayfinder::link::BROADCAST_FAN_OUT);
+    }
 }
