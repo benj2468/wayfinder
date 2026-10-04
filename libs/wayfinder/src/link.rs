@@ -91,13 +91,15 @@ pub trait LinkT: Send {
     /// point-to-point carrier is this, and so is a multi-access one whose
     /// "broadcast" is really a loop over known peers.
     ///
-    /// `Some(n)` means one `send` already reaches every neighbor on this
-    /// medium.  `Some(1)` is the strongest form — a directed copy costs
+    /// `Some(fan)` means one `send` already reaches every neighbor on this
+    /// medium, with `fan.threshold` as the crossover and `fan.max_frame_len`
+    /// as the largest frame the link carries — see [`FanOut`] for why the two
+    /// travel together.  A threshold of `1` is the strongest form — a directed copy costs
     /// exactly what a flood costs, so a single target already justifies
     /// flooding — and fits any carrier that ignores `data.dst` when it
     /// transmits: a LoRa module addressed to its broadcast address, a
     /// non-connectable BLE advertisement, an 802.15.4 frame sent to `0xffff`.
-    /// A larger `n` fits a medium that fans out in one operation but where a
+    /// A larger threshold fits a medium that fans out in one operation but where a
     /// directed copy is still meaningfully cheaper than the mesh-wide cost of
     /// a flood.
     ///

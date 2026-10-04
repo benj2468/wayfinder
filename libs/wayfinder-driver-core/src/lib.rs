@@ -661,8 +661,12 @@ const LINK_FRAME_HEADER_LEN: usize = 2 * core::mem::size_of::<Mac>() + 2;
 /// carries frames up to `max_frame_len`, once the link header and — on an
 /// authenticated node — the signature trailer are added.
 fn merged_frame_fits(payload_len: usize, authenticated: bool, max_frame_len: usize) -> bool {
-    let _ = (payload_len, authenticated, max_frame_len);
-    true
+    let trailer = if authenticated {
+        wayfinder::auth::FANOUT_TRAILER_LEN
+    } else {
+        0
+    };
+    LINK_FRAME_HEADER_LEN + payload_len + trailer <= max_frame_len
 }
 
 /// Emit the collected destination groups, collapsing onto a shared medium where
@@ -720,7 +724,11 @@ fn flush_mcast_groups<R: RouterOps>(
             continue;
         }
         let Some(idx) = iface_of[i] else { continue };
-        let Some(FanOut { threshold, .. }) = fan_out.get(idx).copied().flatten() else {
+        let Some(FanOut {
+            threshold,
+            max_frame_len,
+        }) = fan_out.get(idx).copied().flatten()
+        else {
             continue;
         };
         // The merged frame goes out `Egress::Iface`, which `plan_dispatch`
@@ -796,6 +804,21 @@ fn flush_mcast_groups<R: RouterOps>(
             );
             continue;
         };
+        // The scratch buffer is not the link: a merged frame can fit the 2 KiB
+        // buffer and still be refused by a 512-byte radio, and a refused merge
+        // loses every group it covers. Abandoned rather than sent, so the
+        // directed copies below go out instead — each of them smaller, and
+        // each one the link was always going to be asked to carry.
+        if !merged_frame_fits(len, router.auth().is_some(), max_frame_len) {
+            trace!(
+                iface = idx,
+                dests = union.len(),
+                len,
+                max_frame_len,
+                "abandoning collapse: merged frame exceeds the link's cap"
+            );
+            continue;
+        }
         trace!(
             iface = idx,
             groups = peers.len(),
