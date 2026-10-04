@@ -57,3 +57,72 @@ def test_largest_frame_first_across_functions():
         ]
     )
     assert stack_budget.parse_frames(text) == [("large", 0x800), ("small", 0x10)]
+
+
+# --- `memory.x` against the chip -------------------------------------------
+#
+# The frame gate measures against the region `memory.x` declares, so a wrong
+# `memory.x` makes every number it prints wrong while it still prints OK. The
+# STM32F411 image shipped exactly that: the nRF52840's map (flash at the
+# 0x0 boot alias, 256 KiB of RAM on a 128 KiB part), a stack top past the end
+# of real RAM, and a green gate (design 25 §2.2).
+
+F411_BROKEN_MEMORY_X = """
+MEMORY
+{
+  FLASH : ORIGIN = 0x00000000, LENGTH = 1016K
+  RAM : ORIGIN = 0x20000000, LENGTH = 256K
+}
+"""
+
+DONGLE_MEMORY_X = """
+MEMORY
+{
+  /* SoftDevice S140 and the bootloader sit around this. */
+  FLASH : ORIGIN = 0x00001000, LENGTH = 884K
+  RAM : ORIGIN = 0x20000008, LENGTH = 256K - 8
+}
+"""
+
+
+def test_memory_regions_reads_origin_and_length_expressions():
+    assert stack_budget.memory_regions(DONGLE_MEMORY_X) == {
+        "FLASH": (0x1000, 884 * 1024),
+        "RAM": (0x20000008, 256 * 1024 - 8),
+    }
+
+
+def test_chip_region_spec_accepts_k_and_m_suffixes():
+    assert stack_budget.parse_chip_region("0x20000000:64K") == (0x20000000, 64 * 1024)
+    assert stack_budget.parse_chip_region("0x0:1M") == (0, 1024 * 1024)
+
+
+def test_region_inside_the_chip_has_no_errors():
+    regions = stack_budget.memory_regions(DONGLE_MEMORY_X)
+    assert (
+        stack_budget.region_errors("RAM", regions["RAM"], (0x20000000, 256 * 1024))
+        == []
+    )
+
+
+def test_f411_broken_ram_is_refused():
+    """256 KiB declared on the F411's 128 KiB."""
+    regions = stack_budget.memory_regions(F411_BROKEN_MEMORY_X)
+    errors = stack_budget.region_errors("RAM", regions["RAM"], (0x20000000, 128 * 1024))
+    assert len(errors) == 1
+    assert "RAM" in errors[0] and "0x20040000" in errors[0]
+
+
+def test_f411_broken_flash_origin_is_refused():
+    """Flash at the 0x0 boot alias, on a part whose flash is at 0x08000000."""
+    regions = stack_budget.memory_regions(F411_BROKEN_MEMORY_X)
+    errors = stack_budget.region_errors(
+        "FLASH", regions["FLASH"], (0x08000000, 512 * 1024)
+    )
+    assert errors and "FLASH" in errors[0]
+
+
+def test_stack_top_past_the_chip_is_refused():
+    """The symptom the F411 image printed and the gate let through."""
+    assert stack_budget.stack_top_errors(0x20040000, (0x20000000, 128 * 1024))
+    assert stack_budget.stack_top_errors(0x20020000, (0x20000000, 128 * 1024)) == []
