@@ -456,19 +456,19 @@ stack-budget: stack-budget-nrf52840 stack-budget-nrf52840-dongle stack-budget-st
 [doc("Check the nRF52840-DK image's stack budget.")]
 stack-budget-nrf52840: build-nrf52840-release
     cd bins/wayfinder-nrf52840 && python3 ../../scripts/stack-budget.py \
-        target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x \
+        target/thumbv7em-none-eabihf/release/wayfinder-nrf52840 --memory-x memory.x --chip nrf52840 \
         --task-poll-pct 18
 
 [doc("Check the nRF52840 dongle image's stack budget.")]
 stack-budget-nrf52840-dongle: build-nrf52840-dongle-release
     cd bins/wayfinder-nrf52840-dongle && python3 ../../scripts/stack-budget.py \
-        target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x \
+        target/thumbv7em-none-eabihf/release/wayfinder-nrf52840-dongle --memory-x memory.x --chip nrf52840 \
         --task-poll-pct 18
 
 [doc("Check the NUCLEO-F411RE image's stack budget.")]
 stack-budget-stm32f411: build-stm32f411
     cd bins/wayfinder-stm32f411 && python3 ../../scripts/stack-budget.py \
-        target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x
+        target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x --chip stm32f411re
 
 # `--task-poll-pct 12` rather than the 8% default, from measurements: this
 # board's stack region (37,968 bytes) is under a quarter of the nRF52840's, so
@@ -479,7 +479,7 @@ stack-budget-stm32f411: build-stm32f411
 [doc("Static stack-budget check for the NUCLEO-WL55JC firmware.")]
 stack-budget-wl55jc: build-wl55jc
     cd bins/wayfinder-wl55jc && python3 ../../scripts/stack-budget.py \
-        target/thumbv7em-none-eabi/release/wayfinder-wl55jc --memory-x memory.x \
+        target/thumbv7em-none-eabi/release/wayfinder-wl55jc --memory-x memory.x --chip stm32wl55jc \
         --task-poll-pct 12
 
 # The loose drivers build into the root target directory, so `clean-workspace`

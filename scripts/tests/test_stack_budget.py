@@ -92,9 +92,29 @@ def test_memory_regions_reads_origin_and_length_expressions():
     }
 
 
-def test_chip_region_spec_accepts_k_and_m_suffixes():
-    assert stack_budget.parse_chip_region("0x20000000:64K") == (0x20000000, 64 * 1024)
-    assert stack_budget.parse_chip_region("0x0:1M") == (0, 1024 * 1024)
+def test_every_chip_in_the_table_has_flash_and_ram():
+    for name, chip in stack_budget.CHIPS.items():
+        assert set(chip) == {"FLASH", "RAM"}, name
+
+
+def test_every_board_memory_x_fits_its_chip():
+    """The shipped maps, against the table: the check this gate now makes on
+    every image, run here without building one."""
+    root = Path(__file__).resolve().parent.parent.parent
+    boards = {
+        "wayfinder-nrf52840": "nrf52840",
+        "wayfinder-nrf52840-dongle": "nrf52840",
+        "wayfinder-stm32f411": "stm32f411re",
+        "wayfinder-wl55jc": "stm32wl55jc",
+    }
+    for board, chip in boards.items():
+        regions = stack_budget.memory_regions(
+            (root / "bins" / board / "memory.x").read_text()
+        )
+        for name, chip_region in stack_budget.CHIPS[chip].items():
+            assert stack_budget.region_errors(name, regions[name], chip_region) == [], (
+                board
+            )
 
 
 def test_region_inside_the_chip_has_no_errors():
