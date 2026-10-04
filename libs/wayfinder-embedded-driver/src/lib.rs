@@ -35,8 +35,8 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use core::num::NonZeroU8;
 use core::time::Duration;
+use wayfinder::link::FanOut;
 
 use embassy_futures::select::Either;
 use embassy_futures::select::select;
@@ -424,7 +424,7 @@ pub struct Driver<
     /// through its `recv` futures, so the medium cannot be asked about itself
     /// while one of its frames is in hand. It is a property of the medium and
     /// does not change once the link is built, so one read is enough.
-    fan_out: [Option<NonZeroU8>; N],
+    fan_out: [Option<FanOut>; N],
 }
 
 /// Constructor at the default capacities.

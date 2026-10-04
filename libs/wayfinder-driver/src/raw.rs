@@ -381,6 +381,15 @@ mod tokio_impl {
 
     #[cfg(target_os = "linux")]
     impl LinkT for RawL2Link {
+        /// One L2 segment: a directed copy goes to one station, but the
+        /// merged frame the fan-out collapse builds is addressed to the
+        /// broadcast MAC, which every station on the segment receives. So one
+        /// send does reach every neighbor, the property the declaration
+        /// claims, at the same threshold as the radios.
+        fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+            Some(wayfinder::link::FanOut::broadcast(MAX_LINK_FRAME_LEN))
+        }
+
         async fn send(
             &mut self,
             origin: Mac,

@@ -45,7 +45,6 @@
 
 use core::time::Duration;
 
-use core::num::NonZeroU8;
 use heapless::Vec as HVec;
 use interfaces::engine::FrameSink;
 use interfaces::frame::LinkFrameData;
@@ -63,6 +62,7 @@ use wayfinder::batman::wire::McastPacketView;
 use wayfinder::batman::wire::write_mcast;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::link::FanOut;
 use wayfinder::link::Received;
 use wayfinder::router_ops::OgmAuthOps;
 use wayfinder::router_ops::RouterAuthOps;
@@ -652,6 +652,23 @@ impl<S: MeshSink> FrameSink for McastCollector<'_, S> {
     }
 }
 
+/// The assembled link frame's header ahead of the payload: `[dst][src]` plus
+/// the 2-byte protocol. What [`FanOut::max_frame_len`] counts on top of the
+/// payload a link is handed.
+const LINK_FRAME_HEADER_LEN: usize = 2 * core::mem::size_of::<Mac>() + 2;
+
+/// Whether a merged multicast payload of `payload_len` bytes fits a link that
+/// carries frames up to `max_frame_len`, once the link header and — on an
+/// authenticated node — the signature trailer are added.
+fn merged_frame_fits(payload_len: usize, authenticated: bool, max_frame_len: usize) -> bool {
+    let trailer = if authenticated {
+        wayfinder::auth::FANOUT_TRAILER_LEN
+    } else {
+        0
+    };
+    LINK_FRAME_HEADER_LEN + payload_len + trailer <= max_frame_len
+}
+
 /// Emit the collected destination groups, collapsing onto a shared medium where
 /// one transmission reaches every next hop in a group (design 17 §4.5).
 ///
@@ -684,7 +701,7 @@ fn flush_mcast_groups<R: RouterOps>(
     groups: &[(Mac, HVec<Mac, MAX_MCAST_DESTS>)],
     ttl: u8,
     inner: &[u8],
-    fan_out: &[Option<NonZeroU8>],
+    fan_out: &[Option<FanOut>],
     tx_buffer: &mut [u8],
     sink: &mut impl MeshSink,
 ) {
@@ -707,7 +724,11 @@ fn flush_mcast_groups<R: RouterOps>(
             continue;
         }
         let Some(idx) = iface_of[i] else { continue };
-        let Some(threshold) = fan_out.get(idx).copied().flatten() else {
+        let Some(FanOut {
+            threshold,
+            max_frame_len,
+        }) = fan_out.get(idx).copied().flatten()
+        else {
             continue;
         };
         // The merged frame goes out `Egress::Iface`, which `plan_dispatch`
@@ -783,6 +804,21 @@ fn flush_mcast_groups<R: RouterOps>(
             );
             continue;
         };
+        // The scratch buffer is not the link: a merged frame can fit the 2 KiB
+        // buffer and still be refused by a 512-byte radio, and a refused merge
+        // loses every group it covers. Abandoned rather than sent, so the
+        // directed copies below go out instead — each of them smaller, and
+        // each one the link was always going to be asked to carry.
+        if !merged_frame_fits(len, router.auth().is_some(), max_frame_len) {
+            trace!(
+                iface = idx,
+                dests = union.len(),
+                len,
+                max_frame_len,
+                "abandoning collapse: merged frame exceeds the link's cap"
+            );
+            continue;
+        }
         trace!(
             iface = idx,
             groups = peers.len(),
@@ -864,7 +900,7 @@ pub fn handle_mesh_frame<R: RouterOps>(
     frame: &LinkFrame,
     metrics: LinkMetrics,
     tx_buffer: &mut [u8],
-    fan_out: &[Option<NonZeroU8>],
+    fan_out: &[Option<FanOut>],
     sink: &mut impl MeshSink,
 ) {
     let Some(frame) = strip_directed(router, frame) else {
@@ -1169,7 +1205,7 @@ pub fn handle_link_result<R: RouterOps>(
     idx: usize,
     result: Result<Received<'_>, LinkError>,
     tx_buffer: &mut [u8],
-    fan_out: &[Option<NonZeroU8>],
+    fan_out: &[Option<FanOut>],
     sink: &mut impl MeshSink,
 ) {
     match result {
@@ -1475,6 +1511,7 @@ mod tests {
     // instantiate a concrete default-profile router to drive them.
     use wayfinder::CentralRouter;
     use wayfinder::auth::DIRECTED_TRAILER_LEN;
+    use wayfinder::auth::FANOUT_TRAILER_LEN;
     use wayfinder::auth::OgmAuth;
     use wayfinder::auth::OgmVerdict;
     use wayfinder::batman::wire::BatmanOgmPacket;
@@ -1491,6 +1528,15 @@ mod tests {
     /// the address its key derives, so this module pairs `mac(n)` with the
     /// keypair seeded `n` — as `member_auth` already did at every call site —
     /// rather than numbering addresses independently of the keys it mints.
+    /// A fan-out declaration at `threshold` for a link carrying frames up to
+    /// `max_frame_len` bytes.
+    fn fan_out(threshold: u8, max_frame_len: usize) -> FanOut {
+        FanOut {
+            threshold: core::num::NonZeroU8::new(threshold).unwrap(),
+            max_frame_len,
+        }
+    }
+
     fn mac(n: u8) -> Mac {
         Keypair::from_seed(&[n; 32]).derived_mac()
     }
@@ -3199,7 +3245,10 @@ mod tests {
             &groups,
             49,
             b"INNER",
-            &[NonZeroU8::new(2)],
+            &[Some(fan_out(
+                2,
+                wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN,
+            ))],
             &mut tx,
             &mut sink,
         );
@@ -3251,7 +3300,10 @@ mod tests {
             &groups,
             49,
             b"INNER",
-            &[NonZeroU8::new(2)],
+            &[Some(fan_out(
+                2,
+                wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN,
+            ))],
             &mut tx,
             &mut sink,
         );
@@ -3300,13 +3352,110 @@ mod tests {
             &groups,
             49,
             b"INNER",
-            &[NonZeroU8::new(2)],
+            &[Some(fan_out(
+                2,
+                wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN,
+            ))],
             &mut tx,
             &mut sink,
         );
 
         assert_eq!(sink.mesh.len(), 1);
         assert_eq!(sink.mesh[0].dst, mac(2), "addressed, not broadcast");
+    }
+
+    /// A router on `mac(1)` with `mac(2)` and `mac(3)` as direct neighbours on
+    /// interface 0, so both are terminal groups for a multicast to them.
+    fn router_with_two_neighbours() -> CentralRouter {
+        let mut router = CentralRouter::new(mac(1));
+        for orig in [mac(2), mac(3)] {
+            let ogm = bare_ogm_bytes(orig, 1, 50);
+            let link = frame_bytes(mac(1), orig, DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+            let mut tx = [0u8; 512];
+            let mut sink = CaptureSink::default();
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                0,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &[],
+                &mut sink,
+            );
+        }
+        router
+    }
+
+    /// The two terminal groups `router_with_two_neighbours` sets up.
+    fn two_terminal_groups() -> [(Mac, HVec<Mac, MAX_MCAST_DESTS>); 2] {
+        let mut a: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let _ = a.push(mac(2));
+        let mut b: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let _ = b.push(mac(3));
+        [(mac(2), a), (mac(3), b)]
+    }
+
+    /// Flush the two terminal groups with `inner` behind a fan-out link of the
+    /// given cap, returning what the sink received.
+    fn flush_two(router: &mut CentralRouter, inner: &[u8], fan: Option<FanOut>) -> CaptureSink {
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        flush_mcast_groups(
+            router,
+            Duration::ZERO,
+            &two_terminal_groups(),
+            49,
+            inner,
+            &[fan],
+            &mut tx,
+            &mut sink,
+        );
+        sink
+    }
+
+    /// **A merge must not produce a frame the link cannot carry.** A merged
+    /// frame's destination list is the union, so it is 6 bytes per extra peer
+    /// longer than any one directed copy. On a small-MTU radio that opens a
+    /// window of payload sizes where each copy fits and the merge does not —
+    /// and a refused merge loses *every* listener, since the groups it covers
+    /// get no directed copy. The link's cap is set here to exactly one
+    /// directed copy, so the copies must win.
+    #[test]
+    fn a_merge_past_the_link_cap_keeps_the_directed_copies() {
+        let inner = [0x5Au8; 400];
+        let mut router = router_with_two_neighbours();
+        let unmerged = flush_two(&mut router, &inner, None);
+        assert_eq!(unmerged.mesh.len(), 2);
+        let directed_frame = LINK_FRAME_HEADER_LEN + unmerged.mesh[0].payload.len();
+
+        let capped = flush_two(&mut router, &inner, Some(fan_out(2, directed_frame)));
+        assert_eq!(capped.mesh.len(), 2, "both peers keep a directed copy");
+        assert!(capped.mesh.iter().all(|f| f.dst != Mac::BROADCAST));
+
+        // And the control: with room for the union, the same groups merge.
+        let roomy = flush_two(&mut router, &inner, Some(fan_out(2, directed_frame + 6)));
+        assert_eq!(roomy.mesh.len(), 1, "a merge that fits still happens");
+    }
+
+    /// The same window on an authenticated node is 48 bytes wider: a merged
+    /// frame carries a signature trailer where a directed copy carries a
+    /// pairwise tag, so the rule reserves the signature's room when auth is on
+    /// and nothing when it is off. Tested on the rule itself, because a merge
+    /// in the authenticated posture needs verified neighbours to reach at all.
+    #[test]
+    fn a_merged_frame_reserves_the_signature_trailer_only_with_auth() {
+        let payload = 400;
+        let exact = LINK_FRAME_HEADER_LEN + payload;
+        assert!(merged_frame_fits(payload, false, exact));
+        assert!(!merged_frame_fits(payload, false, exact - 1));
+        assert!(!merged_frame_fits(payload, true, exact));
+        assert!(!merged_frame_fits(
+            payload,
+            true,
+            exact + DIRECTED_TRAILER_LEN
+        ));
+        assert!(merged_frame_fits(payload, true, exact + FANOUT_TRAILER_LEN));
     }
 
     /// A `Unicast` carried under a *group* link-layer dst still has to prove

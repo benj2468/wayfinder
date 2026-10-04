@@ -124,6 +124,8 @@ mod link;
 
 #[cfg(feature = "link")]
 mod frag;
+#[cfg(feature = "link")]
+pub use frag::MAX_REASSEMBLED_LEN;
 
 /// Parse a `+RCV=<Address>,<Length>,<Data>,<RSSI>,<SNR>` line (the `+RCV=`
 /// prefix must already be present) into a [`ReceivedPacket`].

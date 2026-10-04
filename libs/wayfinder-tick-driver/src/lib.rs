@@ -28,7 +28,6 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::time::Duration;
 
-use core::num::NonZeroU8;
 use interfaces::engine::FrameSink;
 use interfaces::link::LinkMetrics;
 use tracing::trace;
@@ -43,6 +42,7 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::link::FanOut;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
@@ -163,7 +163,7 @@ pub struct Driver {
     /// correctness bug, not a missed optimisation — a medium that says one send
     /// reaches every neighbour when it does not drops every destination but
     /// one.
-    fan_out: Vec<Option<NonZeroU8>>,
+    fan_out: Vec<Option<FanOut>>,
     /// Wall-clock unix time (seconds) that `now == 0` corresponds to.
     ///
     /// Certificate validity is judged against unix time, but a tick-driven
@@ -249,7 +249,7 @@ impl Driver {
     /// simulated shared segment (one radio every neighbour hears) declares
     /// `Some(2)`, a point-to-point queue leaves it `None`. Out-of-range indices
     /// are ignored, like every other per-interface setter here.
-    pub fn set_fan_out(&mut self, idx: usize, fan_out: Option<NonZeroU8>) {
+    pub fn set_fan_out(&mut self, idx: usize, fan_out: Option<FanOut>) {
         if let Some(slot) = self.fan_out.get_mut(idx) {
             *slot = fan_out;
         }

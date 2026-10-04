@@ -345,6 +345,14 @@ impl LoraLink {
 }
 
 impl LinkT for LoraLink {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(
+            lora_link::MAX_REASSEMBLED_LEN,
+        ))
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let mut frame = [0u8; lora_link::MAX_REASSEMBLED_LEN];
         let frame_len = lora_link::assemble_frame(origin, data, &mut frame)?;

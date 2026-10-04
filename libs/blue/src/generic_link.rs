@@ -165,6 +165,14 @@ impl<A: BleAdvertiser> BleLink<A> {
 }
 
 impl<A: BleAdvertiser> LinkT for BleLink<A> {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(
+            crate::frame::MAX_REASSEMBLED_LEN,
+        ))
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let (frame_bytes, frame_len) = frame::assemble_frame(origin, data)?;
         // One `msg_id` for the whole send, shared across formats: the two
@@ -865,5 +873,17 @@ mod tests {
         drop(sink);
 
         assert!(matches!(link.recv().await, Err(LinkError::ReceiveFailed)));
+    }
+
+    /// A non-connectable advertisement is heard by every scanner in range.
+    #[test]
+    fn declares_broadcast_fan_out() {
+        let (link, _sink) = BleLink::new(FakeAdvertiser::default(), BleSendMode::Legacy);
+        assert_eq!(
+            link.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(
+                crate::frame::MAX_REASSEMBLED_LEN
+            ))
+        );
     }
 }
