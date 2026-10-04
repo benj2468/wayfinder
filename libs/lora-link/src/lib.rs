@@ -216,7 +216,7 @@ pub fn build_fragment(
 
 /// Parse one received packet into `(src_id, fragment header, content)`.
 ///
-/// Returns [`LinkError::InvalidPacket`] if it is too short, carries a
+/// Returns [`LinkError::MalformedFrame`] if it is too short, carries a
 /// different `net_id` than `net_id`, or has a fragment header that could not
 /// describe a real fragment of *this* format: a `count` above
 /// [`MAX_FRAGMENTS_PER_FRAME`], or a non-final fragment whose body is not
@@ -231,20 +231,20 @@ pub fn build_fragment(
 /// membership is `wayfinder-auth`'s, verified above `LinkT`.
 pub fn decode_fragment(net_id: u8, buf: &[u8]) -> Result<(u16, FragHeader, &[u8]), LinkError> {
     if buf.len() < HEADER_LEN + FRAG_HDR_LEN {
-        return Err(LinkError::InvalidPacket);
+        return Err(LinkError::MalformedFrame);
     }
     if buf[0] != net_id {
-        return Err(LinkError::InvalidPacket);
+        return Err(LinkError::MalformedFrame);
     }
     let src_id = u16::from_be_bytes([buf[1], buf[2]]);
-    let (hdr, body) =
-        wayfinder_link_utils::parse_fragment(&buf[HEADER_LEN..]).ok_or(LinkError::InvalidPacket)?;
+    let (hdr, body) = wayfinder_link_utils::parse_fragment(&buf[HEADER_LEN..])
+        .ok_or(LinkError::MalformedFrame)?;
     let (index, count) = (usize::from(hdr.index), usize::from(hdr.count));
     if count > MAX_FRAGMENTS_PER_FRAME {
-        return Err(LinkError::InvalidPacket);
+        return Err(LinkError::MalformedFrame);
     }
     if index + 1 < count && body.len() != FRAG_PAYLOAD {
-        return Err(LinkError::InvalidPacket);
+        return Err(LinkError::MalformedFrame);
     }
     Ok((src_id, hdr, body))
 }
@@ -284,11 +284,11 @@ pub fn accept_fragment(
 
 /// Reinterpret reassembled bytes as a [`LinkFrame`].
 ///
-/// Returns [`LinkError::InvalidPacket`] if they are too short to hold a
+/// Returns [`LinkError::MalformedFrame`] if they are too short to hold a
 /// [`LinkFrame`] header — which a corrupted reassembly (see this crate's
 /// `CLAUDE.md` on colliding `src_id`s) can produce.
 pub fn decode_frame(bytes: &[u8]) -> Result<&LinkFrame, LinkError> {
-    LinkFrame::ref_from_bytes(bytes).map_err(|_| LinkError::InvalidPacket)
+    LinkFrame::ref_from_bytes(bytes).map_err(|_| LinkError::MalformedFrame)
 }
 
 #[cfg(test)]
