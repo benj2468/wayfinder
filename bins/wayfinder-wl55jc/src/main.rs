@@ -234,6 +234,14 @@ async fn main(spawner: Spawner) {
     };
     spawner.spawn(task);
 
+    // Spawning only queues the task: it starts the IWDG on its first poll,
+    // after `main` yields to the driver, so bring-up above can never trip it.
+    let Ok(task) = wayfinder_wl55jc::watchdog_task(p.IWDG) else {
+        error!("could not spawn the watchdog task; halting");
+        halt();
+    };
+    spawner.spawn(task);
+
     let link = LoraLink::new(LORA_NET_ID, lora_link::short_address_of(NODE_MAC));
 
     led.set_high();

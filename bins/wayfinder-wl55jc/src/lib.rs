@@ -170,3 +170,45 @@ pub fn radio_parts(
         },
     }
 }
+
+/// The IWDG's reset deadline: how long the executor may go without running
+/// [`watchdog_task`] before the part resets.
+///
+/// Four seconds, against a pet every [`WATCHDOG_PET`]: long enough that no
+/// legitimate stretch of work (a full calibration, a burst of signature
+/// checks at 48 MHz) gets near it, short enough that a node which has stopped
+/// scheduling is back on the mesh within an OGM interval.
+pub const WATCHDOG_TIMEOUT_US: u32 = 4_000_000;
+
+/// How often [`watchdog_task`] reloads the IWDG.
+pub const WATCHDOG_PET: embassy_time::Duration = embassy_time::Duration::from_millis(500);
+
+/// Start the independent watchdog and keep it fed for the life of the node.
+///
+/// **What this catches, and what it does not.** The task pets on a timer, so
+/// it proves only that the executor is still *scheduling*: a busy loop, a
+/// critical section that never ends, or a fault handler spinning — the shapes
+/// that stop every task at once, and that nothing else on this board could
+/// recover from (there is no management port to notice). It does **not**
+/// catch a task parked on an `.await` that never resolves while the rest of
+/// the executor runs; that is what the radio task's own deadlines are for
+/// (`iv::BUSY_TIMEOUT` and the transmit deadline, #76). Making the pet
+/// conditional on the driver loop's progress would close that gap too, but
+/// needs a heartbeat out of `wayfinder-embedded-driver` that does not exist.
+///
+/// The IWDG is frozen while the core is halted by a debugger
+/// (`DBGMCU.APB1FZR1.IWDG`), so a breakpoint does not reset the board out from
+/// under the probe. That bit only acts while the core is halted, so setting
+/// it unconditionally costs nothing in the field.
+#[embassy_executor::task]
+pub async fn watchdog_task(iwdg: Peri<'static, embassy_stm32::peripherals::IWDG>) -> ! {
+    embassy_stm32::pac::DBGMCU
+        .apb1fzr1()
+        .modify(|w| w.set_iwdg(true));
+    let mut wdg = embassy_stm32::wdg::IndependentWatchdog::new(iwdg, WATCHDOG_TIMEOUT_US);
+    wdg.unleash();
+    loop {
+        wdg.pet();
+        embassy_time::Timer::after(WATCHDOG_PET).await;
+    }
+}
