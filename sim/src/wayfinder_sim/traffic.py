@@ -129,6 +129,31 @@ class Flow:
             lost += 1
         return Recovery(event_s, None, lost)
 
+    def restored_after(
+        self, event_s: float, *, window_s: float = 2.0, ratio: float = 0.95
+    ) -> float | None:
+        """Seconds from `event_s` until delivery is *sustained* again: the
+        start of the first `window_s` stretch, sent at or after the event, in
+        which at least `ratio` of packets arrived. `None` if it never steadies.
+
+        The honest counterpart to `recovery_after`, which stops at the first
+        packet through — and one packet slipping across a flapping path is not
+        traffic flowing again. Windows must fit inside the flow, so a ragged
+        tail never counts as restored.
+        """
+        sent = [(seq, t) for seq, t in self.sent if t >= event_s]
+        if not sent:
+            return None
+        last = self.sent[-1][1]
+        for i, (_, start) in enumerate(sent):
+            if start + window_s > last:
+                break
+            window = [seq for seq, t in sent[i:] if t < start + window_s]
+            got = sum(1 for seq in window if seq in self.received)
+            if window and got / len(window) >= ratio:
+                return start - event_s
+        return None
+
     def latencies_s(self) -> list[float]:
         """One-way latency of every delivered packet, in send order."""
         return [self.received[seq] - t for seq, t in self.sent if seq in self.received]

@@ -118,3 +118,25 @@ def test_latency_is_receive_minus_send():
     flow.record_sent(0, 1.0)
     flow.record_received(0, 1.25)
     assert flow.latencies_s() == [pytest.approx(0.25)]
+
+
+def test_restored_after_waits_for_sustained_delivery_not_one_lucky_packet():
+    flow = Flow(src="a", dest="b", flow_id=0)
+    # 10 Hz; lost from t=1.0, one stray packet gets through at 1.5, steady again from 3.0.
+    for seq in range(60):
+        t = seq * 0.1
+        flow.record_sent(seq, t)
+        if t < 1.0 or abs(t - 1.5) < 1e-9 or t >= 3.0:
+            flow.record_received(seq, t + 0.01)
+    assert flow.recovery_after(1.0).recovered_s == pytest.approx(0.5)
+    restored = flow.restored_after(1.0, window_s=1.0, ratio=0.95)
+    assert restored == pytest.approx(2.0)
+
+
+def test_restored_after_is_none_when_delivery_never_steadies():
+    flow = Flow(src="a", dest="b", flow_id=0)
+    for seq in range(40):
+        flow.record_sent(seq, seq * 0.1)
+        if seq % 2 == 0:
+            flow.record_received(seq, seq * 0.1)
+    assert flow.restored_after(0.0, window_s=1.0, ratio=0.95) is None

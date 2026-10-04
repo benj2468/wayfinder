@@ -21,9 +21,12 @@ through, the relay carrying that stream is powered off. Later it is powered
 back on — and it *reboots*, coming back with an empty router that has to
 relearn the mesh. Three numbers come out of one run:
 
-- **time to reroute**: from the power-off to the first packet that arrives
-  over the new path — what a user of the link experiences as the outage;
-- **packets lost** in that gap;
+- **time to reroute**: from the power-off until delivery is *sustained*
+  again (95% of packets over a 2 s window, `Flow.restored_after`) — what a
+  user of the link experiences as the outage. Not the first packet through:
+  one packet slipping across a path that is still settling is not traffic
+  flowing;
+- **packets lost** from the power-off to that point;
 - **time to rejoin**: from the power-on until HQ has a route to the rebooted
   relay again.
 
@@ -190,13 +193,19 @@ def run_failover(
     sim.record("victim_reachable", lambda s: s.is_up(victim) and s.has_route(victim, HQ))
     rec = sim.run(until_s=duration_s)
 
-    recovery = flow.recovery_after(fail_at_s)
+    restored_s = flow.restored_after(fail_at_s)
+    lost = sum(
+        1
+        for seq, t in flow.sent
+        if fail_at_s <= t < fail_at_s + (restored_s if restored_s is not None else 1e18)
+        and seq not in flow.received
+    )
     paths = rec.column("path")
     path_after = None
-    if recovery.recovered_s is not None:
+    if restored_s is not None:
         # The path in use once healed, read a few seconds after the first
         # delivery so it is the settled one rather than the first to answer.
-        settle_s = fail_at_s + recovery.recovered_s + 3.0
+        settle_s = fail_at_s + restored_s + 3.0
         path_after = next(
             (p for t, p in zip(rec.times_s, paths) if t >= settle_s and p is not None),
             None,
@@ -216,8 +225,8 @@ def run_failover(
         victim=victim,
         path_before=path_before,
         path_after=path_after,
-        recovered_s=recovery.recovered_s,
-        lost=recovery.lost,
+        recovered_s=restored_s,
+        lost=lost,
         rejoin_s=rejoin_s,
         overhead_fps=overhead_fps,
         flow=flow,
@@ -406,8 +415,8 @@ def showcase(run: FailoverRun, sweep: Sequence[SweepPoint]) -> Showcase:
             "discrete-event simulation. Radios follow free-space path loss with per-frame fading on "
             "one shared channel (24 dBm, 700 m hard range, 450 m grid). A powered-off node neither "
             "sends nor hears; a reboot gives it a fresh router. Recovery is measured from delivered "
-            "packets, not routing tables: it is the time from power-off to the first packet that "
-            f"arrives afterwards. Each setting repeats the failure under {len(SWEEP_SEEDS)} random "
+            "packets, not routing tables: it is the time from power-off until delivery is sustained "
+            f"again (95% over a 2 s window). Each setting repeats the failure under {len(SWEEP_SEEDS)} random "
             "seeds; overhead is all frames sent per node per second before any data flows."
         ),
         charts=[

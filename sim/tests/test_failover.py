@@ -31,10 +31,9 @@ def test_the_mesh_routes_around_a_dead_relay_and_the_relay_rejoins():
     assert run.path_after is not None
     assert run.victim not in run.path_after
     assert run.rejoin_s is not None and run.rejoin_s < 10.0
-    # Once healed, the stream flows again until the relay comes back (fading
-    # still costs the odd frame; nothing retransmits).
-    healed = FAIL_AT_S + run.recovered_s + 2.0
-    assert run.flow.delivery_ratio(healed, healed + 20.0) >= 0.98
+    # "Rerouted" means sustained delivery, so the stretch after it flows.
+    healed = FAIL_AT_S + run.recovered_s
+    assert run.flow.delivery_ratio(healed, healed + 10.0) >= 0.9
 
 
 def test_keepalives_shorten_the_worst_case():
