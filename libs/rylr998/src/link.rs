@@ -83,6 +83,12 @@ impl<S> LinkT for RylrClient<S>
 where
     S: Read + Write + Send,
 {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
+    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+        wayfinder::link::BROADCAST_FAN_OUT
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let frame_len = HEADER_LEN + data.payload.len();
         if frame_len > frag::MAX_REASSEMBLED_LEN {

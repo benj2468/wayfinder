@@ -415,6 +415,12 @@ fn capture(packet: &Packet) -> Option<RxFragment> {
 /// `wayfinder::link_quality::normalize_quality` for why that mapping stays
 /// here rather than moving into the router.
 impl LinkT for Ieee802154Link {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
+    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+        wayfinder::link::BROADCAST_FAN_OUT
+    }
+
     /// Fragment `data` and transmit every fragment, returning the total
     /// on-air bytes.
     ///

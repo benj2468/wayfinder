@@ -234,6 +234,12 @@ async fn ble_scan_task(sd: &'static Softdevice, reports: &'static ReportQueue) -
 }
 
 impl LinkT for NrfBleLink {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
+    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+        wayfinder::link::BROADCAST_FAN_OUT
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let (frame_bytes, frame_len) = frame::assemble_frame(origin, data)?;
         // One `msg_id` across formats: their fragments land in different

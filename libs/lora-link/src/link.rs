@@ -84,6 +84,12 @@ impl<'a, M: RawMutex, const RX: usize> ChannelLink<'a, M, RX> {
 }
 
 impl<M: RawMutex + Sync, const RX: usize> LinkT for ChannelLink<'_, M, RX> {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::BROADCAST_FAN_OUT`].
+    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+        wayfinder::link::BROADCAST_FAN_OUT
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let mut frame = [0u8; MAX_REASSEMBLED_LEN];
         let frame_len = crate::assemble_frame(origin, data, &mut frame)?;
