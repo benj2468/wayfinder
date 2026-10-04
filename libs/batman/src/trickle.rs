@@ -294,4 +294,39 @@ mod tests {
         // Uniform over [30 s, 60 s): about half land in the back half.
         assert!(late > 60, "only {late}/200 fires in [45 s, 60 s)");
     }
+
+    /// A burst of inconsistencies must not starve the node's own emission.
+    /// RFC 6206 §4.2: when `I` is already `I_min`, an inconsistency does
+    /// nothing. Re-drawing the fire on every reset instead pushes it out each
+    /// time, and a node joining a large mesh — which discovers a new originator
+    /// every few hundred milliseconds — never advertised itself until discovery
+    /// settled: 33 s on a 100-node grid with a 1 s `i_min`.
+    #[test]
+    fn repeated_resets_do_not_postpone_a_fire_already_due_within_i_min() {
+        let mut t = TrickleTimer::new(I_MIN, I_MAX, Duration::ZERO, 3);
+        let first = t.time_until(Duration::ZERO);
+        let mut now = Duration::ZERO;
+        while now < first {
+            t.reset(now);
+            now += Duration::from_millis(100);
+        }
+        assert!(t.due(first), "resets pushed the first fire past {first:?}");
+        assert_eq!(t.interval(), I_MIN);
+    }
+
+    /// A reset still pulls a fire scheduled far out (a backed-off interval)
+    /// back to within `[i_min/2, i_min)` — that is what reconvergence needs.
+    #[test]
+    fn reset_still_pulls_a_backed_off_fire_in() {
+        let mut t = TrickleTimer::new(I_MIN, I_MAX, Duration::ZERO, 9);
+        let mut now = Duration::ZERO;
+        for _ in 0..6 {
+            now = t.next_fire;
+            t.on_emit(now);
+        }
+        assert!(t.time_until(now) >= I_MIN, "backed off well past i_min");
+        t.reset(now);
+        let until = t.time_until(now);
+        assert!(until >= I_MIN / 2 && until < I_MIN, "post-reset fire {until:?}");
+    }
 }
