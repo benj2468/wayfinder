@@ -100,3 +100,33 @@ def test_heatmap_shape_must_match_its_axes():
 
     with pytest.raises(ValueError):
         Heatmap(xs=[0.0, 1.0], ys=[0.0], values=[[1.0]], label="x")
+
+
+def test_a_non_finite_number_is_refused_rather_than_written(tmp_path):
+    """`Infinity` is not JSON: the page's data bundle would still load (it is a
+    script), but the raw-results download would not parse."""
+    import pytest
+
+    showcase = _showcase()
+    showcase.charts[0].series[0].y[0] = float("inf")
+    with pytest.raises(ValueError):
+        write_showcase(showcase, tmp_path)
+
+
+def test_the_page_assumptions_are_checked_up_front():
+    import pytest
+    from wayfinder_sim.showcase import Heatmap
+
+    with pytest.raises(ValueError):
+        Chart(title="t", x_label="x", y_label="y", series=[], y_range=(1.0, 1.0))
+    with pytest.raises(ValueError):
+        Chart(title="t", x_label="x", y_label="y", series=[])  # nothing to draw
+    with pytest.raises(ValueError):
+        Heatmap(xs=[0.0, 2.0, 3.0], ys=[0.0], values=[[1.0, 1.0, 1.0]], label="uneven")
+    with pytest.raises(ValueError):
+        Heatmap(xs=[0.0, 1.0], ys=[0.0], values=[[None, None]], label="all empty")
+    s = _showcase()
+    with pytest.raises(ValueError):
+        Showcase(**{**s.__dict__, "slug": "Not A Slug"})
+    with pytest.raises(ValueError):
+        Showcase(**{**s.__dict__, "category": "marketing"})

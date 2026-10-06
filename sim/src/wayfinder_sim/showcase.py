@@ -2,7 +2,8 @@
 
 `report.py` renders a whole run into one self-contained page for whoever ran
 it. This is the other audience: the public results page on wayfndr.dev
-(`www/sim/`), which has no build step and no Python, and so cannot take a
+(`www/sim/`), which has no build step beyond bundling these files and no
+Python, and so cannot take a
 matplotlib figure or a `Recorder`. What it takes instead is the *answer* —
 a few headline numbers, the prose saying what they mean, and the series
 behind each chart — which its own small script draws in the site's palette.
@@ -18,7 +19,9 @@ old file can tell rather than mis-draw it.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -41,7 +44,12 @@ _DECIMALS = 4
 few hundred pixels wide, and full float precision would multiply the size of
 every data file for digits no one can see."""
 
-SeriesKind = Literal["line", "step", "bar", "scatter", "area"]
+SeriesKind = Literal["line", "step", "bar", "scatter"]
+
+CATEGORIES = ("resilience", "security", "range", "planning", "capacity")
+"""The page's sections, in the order `lab.js` names them (its `CATEGORY`)."""
+
+_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
 @dataclasses.dataclass
@@ -89,6 +97,18 @@ class Heatmap:
             raise ValueError(
                 f"heatmap {self.label!r}: values must be {len(self.ys)} rows of {len(self.xs)}"
             )
+        # The page sizes every cell from the first gap on each axis, so the
+        # grid must be non-empty and evenly spaced, ascending.
+        for name, axis in (("xs", self.xs), ("ys", self.ys)):
+            if not axis:
+                raise ValueError(f"heatmap {self.label!r}: {name} is empty")
+            gaps = [b - a for a, b in itertools.pairwise(axis)]
+            if gaps and (min(gaps) <= 0 or max(gaps) - min(gaps) > 1e-6 * max(gaps)):
+                raise ValueError(f"heatmap {self.label!r}: {name} must ascend evenly")
+        if self.value_range is None and not any(
+            v is not None for row in self.values for v in row
+        ):
+            raise ValueError(f"heatmap {self.label!r}: no values and no value_range")
 
 
 @dataclasses.dataclass
@@ -107,6 +127,16 @@ class Chart:
     heatmap: Heatmap | None = None
     """A grid drawn beneath the series — a coverage or interference map —
     with any `series` (tracks, sites) plotted over it."""
+
+    def __post_init__(self) -> None:
+        if not self.series and self.heatmap is None:
+            raise ValueError(f"chart {self.title!r}: nothing to draw")
+        if self.y_range is not None and not self.y_range[0] < self.y_range[1]:
+            raise ValueError(f"chart {self.title!r}: y_range {self.y_range} is empty")
+        if self.x_log and any(
+            isinstance(x, (int, float)) and x <= 0 for s in self.series for x in s.x
+        ):
+            raise ValueError(f"chart {self.title!r}: a log x axis needs positive x")
 
 
 @dataclasses.dataclass
@@ -143,6 +173,16 @@ class Showcase:
     scenario: str | None = None
     """Path of the script that produced this, relative to the repo root."""
 
+    def __post_init__(self) -> None:
+        if not _SLUG.fullmatch(self.slug):
+            raise ValueError(f"slug {self.slug!r}: lowercase words joined by hyphens")
+        if self.category not in CATEGORIES:
+            raise ValueError(f"category {self.category!r} is not one of {CATEGORIES}")
+        if self.table and any(len(row) != len(self.table[0]) for row in self.table):
+            raise ValueError(
+                f"{self.slug}: table rows differ in length from the header"
+            )
+
 
 def _rounded(value: Any) -> Any:
     if isinstance(value, float):
@@ -163,14 +203,18 @@ def write_showcase(showcase: Showcase, out_dir: Path) -> Path:
     """Write `showcase` to `out_dir/<slug>.json` and return the path."""
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{showcase.slug}.json"
-    path.write_text(json.dumps(showcase_dict(showcase), indent=1) + "\n")
+    # allow_nan=False: `Infinity`/`NaN` are not JSON. A result that is not a
+    # finite number is a scenario bug to fix, not something to publish.
+    path.write_text(
+        json.dumps(showcase_dict(showcase), indent=1, allow_nan=False) + "\n"
+    )
     return path
 
 
 def downsample(
     x: Sequence[float], y: Sequence[Any], max_points: int = 600
 ) -> tuple[list[float], list[Any]]:
-    """Thin a long time series to at most `max_points`, keeping every point
+    """Thin a long time series to roughly `max_points`, keeping every point
     where the value *changes* first — so a step signal keeps its edges
     exactly, and only flat stretches lose samples."""
     if len(x) <= max_points:

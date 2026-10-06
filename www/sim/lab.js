@@ -21,7 +21,9 @@
 
   const root = document.getElementById("lab-scenarios");
   const tip = document.getElementById("lab-tip");
-  const data = Array.isArray(window.WF_SIM) ? window.WF_SIM : [];
+  // `null` when /sim/data.js failed to load or parse, as distinct from a
+  // bundle that loaded and was simply empty — the two need different notes.
+  const data = Array.isArray(window.WF_SIM) ? window.WF_SIM : null;
   if (!root) return;
 
   const NS = "http://www.w3.org/2000/svg";
@@ -245,6 +247,13 @@
       ? [...new Set(series.flatMap((s) => s.x.map(String)))]
       : [];
     const numXs = xs.filter(isNum);
+    if (!heat && !categorical && (!numXs.length || !ys.some(isNum))) {
+      // Nothing plottable: say so rather than drawing axes from ±Infinity.
+      host.replaceChildren(
+        el("p", { class: "lab-chart__cap", text: "No data." }),
+      );
+      return;
+    }
     let x0 = Math.min(...numXs);
     let x1 = Math.max(...numXs);
     if (heat) {
@@ -517,7 +526,7 @@
         });
         return;
       }
-      // line / step / area: a path broken at nulls.
+      // line / step: a path broken at nulls.
       let d = "";
       let pen = false;
       s.x.forEach((x, i) => {
@@ -563,9 +572,7 @@
     });
 
     // Crosshair hover for line/step charts.
-    const lines = series.filter(
-      (s) => s.kind === "line" || s.kind === "step" || s.kind === "area",
-    );
+    const lines = series.filter((s) => s.kind === "line" || s.kind === "step");
     if (lines.length && !categorical) {
       const cross = svg("line", {
         y1: m.t,
@@ -605,7 +612,7 @@
           }
           rows.push(
             tipRow(
-              SERIES[series.indexOf(s) % SERIES.length],
+              colorsFor(chart)[series.indexOf(s) % colorsFor(chart).length],
               `${s.name}:`,
               fmt(s.y[best], pct),
             ),
@@ -763,7 +770,17 @@
       const w = Math.floor(host.clientWidth);
       if (w && w !== last) {
         last = w;
-        drawChart(host, chart);
+        try {
+          drawChart(host, chart);
+        } catch (err) {
+          console.error("lab: could not draw", chart.title, err);
+          host.replaceChildren(
+            el("p", {
+              class: "lab-chart__cap",
+              text: "This chart could not be drawn.",
+            }),
+          );
+        }
       }
     };
     if ("ResizeObserver" in window) new ResizeObserver(redraw).observe(host);
@@ -853,9 +870,12 @@
     ]);
   }
 
-  const bySlug = new Map(
-    data.filter((d) => d && d.schema === 1).map((d) => [d.slug, d]),
-  );
+  const usable = (data || []).filter((d) => {
+    if (d && d.schema === 1) return true;
+    console.warn("lab: skipping a result with an unknown schema", d && d.slug);
+    return false;
+  });
+  const bySlug = new Map(usable.map((d) => [d.slug, d]));
   const ordered = [
     ...ORDER.filter((slug) => bySlug.has(slug)).map((slug) => bySlug.get(slug)),
     ...[...bySlug.values()].filter((d) => !ORDER.includes(d.slug)),
@@ -864,16 +884,32 @@
   const sections = ordered.map((s) => {
     const anchor = seen.has(s.category) ? null : s.category;
     seen.add(s.category);
-    return scenario(s, anchor);
+    // One malformed result must not take every other section down with it.
+    try {
+      return scenario(s, anchor);
+    } catch (err) {
+      console.error("lab: could not render", s.slug, err);
+      return el("section", { class: "lab-scn", id: anchor }, [
+        el("div", { class: "wrap" }, [
+          el("h2", { class: "section__title", text: s.title || s.slug }),
+          el("p", {
+            class: "lab-scn__q",
+            text: "This result could not be displayed.",
+          }),
+        ]),
+      ]);
+    }
   });
   if (sections.length) root.replaceChildren(...sections);
-  else
+  else {
+    if (data === null) console.error("lab: /sim/data.js did not load");
     root.append(
       el("div", {
         class: "wrap lab-noscript",
-        text: "No results have been exported yet — run `just sim-export`.",
+        text: "The simulation results are unavailable right now.",
       }),
     );
+  }
 
   window.addEventListener("scroll", hideTip, { passive: true });
 })();
