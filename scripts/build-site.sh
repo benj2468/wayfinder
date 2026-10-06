@@ -28,6 +28,27 @@ cp "$root/assets/logo/wayfinder-icon.svg" "$out/favicon.svg"
 cp "$root/assets/logo/wayfinder-mark.svg" "$out/wayfinder-mark.svg"
 cp "$root/assets/logo/wayfinder-mark-mono.svg" "$out/wayfinder-mark-mono.svg"
 
+# The simulation lab's results must have been computed from the router this
+# tree holds. `just sim-export` stamps www/sim/data/inputs.sha256 with a hash of
+# every input that can move a result; if the tree no longer hashes to it, the
+# numbers on the page describe an older router, and publishing them would be
+# publishing a claim nobody measured. The site workflow regenerates before it
+# gets here; locally, re-export (or set SIM_ALLOW_STALE=1 for a throwaway
+# preview, which says so loudly).
+if [ -d "$root/www/sim/data" ]; then
+  want="$("$root/scripts/sim-inputs-hash.sh")"
+  have="$(cat "$root/www/sim/data/inputs.sha256" 2>/dev/null || true)"
+  if [ "$want" != "$have" ]; then
+    if [ "${SIM_ALLOW_STALE:-}" = 1 ]; then
+      echo "build-site: WARNING: www/sim/data is stale (inputs changed since the last 'just sim-export'); building anyway because SIM_ALLOW_STALE=1" >&2
+    else
+      echo "build-site: www/sim/data is stale: the router, simulator or a scenario changed since the last 'just sim-export'." >&2
+      echo "build-site: run 'just sim-export' and commit the result (or SIM_ALLOW_STALE=1 for a throwaway preview)." >&2
+      exit 1
+    fi
+  fi
+fi
+
 # The simulation lab draws www/sim/data/*.json, but the site's CSP forbids
 # fetch (connect-src 'none'), so the results are bundled into one script the
 # page loads like any other. The JSON files are published too, as the "raw

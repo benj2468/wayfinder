@@ -186,6 +186,15 @@ and scale. Every chart is drawn by `sim/lab.js` from
   (several minutes). It reinstalls the compiled router first, because the sim's
   Python extension does not rebuild itself and a stale one silently shows the
   last build's behaviour.
+- **Stale results are never published.** A complete `just sim-export` stamps
+  `data/inputs.sha256` with a hash of everything that can move a result
+  (`scripts/sim-inputs-hash.sh`: the router crates, the simulator, the
+  scenarios, the lockfiles). `build-site.sh` refuses to build when the tree no
+  longer matches it — `SIM_ALLOW_STALE=1` overrides for a throwaway preview —
+  and the `site` workflow, which also runs when those inputs change on `main`,
+  regenerates the results in the devShell before building instead of failing.
+  Regenerated results are published but not committed; commit a local
+  `just sim-export` to bring the repository's copy back in step.
 - **The data ships as a script, not a fetch.** The CSP is `connect-src 'none'`,
   so `build-site.sh` concatenates `data/*.json` into `/sim/data.js`
   (`window.WF_SIM`). The JSON files are published as well — each section links

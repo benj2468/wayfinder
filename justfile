@@ -370,12 +370,17 @@ site-serve: site-build
 # refreshing its numbers is re-running them — never hand-editing the data. The
 # sim's compiled router does not rebuild itself (it is a Python extension), so
 # reinstall it first or the page will show the last build's behaviour.
+#
+# Only a complete export stamps `inputs.sha256` (`scripts/sim-inputs-hash.sh`):
+# it is what `build-site.sh` checks to refuse publishing results computed from
+# an older router, so a run that stopped halfway must leave the old stamp.
 [doc("Re-run every showcase scenario and refresh www/sim/data (several minutes).")]
 sim-export:
     uv sync --group sim --reinstall-package wayfinder-py
     for s in failover captured_device mountain_relay satellite_relay coverage_per_relay crowded_lora battery_life jammer_map scale; do \
         uv run --group sim python sim/scenarios/$s.py --export www/sim/data || exit 1; \
     done
+    scripts/sim-inputs-hash.sh > www/sim/data/inputs.sha256
 
 [doc("Deploy the landing page to Cloudflare Pages (needs CLOUDFLARE_API_TOKEN).")]
 site-deploy branch="main": site-build
