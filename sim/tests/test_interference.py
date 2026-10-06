@@ -114,3 +114,17 @@ def test_interference_at_reports_total_jammer_power():
     sim.add_jammer(Jammer("j", mobility=Static(Vec3(210.0, 0.0, 0.0)), power_dbm=20.0))
     level = sim.interference_dbm("b")
     assert level is not None and level > -60.0
+
+
+def test_jammer_windows_and_scopes_are_validated():
+    with pytest.raises(ValueError):
+        Jammer("j", mobility=Static(Vec3()), power_dbm=10.0, active=(5.0, 5.0))
+    with pytest.raises(TypeError):
+        Jammer("j", mobility=Static(Vec3()), power_dbm=10.0, links="a-b")
+
+
+def test_a_jammer_is_active_at_the_first_instant_of_its_window_on_both_paths():
+    j = Jammer("j", mobility=Static(Vec3()), power_dbm=10.0, active=(5.0, 6.0))
+    assert j.is_active(5.0)
+    assert j.overlaps(5.0, 5.0)
+    assert not j.overlaps(6.0, 6.0)

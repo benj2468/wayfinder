@@ -124,3 +124,24 @@ def test_next_hop_and_route_path_follow_the_originator_tables():
     assert sim.next_hop("a", "b") == "b"
     assert sim.route_path("a", "c") == ("a", "b", "c")
     assert sim.route_path("a", "a") == ("a",)
+
+
+def test_two_links_may_not_share_a_name():
+    """Radios, cuts, taps and jammer scopes are all keyed on a link's name, so
+    two links called "a-b" would silently share all of them."""
+    nodes = [Node(n, trickle=FAST) for n in ("a", "b")]
+    with pytest.raises(ValueError):
+        Simulation(
+            nodes, [pair("a", "b", PerfectWire()), pair("a", "b", PerfectWire())]
+        )
+
+
+def test_overlapping_failure_windows_are_refused():
+    sim = _diamond_sim()
+    sim.fail_node("b", at_s=5.0, recover_s=10.0)
+    with pytest.raises(ValueError):
+        sim.fail_node("b", at_s=8.0, recover_s=12.0)
+    sim.fail_link("a-c", at_s=5.0, recover_s=10.0)
+    with pytest.raises(ValueError):
+        sim.fail_link("a-c", at_s=9.0)
+    sim.fail_node("b", at_s=10.0, recover_s=11.0)  # back to back is fine

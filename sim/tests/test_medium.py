@@ -204,3 +204,47 @@ def test_nodes_on_slow_schedules_do_not_transmit_in_lockstep():
     assert sim.radio_stats("a").rx_frames > 0
     assert sim.radio_stats("b").rx_frames > 0
     assert sim.has_route("a", "b")
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def test_frames_queued_before_a_reboot_die_with_the_old_router():
+    """A reboot loses everything the old router held — including frames still
+    waiting for the air. Without that, the rebooted node transmits its
+    predecessor's queue."""
+    sim = _three(Medium(phy=FixedRate(bitrate_bps=1_000)))
+    for _ in range(4):
+        sim.inject("a", _garbage(), at_s=5.0)
+    sim.fail_node("a", at_s=5.01, recover_s=5.02)
+    sim.run(until_s=10.0)
+    # The frame on the air when the node died is cut off too.
+    assert sim.radio_stats("a").tx_frames <= 1
+    assert sim.radio_stats("b").rx_frames == 0
+
+
+def test_a_reception_dies_when_its_transmitter_powers_off_mid_frame():
+    medium = Medium(phy=FixedRate(bitrate_bps=1_000))
+    sim = _three(medium)
+    sim.inject("a", _garbage(), at_s=5.0)
+    sim.fail_node("a", at_s=5.01)
+    sim.run(until_s=10.0)
+    assert sim.radio_stats("b").rx_frames == 0
+
+
+def test_radio_stats_is_a_snapshot_not_the_live_counters():
+    sim = _three(Medium(phy=FixedRate(bitrate_bps=10_000)))
+    before = sim.radio_stats("a")
+    sim.inject("a", _garbage(), at_s=5.0)
+    sim.run(until_s=6.0)
+    assert before.tx_frames == 0
+    assert (sim.radio_stats("a") - before).tx_frames == 1
+
+
+def test_phy_parameters_are_validated():
+    with pytest.raises(ValueError):
+        FixedRate(bitrate_bps=0)
+    with pytest.raises(ValueError):
+        FixedRate(bitrate_bps=1000, overhead_bytes=-1)
+    with pytest.raises(ValueError):
+        LoRaPhy(bw_hz=0)

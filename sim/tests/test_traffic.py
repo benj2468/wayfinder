@@ -140,3 +140,14 @@ def test_restored_after_is_none_when_delivery_never_steadies():
         if seq % 2 == 0:
             flow.record_received(seq, seq * 0.1)
     assert flow.restored_after(0.0, window_s=1.0, ratio=0.95) is None
+
+
+def test_a_flow_refuses_out_of_order_sends_and_unknown_receipts():
+    flow = Flow(src="a", dest="b", flow_id=0)
+    flow.record_sent(0, 1.0)
+    with pytest.raises(ValueError):
+        flow.record_sent(0, 2.0)  # duplicate seq
+    with pytest.raises(ValueError):
+        flow.record_sent(1, 0.5)  # earlier than the last send
+    with pytest.raises(ValueError):
+        flow.record_received(7, 3.0)  # never sent
