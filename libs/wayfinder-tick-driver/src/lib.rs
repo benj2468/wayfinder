@@ -859,7 +859,7 @@ mod tests {
             .collect();
 
         // One shared segment: every frame anyone sends, everyone else hears.
-        let mut shuttle = |nodes: &mut Vec<Driver>, now: Duration| -> Vec<Vec<u8>> {
+        let shuttle = |nodes: &mut Vec<Driver>, now: Duration| -> Vec<Vec<u8>> {
             let mut aired = Vec::new();
             for i in 0..nodes.len() {
                 nodes[i].tick(now);
