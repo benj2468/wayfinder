@@ -165,6 +165,12 @@ def damage_reach_m(runs: Sequence[JamRun], threshold: float = 0.5) -> float:
     return max(bad) if bad else 0.0
 
 
+def where_damaging(reach_m: float, step_m: float = STEP_M) -> str:
+    """`damage_reach_m` as words: a reach inside one grid step of HQ means the
+    only damaging positions were HQ's own cell."""
+    return "on top of HQ" if reach_m < step_m else f"within {reach_m:.0f} m of HQ"
+
+
 def print_summary(baseline: JamRun, maps: dict[float, list[JamRun]]) -> None:
     print(
         f"Jammer map — {len(node_sites())} radios, every node streaming to HQ at {RATE_HZ:g}/s"
@@ -217,7 +223,7 @@ def showcase(
             Headline(
                 f"{weak_bad} of {len(weak_runs)}",
                 f"positions where a {weak:.0f} dBm jammer halves traffic",
-                f"it has to stand within ~{damage_reach_m(weak_runs):.0f} m of HQ; elsewhere the mesh routes around it",
+                f"only {where_damaging(damage_reach_m(weak_runs), step_m)}; elsewhere the mesh routes around it",
             ),
             Headline(
                 f"{strong_bad} of {len(strong_runs)}",
@@ -227,7 +233,9 @@ def showcase(
             Headline(
                 f"{damage_reach_m(strong_runs):.0f} m",
                 f"from HQ is the farthest a {strong:.0f} dBm jammer still halved traffic",
-                f"{damage_reach_m(weak_runs):.0f} m for a {weak:.0f} dBm one",
+                f"{damage_reach_m(weak_runs):.0f} m for a {weak:.0f} dBm one (its only damaging spot)"
+                if damage_reach_m(weak_runs) < step_m
+                else f"{damage_reach_m(weak_runs):.0f} m for a {weak:.0f} dBm one",
             ),
         ],
         summary=(
@@ -236,8 +244,8 @@ def showcase(
             f"{len(grid_axes(step_m)[0])}×{len(grid_axes(step_m)[1])} grid. Jamming happens at the "
             f"receiver: a frame dies when the jammer's power where it lands drowns the signal. A weak "
             f"{weak:.0f} dBm jammer deafens only the radio it stands beside, and the mesh routes around "
-            f"it. It does real damage from {weak_bad} of {len(weak_runs)} positions, all within "
-            f"{damage_reach_m(weak_runs):.0f} m of HQ, "
+            f"it. It does real damage from {weak_bad} of {len(weak_runs)} positions, all "
+            f"{where_damaging(damage_reach_m(weak_runs), step_m)}, "
             f"the one receiver every packet has to reach. At {strong:.0f} dBm the picture changes. A "
             f"receiver can no longer hear its 450 m neighbour from several hundred metres away, so one "
             f"jammer deafens several radios at once, and there's no clean path left to route around "
