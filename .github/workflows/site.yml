@@ -19,7 +19,7 @@
 #
 # **The simulation lab is never published stale.** `/sim/` shows results the
 # scenario scripts computed by running the router, and `www/sim/data/
-# inputs.sha256` records which router (`scripts/sim-inputs-hash.sh`). This
+# inputs.sha256` records which router (`scripts/sim-inputs-hash.py`). This
 # workflow therefore also runs when the router, the simulator or a scenario
 # changes on `main`, and when the tree no longer matches the stamp it
 # regenerates every result in the devShell (`just sim-export`, ~15-25 minutes)
@@ -42,13 +42,13 @@ on:
       - "scripts/build-site.sh"
       - ".github/workflows/site.yml"
       # What the simulation lab's results are computed from — kept in step
-      # with scripts/sim-inputs-hash.sh, which decides whether to regenerate.
+      # with scripts/sim-inputs-hash.py, which decides whether to regenerate.
       - "libs/**"
       - "sim/**"
-      - "Cargo.lock"
+      - "Cargo.toml"
       - "uv.lock"
       - "pyproject.toml"
-      - "scripts/sim-inputs-hash.sh"
+      - "scripts/sim-inputs-hash.py"
       - "justfile"
   workflow_dispatch:
 # Never two uploads at once. A newer merge displacing a still-pending older run
@@ -70,13 +70,12 @@ jobs:
       - name: Are the simulation lab's results current?
         id: sim
         run: |
-          want="$(scripts/sim-inputs-hash.sh)"
+          want="$(scripts/sim-inputs-hash.py)"
           have="$(cat www/sim/data/inputs.sha256 2>/dev/null || true)"
           if [ "$want" = "$have" ]; then
             echo "stale=false" >> "$GITHUB_OUTPUT"
           else
             echo "stale=true" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Simulation results regenerated::www/sim/data was computed from an older router; this run regenerates it before publishing. Commit a local 'just sim-export' to update the repository's copy."
           fi
       - if: steps.sim.outputs.stale == 'true'
         uses: ./.github/actions/nix
@@ -87,7 +86,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       - name: Regenerate the simulation lab's results
         if: steps.sim.outputs.stale == 'true'
-        run: nix develop --command just sim-export
+        run: |
+          nix develop --command just sim-export
+          echo "::warning title=Simulation results regenerated::www/sim/data in the repository was computed from an older router; this run published freshly regenerated results instead. Commit a local 'just sim-export' to bring the repository's copy in step (until then every deploy regenerates)."
       # build-site.sh refuses stale results itself, so a regeneration that
       # silently failed to stamp fails here rather than publishing old numbers.
       - run: ./scripts/build-site.sh dist/site

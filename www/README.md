@@ -188,7 +188,7 @@ and scale. Every chart is drawn by `sim/lab.js` from
   last build's behaviour.
 - **Stale results are never published.** A complete `just sim-export` stamps
   `data/inputs.sha256` with a hash of everything that can move a result
-  (`scripts/sim-inputs-hash.sh`: the router crates, the simulator, the
+  (`scripts/sim-inputs-hash.py`: the router crates, the simulator, the
   scenarios, the lockfiles). `build-site.sh` refuses to build when the tree no
   longer matches it — `SIM_ALLOW_STALE=1` overrides for a throwaway preview —
   and the `site` workflow, which also runs when those inputs change on `main`,
