@@ -61,9 +61,16 @@ class _Reception:
     """One frame arriving at one receiver's radio over a contended medium."""
 
     src: str
+    src_boot: int
+    """The transmitter's boot epoch when it keyed up: if it powers off before
+    the frame ends, the frame is cut off."""
     start_ms: float
     end_ms: float
     rssi_dbm: float
+    has_rssi: bool
+    """Whether the channel reported a signal level. One that does not
+    (`PerfectWire`) collides at equal power but is never jammed — the same
+    rule the uncontended path applies."""
     frame: bytes
     metrics: wf.PyLinkMetrics
     delivery_probability: float
@@ -76,7 +83,9 @@ class _Reception:
 class _Radio:
     """One node's radio on one contended link."""
 
-    queue: deque[tuple[int, bytes]] = dataclasses.field(default_factory=deque)
+    queue: deque[tuple[int, int, bytes]] = dataclasses.field(default_factory=deque)
+    """Waiting frames as `(boot, iface, frame)`: the sender's boot epoch, so a
+    frame its previous router queued is never sent by the rebooted one."""
     sending: bool = False
     off_until_ms: float = 0.0
     tx_intervals: list[tuple[float, float]] = dataclasses.field(default_factory=list)
@@ -99,6 +108,8 @@ class _NodeState:
     trickle: list[tuple[int, int]]
     keepalive: list[int | None]
     keypair: wf.PyKeypair | None = None
+    """This node's mesh identity, when it has one. Retained so a scenario can
+    sign or re-enroll on its behalf mid-run."""
     up: bool = True
     # Bumped on every reboot, so a frame already in flight to the old router
     # is not delivered into the new one's queue as if it had just arrived.
@@ -108,8 +119,6 @@ class _NodeState:
     inbox: deque[bytes] = dataclasses.field(default_factory=deque)
     tx_frames: int = 0
     tx_bytes: int = 0
-    """This node's mesh identity, when it has one. Retained so a scenario can
-    sign or re-enroll on its behalf mid-run."""
 
 
 class Simulation:
@@ -133,6 +142,13 @@ class Simulation:
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate node names: {names!r}")
         name_set = set(names)
+        link_names = [link.name for link in links]
+        if len(set(link_names)) != len(link_names):
+            # Radios, cuts, wiretaps and jammer scopes are all keyed on a
+            # link's name, so two links called "a-b" would silently share them.
+            raise ValueError(
+                f"duplicate link names: {link_names!r} — give parallel links a name="
+            )
         for link in links:
             for endpoint in link.endpoints:
                 if endpoint not in name_set:
@@ -249,6 +265,7 @@ class Simulation:
         self._probes: dict[str, Probe] = {}
         self._recorder: Recorder | None = None
         self._down_links: set[str] = set()
+        self._failure_windows: dict[tuple[str, str], list[tuple[float, float]]] = {}
         self._radios: dict[tuple[str, str], _Radio] = {}
         self._jammers: list[Jammer] = []
         self._receivers: dict[tuple[int, str], tuple[str, ...]] = {}
@@ -554,8 +571,7 @@ class Simulation:
         """
         if node not in self._states:
             raise KeyError(node)
-        if recover_s is not None and recover_s <= at_s:
-            raise ValueError(f"recover_s={recover_s} must be after at_s={at_s}")
+        self._claim_window(("node", node), at_s, recover_s)
         self.env.process(self._fail_node_proc(node, at_s, recover_s))
 
     def fail_link(
@@ -566,9 +582,25 @@ class Simulation:
         blocked, with both ends still running."""
         if not any(existing.name == link for existing in self._links):
             raise KeyError(f"no link named {link!r}")
+        self._claim_window(("link", link), at_s, recover_s)
+        self.env.process(self._fail_link_proc(link, at_s, recover_s))
+
+    def _claim_window(
+        self, key: tuple[str, str], at_s: float, recover_s: float | None
+    ) -> None:
+        """Record a failure window, refusing one that overlaps another for the
+        same node or link: the first recovery would bring it back while the
+        later window still wants it down."""
         if recover_s is not None and recover_s <= at_s:
             raise ValueError(f"recover_s={recover_s} must be after at_s={at_s}")
-        self.env.process(self._fail_link_proc(link, at_s, recover_s))
+        end = float("inf") if recover_s is None else recover_s
+        for start, stop in self._failure_windows.setdefault(key, []):
+            if at_s < stop and start < end:
+                raise ValueError(
+                    f"{key[0]} {key[1]!r}: failure window [{at_s}, {recover_s}) overlaps "
+                    f"[{start}, {stop if stop != float('inf') else None})"
+                )
+        self._failure_windows[key].append((at_s, end))
 
     def is_up(self, node: str) -> bool:
         """Whether `node` is powered on right now."""
@@ -619,9 +651,9 @@ class Simulation:
 
     def radio_stats(self, node: str) -> RadioStats:
         """What `node`'s radios have done on contended (`Link.medium`) links:
-        airtime, frames, and every way a reception was lost. All zero for a
-        node with no such link."""
-        return self._radio_stats[node]
+        airtime, frames, and every way a reception was lost (`jammed` counts
+        on any link). A snapshot: subtract two for what happened between."""
+        return dataclasses.replace(self._radio_stats[node])
 
     def energy_mj(self, node: str, model: EnergyModel) -> float:
         """Energy `node`'s radios have used so far under `model`, from its
@@ -1037,22 +1069,27 @@ class Simulation:
         the radio is idle and owes no off-time, into its queue otherwise."""
         assert link.medium is not None
         radio = self._radio(src, link)
+        entry = (self._states[src].boot, iface, frame)
         if not radio.sending:
             radio.sending = True
             first = None
             if radio.off_until_ms <= self.env.now:
-                first = (iface, frame)
+                first = entry
             else:
-                radio.queue.append((iface, frame))
+                radio.queue.append(entry)
             self.env.process(self._radio_proc(link, src, radio, first))
             return
         if len(radio.queue) >= link.medium.queue_limit:
             self._radio_stats[src].queue_drops += 1
             return
-        radio.queue.append((iface, frame))
+        radio.queue.append(entry)
 
     def _radio_proc(
-        self, link: Link, src: str, radio: _Radio, first: tuple[int, bytes] | None
+        self,
+        link: Link,
+        src: str,
+        radio: _Radio,
+        first: tuple[int, int, bytes] | None,
     ):
         assert link.medium is not None
         medium = link.medium
@@ -1070,12 +1107,17 @@ class Simulation:
                 if not radio.queue:
                     break
                 pending = radio.queue.popleft()
-            _, frame = pending
+            boot, _, frame = pending
             pending = None
             if not state.up or link.name in self._down_links:
                 # Powered off or cut with frames still queued: they die with it.
+                stats.outage_losses += 1 + len(radio.queue)
                 radio.queue.clear()
                 break
+            if boot != state.boot:
+                # Queued by the router this node had before it rebooted.
+                stats.outage_losses += 1
+                continue
             airtime_ms = medium.phy.airtime_s(len(frame)) * 1000.0
             self._transmit(link, src, frame, airtime_ms)
             stats.tx_frames += 1
@@ -1113,9 +1155,11 @@ class Simulation:
             _prune(rx_radio, now)
             reception = _Reception(
                 src=src,
+                src_boot=self._states[src].boot,
                 start_ms=now,
                 end_ms=end,
                 rssi_dbm=0.0 if rssi is None else float(rssi),
+                has_rssi=rssi is not None,
                 frame=frame,
                 metrics=sample.metrics,
                 delivery_probability=sample.delivery_probability,
@@ -1134,9 +1178,13 @@ class Simulation:
         assert link.medium is not None
         yield self.env.timeout(rec.end_ms - self.env.now)
         dst_state = self._states[dst]
-        if not dst_state.up or dst_state.boot != rec.boot:
-            return
         stats = self._radio_stats[dst]
+        if not dst_state.up or dst_state.boot != rec.boot:
+            stats.outage_losses += 1  # the receiver powered off mid-frame
+            return
+        if self._states[rec.src].boot != rec.src_boot:
+            stats.outage_losses += 1  # the transmitter powered off mid-frame
+            return
         if any(s < rec.end_ms and e > rec.start_ms for s, e in radio.tx_intervals):
             stats.half_duplex_losses += 1
             return
@@ -1148,7 +1196,7 @@ class Simulation:
             and other.end_ms > rec.start_ms
         )
         jam_mw = 0.0
-        if self._jammers:
+        if self._jammers and rec.has_rssi:
             jam_mw = self._jamming_mw(
                 link,
                 dst_state.node.mobility.position(rec.start_ms / 1000.0),
@@ -1168,11 +1216,13 @@ class Simulation:
         if self._delivery_rng.random() >= rec.delivery_probability:
             stats.noise_losses += 1
             return
-        stats.rx_frames += 1
         if rec.latency_ms > 0:
             yield self.env.timeout(rec.latency_ms)
             if not dst_state.up or dst_state.boot != rec.boot:
+                stats.outage_losses += 1
                 return
+        # Counted only once the router actually has it.
+        stats.rx_frames += 1
         self._push_rx(dst_state, rec.iface, rec.frame, rec.metrics)
 
     def _inject_proc(self, src: str, frame: bytes, at_s: float, link: str | None):
@@ -1225,11 +1275,17 @@ class Simulation:
         yield from self._wait_until(at_s)
         state = self._states[node]
         state.up = False
+        # A new epoch from the moment power goes: anything in flight to or from
+        # the dead router, or still queued on its radios, belongs to the old one.
+        state.boot += 1
         state.inbox.clear()
+        for (owner, _), radio in self._radios.items():
+            if owner == node:
+                self._radio_stats[node].outage_losses += len(radio.queue)
+                radio.queue.clear()
         if recover_s is None:
             return
         yield from self._wait_until(recover_s)
-        state.boot += 1
         state.driver = self._build_driver(
             state.node, state.mac, state.trickle, state.keepalive, state.keypair
         )

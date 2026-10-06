@@ -52,8 +52,10 @@ class Recovery:
     """What a flow went through after an event at `event_s`.
 
     `recovered_s` is the time from the event to the send time of the first
-    packet sent at or after it that arrived — the "time to reroute" a user
-    experiences — or `None` if nothing sent after the event ever arrived.
+    packet sent at or after it that arrived, or `None` if nothing sent after
+    the event ever arrived. That is the *first* packet through, which can
+    slip across a path still settling; `Flow.restored_after` is the time to
+    sustained delivery, which is what a user experiences as the outage.
     `lost` counts the packets sent from the event up to that one (or to the
     end of the flow, when it never recovered).
     """
@@ -75,12 +77,24 @@ class Flow:
     received: dict[int, float] = dataclasses.field(default_factory=dict)
 
     def record_sent(self, seq: int, t_s: float) -> None:
-        """Note that packet `seq` left `src` at `t_s`."""
+        """Note that packet `seq` left `src` at `t_s`. Sends must arrive in
+        order — the next seq, no earlier than the last — since every analysis
+        below reads `sent` as a time-ordered sequence."""
+        if seq != len(self.sent):
+            raise ValueError(
+                f"flow {self.flow_id}: expected seq {len(self.sent)}, got {seq}"
+            )
+        if self.sent and t_s < self.sent[-1][1]:
+            raise ValueError(
+                f"flow {self.flow_id}: send at {t_s} precedes the last one"
+            )
         self.sent.append((seq, t_s))
 
     def record_received(self, seq: int, t_s: float) -> None:
         """Note that packet `seq` reached `dest` at `t_s`. A duplicate keeps
-        the first arrival."""
+        the first arrival; a seq never sent is refused rather than counted."""
+        if not 0 <= seq < len(self.sent):
+            raise ValueError(f"flow {self.flow_id}: received seq {seq} was never sent")
         self.received.setdefault(seq, t_s)
 
     def _window(

@@ -66,7 +66,8 @@ class Phy(Protocol):
 class LoRaPhy:
     """LoRa time-on-air (Semtech AN1200.13).
 
-    `sf` 7..12, `bw_hz` (125/250/500 kHz), `cr` 1..4 meaning 4/5..4/8,
+    `sf` 6..12 (SF6 needs an implicit header on real radios), `bw_hz`
+    (125/250/500 kHz), `cr` 1..4 meaning 4/5..4/8,
     `preamble` symbols. Low-data-rate optimisation switches on automatically
     when a symbol exceeds 16 ms (SF11/12 at 125 kHz), as the radios require.
 
@@ -90,6 +91,10 @@ class LoRaPhy:
             raise ValueError(f"coding rate {self.cr} outside 1..4 (4/5..4/8)")
         if self.max_payload <= 0:
             raise ValueError("max_payload must be positive")
+        if self.bw_hz <= 0:
+            raise ValueError("bw_hz must be positive")
+        if self.preamble < 0:
+            raise ValueError("preamble must not be negative")
 
     @property
     def symbol_s(self) -> float:
@@ -123,6 +128,12 @@ class FixedRate:
     bitrate_bps: float
     overhead_bytes: int = 0
 
+    def __post_init__(self) -> None:
+        if self.bitrate_bps <= 0:
+            raise ValueError("bitrate_bps must be positive")
+        if self.overhead_bytes < 0:
+            raise ValueError("overhead_bytes must not be negative")
+
     def airtime_s(self, frame_len: int) -> float:
         return (frame_len + self.overhead_bytes) * 8 / self.bitrate_bps
 
@@ -155,7 +166,11 @@ class Medium:
 
 @dataclasses.dataclass
 class RadioStats:
-    """What one node's radios did on media-carrying links, summed over them.
+    """What one node's radios did on media-carrying links, summed over them
+    (`jammed` alone also counts on links with no medium).
+
+    `Simulation.radio_stats` hands out a snapshot; subtract two of them for
+    what happened in between.
 
     `rx_airtime_s` is time spent receiving anything — frames for others and
     frames that collided included, since the radio burns receive power on all
@@ -174,12 +189,24 @@ class RadioStats:
     link, contended or not)."""
     half_duplex_losses: int = 0
     """Receptions lost because this radio was transmitting at the time."""
+    outage_losses: int = 0
+    """Frames lost to a node powering off: queued on, or on the air from, a
+    transmitter that died, or landing on a receiver that had."""
     noise_losses: int = 0
     """Receptions that were alone on the air and lost to the channel anyway."""
     queue_drops: int = 0
     """Frames discarded because the transmit queue was full."""
     duty_wait_s: float = 0.0
     """Total time frames spent waiting out duty-cycle off-time."""
+
+    def __sub__(self, earlier: RadioStats) -> RadioStats:
+        """What happened between `earlier` and this snapshot."""
+        return RadioStats(
+            **{
+                f.name: getattr(self, f.name) - getattr(earlier, f.name)
+                for f in dataclasses.fields(RadioStats)
+            }
+        )
 
 
 @dataclasses.dataclass(frozen=True)

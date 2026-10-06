@@ -43,14 +43,29 @@ class Jammer:
     links: tuple[str, ...] | None = None
     active: tuple[float, float] | None = None
 
+    def __post_init__(self) -> None:
+        if self.active is not None and not self.active[0] < self.active[1]:
+            raise ValueError(
+                f"jammer {self.name!r}: active window {self.active} is empty"
+            )
+        if isinstance(self.links, str):
+            # A bare string would be matched as a substring by `in`.
+            raise TypeError(
+                f"jammer {self.name!r}: links must be a tuple of names, not a str"
+            )
+        if self.links is not None:
+            object.__setattr__(self, "links", tuple(self.links))
+
     def is_active(self, t_s: float) -> bool:
         """Whether it is transmitting at `t_s`."""
         return self.active is None or self.active[0] <= t_s < self.active[1]
 
     def overlaps(self, start_s: float, end_s: float) -> bool:
-        """Whether it transmits at any point in `[start_s, end_s]`."""
+        """Whether it transmits at any point in `[start_s, end_s]` — the same
+        half-open `[start, end)` window `is_active` uses, so an instant query
+        (`start_s == end_s`) agrees with it."""
         return self.active is None or (
-            self.active[0] < end_s and self.active[1] > start_s
+            self.active[0] <= end_s and self.active[1] > start_s
         )
 
     def reaches(self, link: str) -> bool:
