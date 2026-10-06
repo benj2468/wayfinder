@@ -17,6 +17,17 @@
 # - variable `SITE_PROJECT_NAME` — optional, defaults to `wayfinder-site`, the
 #   default of `site_project_name` in `infra/oracle/`.
 #
+# **The simulation lab is never published stale.** `/sim/` shows results the
+# scenario scripts computed by running the router, and `www/sim/data/
+# inputs.sha256` records which router (`scripts/sim-inputs-hash.py`). This
+# workflow therefore also runs when the router, the simulator or a scenario
+# changes on `main`, and when the tree no longer matches the stamp it
+# regenerates every result in the devShell (`just sim-export`, ~15-25 minutes)
+# before building. A run with nothing stale costs what it always did.
+# Regenerated results are published, not committed: commit a local
+# `just sim-export` to bring the repository's copy up to date (the run's
+# notice says when it had to).
+#
 # An environment secret rather than a repository one, with the environment's
 # deployment branches limited to `main`: a repository secret is readable by
 # any workflow on any branch pushed to this repository, while this one is
@@ -30,6 +41,15 @@ on:
       - "assets/logo/**"
       - "scripts/build-site.sh"
       - ".github/workflows/site.yml"
+      # What the simulation lab's results are computed from — kept in step
+      # with scripts/sim-inputs-hash.py, which decides whether to regenerate.
+      - "libs/**"
+      - "sim/**"
+      - "Cargo.toml"
+      - "uv.lock"
+      - "pyproject.toml"
+      - "scripts/sim-inputs-hash.py"
+      - "justfile"
   workflow_dispatch:
 # Never two uploads at once. A newer merge displacing a still-pending older run
 # is fine — both would publish `main`, and the newer `main` is the one wanted.
@@ -41,11 +61,36 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment:
       name: site
       url: https://wayfndr.dev
     steps:
       - uses: actions/checkout@v5
+      - name: Are the simulation lab's results current?
+        id: sim
+        run: |
+          want="$(scripts/sim-inputs-hash.py)"
+          have="$(cat www/sim/data/inputs.sha256 2>/dev/null || true)"
+          if [ "$want" = "$have" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.sim.outputs.stale == 'true'
+        uses: ./.github/actions/nix
+        with:
+          cache-url: ${{ vars.NIX_CACHE_URL }}
+          public-key: ${{ vars.NIX_CACHE_PUBLIC_KEY }}
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      - name: Regenerate the simulation lab's results
+        if: steps.sim.outputs.stale == 'true'
+        run: |
+          nix develop --command just sim-export
+          echo "::warning title=Simulation results regenerated::www/sim/data in the repository was computed from an older router; this run published freshly regenerated results instead. Commit a local 'just sim-export' to bring the repository's copy in step (until then every deploy regenerates)."
+      # build-site.sh refuses stale results itself, so a regeneration that
+      # silently failed to stamp fails here rather than publishing old numbers.
       - run: ./scripts/build-site.sh dist/site
       - name: Publish to Cloudflare Pages
         env:

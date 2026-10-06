@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 
 from .channel import Channel
+from .medium import Medium
 
 
 @dataclasses.dataclass
@@ -20,13 +21,16 @@ class Link:
     overrides every member's `Node.trickle` for the interface this link
     creates on that node. `tx_keepalive_interval_ms`, if set, likewise
     overrides every member's `Node.tx_keepalive_interval_ms` for that
-    interface."""
+    interface. `medium`, if set, makes the segment contended: frames take
+    airtime, collide and obey a duty cycle (see `medium.py`); `None` keeps
+    instantaneous, collision-free delivery."""
 
     endpoints: tuple[str, ...]
     channel: Channel
     name: str | None = None
     trickle: tuple[int, int] | None = None
     tx_keepalive_interval_ms: int | None = None
+    medium: Medium | None = None
 
     def __post_init__(self) -> None:
         if len(set(self.endpoints)) < 2:

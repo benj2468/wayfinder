@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import math
+from collections import deque
 from collections.abc import Callable, Sequence
 from random import Random
 from typing import Any
@@ -25,11 +27,14 @@ import wayfinder_py as wf
 
 from . import NoLinkError
 from .adversary import Wiretap
+from .interference import DEFAULT_CAPTURE_DB, Jammer, sum_dbm
 from .link import Link
-from .mobility import Vec3
+from .medium import EnergyModel, RadioStats
+from .mobility import Static, Vec3
 from .node import Node
 from .recorder import Recorder
 from .security import Mesh
+from .traffic import Flow, decode_payload, encode_payload
 
 Probe = Callable[["Simulation"], Any]
 """A function of the running `Simulation`, sampled once per recorder tick —
@@ -43,7 +48,54 @@ _AUTO_MAC_OUI = (0x02, 0x00, 0x00, 0x00, 0x00)
 # Trickle i_min when `Node.tick_interval_ms` isn't set explicitly: fine
 # enough to resolve that node's own timer, no finer.
 _MIN_TICK_INTERVAL_MS = 10
+_MAX_TICK_INTERVAL_MS = 1000
 _TICK_INTERVAL_DIVISOR = 4
+"""A derived tick is `i_min / 4`, clamped to `[10, 1000]` ms. The ceiling
+matters on slow schedules: a node's timers only fire on its ticks, so an
+18-second tick for a 75-second `i_min` quantises every emission onto a coarse
+grid — and with every node on the same grid, onto the same instants."""
+
+
+@dataclasses.dataclass
+class _Reception:
+    """One frame arriving at one receiver's radio over a contended medium."""
+
+    src: str
+    src_boot: int
+    """The transmitter's boot epoch when it keyed up: if it powers off before
+    the frame ends, the frame is cut off."""
+    start_ms: float
+    end_ms: float
+    rssi_dbm: float
+    has_rssi: bool
+    """Whether the channel reported a signal level. One that does not
+    (`PerfectWire`) collides at equal power but is never jammed — the same
+    rule the uncontended path applies."""
+    frame: bytes
+    metrics: wf.PyLinkMetrics
+    delivery_probability: float
+    iface: int
+    boot: int
+    latency_ms: float
+
+
+@dataclasses.dataclass
+class _Radio:
+    """One node's radio on one contended link."""
+
+    queue: deque[tuple[int, int, bytes]] = dataclasses.field(default_factory=deque)
+    """Waiting frames as `(boot, iface, frame)`: the sender's boot epoch, so a
+    frame its previous router queued is never sent by the rebooted one."""
+    sending: bool = False
+    off_until_ms: float = 0.0
+    tx_intervals: list[tuple[float, float]] = dataclasses.field(default_factory=list)
+    receptions: list[_Reception] = dataclasses.field(default_factory=list)
+    rx_busy_until_ms: float = 0.0
+
+
+_HISTORY_MS = 60_000.0
+"""How long a radio remembers past transmissions and receptions, for judging
+overlap with ones still in progress. Far longer than any single airtime."""
 
 
 @dataclasses.dataclass
@@ -53,9 +105,20 @@ class _NodeState:
     driver: wf.PyDriver
     interfaces: dict[int, Link]  # this node's interface index -> the Link on it
     tick_interval_ms: int
+    trickle: list[tuple[int, int]]
+    keepalive: list[int | None]
     keypair: wf.PyKeypair | None = None
     """This node's mesh identity, when it has one. Retained so a scenario can
     sign or re-enroll on its behalf mid-run."""
+    up: bool = True
+    # Bumped on every reboot, so a frame already in flight to the old router
+    # is not delivered into the new one's queue as if it had just arrived.
+    boot: int = 0
+    # Payloads the router delivered locally that are not stream packets,
+    # waiting for `Simulation.poll_local`.
+    inbox: deque[bytes] = dataclasses.field(default_factory=deque)
+    tx_frames: int = 0
+    tx_bytes: int = 0
 
 
 class Simulation:
@@ -79,6 +142,13 @@ class Simulation:
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate node names: {names!r}")
         name_set = set(names)
+        link_names = [link.name for link in links]
+        if len(set(link_names)) != len(link_names):
+            # Radios, cuts, wiretaps and jammer scopes are all keyed on a
+            # link's name, so two links called "a-b" would silently share them.
+            raise ValueError(
+                f"duplicate link names: {link_names!r} — give parallel links a name="
+            )
         for link in links:
             for endpoint in link.endpoints:
                 if endpoint not in name_set:
@@ -91,6 +161,7 @@ class Simulation:
         # simulated drops (deterministic given `seed`), `_probe_rng` backs
         # `sample_channel` so charting/inspecting a channel never perturbs
         # the delivery outcome by consuming from the same stream.
+        self._seed = seed
         self._delivery_rng = Random(seed)
         self._probe_rng = Random(seed)
 
@@ -170,17 +241,15 @@ class Simulation:
                 mac = node.mac
             else:
                 mac = wf.PyMac(bytes((*_AUTO_MAC_OUI, idx)))
-            features = [
-                wf.PyLinkFeatures(tx_keepalive_interval_ms=ka)
-                for ka in node_keepalive[node.name]
-            ]
-            driver = wf.PyDriver(mac, node_trickle[node.name], features)
-            self._install_credential(node, driver, keypair)
+            driver = self._build_driver(
+                node, mac, node_trickle[node.name], node_keepalive[node.name], keypair
+            )
             tick_interval_ms = node.tick_interval_ms
             if tick_interval_ms is None:
                 i_mins = [t[0] for t in node_trickle[node.name]] or [node.trickle[0]]
-                tick_interval_ms = max(
-                    _MIN_TICK_INTERVAL_MS, min(i_mins) // _TICK_INTERVAL_DIVISOR
+                tick_interval_ms = min(
+                    _MAX_TICK_INTERVAL_MS,
+                    max(_MIN_TICK_INTERVAL_MS, min(i_mins) // _TICK_INTERVAL_DIVISOR),
                 )
             self._states[node.name] = _NodeState(
                 node=node,
@@ -188,14 +257,46 @@ class Simulation:
                 driver=driver,
                 interfaces=node_interfaces[node.name],
                 tick_interval_ms=tick_interval_ms,
+                trickle=node_trickle[node.name],
+                keepalive=node_keepalive[node.name],
                 keypair=keypair,
             )
 
         self._probes: dict[str, Probe] = {}
         self._recorder: Recorder | None = None
+        self._down_links: set[str] = set()
+        self._failure_windows: dict[tuple[str, str], list[tuple[float, float]]] = {}
+        self._radios: dict[tuple[str, str], _Radio] = {}
+        self._jammers: list[Jammer] = []
+        self._receivers: dict[tuple[int, str], tuple[str, ...]] = {}
+        self._radio_stats: dict[str, RadioStats] = {
+            name: RadioStats() for name in names
+        }
+        self._compromised: set[str] = set()
+        self._compromise_discards: dict[str, int] = {}
+        # Wire bytes of every revocation issued, keyed by the revoked node's
+        # name — what a compromised node's firmware watches for and discards.
+        self._revocation_bytes: dict[str, list[bytes]] = {}
+        self._flows: list[Flow] = []
 
         for name in self._states:
             self.env.process(self._tick_proc(name))
+
+    def _build_driver(
+        self,
+        node: Node,
+        mac: wf.PyMac,
+        trickle: list[tuple[int, int]],
+        keepalive: list[int | None],
+        keypair: wf.PyKeypair | None,
+    ) -> wf.PyDriver:
+        """A fresh router for `node` — at construction, and again on every
+        reboot, which is what makes a reboot lose everything the old one
+        learned."""
+        features = [wf.PyLinkFeatures(tx_keepalive_interval_ms=ka) for ka in keepalive]
+        driver = wf.PyDriver(mac, trickle, features)
+        self._install_credential(node, driver, keypair)
+        return driver
 
     # --- identity ---------------------------------------------------------
 
@@ -249,22 +350,70 @@ class Simulation:
         """`node`'s mesh identity, or `None` if it has none."""
         return self._states[node].keypair
 
-    def revoke(self, node: str, *, effective_s: float = 0.0) -> None:
+    def revoke(
+        self,
+        node: str,
+        *,
+        effective_s: float = 0.0,
+        notify: Sequence[str] | None = None,
+    ) -> None:
         """Have the mesh root purge `node`, and hand the signed record to
-        every other member.
+        every other member — or, with `notify`, only to those members.
 
         Delivering it to each member directly models an operator pushing the
         revocation over the management API — which is what a real deployment
         does, because a node that has just been revoked is precisely the one
         you cannot rely on to flood the order that revokes it. Members
-        re-flood it on their own OGMs from there.
+        re-flood it on their own OGMs from there, so `notify=["gateway"]`
+        models the common case of an operator who can reach one node and
+        leaves the mesh to carry the order to the rest; `knows_revoked` then
+        says how far it has got.
         """
         if self._mesh is None:
             raise ValueError("no mesh: nothing to revoke against")
+        targets = [name for name in self._states if name != node]
+        if notify is not None:
+            for name in notify:
+                if name not in self._states:
+                    raise KeyError(name)
+                if name == node:
+                    raise ValueError(f"cannot notify {node!r} of its own revocation")
+            targets = list(notify)
         record = self._mesh.revoke(self.mac(node), effective_s=effective_s)
-        for name, state in self._states.items():
-            if name != node:
-                state.driver.ingest_revocation(record)
+        self._revocation_bytes.setdefault(node, []).append(bytes(record))
+        for name in targets:
+            self._states[name].driver.ingest_revocation(record)
+
+    def compromise(self, node: str) -> None:
+        """Hand `node` to an attacker: from now on it runs firmware that
+        discards any frame carrying a revocation of itself, so it never goes
+        inert and keeps relaying and sending under its still-valid key.
+
+        This is the captured-radio threat. An honest node that hears its own
+        revocation stops (`auth_locked`); a stolen one has no reason to, and a
+        scenario that let it would credit the mesh for an exclusion the
+        attacker performed on themselves. Exclusion then has to come from the
+        members alone, which is the claim worth measuring.
+
+        The filter matches the record's exact wire bytes, which every frame
+        re-flooding that record carries verbatim — so it needs no knowledge of
+        the TVLV layout, and drops the whole frame the way firmware that
+        refused to parse it would.
+        """
+        if node not in self._states:
+            raise KeyError(node)
+        self._compromised.add(node)
+
+    def compromise_discards(self, node: str) -> int:
+        """How many frames carrying its own revocation `node`'s attacker
+        firmware has thrown away. A scenario crediting the members with an
+        exclusion should check this is non-zero: if the filter never fired,
+        the node may have honoured the order and excluded itself."""
+        return self._compromise_discards.get(node, 0)
+
+    def knows_revoked(self, node: str, target: str) -> bool:
+        """Whether `node` holds a revocation naming `target` right now."""
+        return self._states[target].mac in self._states[node].driver.revoked_macs()
 
     def admitted(
         self, node: str, targets: Sequence[str] | None = None
@@ -414,6 +563,145 @@ class Simulation:
             self._flood_proc(src, frame, rate_hz, start_s, duration_s, link)
         )
 
+    # --- failures ---------------------------------------------------------
+
+    def fail_node(
+        self, node: str, *, at_s: float, recover_s: float | None = None
+    ) -> None:
+        """Power `node` off at `at_s` and, if `recover_s` is given, back on
+        then.
+
+        Off means off: it neither ticks nor transmits, and a frame addressed
+        to it is lost on the air. Coming back is a *reboot* rather than a
+        resume — the node gets a fresh router (same address, same credential)
+        that has to relearn the mesh from nothing, which is what a power-cycled
+        board does and what makes recovery time worth measuring at all.
+        """
+        if node not in self._states:
+            raise KeyError(node)
+        self._claim_window(("node", node), at_s, recover_s)
+        self.env.process(self._fail_node_proc(node, at_s, recover_s))
+
+    def fail_link(
+        self, link: str, *, at_s: float, recover_s: float | None = None
+    ) -> None:
+        """Cut `link` at `at_s` (every frame on it is lost) and, if
+        `recover_s` is given, restore it then. A cable pulled or a radio
+        blocked, with both ends still running."""
+        if not any(existing.name == link for existing in self._links):
+            raise KeyError(f"no link named {link!r}")
+        self._claim_window(("link", link), at_s, recover_s)
+        self.env.process(self._fail_link_proc(link, at_s, recover_s))
+
+    def _claim_window(
+        self, key: tuple[str, str], at_s: float, recover_s: float | None
+    ) -> None:
+        """Record a failure window, refusing one that overlaps another for the
+        same node or link: the first recovery would bring it back while the
+        later window still wants it down."""
+        if recover_s is not None and recover_s <= at_s:
+            raise ValueError(f"recover_s={recover_s} must be after at_s={at_s}")
+        end = float("inf") if recover_s is None else recover_s
+        for start, stop in self._failure_windows.setdefault(key, []):
+            if at_s < stop and start < end:
+                raise ValueError(
+                    f"{key[0]} {key[1]!r}: failure window [{at_s}, {recover_s}) overlaps "
+                    f"[{start}, {stop if stop != float('inf') else None})"
+                )
+        self._failure_windows[key].append((at_s, end))
+
+    def is_up(self, node: str) -> bool:
+        """Whether `node` is powered on right now."""
+        return self._states[node].up
+
+    def tx_frames(self, node: str) -> int:
+        """Frames `node`'s router has put on the air so far, across every
+        interface — control and data alike. Survives a reboot (it counts the
+        node's radio, not one router's lifetime); injected frames are not
+        counted, since no router sent them."""
+        return self._states[node].tx_frames
+
+    def tx_bytes(self, node: str) -> int:
+        """Total size of the frames counted by `tx_frames`."""
+        return self._states[node].tx_bytes
+
+    def add_jammer(self, jammer: Jammer) -> None:
+        """Switch on `jammer` (see `interference.py`): from now on every
+        reception on the links it reaches must beat its power by the capture
+        margin."""
+        if jammer.links is not None:
+            known = {link.name for link in self._links}
+            for name in jammer.links:
+                if name not in known:
+                    raise KeyError(f"no link named {name!r}")
+        self._jammers.append(jammer)
+
+    def interference_dbm(self, node: str) -> float | None:
+        """Total power of the jammers active right now at `node`'s position,
+        on any of its links, or `None` when none is."""
+        t_s = self.env.now / 1000.0
+        pos = self.position(node)
+        names = {link.name for link in self._states[node].interfaces.values()}
+        return sum_dbm(
+            j.received_dbm(pos, t_s)
+            for j in self._jammers
+            if j.is_active(t_s) and any(j.reaches(n or "") for n in names)
+        )
+
+    def _jamming_mw(self, link: Link, rx: Vec3, start_s: float, end_s: float) -> float:
+        """Summed power, in mW, of jammers reaching `link` and transmitting
+        at some point in `[start_s, end_s]`, arriving at `rx`."""
+        return sum(
+            10.0 ** (j.received_dbm(rx, start_s) / 10.0)
+            for j in self._jammers
+            if j.reaches(link.name or "") and j.overlaps(start_s, end_s)
+        )
+
+    def radio_stats(self, node: str) -> RadioStats:
+        """What `node`'s radios have done on contended (`Link.medium`) links:
+        airtime, frames, and every way a reception was lost (`jammed` counts
+        on any link). A snapshot: subtract two for what happened between."""
+        return dataclasses.replace(self._radio_stats[node])
+
+    def energy_mj(self, node: str, model: EnergyModel) -> float:
+        """Energy `node`'s radios have used so far under `model`, from its
+        transmit, receive and idle time on contended links."""
+        return model.energy_mj(self.env.now / 1000.0, self._radio_stats[node])
+
+    def average_power_mw(self, node: str, model: EnergyModel) -> float:
+        """`energy_mj` averaged over the time simulated so far."""
+        elapsed_s = self.env.now / 1000.0
+        return self.energy_mj(node, model) / elapsed_s if elapsed_s > 0 else 0.0
+
+    def is_link_up(self, link: str) -> bool:
+        """Whether `link` is carrying frames right now."""
+        return link not in self._down_links
+
+    # --- traffic -----------------------------------------------------------
+
+    def stream(
+        self,
+        src: str,
+        dest: str,
+        *,
+        rate_hz: float,
+        start_s: float,
+        duration_s: float,
+    ) -> Flow:
+        """Send numbered packets from `src` to `dest` at `rate_hz` for
+        `duration_s` from `start_s`, and return the `Flow` recording what
+        arrived. Stream packets are consumed by their flow and never surface
+        through `poll_local`."""
+        for name in (src, dest):
+            if name not in self._states:
+                raise KeyError(name)
+        if rate_hz <= 0:
+            raise ValueError("rate_hz must be positive")
+        flow = Flow(src=src, dest=dest, flow_id=len(self._flows))
+        self._flows.append(flow)
+        self.env.process(self._stream_proc(flow, rate_hz, start_s, duration_s))
+        return flow
+
     # --- probe-facing introspection -----------------------------------
 
     @property
@@ -469,6 +757,32 @@ class Simulation:
         if egress.all or egress.interface is None:
             return "*"
         return self._states[src].interfaces[egress.interface].name
+
+    def next_hop(self, src: str, dest: str) -> str | None:
+        """The neighbour `src` forwards toward `dest` through, by name, or
+        `None` with no usable route. On a shared segment every route leaves
+        by the same link, so this — not `route_via` — is what says which
+        relay is carrying the traffic."""
+        mac = self._states[dest].mac
+        for record in self._states[src].driver.originator_table():
+            if record.originator == mac and record.best_next_hop is not None:
+                return self.node_for_mac(record.best_next_hop)
+        return None
+
+    def route_path(self, src: str, dest: str) -> tuple[str, ...] | None:
+        """The whole path `src`'s traffic to `dest` takes right now, hop by
+        hop through each relay's *own* next-hop choice, or `None` if it breaks
+        anywhere (a hop with no route, or a forwarding loop).
+
+        Each hop's choice is that node's, not `src`'s: BATMAN routes hop by
+        hop, so this is the path a packet would actually walk."""
+        path = [src]
+        while path[-1] != dest:
+            hop = self.next_hop(path[-1], dest)
+            if hop is None or hop in path:
+                return None
+            path.append(hop)
+        return tuple(path)
 
     def link_quality(self, src: str, neighbor: str) -> float | None:
         """`src`'s own estimate of the link it hears `neighbor` on — the EWMA
@@ -561,8 +875,11 @@ class Simulation:
 
     def poll_local(self, node: str) -> bytes | None:
         """Pop the next payload delivered to `node`'s local host, if any —
-        see `wf.PyDriver.poll_local`."""
-        return self._states[node].driver.poll_local()
+        see `wf.PyDriver.poll_local`. Packets belonging to a `stream` are
+        never returned here; their `Flow` consumed them."""
+        state = self._states[node]
+        self._drain_local(state, node)
+        return state.inbox.popleft() if state.inbox else None
 
     # --- setup -----------------------------------------------------------
 
@@ -581,25 +898,55 @@ class Simulation:
     def run(self, until_s: float, *, sample_interval_ms: int = 50) -> Recorder:
         """Run the simulation from wherever it currently is up to `until_s`,
         sampling every registered probe every `sample_interval_ms`."""
-        self._recorder = Recorder(interval_ms=sample_interval_ms)
-        self.env.process(self._sample_proc(sample_interval_ms))
+        recorder = Recorder(interval_ms=sample_interval_ms)
+        self._recorder = recorder
+        self.env.process(self._sample_proc(sample_interval_ms, recorder))
         self.env.run(until=until_s * 1000)
-        return self._recorder
+        return recorder
 
     # --- internal SimPy processes ------------------------------------------
 
     def _tick_node(self, name: str) -> None:
         state = self._states[name]
+        if not state.up:
+            return
         state.driver.tick(int(self.env.now))
         for iface, link in state.interfaces.items():
             frame = state.driver.poll_egress(iface)
             while frame is not None:
+                state.tx_frames += 1
+                state.tx_bytes += len(frame)
                 self._schedule_delivery(link, name, iface, frame)
                 frame = state.driver.poll_egress(iface)
+        self._drain_local(state, name)
+
+    def _drain_local(self, state: _NodeState, name: str) -> None:
+        """Move what the router delivered locally into `state.inbox`,
+        handing stream packets to their flow on the way."""
+        t_s = self.env.now / 1000.0
+        payload = state.driver.poll_local()
+        while payload is not None:
+            decoded = decode_payload(payload)
+            if (
+                decoded is not None
+                and decoded[0] < len(self._flows)
+                and self._flows[decoded[0]].dest == name
+            ):
+                self._flows[decoded[0]].record_received(decoded[1], t_s)
+            else:
+                state.inbox.append(payload)
+            payload = state.driver.poll_local()
 
     def _tick_proc(self, name: str):
         self._tick_node(name)
         state = self._states[name]
+        # Every node runs its own clock: after booting, its tick grid starts
+        # at a phase of its own (seeded by name, so runs stay reproducible).
+        # A shared grid would key every node's timers to the same instants,
+        # and on a half-duplex medium nodes in lockstep never hear each other.
+        phase_ms = Random(f"{self._seed}:{name}").uniform(0.0, state.tick_interval_ms)
+        yield self.env.timeout(phase_ms)
+        self._tick_node(name)
         while True:
             yield self.env.timeout(state.tick_interval_ms)
             self._tick_node(name)
@@ -607,6 +954,11 @@ class Simulation:
     def _schedule_delivery(
         self, link: Link, src_name: str, src_iface: int, frame: bytes
     ) -> None:
+        if link.name in self._down_links or not self._states[src_name].up:
+            return
+        if link.medium is not None:
+            self._enqueue(link, src_name, src_iface, frame)
+            return
         t_s = self.env.now / 1000.0
         # Tap on transmit, not on delivery: a listener hears what went out
         # over the medium, including the frames a lossy channel then drops
@@ -616,17 +968,31 @@ class Simulation:
         for tap in self._taps.get(link.name or "", ()):
             tap.capture(t_s, frame)
         tx_pos = self._states[src_name].node.mobility.position(t_s)
-        for dst_name in link.endpoints:
-            if dst_name == src_name:
-                continue
+        for dst_name in self._receivers_for(link, src_name):
             dst_state = self._states[dst_name]
+            if not dst_state.up:
+                continue
             rx_pos = dst_state.node.mobility.position(t_s)
             sample = link.channel.evaluate(tx_pos, rx_pos, t_s, self._delivery_rng)
+            rssi = sample.metrics.rssi_dbm
+            if self._jammers and rssi is not None:
+                jam_mw = self._jamming_mw(link, rx_pos, t_s, t_s)
+                if (
+                    jam_mw > 0.0
+                    and rssi - 10.0 * math.log10(jam_mw) < DEFAULT_CAPTURE_DB
+                ):
+                    self._radio_stats[dst_name].jammed += 1
+                    continue
             if self._delivery_rng.random() < sample.delivery_probability:
                 dst_iface = self._link_iface[id(link)][dst_name]
                 self.env.process(
                     self._deliver(
-                        sample.latency_ms, dst_state, dst_iface, frame, sample.metrics
+                        sample.latency_ms,
+                        dst_state,
+                        dst_state.boot,
+                        dst_iface,
+                        frame,
+                        sample.metrics,
                     )
                 )
 
@@ -634,13 +1000,239 @@ class Simulation:
         self,
         latency_ms: float,
         dst_state: _NodeState,
+        boot: int,
         dst_iface: int,
         frame: bytes,
         metrics: wf.PyLinkMetrics,
     ):
         if latency_ms > 0:
             yield self.env.timeout(latency_ms)
+        # Lost if the receiver went down (or down and back up) mid-flight.
+        if not dst_state.up or dst_state.boot != boot:
+            return
+        self._push_rx(dst_state, dst_iface, frame, metrics)
+
+    def _push_rx(
+        self,
+        dst_state: _NodeState,
+        dst_iface: int,
+        frame: bytes,
+        metrics: wf.PyLinkMetrics,
+    ) -> None:
+        """Hand a frame that survived the air to `dst_state`'s router —
+        unless that node is compromised and the frame carries its own
+        revocation, which its firmware discards."""
+        name = dst_state.node.name
+        if name in self._compromised and any(
+            record in frame for record in self._revocation_bytes.get(name, ())
+        ):
+            self._compromise_discards[name] = self._compromise_discards.get(name, 0) + 1
+            return
         dst_state.driver.push_rx(dst_iface, frame, metrics)
+
+    # --- contended medium ---------------------------------------------------
+
+    def _receivers_for(self, link: Link, src: str) -> tuple[str, ...]:
+        """The members of `link` worth evaluating a frame from `src` at.
+
+        Everyone but `src`, except that where `src` and a receiver are both
+        `Static` and the channel has a hard range cutoff (`max_range_m`, on it
+        or on the model it wraps), a receiver beyond that range is dropped once
+        and for all. On a large segment that is most of it, and asking the
+        channel per frame for an answer fixed at construction is the dominant
+        cost of a big simulation.
+        """
+        key = (id(link), src)
+        cached = self._receivers.get(key)
+        if cached is not None:
+            return cached
+        others = [n for n in link.endpoints if n != src]
+        max_range = getattr(link.channel, "max_range_m", None)
+        if max_range is None:
+            max_range = getattr(
+                getattr(link.channel, "base", None), "max_range_m", None
+            )
+        src_mob = self._states[src].node.mobility
+        if max_range is not None and isinstance(src_mob, Static):
+            src_pos = src_mob.position(0.0)
+            others = [
+                n
+                for n in others
+                if not isinstance(self._states[n].node.mobility, Static)
+                or src_pos.distance_to(self._states[n].node.mobility.position(0.0))
+                <= max_range
+            ]
+        result = tuple(others)
+        self._receivers[key] = result
+        return result
+
+    def _radio(self, node: str, link: Link) -> _Radio:
+        key = (node, link.name or "")
+        radio = self._radios.get(key)
+        if radio is None:
+            radio = self._radios[key] = _Radio()
+        return radio
+
+    def _enqueue(self, link: Link, src: str, iface: int, frame: bytes) -> None:
+        """Put `frame` on `src`'s radio for `link`: straight onto the air if
+        the radio is idle and owes no off-time, into its queue otherwise."""
+        assert link.medium is not None
+        radio = self._radio(src, link)
+        entry = (self._states[src].boot, iface, frame)
+        if not radio.sending:
+            radio.sending = True
+            first = None
+            if radio.off_until_ms <= self.env.now:
+                first = entry
+            else:
+                radio.queue.append(entry)
+            self.env.process(self._radio_proc(link, src, radio, first))
+            return
+        if len(radio.queue) >= link.medium.queue_limit:
+            self._radio_stats[src].queue_drops += 1
+            return
+        radio.queue.append(entry)
+
+    def _radio_proc(
+        self,
+        link: Link,
+        src: str,
+        radio: _Radio,
+        first: tuple[int, int, bytes] | None,
+    ):
+        assert link.medium is not None
+        medium = link.medium
+        stats = self._radio_stats[src]
+        state = self._states[src]
+        pending = first
+        while True:
+            if pending is None:
+                if not radio.queue:
+                    break
+                wait_ms = radio.off_until_ms - self.env.now
+                if wait_ms > 0:
+                    stats.duty_wait_s += wait_ms / 1000.0
+                    yield self.env.timeout(wait_ms)
+                if not radio.queue:
+                    break
+                pending = radio.queue.popleft()
+            boot, _, frame = pending
+            pending = None
+            if not state.up or link.name in self._down_links:
+                # Powered off or cut with frames still queued: they die with it.
+                stats.outage_losses += 1 + len(radio.queue)
+                radio.queue.clear()
+                break
+            if boot != state.boot:
+                # Queued by the router this node had before it rebooted.
+                stats.outage_losses += 1
+                continue
+            airtime_ms = medium.phy.airtime_s(len(frame)) * 1000.0
+            self._transmit(link, src, frame, airtime_ms)
+            stats.tx_frames += 1
+            stats.tx_airtime_s += airtime_ms / 1000.0
+            yield self.env.timeout(airtime_ms)
+            radio.off_until_ms = (
+                self.env.now + medium.off_time_s(airtime_ms / 1000.0) * 1000.0
+            )
+        radio.sending = False
+
+    def _transmit(self, link: Link, src: str, frame: bytes, airtime_ms: float) -> None:
+        """Start `frame` on the air from `src`: record the transmission (for
+        half-duplex), let wiretaps hear it, and open a reception at every
+        receiver the signal reaches."""
+        now = self.env.now
+        end = now + airtime_ms
+        tx_radio = self._radio(src, link)
+        _prune(tx_radio, now)
+        tx_radio.tx_intervals.append((now, end))
+        t_s = now / 1000.0
+        for tap in self._taps.get(link.name or "", ()):
+            tap.capture(t_s, frame)
+        tx_pos = self._states[src].node.mobility.position(t_s)
+        for dst in self._receivers_for(link, src):
+            dst_state = self._states[dst]
+            if not dst_state.up:
+                continue
+            sample = link.channel.evaluate(
+                tx_pos, dst_state.node.mobility.position(t_s), t_s, self._delivery_rng
+            )
+            rssi = sample.metrics.rssi_dbm
+            if sample.delivery_probability == 0.0 and rssi is None:
+                continue  # beyond any reach: no signal, no interference
+            rx_radio = self._radio(dst, link)
+            _prune(rx_radio, now)
+            reception = _Reception(
+                src=src,
+                src_boot=self._states[src].boot,
+                start_ms=now,
+                end_ms=end,
+                rssi_dbm=0.0 if rssi is None else float(rssi),
+                has_rssi=rssi is not None,
+                frame=frame,
+                metrics=sample.metrics,
+                delivery_probability=sample.delivery_probability,
+                iface=self._link_iface[id(link)][dst],
+                boot=dst_state.boot,
+                latency_ms=sample.latency_ms,
+            )
+            rx_radio.receptions.append(reception)
+            busy_from = max(now, rx_radio.rx_busy_until_ms)
+            if end > busy_from:
+                self._radio_stats[dst].rx_airtime_s += (end - busy_from) / 1000.0
+                rx_radio.rx_busy_until_ms = end
+            self.env.process(self._reception_proc(link, dst, rx_radio, reception))
+
+    def _reception_proc(self, link: Link, dst: str, radio: _Radio, rec: _Reception):
+        assert link.medium is not None
+        yield self.env.timeout(rec.end_ms - self.env.now)
+        dst_state = self._states[dst]
+        stats = self._radio_stats[dst]
+        if not dst_state.up or dst_state.boot != rec.boot:
+            stats.outage_losses += 1  # the receiver powered off mid-frame
+            return
+        if self._states[rec.src].boot != rec.src_boot:
+            stats.outage_losses += 1  # the transmitter powered off mid-frame
+            return
+        if any(s < rec.end_ms and e > rec.start_ms for s, e in radio.tx_intervals):
+            stats.half_duplex_losses += 1
+            return
+        overlap_mw = sum(
+            10.0 ** (other.rssi_dbm / 10.0)
+            for other in radio.receptions
+            if other is not rec
+            and other.start_ms < rec.end_ms
+            and other.end_ms > rec.start_ms
+        )
+        jam_mw = 0.0
+        if self._jammers and rec.has_rssi:
+            jam_mw = self._jamming_mw(
+                link,
+                dst_state.node.mobility.position(rec.start_ms / 1000.0),
+                rec.start_ms / 1000.0,
+                rec.end_ms / 1000.0,
+            )
+        interference_mw = overlap_mw + jam_mw
+        if interference_mw > 0.0:
+            sir_db = rec.rssi_dbm - 10.0 * math.log10(interference_mw)
+            if sir_db < link.medium.capture_db:
+                # Blame whichever contributed more of the interference.
+                if jam_mw >= overlap_mw:
+                    stats.jammed += 1
+                else:
+                    stats.collisions += 1
+                return
+        if self._delivery_rng.random() >= rec.delivery_probability:
+            stats.noise_losses += 1
+            return
+        if rec.latency_ms > 0:
+            yield self.env.timeout(rec.latency_ms)
+            if not dst_state.up or dst_state.boot != rec.boot:
+                stats.outage_losses += 1
+                return
+        # Counted only once the router actually has it.
+        stats.rx_frames += 1
+        self._push_rx(dst_state, rec.iface, rec.frame, rec.metrics)
 
     def _inject_proc(self, src: str, frame: bytes, at_s: float, link: str | None):
         target_ms = at_s * 1000
@@ -680,12 +1272,75 @@ class Simulation:
         if target_ms > self.env.now:
             yield self.env.timeout(target_ms - self.env.now)
         mac = wf.PyMac.BROADCAST if dest == "*" else self._states[dest].mac
-        self._states[src].driver.queue_local_send(mac, payload)
+        if self._states[src].up:
+            self._states[src].driver.queue_local_send(mac, payload)
 
-    def _sample_proc(self, interval_ms: int):
-        assert self._recorder is not None
-        while True:
+    def _wait_until(self, t_s: float):
+        target_ms = t_s * 1000
+        if target_ms > self.env.now:
+            yield self.env.timeout(target_ms - self.env.now)
+
+    def _fail_node_proc(self, node: str, at_s: float, recover_s: float | None):
+        yield from self._wait_until(at_s)
+        state = self._states[node]
+        state.up = False
+        # A new epoch from the moment power goes: anything in flight to or from
+        # the dead router, or still queued on its radios, belongs to the old one.
+        state.boot += 1
+        state.inbox.clear()
+        for (owner, _), radio in self._radios.items():
+            if owner == node:
+                self._radio_stats[node].outage_losses += len(radio.queue)
+                radio.queue.clear()
+        if recover_s is None:
+            return
+        yield from self._wait_until(recover_s)
+        state.driver = self._build_driver(
+            state.node, state.mac, state.trickle, state.keepalive, state.keypair
+        )
+        state.up = True
+        self._tick_node(node)
+
+    def _fail_link_proc(self, link: str, at_s: float, recover_s: float | None):
+        yield from self._wait_until(at_s)
+        self._down_links.add(link)
+        if recover_s is None:
+            return
+        yield from self._wait_until(recover_s)
+        self._down_links.discard(link)
+
+    def _stream_proc(
+        self, flow: Flow, rate_hz: float, start_s: float, duration_s: float
+    ):
+        yield from self._wait_until(start_s)
+        interval_ms = 1000.0 / rate_hz
+        count = round(duration_s * rate_hz)
+        dest_mac = self._states[flow.dest].mac
+        for seq in range(count):
+            # Recorded even when the source is down: the application tried,
+            # and a packet that never left is as lost as one dropped en route.
+            flow.record_sent(seq, self.env.now / 1000.0)
+            src = self._states[flow.src]
+            if src.up:
+                src.driver.queue_local_send(dest_mac, encode_payload(flow.flow_id, seq))
+            yield self.env.timeout(interval_ms)
+
+    def _sample_proc(self, interval_ms: int, recorder: Recorder):
+        # Each `run` starts its own sampler for its own recorder; one left over
+        # from an earlier `run` stops the moment a newer one takes over, or a
+        # scenario run in segments would sample every instant once per segment.
+        while self._recorder is recorder:
             t_s = self.env.now / 1000.0
             values = {name: probe(self) for name, probe in self._probes.items()}
-            self._recorder.append(t_s, values)
+            recorder.append(t_s, values)
             yield self.env.timeout(interval_ms)
+
+
+def _prune(radio: _Radio, now_ms: float) -> None:
+    """Forget transmissions and receptions too old to overlap anything still
+    on the air."""
+    horizon = now_ms - _HISTORY_MS
+    if radio.tx_intervals and radio.tx_intervals[0][1] < horizon:
+        radio.tx_intervals = [iv for iv in radio.tx_intervals if iv[1] >= horizon]
+    if radio.receptions and radio.receptions[0].end_ms < horizon:
+        radio.receptions = [r for r in radio.receptions if r.end_ms >= horizon]

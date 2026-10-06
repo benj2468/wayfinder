@@ -376,6 +376,52 @@ across the settled window instead.
 scenario prose (both constants an ideal chain exposes, and `None`-vs-`0`),
 the way `test_red_team.py` pins that script's verdicts.
 
+### Failures, traffic and contended media
+
+Four primitives for the resilience and capacity scenarios:
+
+* **Failures.** `Simulation.fail_node(name, at_s=, recover_s=)` powers a node
+  off (it neither sends nor hears) and back on as a *reboot* — a fresh router
+  that relearns the mesh. `fail_link` cuts a segment. `compromise(name)` hands a
+  node to an attacker whose firmware discards its own revocation, so exclusion
+  has to come from the members; `revoke(name, notify=[...])` pushes the order
+  to chosen members only, and `knows_revoked` says how far it has spread.
+* **Traffic.** `Simulation.stream(src, dest, rate_hz=, start_s=, duration_s=)`
+  sends numbered packets and returns a `traffic.Flow` — delivery ratio,
+  outages, latency, `recovery_after(event_s)` (time to the first packet
+  through after a failure) and `restored_after(event_s)` (time until delivery
+  is sustained again, which is what the failover scenario reports). Every
+  result a scenario reports about healing is read off delivered packets, not
+  off routing tables.
+* **A contended medium.** A `Link(medium=medium.Medium(...))` makes a segment
+  cost airtime (`LoRaPhy` time-on-air or `FixedRate`), sends one frame at a time
+  per radio from a bounded queue, loses overlapping receptions that fail a
+  capture margin (pure ALOHA), is half-duplex, and enforces a duty cycle as
+  ETSI-style off-time. `radio_stats(name)` counts airtime and each kind of
+  loss; `energy_mj`/`average_power_mw` price it with an `EnergyModel`.
+* **Interference.** `add_jammer(interference.Jammer(...))` adds a noise source
+  every reception on its links must out-power by the capture margin.
+
+Static nodes behind a channel with a hard `max_range_m` are pruned from each
+other's receiver sets once, which is what makes 150-node grids tractable.
+Each node also ticks on its own phase: a shared tick grid synchronises slow
+Trickle schedules into permanent half-duplex collisions.
+
+### Showcase scenarios and the results page
+
+`failover.py`, `captured_device.py`, `coverage_per_relay.py`, `crowded_lora.py`,
+`battery_life.py`, `jammer_map.py` and `scale.py` each answer one question a
+customer would ask, and each takes `--export DIR` to write the JSON the public
+results page (`www/sim/`, wayfndr.dev/sim) draws — see
+`wayfinder_sim.showcase` for the schema. `just sim-export` re-runs them all into
+`www/sim/data`. Each has a `sim/tests/test_<name>.py` pinning the claims its
+page states (for `scale.py`, the healthy side only: the collapse past the
+table takes minutes to simulate).
+
+`mountain_relay.py` and `satellite_relay.py` take `--export DIR` too, for the
+page's range-and-terrain section; with it they write the JSON and skip their
+own charts and HTML reports.
+
 ## Topology
 
 The default is a **4-node diamond bolted onto a 5-node complete-graph mesh**,
