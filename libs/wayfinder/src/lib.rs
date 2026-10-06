@@ -1539,17 +1539,21 @@ impl<
                 // (`strip_directed`, "directed frame addressed to another
                 // hop"); this is the same rule for an open one.
                 //
-                // Flood sub-types are exempt: an OGM, keep-alive or broadcast
-                // is meant for every node that hears it and re-floods under
-                // the engine's seqno high-water mark, so its link `dst` carries
-                // no meaning to honour.
-                let flood = matches!(
+                // Exempt: the sub-types meant for every node that hears them —
+                // OGMs and broadcasts (which re-flood under the engine's seqno
+                // high-water mark) and keep-alives (single-hop) — whose link
+                // `dst` carries no meaning to honour; and an unrecognised
+                // sub-type, which `route_by_dest` deliberately routes by its
+                // link `dst` as the end-to-end address, so a relay is *meant*
+                // to act on one not addressed to it. That is the
+                // forward-compatibility path for a newer peer's packet types.
+                let exempt = matches!(
                     packet_type,
-                    Some(BatmanPacketType::Ogm)
+                    None | Some(BatmanPacketType::Ogm)
                         | Some(BatmanPacketType::Keepalive)
                         | Some(BatmanPacketType::Bcast)
                 );
-                if !flood && !dst.is_multicast() && dst != self.batman.self_ident {
+                if !exempt && !dst.is_multicast() && dst != self.batman.self_ident {
                     trace!("drop: unicast addressed to another hop");
                     return RxOutcome::empty();
                 }
@@ -3693,6 +3697,147 @@ mod cert_control_delivery {
         assert_eq!(fwd_hdr.ttl, 9);
         assert_eq!(&rest[..b"cert body".len()], b"cert body");
         assert!(outcome.deliver_local.is_none());
+    }
+}
+
+#[cfg(test)]
+mod overheard_frames {
+    //! A shared medium hands up every frame in range, so an open-mesh router
+    //! sees directed frames addressed to other hops. These pin which of them
+    //! it must leave alone (relaying one is a storm) and which must still be
+    //! processed whatever their link `dst`.
+
+    use super::*;
+    use batman::wire::BatmanCertReqPacket;
+    use batman::wire::BatmanOgmPacket;
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::IntoBytes;
+
+    const INNER: &[u8] = b"payload";
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn frame_bytes(dst: Mac, src: Mac, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(dst.as_bytes());
+        v.extend_from_slice(src.as_bytes());
+        v.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Router `mac(1)` with a route to `mac(5)` through `mac(2)`.
+    fn router_with_route_to_5() -> CentralRouter {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig: mac(5),
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        let bytes = frame_bytes(Mac::BROADCAST, mac(2), ogm.as_bytes());
+        let mut tx = [0u8; 256];
+        router.handle_frame(
+            core::time::Duration::ZERO,
+            0,
+            LinkFrame::ref_from_bytes(&bytes).unwrap(),
+            &mut tx,
+            &mut (),
+        );
+        router
+    }
+
+    fn unicast_to(dest: Mac) -> Vec<u8> {
+        let hdr = BatmanUnicastPacket {
+            packet_type: BatmanPacketType::Unicast.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 10,
+            dest,
+        };
+        let mut payload = hdr.as_bytes().to_vec();
+        payload.extend_from_slice(INNER);
+        payload
+    }
+
+    fn handle<'rx, 'tx>(
+        router: &mut CentralRouter,
+        bytes: &'rx [u8],
+        tx: &'tx mut [u8],
+    ) -> RxOutcome<'rx, 'tx> {
+        router.handle_frame(
+            core::time::Duration::ZERO,
+            0,
+            LinkFrame::ref_from_bytes(bytes).unwrap(),
+            tx,
+            &mut (),
+        )
+    }
+
+    #[test]
+    fn an_overheard_unicast_for_another_hop_is_neither_relayed_nor_delivered() {
+        let mut router = router_with_route_to_5();
+        let bytes = frame_bytes(mac(9), mac(3), &unicast_to(mac(5)));
+        let mut tx = [0u8; 256];
+        let outcome = handle(&mut router, &bytes, &mut tx);
+        assert!(outcome.forward.is_none());
+        assert!(outcome.deliver_local.is_none());
+    }
+
+    #[test]
+    fn the_same_unicast_addressed_to_this_hop_is_relayed() {
+        let mut router = router_with_route_to_5();
+        let bytes = frame_bytes(mac(1), mac(3), &unicast_to(mac(5)));
+        let mut tx = [0u8; 256];
+        let outcome = handle(&mut router, &bytes, &mut tx);
+        assert_eq!(outcome.forward.expect("relayed toward 5").dst, mac(2));
+    }
+
+    #[test]
+    fn a_directed_control_frame_for_another_hop_is_dropped_too() {
+        let mut router = router_with_route_to_5();
+        let hdr = BatmanCertReqPacket {
+            packet_type: BatmanPacketType::CertReq.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 10,
+            dest: mac(5),
+        };
+        let bytes = frame_bytes(mac(9), mac(3), hdr.as_bytes());
+        let mut tx = [0u8; 256];
+        assert!(handle(&mut router, &bytes, &mut tx).forward.is_none());
+    }
+
+    /// A group link `dst` is not "another hop": a multicast-capable medium
+    /// may carry a directed frame under one, and it must still be read.
+    #[test]
+    fn a_unicast_under_a_group_link_dst_is_still_delivered() {
+        let mut router = router_with_route_to_5();
+        let group = Mac([0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]);
+        let bytes = frame_bytes(group, mac(3), &unicast_to(mac(1)));
+        let mut tx = [0u8; 256];
+        assert_eq!(
+            handle(&mut router, &bytes, &mut tx).deliver_local,
+            Some(INNER)
+        );
+    }
+
+    /// An unrecognised sub-type is routed by its link `dst` as the end-to-end
+    /// address (`route_by_dest`), which is the forward-compatibility path for a
+    /// newer peer's packet types — so it must not be caught by the drop.
+    #[test]
+    fn an_unknown_sub_type_still_routes_by_its_link_dst() {
+        let mut router = router_with_route_to_5();
+        let bytes = frame_bytes(mac(5), mac(3), &[0x7e, BATMAN_VERSION, 0, 0]);
+        let mut tx = [0u8; 256];
+        let outcome = handle(&mut router, &bytes, &mut tx);
+        assert_eq!(outcome.forward.expect("forwarded toward 5").dst, mac(2));
     }
 }
 

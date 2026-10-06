@@ -116,8 +116,10 @@ impl TrickleTimer {
     /// the next fire is further out than `i_min`, reschedule it within
     /// `[i_min/2, i_min)` after `now`.
     ///
-    /// A fire already due within `i_min` is kept. That is RFC 6206 §4.2's "if
-    /// I is already Imin, do nothing", and it is load-bearing: re-drawing the
+    /// A fire already due within `i_min` is kept. That generalises RFC 6206
+    /// §4.2's "if I is already Imin, do nothing" (at `I == Imin` the pending
+    /// fire is always within `i_min`) to a backed-off interval whose fire
+    /// happens to be imminent anyway, and it is load-bearing: re-drawing the
     /// fire on every reset pushes it out each time, so a node meeting a large
     /// mesh — a new originator every few hundred milliseconds — would never
     /// emit its own advert until discovery settled. The backoff still restarts
