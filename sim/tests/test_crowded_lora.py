@@ -18,14 +18,14 @@ from crowded_lora import (
     TARGET_DELIVERY,
     collision_limited_n,
     duty_limited_n,
-    run_point,
+    median_run,
 )
 
 
 def test_a_few_sensors_deliver_and_a_crowd_does_not():
-    few = run_point(4, 300.0, measure_s=1800.0)
-    busy = run_point(8, 300.0, measure_s=1800.0)
-    crowd = run_point(20, 300.0, measure_s=1800.0)
+    few = median_run(4, 300.0)
+    busy = median_run(8, 300.0)
+    crowd = median_run(20, 300.0)
     assert few.delivery >= TARGET_DELIVERY
     assert crowd.delivery < 0.75
     assert crowd.busiest_duty <= 0.0101  # the regulator holds

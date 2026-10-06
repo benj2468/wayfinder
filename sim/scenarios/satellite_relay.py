@@ -857,7 +857,7 @@ def write_sweep_report_page(
                     "constellation": f"{planes} plane(s) x {per_plane} satellites",
                     "user link": f"{UT_EIRP_DBM:.0f} dBm EIRP + {SAT_RX_GAIN_DBI:.0f} dBi, Ku-band",
                     "elevation mask": f"{MIN_ELEVATION_DEG:.0f}°",
-                    "flight": f"{FLIGHT_RANGE_M / 1000:.0f} km out and back at {SPEED_M_S:.0f} m/s",
+                    "flight": f"out along a {FLIGHT_RANGE_M / 1000:.0f} km leg at {SPEED_M_S:.0f} m/s",
                 },
                 metrics={
                     "gateway sky": f"{visible:.1%} of the flight",
@@ -956,7 +956,7 @@ def showcase(results: Sequence[SweepResult[tuple[int, int]]]) -> Any:
         title="Relaying through orbit",
         category="range",
         scenario="sim/scenarios/satellite_relay.py",
-        question="An aircraft flies 9,000 km from its gateway. Can a small satellite constellation keep the mesh connected?",
+        question="An aircraft flies thousands of kilometres from its gateway. Can a small satellite constellation keep the mesh connected?",
         headlines=[
             Headline(
                 f"{d_stats.connected_fraction:.0%}",

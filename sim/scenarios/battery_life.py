@@ -72,15 +72,6 @@ LISTEN_MW = (17.0, 5.0, 1.0, 0.3, 0.1)
 MEASURE_S = 3600.0
 
 
-def _delta(after: RadioStats, before: RadioStats) -> RadioStats:
-    return RadioStats(
-        **{
-            f.name: getattr(after, f.name) - getattr(before, f.name)
-            for f in dataclasses.fields(RadioStats)
-        }
-    )
-
-
 @dataclass(frozen=True)
 class NodeEnergy:
     """One node's measured activity over the window."""
@@ -143,13 +134,13 @@ def run_network(
             duration_s=measure_s,
         )
     sim.run(until_s=warmup_s)
-    before = {x.name: dataclasses.replace(sim.radio_stats(x.name)) for x in nodes}
+    before = {x.name: sim.radio_stats(x.name) for x in nodes}  # snapshots
     sim.run(until_s=warmup_s + measure_s)
     return [
         NodeEnergy(
             x.name,
             "gateway" if x.name == lora.GATEWAY else "sensor",
-            _delta(sim.radio_stats(x.name), before[x.name]),
+            sim.radio_stats(x.name) - before[x.name],
             measure_s,
         )
         for x in nodes

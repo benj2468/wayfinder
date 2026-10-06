@@ -180,10 +180,13 @@ An engineering-forward page of results from the physics simulator
 satellite constellation, relay coverage, battery life, a crowded LoRa channel
 and scale. Every chart is drawn by `sim/lab.js` from
 `sim/data/<slug>.json`, which the scenario scripts write
-(`wayfinder_sim.showcase`); nothing on the page is typed in by hand.
+(`wayfinder_sim.showcase`); no result on the page is typed in by hand. (The
+"What it found" cards in `index.html` are prose about the router fixes, with
+the figures measured while making them — the 40-copy storm and the 33 s
+convergence are in the tests' doc comments that pin each fix.)
 
 - **Refreshing the numbers** is re-running the scenarios: `just sim-export`
-  (several minutes). It reinstalls the compiled router first, because the sim's
+  (15-25 minutes). It reinstalls the compiled router first, because the sim's
   Python extension does not rebuild itself and a stale one silently shows the
   last build's behaviour.
 - **Stale results are never published.** A complete `just sim-export` stamps

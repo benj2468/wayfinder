@@ -1,5 +1,5 @@
-"""Scale: what happens as the mesh grows from a couple of dozen radios to a
-few hundred?
+"""Scale: what happens as the mesh grows from a couple of dozen radios to
+about 150?
 
 Square grids of N radios, 450 m apart on one shared 2.4 GHz channel, HQ in a
 corner — the field grid of `failover.py`, made bigger. Every node streams to
@@ -14,15 +14,16 @@ Three things grow with N, and the scenario measures each:
   round, so each node's share of the flood grows linearly with N, and the
   channel's total with N². That cost is paid whether or not any data moves.
 - **The originator table.** A router remembers a bounded number of other
-  nodes. The default capacity profile — what the simulator, the tests and a
-  small gateway build — holds 128 (`wayfinder::default`); the `host` profile a
-  server-class node builds holds 4,096.
+  nodes. The default capacity profile — what the simulator, the tests and
+  the boards build — holds 128 others (`wayfinder::default`); the `host`
+  profile a gateway or server builds holds 4,096.
 
-**The edge is a cliff, not a slope.** Below 128 nodes everything scales as
-expected. Past it, a default-profile router must evict an originator to admit
-one, the evicted one is heard again within a round, and re-learning it counts
-as a topology change — which resets Trickle. With every router evicting and
-re-learning continuously, every Trickle timer is pinned at `i_min`, the advert
+**The edge is a cliff, not a slope.** Up to 129 nodes (128 others) everything
+scales as expected. Past it, a default-profile router must evict an
+originator to admit one, the evicted one is heard again within a round, and
+re-learning it counts as a new originator — which resets that router's
+Trickle timers. With every router evicting and re-learning continuously,
+every Trickle timer is pinned at `i_min`, the advert
 rate jumps to `N²/(0.75·i_min)`, and the channel collapses in both
 directions. (Beyond ~150 nodes the storm is large enough that the simulation
 itself runs out of memory, which is why the sweep stops there.) So the
@@ -163,6 +164,12 @@ def showcase(runs: Sequence[ScaleRun]) -> Showcase:
     fits = [r for r in runs if r.nodes - 1 <= TABLE_CAPACITY]
     over = [r for r in runs if r.nodes - 1 > TABLE_CAPACITY]
     edge = max(fits, key=lambda r: r.nodes)
+    # The healthy side's claims must hold for every size on it, both ways.
+    for r in fits:
+        if r.converged_s is None or min(r.to_hq, r.from_hq) < 0.95:
+            raise RuntimeError(
+                f"{r.nodes} nodes fits the table but did not converge and deliver both ways"
+            )
     past = min(over, key=lambda r: r.nodes) if over else None
     worst = min(over, key=lambda r: r.to_hq) if over else None
     return Showcase(
@@ -175,7 +182,7 @@ def showcase(runs: Sequence[ScaleRun]) -> Showcase:
             Headline(
                 f"{edge.nodes}",
                 "nodes on the default router profile, at full delivery",
-                f"{edge.to_hq:.0%} to HQ, {edge.from_hq:.0%} back; ready {edge.converged_s or 0:.0f} s after power-on",
+                f"{edge.to_hq:.0%} to HQ, {edge.from_hq:.0%} back; ready {edge.converged_s:.0f} s after power-on",
             ),
             Headline(
                 f"{worst.to_hq:.0%}" if worst else "–",
@@ -197,12 +204,13 @@ def showcase(runs: Sequence[ScaleRun]) -> Showcase:
         summary=(
             f"Square grids from {ns[0]} to {ns[-1]} radios, every node streaming to HQ and HQ streaming "
             f"back. Up to {edge.nodes} nodes the mesh scales as it should: delivery stays at "
-            f"{min(r.to_hq for r in fits):.0%} or better both ways, every node has a route to HQ within "
-            f"{max(r.converged_s or 0 for r in fits):.0f} s of power-on, and each node's control traffic "
+            f"{min(min(r.to_hq, r.from_hq) for r in fits):.0%} or better both ways, every node has a route "
+            f"to HQ within {max(r.converged_s or 0 for r in fits):.0f} s of power-on, and each node's control traffic "
             f"grows in step with the mesh. The default router profile remembers {TABLE_CAPACITY} other "
             f"nodes, and past that the mesh doesn't degrade gracefully. Routers start evicting nodes and "
-            f"hearing them again a moment later. Each re-learned node counts as a topology change and "
-            f"resets every router to its fastest advertising rate, so control traffic "
+            f"hearing them again a moment later. Each re-learned node counts as new and resets that "
+            f"router to its fastest advertising rate; with every router churning, all of them are pinned "
+            f"there, so control traffic "
             + (
                 f"jumps {past.frames_per_node_s / edge.frames_per_node_s:.0f}x and delivery falls to "
                 f"{worst.to_hq:.0%}. "

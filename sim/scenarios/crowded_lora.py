@@ -21,17 +21,19 @@ broadcast would cost N. That is the price of having no split-horizon (see
 
 **Two ceilings, and the lower one is not the obvious one.** Trickle fires
 each round uniformly within `[I/2, I)`, so a round averages `0.75·I`, and the
-channel carries `N²·T / 0.75·I` of advert airtime (`T` one advert's airtime).
+channel carries `N²·T / (0.75·I)` of advert airtime (`T` one advert's airtime).
 
 - *Duty cycle.* EU 868 MHz rules allow each radio 1% of airtime, and each
-  node relays N adverts per round: `N·T / 0.75·I ≤ 0.01`. Past that, adverts
+  node relays N adverts per round: `N·T / (0.75·I) ≤ 0.01`. Past that, adverts
   queue behind the off-time, queues overflow, routes age out.
 - *Collisions.* LoRa radios do not listen before talking (pure ALOHA), so
   every reading risks landing on an advert. At channel load `G` a frame
   survives with probability `e^(-2G)`; keeping losses to 5% needs `G` under
   ~2.5%, so `N ≤ √(0.025 · 0.75·I / T)`.
 
-The second binds first, and it scales with the *square root* of the advert
+For any advert interval slower than about half a minute at SF7 (where
+`0.75·I/T` exceeds ~256) the second binds first, and it scales with the
+*square root* of the advert
 interval: slowing adverts tenfold buys ~3x the sensors, not 10x — the N²
 flood (no split-horizon, see `CLAUDE.md`) is what turns a linear budget into
 a square-root one.
@@ -137,9 +139,10 @@ class ChannelRun:
     @property
     def amplification(self) -> float:
         """Measured advert airtime over the quiet-channel steady state. Above
-        one means contention is making the routers advertise faster: a lost
-        advert reads as a changed next hop or a lost route, either of which
-        resets Trickle to its fastest interval."""
+        one means contention is making the routers advertise faster: lost
+        adverts let a route expire, the purge resets that router's Trickle
+        timers to their fastest interval, and so does re-learning the
+        originator as new when its adverts get through again."""
         steady = steady_routing_airtime_s(
             self.sensors + 1, self.i_max_s, self.measure_s
         )
@@ -225,10 +228,10 @@ def run_point(
     )
 
 
-OGM_FRAME_LEN = forge.LINK_HEADER_LEN + 20 + 8
-"""A relayed open-mesh advert on the wire: link header, the OGM header, and
-the 8-byte previous-sender TVLV a relay appends — 42 bytes, measured off a
-wiretap rather than assumed."""
+OGM_FRAME_LEN = forge.LINK_HEADER_LEN + 18 + 10
+"""A relayed open-mesh advert on the wire: the 14-byte link header, the
+18-byte OGM header, and the 10-byte previous-sender TVLV a relay appends (a
+4-byte TVLV header and a MAC) — 42 bytes, which a wiretap confirms."""
 
 
 def ogm_airtime_s() -> float:
@@ -256,7 +259,7 @@ def duty_limited_n(i_max_s: float, duty_cycle: float = DUTY_CYCLE) -> float:
 
 def collision_limited_n(i_max_s: float, loss: float = 1.0 - TARGET_DELIVERY) -> float:
     """The N at which pure-ALOHA collisions with the advert flood alone cost
-    a reading `loss`: survival is `e^(-2G)` at load `G = N²·T / 0.75·I`."""
+    a reading `loss`: survival is `e^(-2G)` at load `G = N²·T / (0.75·I)`."""
     load = -math.log(1.0 - loss) / 2.0
     return math.sqrt(load * TRICKLE_MEAN_ROUND * i_max_s / ogm_airtime_s())
 
@@ -320,7 +323,11 @@ def _median_amp(runs: Sequence[ChannelRun]) -> float:
     """Median advert amplification over the points that still worked —
     collapsed points are dominated by queue drops, not by resets."""
     values = sorted(r.amplification for r in runs if r.delivery >= 0.5)
-    return values[len(values) // 2] if values else 0.0
+    if not values:
+        raise RuntimeError(
+            "no swept point delivered half its readings; nothing to measure"
+        )
+    return values[len(values) // 2]
 
 
 def showcase(runs: Sequence[ChannelRun]) -> Showcase:
@@ -342,6 +349,14 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
 
     fast, slow = schedules[0], schedules[-1]
     cap_fast, cap_slow = capacity(runs, fast), capacity(runs, slow)
+
+    def cap_text(cap: int | None) -> str:
+        # None: even the smallest count swept missed the target; the top of
+        # the sweep still delivering means the real ceiling is higher.
+        if cap is None:
+            return f"<{counts[0]}"
+        return f"{cap}+" if cap == counts[-1] else f"{cap}"
+
     return Showcase(
         slug="crowded-lora",
         title="Sensors on one LoRa channel",
@@ -350,20 +365,19 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
         question="How many battery sensors can share one LoRa channel before the network stops delivering?",
         headlines=[
             Headline(
-                f"{cap_fast if cap_fast is not None else 0}",
+                cap_text(cap_fast),
                 f"sensors at {label(fast).replace('adverts every ', 'adverts every ')}",
                 f"most that still deliver ≥{TARGET_DELIVERY:.0%} of readings",
             ),
             Headline(
-                f"{cap_slow if cap_slow is not None else 0}"
-                + ("+" if cap_slow == counts[-1] else ""),
+                cap_text(cap_slow),
                 f"sensors at {label(slow)}",
                 "capacity grows only with the square root of the advert interval",
             ),
             Headline(
                 f"{_median_amp(runs):.1f}x",
                 "more adverts than a quiet channel would carry",
-                "lost adverts reset the routers to their fastest rate",
+                "lost adverts expire routes, and expiry resets the routers to their fastest rate",
             ),
         ],
         summary=(
@@ -372,13 +386,13 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
             f"by every node on the channel, so N sensors cost N² adverts per round. LoRa radios don't "
             f"listen before they talk, so readings collide with that advert traffic, and the collisions "
             f"bite before EU rules' {DUTY_CYCLE:.0%} duty cycle does. With adverts every {fast:g} s the "
-            f"channel delivers ≥{TARGET_DELIVERY:.0%} of readings for {cap_fast or 0} sensors. Slowing "
-            f"adverts to every {slow / 60:g} minutes lifts that to {cap_slow or 0}, but only by about the "
+            f"channel delivers ≥{TARGET_DELIVERY:.0%} of readings for {cap_text(cap_fast)} sensors. Slowing "
+            f"adverts to every {slow / 60:g} minutes lifts that to {cap_text(cap_slow)}, but only by about the "
             f"square root of the slowdown, because the advert load grows with N². Contention also "
-            f"feeds on itself. A lost advert reads to its receivers as a changed route, which resets "
-            f"them to their fastest advertising rate, so a busy channel carries about "
+            f"feeds on itself. Lost adverts let routes expire, and both the expiry and the re-learning "
+            f"that follows reset a router to its fastest advertising rate, so a busy channel carries about "
             f"{_median_amp(runs):.1f}x the adverts a quiet one would. That is why the simulated "
-            f"capacity lands below the closed-form ceiling (chart 4). Use the arithmetic as an upper "
+            f"capacity lands below the closed-form ceiling (the last chart). Use the arithmetic as an upper "
             f"bound and the simulation for sizing. Slower adverts also mean slower failover, as the "
             f"relay scenario measures."
         ),
@@ -439,7 +453,10 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
                     Series(
                         "simulated (≥95% delivered)",
                         schedules,
-                        [float(capacity(runs, i) or 0) for i in schedules],
+                        [
+                            None if (c := capacity(runs, i)) is None else float(c)
+                            for i in schedules
+                        ],
                         kind="line",
                     ),
                     Series(
@@ -452,7 +469,7 @@ def showcase(runs: Sequence[ChannelRun]) -> Showcase:
                 x_log=True,
                 caption=(
                     "The closed form assumes a quiet channel's advert rate; contention raises it, so the "
-                    "simulation lands below. The duty-cycle ceiling (0.01·0.75I/T) is far higher — "
+                    "simulation lands below. The duty-cycle ceiling (0.01·0.75I/T) is higher — "
                     f"{duty_limited_n(schedules[0]):.0f} to {duty_limited_n(schedules[-1]):.0f} sensors over "
                     "this range — so collisions bind long before it does."
                 ),

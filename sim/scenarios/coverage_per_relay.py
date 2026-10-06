@@ -144,7 +144,7 @@ def greedy_layouts(
     terrain: Terrain, max_relays: int = MAX_RELAYS
 ) -> list[tuple[list[Vec3], float]]:
     """For N = 1..max_relays, the greedy layout and its planned coverage
-    share. Greedy is within (1 - 1/e) of optimal for a coverage objective,
+    share. Greedy achieves at least (1 - 1/e) ≈ 63% of the optimal coverage,
     and — unlike re-optimising from scratch for each N — it describes a
     deployment that grows by adding relays, never moving one."""
     sites = candidate_sites(terrain)
@@ -343,12 +343,12 @@ def showcase(results: Sequence[LayoutResult]) -> Showcase:
             ),
         ],
         summary=(
-            f"A drone crosses 8 km of mountains at {world.AGL_M:.0f} m above the ground, and every "
+            f"A drone crosses a mountain range at {world.AGL_M:.0f} m above the ground, and every "
             f"relay has its own backhaul, so the drone is connected whenever it can reach any relay. "
             f"Relays are added one at a time, each placed where it covers the most of what the others "
             f"miss. The first relay alone covers {results[0].measured_mean:.0%} of the flight. "
             f"Returns fall off quickly after that: {k.relays} relays reach {k.measured_mean:.0%}, "
-            f"and each one beyond that adds less than {KNEE_GAIN:.0%}. Every layout is also flown "
+            f"and the next one adds less than {KNEE_GAIN:.0%}. Every layout is also flown "
             f"through the real router, counting a second as covered only when a probe packet "
             f"got through. Delivered coverage lands within "
             f"{max(abs(r.planned - r.measured_mean) for r in results) * 100:.1f} points of the "

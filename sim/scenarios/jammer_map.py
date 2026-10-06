@@ -156,14 +156,13 @@ def hq_distance(run: JamRun) -> float:
     return (run.x**2 + run.y**2) ** 0.5
 
 
-def denial_radius_m(runs: Sequence[JamRun], threshold: float = 0.5) -> float:
-    """Distance from HQ inside which the jammer cuts delivery below
-    `threshold` at every position measured — the radius it must reach."""
-    far_ok = [hq_distance(r) for r in runs if r.delivered >= threshold]
-    near_bad = [hq_distance(r) for r in runs if r.delivered < threshold]
-    if not near_bad:
-        return 0.0
-    return min(far_ok) if far_ok else max(near_bad)
+def damage_reach_m(runs: Sequence[JamRun], threshold: float = 0.5) -> float:
+    """The farthest from HQ any measured position still cut delivery below
+    `threshold` — the outer bound of where a jammer this strong matters. A
+    jammer standing further out than this did no such damage anywhere on the
+    grid; nearer in, it may or may not, depending on what it is beside."""
+    bad = [hq_distance(r) for r in runs if r.delivered < threshold]
+    return max(bad) if bad else 0.0
 
 
 def print_summary(baseline: JamRun, maps: dict[float, list[JamRun]]) -> None:
@@ -176,7 +175,7 @@ def print_summary(baseline: JamRun, maps: dict[float, list[JamRun]]) -> None:
         print(
             f"  {power:>4.0f} dBm: median {statistics.median(r.delivered for r in runs):.1%}, worst {worst.delivered:.1%} "
             f"at ({worst.x:.0f}, {worst.y:.0f}); positions below 50%: {sum(r.delivered < 0.5 for r in runs)}/{len(runs)}; "
-            f"denial radius around HQ ≈ {denial_radius_m(runs):.0f} m"
+            f"farthest damaging position from HQ ≈ {damage_reach_m(runs):.0f} m"
         )
 
 
@@ -218,7 +217,7 @@ def showcase(
             Headline(
                 f"{weak_bad} of {len(weak_runs)}",
                 f"positions where a {weak:.0f} dBm jammer halves traffic",
-                f"it has to stand within ~{denial_radius_m(weak_runs):.0f} m of HQ; elsewhere the mesh routes around it",
+                f"it has to stand within ~{damage_reach_m(weak_runs):.0f} m of HQ; elsewhere the mesh routes around it",
             ),
             Headline(
                 f"{strong_bad} of {len(strong_runs)}",
@@ -226,9 +225,9 @@ def showcase(
                 f"median delivery across all positions {strong_median:.0%}",
             ),
             Headline(
-                f"{denial_radius_m(strong_runs):.0f} m",
-                f"from HQ before a {strong:.0f} dBm jammer stops mattering",
-                f"{denial_radius_m(weak_runs):.0f} m for a {weak:.0f} dBm one",
+                f"{damage_reach_m(strong_runs):.0f} m",
+                f"from HQ is the farthest a {strong:.0f} dBm jammer still halved traffic",
+                f"{damage_reach_m(weak_runs):.0f} m for a {weak:.0f} dBm one",
             ),
         ],
         summary=(
@@ -237,7 +236,8 @@ def showcase(
             f"{len(grid_axes(step_m)[0])}×{len(grid_axes(step_m)[1])} grid. Jamming happens at the "
             f"receiver: a frame dies when the jammer's power where it lands drowns the signal. A weak "
             f"{weak:.0f} dBm jammer deafens only the radio it stands beside, and the mesh routes around "
-            f"it. It does real damage from {weak_bad} of {len(weak_runs)} positions, all on top of HQ, "
+            f"it. It does real damage from {weak_bad} of {len(weak_runs)} positions, all within "
+            f"{damage_reach_m(weak_runs):.0f} m of HQ, "
             f"the one receiver every packet has to reach. At {strong:.0f} dBm the picture changes. A "
             f"receiver can no longer hear its 450 m neighbour from several hundred metres away, so one "
             f"jammer deafens several radios at once, and there's no clean path left to route around "

@@ -273,6 +273,7 @@ class Simulation:
             name: RadioStats() for name in names
         }
         self._compromised: set[str] = set()
+        self._compromise_discards: dict[str, int] = {}
         # Wire bytes of every revocation issued, keyed by the revoked node's
         # name — what a compromised node's firmware watches for and discards.
         self._revocation_bytes: dict[str, list[bytes]] = {}
@@ -402,6 +403,13 @@ class Simulation:
         if node not in self._states:
             raise KeyError(node)
         self._compromised.add(node)
+
+    def compromise_discards(self, node: str) -> int:
+        """How many frames carrying its own revocation `node`'s attacker
+        firmware has thrown away. A scenario crediting the members with an
+        exclusion should check this is non-zero: if the filter never fired,
+        the node may have honoured the order and excluded itself."""
+        return self._compromise_discards.get(node, 0)
 
     def knows_revoked(self, node: str, target: str) -> bool:
         """Whether `node` holds a revocation naming `target` right now."""
@@ -1018,6 +1026,7 @@ class Simulation:
         if name in self._compromised and any(
             record in frame for record in self._revocation_bytes.get(name, ())
         ):
+            self._compromise_discards[name] = self._compromise_discards.get(name, 0) + 1
             return
         dst_state.driver.push_rx(dst_iface, frame, metrics)
 

@@ -388,9 +388,11 @@ Four primitives for the resilience and capacity scenarios:
   to chosen members only, and `knows_revoked` says how far it has spread.
 * **Traffic.** `Simulation.stream(src, dest, rate_hz=, start_s=, duration_s=)`
   sends numbered packets and returns a `traffic.Flow` — delivery ratio,
-  outages, latency, and `recovery_after(event_s)` (time to the first packet
-  through after a failure). Every result a scenario reports about healing is
-  read off delivered packets, not off routing tables.
+  outages, latency, `recovery_after(event_s)` (time to the first packet
+  through after a failure) and `restored_after(event_s)` (time until delivery
+  is sustained again, which is what the failover scenario reports). Every
+  result a scenario reports about healing is read off delivered packets, not
+  off routing tables.
 * **A contended medium.** A `Link(medium=medium.Medium(...))` makes a segment
   cost airtime (`LoRaPhy` time-on-air or `FixedRate`), sends one frame at a time
   per radio from a bounded queue, loses overlapping receptions that fail a
@@ -413,7 +415,8 @@ customer would ask, and each takes `--export DIR` to write the JSON the public
 results page (`www/sim/`, wayfndr.dev/sim) draws — see
 `wayfinder_sim.showcase` for the schema. `just sim-export` re-runs them all into
 `www/sim/data`. Each has a `sim/tests/test_<name>.py` pinning the claims its
-page states.
+page states (for `scale.py`, the healthy side only: the collapse past the
+table takes minutes to simulate).
 
 `mountain_relay.py` and `satellite_relay.py` take `--export DIR` too, for the
 page's range-and-terrain section; with it they write the JSON and skip their

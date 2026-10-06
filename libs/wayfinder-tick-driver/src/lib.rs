@@ -848,6 +848,8 @@ mod tests {
     ///
     /// An authenticated mesh already drops such a frame (`strip_directed`'s
     /// "directed frame addressed to another hop"); this pins the open mesh.
+    /// Before the fix, 40 copies of the one unicast crossed this three-node
+    /// segment in the 200 ms the test watches.
     #[test]
     fn an_overheard_unicast_for_another_hop_is_not_relayed() {
         let trickle = [TrickleConfig {

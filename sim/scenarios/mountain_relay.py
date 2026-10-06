@@ -988,11 +988,15 @@ def showcase(results: Sequence[SweepResult[str]], terrain: Terrain) -> Any:
     profile_chart = None
     moment = worst_outage_profile(worst.recorder, relay_sites(worst.param, terrain))
     sep_m = None
+    why = "nothing was out of reach"
+    why_short = ""
     if moment is not None:
         relay, t_mid, drone, site = moment
         prof = elevation_profile(terrain, drone, site, samples=96)
         total = math.dist((drone.x, drone.y), (site.x, site.y))
-        sep_m = total
+        # The relay was picked as nearest by straight-line distance, so that
+        # is the distance reported; the profile below is drawn over the ground.
+        sep_m = drone.distance_to(site)
         dist = [0.0, *(p.distance_m for p in prof), total]
         ground_z = [
             terrain.elevation(drone.x, drone.y),
@@ -1003,6 +1007,24 @@ def showcase(results: Sequence[SweepResult[str]], terrain: Terrain) -> Any:
         fresnel = [
             z - fresnel_radius_m(d, total - d, FREQ_HZ) for z, d in zip(los, dist)
         ]
+        # Say what the geometry shows, not what it usually shows.
+        blocked = any(g > los_z for g, los_z in zip(ground_z, los))
+        in_range = sep_m <= MAX_RANGE_M
+        if not in_range:
+            why = f"{relay} was {sep_m / 1000:.1f} km away, beyond the radio's range"
+            why_short = "beyond the radio's range"
+        elif blocked:
+            why = (
+                f"{relay} was only {sep_m / 1000:.1f} km away, inside radio range, but the "
+                "ridge between them rises through the line of sight"
+            )
+            why_short = "close enough by range, hidden behind a ridge"
+        else:
+            why = (
+                f"{relay} was {sep_m / 1000:.1f} km away with a clear line of sight, but the "
+                "ground reaches into the first Fresnel zone"
+            )
+            why_short = "in range and in sight, but the ground crowds the Fresnel zone"
         profile_chart = Chart(
             title=f"Why it went dark: the ground between drone and {relay} at t = {t_mid:.0f} s",
             x_label=f"distance from drone toward {relay} (m)",
@@ -1013,9 +1035,8 @@ def showcase(results: Sequence[SweepResult[str]], terrain: Terrain) -> Any:
                 Series("first Fresnel zone, lower edge", dist, fresnel),
             ],
             caption=(
-                f"{worst.param} placement, longest outage. {relay} is {total / 1000:.1f} km away, "
-                "but the ridge rises through the line of sight; at 900 MHz anything inside the "
-                "first Fresnel zone costs diffraction loss, and here the path is buried."
+                f"{worst.param} placement, longest outage: {why}. At 900 MHz anything inside "
+                "the first Fresnel zone costs diffraction loss."
             ),
         )
 
@@ -1102,11 +1123,11 @@ def showcase(results: Sequence[SweepResult[str]], terrain: Terrain) -> Any:
             Headline(
                 f"{sep_m / 1000:.1f} km" if sep_m else "–",
                 "to the nearest relay at the worst moment",
-                "close enough by range, hidden behind a ridge",
+                why_short,
             ),
         ],
         summary=(
-            f"A drone crosses 8 km of mountains at {AGL_M:.0f} m above the ground, and every relay has "
+            f"A drone crosses a mountain range at {AGL_M:.0f} m above the ground, and every relay has "
             f"its own satellite backhaul, so the drone is in touch whenever it can reach any relay, "
             f"directly or through another. Radio links are charged knife-edge diffraction loss for the "
             f"worst ridge between the two ends, so line of sight decides coverage, not distance. With "
@@ -1114,12 +1135,7 @@ def showcase(results: Sequence[SweepResult[str]], terrain: Terrain) -> Any:
             f"{best_stats.connected_fraction:.0%} of the way; the same flight with "
             f"{PLACEMENT_PROSE.get(worst.param, worst.param)} manages "
             f"{worst_stats.connected_fraction:.0%}. The last chart shows why: at the worst moment "
-            + (
-                f"the nearest relay is only {sep_m / 1000:.1f} km away, well inside radio range, but "
-                f"the ridge between them blocks the line of sight."
-                if sep_m
-                else "nothing was out of reach."
-            )
+            f"{why}."
         ),
         method=(
             "Terrain is a sum of Gaussian peaks over 8 × 6 km. Links are 900 MHz free-space loss at "

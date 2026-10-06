@@ -27,8 +27,8 @@ relearn the mesh. Three numbers come out of one run:
   one packet slipping across a path that is still settling is not traffic
   flowing;
 - **packets lost** from the power-off to that point;
-- **time to rejoin**: from the power-on until HQ has a route to the rebooted
-  relay again.
+- **time to rejoin**: from the power-on until the rebooted relay has
+  relearned a route to HQ.
 
 All three are read off delivered traffic (`Simulation.stream`) and the
 routers' own tables, never inferred from a schedule.
@@ -207,8 +207,8 @@ def run_failover(
     paths = rec.column("path")
     path_after = None
     if restored_s is not None:
-        # The path in use once healed, read a few seconds after the first
-        # delivery so it is the settled one rather than the first to answer.
+        # The path in use once healed, read a few seconds after delivery was
+        # restored so it is the settled one rather than the first to answer.
         settle_s = fail_at_s + restored_s + 3.0
         path_after = next(
             (p for t, p in zip(rec.times_s, paths) if t >= settle_s and p is not None),
@@ -292,12 +292,15 @@ class SweepPoint:
 
     @property
     def recoveries_s(self) -> list[float]:
-        # A run that never healed inside its window counts at the window's
-        # end — an underestimate, said so in the method note; none do here.
-        return [
-            r.recovered_s if r.recovered_s is not None else float("inf")
-            for r in self.runs
-        ]
+        # Every run must heal inside its window: one that did not has no
+        # recovery time to report, and quietly dropping it (or calling it
+        # infinite) would misstate the worst case. Lengthen the window instead.
+        missing = [r.seed for r in self.runs if r.recovered_s is None]
+        if missing:
+            raise RuntimeError(
+                f"{self.family} {self.setting_ms} ms: seeds {missing} never restored delivery"
+            )
+        return [r.recovered_s for r in self.runs if r.recovered_s is not None]
 
     @property
     def median_s(self) -> float:
@@ -429,7 +432,7 @@ def showcase(run: FailoverRun, sweep: Sequence[SweepPoint]) -> Showcase:
             "one shared channel (24 dBm, 700 m hard range, 450 m grid). A powered-off node neither "
             "sends nor hears; a reboot gives it a fresh router. Recovery is measured from delivered "
             "packets, not routing tables: it is the time from power-off until delivery is sustained "
-            f"again (95% over a 2 s window). Each setting repeats the failure under {len(SWEEP_SEEDS)} random "
+            f"again (95% over a 2 s window). Each setting repeats the failure under {len(ogm[0].runs)} random "
             "seeds; overhead is all frames sent per node per second before any data flows."
         ),
         charts=[
@@ -471,7 +474,7 @@ def showcase(run: FailoverRun, sweep: Sequence[SweepPoint]) -> Showcase:
                     ),
                 ],
                 caption=(
-                    "Lower-left is better. Each point is ten failures; keep-alives buy a short "
+                    f"Lower-left is better. Each point is {len(ogm[0].runs)} failures; keep-alives buy a short "
                     "worst case for far less airtime than speeding up the adverts."
                 ),
             ),

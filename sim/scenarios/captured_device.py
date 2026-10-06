@@ -29,7 +29,7 @@ captured relay would be a paper exclusion; the traffic columns are what show
 it is a real one.
 
 **Outsiders.** Alongside, three would-be joiners sit inside radio range of HQ
-and stream to it for the whole run: a stock open router with no credentials,
+and stream to it from the 20 s mark on: a stock open router with no credentials,
 a node holding a structurally perfect certificate from a *different* mesh
 root, and a former member whose certificate has expired. A legitimate new
 member is powered on mid-run as the control. Each is scored by the one number
@@ -224,10 +224,11 @@ class CaptureRun:
 
 
 def run_capture(
-    seed: int = 0, *, notify: Sequence[str] = (HQ,), joiners: bool = True
+    seed: int = 0, *, notify: Sequence[str] | None = (HQ,), joiners: bool = True
 ) -> CaptureRun:
-    """Converge, capture the relay carrying team→HQ, revoke it via `notify`,
-    and measure the exclusion."""
+    """Converge, capture the relay carrying team→HQ, revoke it via `notify`
+    (`None`: every member, as `Simulation.revoke` reads it), and measure the
+    exclusion."""
     sim = build_simulation(seed, joiners=joiners)
     team_flow = sim.stream(
         TEAM, HQ, rate_hz=RATE_HZ, start_s=STREAM_START_S, duration_s=DURATION_S
@@ -268,10 +269,17 @@ def run_capture(
     sim.record("routes", lambda s: sum(s.has_route(n, captured) for n in others))
 
     sim.run(until_s=REVOKE_AT_S)
-    if isinstance(notify, _AllMembers):
-        notify = tuple(others)
+    notify = tuple(others) if notify is None else tuple(notify)
     sim.revoke(captured, notify=list(notify))
     rec = sim.run(until_s=DURATION_S, sample_interval_ms=50)
+    # The exclusion is credited to the members only if the attacker's radio
+    # demonstrably refused the order and stayed up — otherwise it may simply
+    # have excluded itself, and the result would be measuring the wrong thing.
+    if sim.compromise_discards(captured) == 0 or sim.driver(captured).auth_locked:
+        raise RuntimeError(
+            f"seed {seed}: the captured radio did not refuse its own revocation; "
+            "the exclusion measured would be its own"
+        )
 
     learned = {m: _first_true_after(rec, f"knows:{m}", REVOKE_AT_S) for m in others}
     newcomer_s = (
@@ -283,7 +291,7 @@ def run_capture(
     return CaptureRun(
         seed=seed,
         captured=captured,
-        notify=tuple(notify),
+        notify=notify,
         times_s=list(rec.times_s),
         knows=list(rec.column("knows")),
         admits=list(rec.column("admits")),
@@ -315,29 +323,33 @@ class NotifySweep:
 
     @property
     def all_know_s(self) -> list[float]:
-        return [r.all_know_s for r in self.runs if r.all_know_s is not None]
+        return self._every("all_know_s", "reached every member")
 
     @property
     def excluded_s(self) -> list[float]:
-        return [r.excluded_s for r in self.runs if r.excluded_s is not None]
+        return self._every("excluded_s", "excluded the captured radio")
+
+    def _every(self, field: str, what: str) -> list[float]:
+        """The field from every run — refusing, rather than quietly dropping,
+        a run where it never happened: a median over the runs that worked,
+        labelled as a median over all of them, overstates a security claim."""
+        values = [getattr(r, field) for r in self.runs]
+        missing = sum(v is None for v in values)
+        if missing:
+            raise RuntimeError(
+                f"{self.label}: {missing} of {len(values)} runs never {what}"
+            )
+        return values
 
 
 def run_sweep(seeds: Sequence[int] = SWEEP_SEEDS) -> list[NotifySweep]:
     """Revocation pushed to HQ alone vs. to every member, across seeds."""
     hq_only = tuple(run_capture(s, notify=(HQ,), joiners=False) for s in seeds)
-    everyone = tuple(run_capture(s, notify=_ALL, joiners=False) for s in seeds)
+    everyone = tuple(run_capture(s, notify=None, joiners=False) for s in seeds)
     return [
         NotifySweep("pushed to HQ only", hq_only),
         NotifySweep("pushed to every member", everyone),
     ]
-
-
-class _AllMembers(tuple):
-    """Sentinel for "notify every member" — resolved inside `run_capture`
-    once the captured relay is known."""
-
-
-_ALL = _AllMembers()
 
 
 def print_summary(run: CaptureRun, sweep: Sequence[NotifySweep]) -> None:
@@ -463,22 +475,31 @@ def showcase(run: CaptureRun, sweep: Sequence[NotifySweep]) -> Showcase:
             f"so to any cryptographic check it is a member. The operator revokes it by "
             f"pushing one signed record to the HQ gateway, and the mesh carries that record the rest of the way. "
             f"In the run charted here, all {run.member_count} other radios held the revocation "
-            f"{_fmt(run.all_know_s)} after the push. From then on none of them admitted or routed to "
-            f"the captured radio, and HQ accepted {run.accepted_after_exclusion} of its packets. The "
+            f"{_fmt(run.all_know_s)} after the push, and {_fmt(run.excluded_s)} after it none of them "
+            f"admitted the captured radio or held a route to it; from then on HQ accepted "
+            f"{run.accepted_after_exclusion} of its packets. The "
             f"field team's traffic had been relayed through the captured radio. It moved to another "
             f"path, losing {_team_lost(run)} packet{'' if _team_lost(run) == 1 else 's'} in the "
-            f"{TEAM_WINDOW_S:.0f} s after the push. Meanwhile three outsiders streamed at HQ for the whole run: "
-            f"an open router, a node with a flawless certificate from another mesh, and a lapsed member. "
-            f"None of their packets were accepted. A genuinely new member's traffic was "
+            f"{TEAM_WINDOW_S:.0f} s after the push. Meanwhile three outsiders streamed at HQ from "
+            f"the {STREAM_START_S:.0f} s mark: an open router, a node with a flawless certificate from "
+            f"another mesh, and a lapsed member. "
+            + (
+                "None of their packets were accepted. "
+                if outsider_accepted == 0
+                else f"{outsider_accepted} of their packets were accepted. "
+            )
+            + f"A genuinely new member's traffic was "
             f"accepted {_fmt(run.newcomer_joined_s)} after it switched on."
         ),
         method=(
             "Every node runs the real wayfinder router with mesh authentication on: Ed25519 membership "
             "certificates, signed routing adverts, pairwise-tagged unicast. Revocation is the "
             "production mechanism, a root-signed record re-flooded on the members' own adverts. The "
-            "simulation never delivers it to anyone but HQ. Exclusion is the first instant at which no "
-            "member both admits the captured radio and holds a route to it. Radios: 24 dBm, 700 m "
-            f"range, one shared channel. Sweep: {len(SWEEP_SEEDS)} seeds per delivery mode."
+            "simulation never delivers it to anyone but HQ, and the captured radio's firmware discards "
+            "the order (checked, so the exclusion is the members' doing). Exclusion is the first "
+            "instant at which no member admits the captured radio and none holds a route to it. "
+            f"Radios: 24 dBm, 700 m range, one shared channel. Sweep: {len(hq_only.runs)} seeds per "
+            "delivery mode."
         ),
         charts=[
             Chart(
@@ -520,7 +541,15 @@ def showcase(run: CaptureRun, sweep: Sequence[NotifySweep]) -> Showcase:
                         kind="scatter",
                     )
                 ],
-                caption="The order travels on routing adverts, so each hop adds roughly one advert interval.",
+                caption=(
+                    "The order travels on routing adverts, and a new revocation resets each "
+                    "receiver to its fastest advert rate, so each hop adds a fraction of a second."
+                    + (
+                        f" {never} member(s) never learned and are not plotted."
+                        if (never := sum(t is None for t in run.learned_at_s.values()))
+                        else ""
+                    )
+                ),
             ),
             Chart(
                 title="Captured radio → HQ: packets accepted",

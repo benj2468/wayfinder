@@ -298,6 +298,7 @@ def test_a_compromised_node_ignores_its_own_revocation_and_is_still_excluded():
     sim.run(until_s=60.0)
 
     assert not sim.knows_revoked("rogue", "rogue"), "its firmware discarded the order"
+    assert sim.compromise_discards("rogue") > 0, "and the filter demonstrably fired"
     assert not sim.driver("rogue").auth_locked, "so it never went inert"
     assert "rogue" not in sim.admitted("a")
     assert "rogue" not in sim.admitted("b")
