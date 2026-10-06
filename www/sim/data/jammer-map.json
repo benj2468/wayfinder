@@ -7,7 +7,7 @@
   {
    "value": "1 of 154",
    "label": "positions where a 5 dBm jammer halves traffic",
-   "detail": "it has to stand within ~150 m of HQ; elsewhere the mesh routes around it"
+   "detail": "only on top of HQ; elsewhere the mesh routes around it"
   },
   {
    "value": "56 of 154",
@@ -15,9 +15,9 @@
    "detail": "median delivery across all positions 64%"
   },
   {
-   "value": "671 m",
-   "label": "from HQ before a 20 dBm jammer stops mattering",
-   "detail": "150 m for a 5 dBm one"
+   "value": "960 m",
+   "label": "from HQ is the farthest a 20 dBm jammer still halved traffic",
+   "detail": "0 m for a 5 dBm one (its only damaging spot)"
   }
  ],
  "summary": "Every radio in the field streams readings to HQ while a noise jammer switches on, then the jammer is moved and the run repeated, once per cell of a 14\u00d711 grid. Jamming happens at the receiver: a frame dies when the jammer's power where it lands drowns the signal. A weak 5 dBm jammer deafens only the radio it stands beside, and the mesh routes around it. It does real damage from 1 of 154 positions, all on top of HQ, the one receiver every packet has to reach. At 20 dBm the picture changes. A receiver can no longer hear its 450 m neighbour from several hundred metres away, so one jammer deafens several radios at once, and there's no clean path left to route around them. Traffic halves from 56 of 154 positions, and the median position leaves 64% getting through. Path diversity defends against a weak jammer. Against a strong one, the defences are shorter hops, which make every signal stronger than the noise, and more than one gateway.",

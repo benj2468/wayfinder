@@ -17,10 +17,10 @@
   {
    "value": "1.3x",
    "label": "more adverts than a quiet channel would carry",
-   "detail": "lost adverts reset the routers to their fastest rate"
+   "detail": "lost adverts expire routes, and expiry resets the routers to their fastest rate"
   }
  ],
- "summary": "Each sensor sends one short reading every 2 minutes, which by itself is a trivial load. The limit comes from the mesh itself. Every routing advert is re-broadcast by every node on the channel, so N sensors cost N\u00b2 adverts per round. LoRa radios don't listen before they talk, so readings collide with that advert traffic, and the collisions bite before EU rules' 1% duty cycle does. With adverts every 60 s the channel delivers \u226595% of readings for 2 sensors. Slowing adverts to every 30 minutes lifts that to 10, but only by about the square root of the slowdown, because the advert load grows with N\u00b2. Contention also feeds on itself. A lost advert reads to its receivers as a changed route, which resets them to their fastest advertising rate, so a busy channel carries about 1.3x the adverts a quiet one would. That is why the simulated capacity lands below the closed-form ceiling (chart 4). Use the arithmetic as an upper bound and the simulation for sizing. Slower adverts also mean slower failover, as the relay scenario measures.",
+ "summary": "Each sensor sends one short reading every 2 minutes, which by itself is a trivial load. The limit comes from the mesh itself. Every routing advert is re-broadcast by every node on the channel, so N sensors cost N\u00b2 adverts per round. LoRa radios don't listen before they talk, so readings collide with that advert traffic, and the collisions bite before EU rules' 1% duty cycle does. With adverts every 60 s the channel delivers \u226595% of readings for 2 sensors. Slowing adverts to every 30 minutes lifts that to 10, but only by about the square root of the slowdown, because the advert load grows with N\u00b2. Contention also feeds on itself. Lost adverts let routes expire, and both the expiry and the re-learning that follows reset a router to its fastest advertising rate, so a busy channel carries about 1.3x the adverts a quiet one would. That is why the simulated capacity lands below the closed-form ceiling (the last chart). Use the arithmetic as an upper bound and the simulation for sizing. Slower adverts also mean slower failover, as the relay scenario measures.",
  "charts": [
   {
    "title": "Readings delivered",
@@ -449,7 +449,7 @@
    ],
    "markers": [],
    "y_range": null,
-   "caption": "The closed form assumes a quiet channel's advert rate; contention raises it, so the simulation lands below. The duty-cycle ceiling (0.01\u00b70.75I/T) is far higher \u2014 5 to 155 sensors over this range \u2014 so collisions bind long before it does.",
+   "caption": "The closed form assumes a quiet channel's advert rate; contention raises it, so the simulation lands below. The duty-cycle ceiling (0.01\u00b70.75I/T) is higher \u2014 5 to 155 sensors over this range \u2014 so collisions bind long before it does.",
    "x_log": true,
    "heatmap": null
   }

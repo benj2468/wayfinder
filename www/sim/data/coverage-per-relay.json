@@ -20,7 +20,7 @@
    "detail": "so the geometric planner can be trusted to pick sites"
   }
  ],
- "summary": "A drone crosses 8 km of mountains at 80 m above the ground, and every relay has its own backhaul, so the drone is connected whenever it can reach any relay. Relays are added one at a time, each placed where it covers the most of what the others miss. The first relay alone covers 43% of the flight. Returns fall off quickly after that: 3 relays reach 98%, and each one beyond that adds less than 3%. Every layout is also flown through the real router, counting a second as covered only when a probe packet got through. Delivered coverage lands within 0.5 points of the geometric plan. The routing table is more optimistic: a route outlives a short shadow by several missed adverts, so route-based coverage reads up to 5.3 points higher than what traffic actually got.",
+ "summary": "A drone crosses a mountain range at 80 m above the ground, and every relay has its own backhaul, so the drone is connected whenever it can reach any relay. Relays are added one at a time, each placed where it covers the most of what the others miss. The first relay alone covers 43% of the flight. Returns fall off quickly after that: 3 relays reach 98%, and the next one adds less than 3%. Every layout is also flown through the real router, counting a second as covered only when a probe packet got through. Delivered coverage lands within 0.5 points of the geometric plan. The routing table is more optimistic: a route outlives a short shadow by several missed adverts, so route-based coverage reads up to 5.3 points higher than what traffic actually got.",
  "charts": [
   {
    "title": "Share of the flight covered",

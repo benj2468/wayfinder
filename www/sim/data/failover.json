@@ -1799,7 +1799,7 @@
    ],
    "markers": [],
    "y_range": null,
-   "caption": "Lower-left is better. Each point is ten failures; keep-alives buy a short worst case for far less airtime than speeding up the adverts.",
+   "caption": "Lower-left is better. Each point is 10 failures; keep-alives buy a short worst case for far less airtime than speeding up the adverts.",
    "x_log": false,
    "heatmap": null
   },

@@ -2,7 +2,7 @@
  "schema": 1,
  "slug": "satellite-relay",
  "title": "Relaying through orbit",
- "question": "An aircraft flies 9,000 km from its gateway. Can a small satellite constellation keep the mesh connected?",
+ "question": "An aircraft flies thousands of kilometres from its gateway. Can a small satellite constellation keep the mesh connected?",
  "headlines": [
   {
    "value": "36%",

@@ -20,7 +20,7 @@
    "detail": "from power-on, with no operator involvement"
   }
  ],
- "summary": "A captured radio is the hardest case. It holds a valid certificate and the matching key, so to any cryptographic check it is a member. The operator revokes it by pushing one signed record to the HQ gateway, and the mesh carries that record the rest of the way. In the run charted here, all 11 other radios held the revocation 0.25 s after the push. From then on none of them admitted or routed to the captured radio, and HQ accepted 0 of its packets. The field team's traffic had been relayed through the captured radio. It moved to another path, losing 1 packet in the 10 s after the push. Meanwhile three outsiders streamed at HQ for the whole run: an open router, a node with a flawless certificate from another mesh, and a lapsed member. None of their packets were accepted. A genuinely new member's traffic was accepted 0.30 s after it switched on.",
+ "summary": "A captured radio is the hardest case. It holds a valid certificate and the matching key, so to any cryptographic check it is a member. The operator revokes it by pushing one signed record to the HQ gateway, and the mesh carries that record the rest of the way. In the run charted here, all 11 other radios held the revocation 0.25 s after the push, and 0.25 s after it none of them admitted the captured radio or held a route to it; from then on HQ accepted 0 of its packets. The field team's traffic had been relayed through the captured radio. It moved to another path, losing 1 packet in the 10 s after the push. Meanwhile three outsiders streamed at HQ from the 20 s mark: an open router, a node with a flawless certificate from another mesh, and a lapsed member. None of their packets were accepted. A genuinely new member's traffic was accepted 0.30 s after it switched on.",
  "charts": [
   {
    "title": "The revocation crossing the mesh",
@@ -830,7 +830,7 @@
    ],
    "markers": [],
    "y_range": null,
-   "caption": "The order travels on routing adverts, so each hop adds roughly one advert interval.",
+   "caption": "The order travels on routing adverts, and a new revocation resets each receiver to its fastest advert rate, so each hop adds a fraction of a second.",
    "x_log": false,
    "heatmap": null
   },
@@ -1192,7 +1192,7 @@
   "stream_rate_hz": 10.0,
   "seeds": 10
  },
- "method": "Every node runs the real wayfinder router with mesh authentication on: Ed25519 membership certificates, signed routing adverts, pairwise-tagged unicast. Revocation is the production mechanism, a root-signed record re-flooded on the members' own adverts. The simulation never delivers it to anyone but HQ. Exclusion is the first instant at which no member both admits the captured radio and holds a route to it. Radios: 24 dBm, 700 m range, one shared channel. Sweep: 10 seeds per delivery mode.",
+ "method": "Every node runs the real wayfinder router with mesh authentication on: Ed25519 membership certificates, signed routing adverts, pairwise-tagged unicast. Revocation is the production mechanism, a root-signed record re-flooded on the members' own adverts. The simulation never delivers it to anyone but HQ, and the captured radio's firmware discards the order (checked, so the exclusion is the members' doing). Exclusion is the first instant at which no member admits the captured radio and none holds a route to it. Radios: 24 dBm, 700 m range, one shared channel. Sweep: 10 seeds per delivery mode.",
  "table": [
   [
    "delivery",

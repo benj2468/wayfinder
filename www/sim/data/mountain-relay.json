@@ -20,7 +20,7 @@
    "detail": "close enough by range, hidden behind a ridge"
   }
  ],
- "summary": "A drone crosses 8 km of mountains at 80 m above the ground, and every relay has its own satellite backhaul, so the drone is in touch whenever it can reach any relay, directly or through another. Radio links are charged knife-edge diffraction loss for the worst ridge between the two ends, so line of sight decides coverage, not distance. With relays on the summits the drone stays in touch 81% of the way; the same flight with relays on the valley floor manages 60%. The last chart shows why: at the worst moment the nearest relay is only 3.7 km away, well inside radio range, but the ridge between them blocks the line of sight.",
+ "summary": "A drone crosses a mountain range at 80 m above the ground, and every relay has its own satellite backhaul, so the drone is in touch whenever it can reach any relay, directly or through another. Radio links are charged knife-edge diffraction loss for the worst ridge between the two ends, so line of sight decides coverage, not distance. With relays on the summits the drone stays in touch 81% of the way; the same flight with relays on the valley floor manages 60%. The last chart shows why: at the worst moment r3 was only 3.7 km away, inside radio range, but the ridge between them rises through the line of sight.",
  "charts": [
   {
    "title": "Share of the transit with a route to the ground",
@@ -5007,7 +5007,7 @@
    ],
    "markers": [],
    "y_range": null,
-   "caption": "valley floor placement, longest outage. r3 is 3.7 km away, but the ridge rises through the line of sight; at 900 MHz anything inside the first Fresnel zone costs diffraction loss, and here the path is buried.",
+   "caption": "valley floor placement, longest outage: r3 was only 3.7 km away, inside radio range, but the ridge between them rises through the line of sight. At 900 MHz anything inside the first Fresnel zone costs diffraction loss.",
    "x_log": false,
    "heatmap": null
   }
