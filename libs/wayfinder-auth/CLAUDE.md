@@ -44,6 +44,14 @@ worth knowing before you design against this:
   build a misissuance on purpose — so "the CA will sign it" and "a node will
   honour it" are deliberately different questions.
 
+**The X25519 key is checked the same way, at both ends.** A low-order
+`x_pubkey` makes every key agreement with it the all-zero secret, so the
+"pairwise" key — and every directed-frame tag on that link — would be public.
+`pairwise_key` returns `AuthError::NonContributoryKey` rather than that key, so
+a node never admits such a holder; and every issuance path — the three above,
+plus mesh renewal and user login — refuses to mint one, through
+`validate_x25519_pubkey` (issue #103).
+
 See `docs/design/implemented/09-mesh-auth-gaps.md` §5.
 
 ## Two mechanisms, chosen by fan-out

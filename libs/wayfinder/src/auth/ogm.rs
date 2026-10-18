@@ -326,7 +326,15 @@ impl<
                     }
                 };
                 self.ogm_crypto_ops += 1;
-                let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
+                // A low-order X25519 key would make this "pairwise" key public,
+                // and every directed tag on the link forgeable by anyone.
+                let pairwise_key = match self.keypair.pairwise_key(&verified.x_pubkey) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        tracing::trace!(error = ?e, "auth: dropping OGM whose certificate carries a low-order x25519 key");
+                        return OgmVerdict::Rejected;
+                    }
+                };
                 (verified, pairwise_key, false)
             }
         };
@@ -715,6 +723,24 @@ mod tests {
         let (mut buf, len) = bare_ogm(mac(9), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+    }
+
+    /// A certificate the mesh root signed but whose X25519 key is a low-order
+    /// point — a misissuance, deliberate or a key-generation bug — must not
+    /// admit its holder: every pairwise key derived from it would be computable
+    /// by anyone, and so would every directed-frame tag (issue #103). The OGM
+    /// is rejected and no neighbor entry is cached.
+    #[test]
+    fn an_ogm_whose_cert_carries_a_low_order_x25519_key_is_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member_with_x_pubkey(&authority, 2, mac(2), 1000, [0u8; 32]);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+        assert_eq!(b.neighbors().len(), 0, "no neighbor is cached for it");
     }
 
     /// A node from another mesh (different trust anchor) is rejected — the

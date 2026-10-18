@@ -138,7 +138,15 @@ impl<
         // request — so dropping the entry here would both report success and
         // delete the retry backstop this function's contract promises, letting
         // whoever raced the reply in consume every fetch attempt for that MAC.
-        let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
+        // A low-order X25519 key would make this "pairwise" key public — the
+        // same refusal the OGM path makes, at this second door (issue #103).
+        let pairwise_key = match self.keypair.pairwise_key(&verified.x_pubkey) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::trace!(error = ?e, "auth: dropping cert reply carrying a low-order x25519 key");
+                return false;
+            }
+        };
         let mac = verified.mac;
         if self.cache_neighbor(NeighborKeys {
             cert: verified,
@@ -232,7 +240,15 @@ impl<
             return None;
         }
 
-        let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
+        // After the rate limiter, so a flood of these costs one X25519 per
+        // window rather than one per frame.
+        let pairwise_key = match self.keypair.pairwise_key(&verified.x_pubkey) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::trace!(error = ?e, "auth: dropping cert request carrying a low-order x25519 key");
+                return None;
+            }
+        };
         // Cannot be refused: `identity_conflict` was just checked above, and
         // nothing between here and there mutates the neighbour table.
         let _ = self.cache_neighbor(NeighborKeys {
@@ -676,6 +692,41 @@ mod tests {
         let foreign = member(&theirs, 2, mac(2), 1000);
         assert!(!b.ingest_cert_reply(foreign.cert.as_bytes()));
         assert!(b.neighbor_cert(mac(2)).is_none());
+    }
+
+    /// A reply that answers an outstanding request with a certificate the root
+    /// really signed, but whose X25519 key is a low-order point, is refused and
+    /// nothing is cached: lazy distribution is a second door into the neighbor
+    /// table, and it must refuse what the OGM path refuses (issue #103).
+    #[test]
+    fn ingest_cert_reply_with_a_low_order_x25519_key_is_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+            .unwrap();
+
+        let a = member_with_x_pubkey(&authority, 2, mac(2), 1000, [0u8; 32]);
+        assert!(!b.ingest_cert_reply(a.cert.as_bytes()));
+        assert!(b.neighbor_cert(mac(2)).is_none());
+    }
+
+    /// The responder side of the same door: a self-authenticating `CertReq`
+    /// whose requester certificate carries a low-order X25519 key is refused,
+    /// and the requester is not cached (issue #103).
+    #[test]
+    fn verify_cert_request_rejects_a_low_order_x25519_key() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut requester = member_with_x_pubkey(&authority, 3, mac(3), 1000, [0u8; 32]);
+
+        let mut buf = [0u8; 512];
+        let len = requester
+            .build_cert_request(mac(2), [0; 8], mac(9), &mut buf)
+            .unwrap();
+
+        assert_eq!(a.verify_cert_request(&buf[..len]), None);
+        assert!(a.neighbor_cert(mac(3)).is_none());
     }
 
     /// A well-formed `CertReq` body (built with the real requester-side

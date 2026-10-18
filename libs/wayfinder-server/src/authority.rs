@@ -858,7 +858,14 @@ impl CertAuthority {
         }
         let mac = node_mac_of(node_mac)?;
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
-        let x = fixed::<32>(x_pubkey, "x_pubkey")?;
+        // A refusal, not an `Err`: `Err` here means an unusable clock, and the
+        // caller logs it at `error!`. The key comes from a certificate this
+        // authority signed, so only a holder misissued before the check
+        // existed can present one (issue #103).
+        let x = match x25519_pubkey_of(x_pubkey) {
+            Ok(x) => x,
+            Err(why) => return Ok(RenewalOutcome::Refused(why)),
+        };
         // The address must be the one this key derives. Checked here as well as
         // at `submit_csr` because this is a second door into the same act, and
         // a binding enforced at one door is not enforced.
@@ -1913,6 +1920,21 @@ fn fixed<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N], String> {
         .map_err(|_| alloc::format!("{what} must be {N} bytes"))
 }
 
+/// Parse a 32-byte X25519 public key from a wire slice and refuse a low-order
+/// point, so every door a key enters the authority through refuses the same
+/// keys (issue #103). A certificate carrying one would make every pairwise key
+/// its holder shares, and every directed tag on those links, public. Refused as
+/// a malformed request, like a key of the wrong length.
+fn x25519_pubkey_of(bytes: &[u8]) -> Result<[u8; 32], String> {
+    let x = fixed::<32>(bytes, "x_pubkey")?;
+    wayfinder_auth::validate_x25519_pubkey(&x).map_err(|_| {
+        "x_pubkey is a low-order X25519 point, so any key agreement with it is public; \
+         generate the node's keys again"
+            .to_string()
+    })?;
+    Ok(x)
+}
+
 /// Parse a 6-byte node MAC from a wire slice, with a descriptive error, so the
 /// enrollment methods below don't each open-code the length check and label.
 fn node_mac_of(bytes: &[u8]) -> Result<Mac, String> {
@@ -2095,7 +2117,7 @@ impl MeshAuthority for CertAuthority {
         // sent 31 bytes has a bug, and telling it so reveals nothing about
         // whether the account exists.
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
-        let x = fixed::<32>(x_pubkey, "x_pubkey")?;
+        let x = x25519_pubkey_of(x_pubkey)?;
 
         let now = self.now_unix();
         let name = username.to_string();
@@ -2211,7 +2233,7 @@ impl MeshAuthority for CertAuthority {
         }
         let mac = node_mac_of(node_mac)?;
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
-        let x = fixed::<32>(x_pubkey, "x_pubkey")?;
+        let x = x25519_pubkey_of(x_pubkey)?;
         // The address must be the one this key derives. Checked here as well as
         // in `verify_cert` so the failure surfaces where the mistake is made,
         // rather than as a certificate that issues cleanly and is then refused
@@ -2469,6 +2491,9 @@ impl MeshAuthority for CertAuthority {
         // otherwise be signed on an operator's say-so without ever passing the
         // guard `submit_csr` applies.
         check_mac_derives_from(mac, &ed, true)?;
+        // The X25519 key, for the same reason (issue #103): a row parked before
+        // low-order keys were refused would otherwise be signed here.
+        x25519_pubkey_of(&x)?;
         // Sign now (stamping the current clock) and stash the bytes; the node
         // collects them on its next poll.  Restart the entry's TTL clock so the
         // node gets a full pending-TTL window to collect from the approval.
@@ -3548,6 +3573,42 @@ mod tests {
         assert!(ca.submit_csr(&[0; 6], &ed[..16], &x, "").is_err()); // short ed key
     }
 
+    /// An X25519 key on a low-order point is refused at every door a key
+    /// enters the authority through — enrollment, renewal and user login — so
+    /// a certificate carrying one is never minted (issue #103).
+    ///
+    /// Enrollment and login refuse it as an unserviceable request, like a key
+    /// of the wrong length. Renewal answers with a refusal instead, because
+    /// `renew_holder` reserves `Err` for an authority with no usable clock and
+    /// its caller logs every `Err` at `error!`.
+    #[test]
+    fn a_low_order_x25519_key_is_refused_at_every_intake() {
+        let low_order = [0u8; 32];
+
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let err = ca
+            .submit_csr(&node_mac(2), &ed, &low_order, "")
+            .unwrap_err();
+        assert!(
+            err.contains("x_pubkey"),
+            "the refusal names the field: {err}"
+        );
+
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
+        assert!(matches!(
+            ca.renew_holder(&node_mac(2), &ed, &low_order).unwrap(),
+            RenewalOutcome::Refused(_)
+        ));
+
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let code = live_code(&secret, 100);
+        assert!(
+            ca.authenticate_user("ops", "hunter2", &code, &ed, &low_order)
+                .is_err()
+        );
+    }
+
     /// Nothing is issued without a usable clock, and the refusal says what an
     /// operator should go and look at.
     ///
@@ -4144,6 +4205,31 @@ mod tests {
             ca.approve_csr(&node_mac(3), None).is_err(),
             "approval must refuse a held row whose MAC its key does not derive"
         );
+    }
+
+    /// The same re-check for the X25519 key (issue #103): a held row parked by
+    /// a build that did not yet refuse low-order keys, or restored from a
+    /// snapshot one wrote, is refused at approval rather than signed.
+    #[test]
+    fn approving_a_held_csr_refuses_a_low_order_x25519_key() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        assert!(matches!(
+            ca.submit_csr(&node_mac(2), &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+        let (_, persisted) = ca.log.mutate_held(|held| {
+            for row in held.iter_mut() {
+                row.x_pubkey = [0u8; 32];
+            }
+        });
+        persisted.unwrap();
+
+        assert!(
+            ca.approve_csr(&node_mac(2), None).is_err(),
+            "approval must refuse a held row carrying a low-order x25519 key"
+        );
+        assert!(ca.list_certs().is_empty(), "and nothing was issued");
     }
 
     #[test]

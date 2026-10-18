@@ -50,7 +50,13 @@ impl<
     /// value only the holder of our secret can compute, with no new dependency
     /// and no RNG to plumb through every board.
     pub(super) fn nonce_prf_key(&self) -> [u8; 32] {
-        self.keypair.pairwise_key(&self.keypair.x_pubkey())
+        #[expect(
+            clippy::expect_used,
+            reason = "our own public key is secret · B for the prime-order base point B, so an agreement with it is never the identity"
+        )]
+        self.keypair
+            .pairwise_key(&self.keypair.x_pubkey())
+            .expect("a key agreement with our own public key is always contributory")
     }
 
     /// Build the `context` a challenge response is tagged under: the domain
