@@ -1,0 +1,326 @@
+{
+ "schema": 1,
+ "slug": "scale",
+ "title": "Growing the mesh",
+ "question": "Does it scale, and where is the edge?",
+ "headlines": [
+  {
+   "value": "128",
+   "label": "nodes on the default router profile, at full delivery",
+   "detail": "100% to HQ, 100% back; ready 2 s after power-on"
+  },
+  {
+   "value": "36%",
+   "label": "delivered past the edge (144 nodes)",
+   "detail": "a full routing table triggers an advert storm"
+  },
+  {
+   "value": "6x",
+   "label": "jump in control traffic one step past the edge",
+   "detail": "27 \u2192 163 frames/s per node"
+  }
+ ],
+ "summary": "Square grids from 25 to 144 radios, every node streaming to HQ and HQ streaming back. Up to 128 nodes the mesh scales as it should: delivery stays at 99% or better both ways, every node has a route to HQ within 2 s of power-on, and each node's control traffic grows in step with the mesh. The default router profile remembers 128 other nodes, and past that the mesh doesn't degrade gracefully. Routers start evicting nodes and hearing them again a moment later. Each re-learned node counts as new and resets that router to its fastest advertising rate; with every router churning, all of them are pinned there, so control traffic jumps 6x and delivery falls to 36%. The default profile is therefore a hard ceiling. A larger mesh needs the host profile (4,096 nodes) on every router, and the storm itself is worth fixing in the router.",
+ "charts": [
+  {
+   "title": "Traffic delivered, both directions",
+   "x_label": "nodes in the mesh",
+   "y_label": "delivery ratio",
+   "series": [
+    {
+     "name": "node \u2192 HQ",
+     "x": [
+      25,
+      49,
+      81,
+      100,
+      121,
+      128,
+      132,
+      144
+     ],
+     "y": [
+      1.0,
+      0.9979,
+      0.9958,
+      0.9946,
+      0.9978,
+      0.9969,
+      0.7952,
+      0.359
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "HQ \u2192 node",
+     "x": [
+      25,
+      49,
+      81,
+      100,
+      121,
+      128,
+      132,
+      144
+     ],
+     "y": [
+      0.9986,
+      0.9979,
+      0.9971,
+      0.9973,
+      0.9933,
+      0.9955,
+      0.828,
+      0.4291
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": [
+    0.0,
+    1.0
+   ],
+   "caption": "Both directions collapse once the mesh outgrows the default router's 128-entry table.",
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Who the gateway remembers",
+   "x_label": "nodes in the mesh",
+   "y_label": "originators in HQ's table",
+   "series": [
+    {
+     "name": "HQ's table",
+     "x": [
+      25,
+      49,
+      81,
+      100,
+      121,
+      128,
+      132,
+      144
+     ],
+     "y": [
+      24.0,
+      48.0,
+      80.0,
+      99.0,
+      120.0,
+      127.0,
+      128.0,
+      128.0
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "every other node",
+     "x": [
+      25,
+      49,
+      81,
+      100,
+      121,
+      128,
+      132,
+      144
+     ],
+     "y": [
+      24.0,
+      48.0,
+      80.0,
+      99.0,
+      120.0,
+      127.0,
+      131.0,
+      143.0
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": null,
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Control traffic per node",
+   "x_label": "nodes in the mesh",
+   "y_label": "frames / s / node",
+   "series": [
+    {
+     "name": "adverts relayed and sent",
+     "x": [
+      25,
+      49,
+      81,
+      100,
+      121,
+      128,
+      132,
+      144
+     ],
+     "y": [
+      6.8207,
+      11.6017,
+      18.2144,
+      22.3913,
+      25.4106,
+      26.7923,
+      163.0746,
+      175.0659
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": "Linear per node below the edge; past it, eviction churn pins every router at its fastest advert rate.",
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Time to a usable mesh",
+   "x_label": "nodes in the mesh",
+   "y_label": "seconds from power-on",
+   "series": [
+    {
+     "name": "every node has a route to HQ",
+     "x": [
+      25,
+      49,
+      81,
+      100,
+      121,
+      128,
+      132,
+      144
+     ],
+     "y": [
+      1.5,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      3.0,
+      3.5
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": null,
+   "x_log": false,
+   "heatmap": null
+  }
+ ],
+ "params": {
+  "sizes": [
+   25,
+   49,
+   81,
+   100,
+   121,
+   128,
+   132,
+   144
+  ],
+  "spacing_m": 450.0,
+  "trickle_ms": [
+   1000,
+   10000
+  ],
+  "table_capacity": 128,
+  "stream_hz": 0.5
+ },
+ "method": "The real wayfinder router (default capacity profile) on square grids, 450 m apart, one shared 2.4 GHz channel at 24 dBm with a 700 m range. Adverts run on a 1\u201310 s schedule. After 60 s of warm-up, every node streams to HQ and HQ to every node at 0.5 packets/s for 60 s. Reachability is delivered packets; convergence is the first instant every node held a route to HQ, sampled every 0.5 s.",
+ "table": [
+  [
+   "nodes",
+   "converged (s)",
+   "\u2192HQ",
+   "HQ\u2192",
+   "HQ table",
+   "frames/s/node",
+   "max hops"
+  ],
+  [
+   25,
+   1.5,
+   1.0,
+   0.999,
+   24,
+   6.8,
+   5
+  ],
+  [
+   49,
+   2.0,
+   0.998,
+   0.998,
+   48,
+   11.6,
+   7
+  ],
+  [
+   81,
+   2.0,
+   0.996,
+   0.997,
+   80,
+   18.2,
+   12
+  ],
+  [
+   100,
+   2.0,
+   0.995,
+   0.997,
+   99,
+   22.4,
+   12
+  ],
+  [
+   121,
+   2.0,
+   0.998,
+   0.993,
+   120,
+   25.4,
+   12
+  ],
+  [
+   128,
+   2.0,
+   0.997,
+   0.996,
+   127,
+   26.8,
+   14
+  ],
+  [
+   132,
+   3.0,
+   0.795,
+   0.828,
+   128,
+   163.1,
+   15
+  ],
+  [
+   144,
+   3.5,
+   0.359,
+   0.429,
+   128,
+   175.1,
+   14
+  ]
+ ],
+ "category": "capacity",
+ "scenario": "sim/scenarios/scale.py"
+}

@@ -366,6 +366,32 @@ site-serve: site-build
     @echo "wayfndr.dev preview -> http://127.0.0.1:8899"
     cd dist/site && python3 -m http.server 8899
 
+# The simulation lab (`www/sim/`) draws JSON the scenario scripts export, so
+# refreshing its numbers is re-running them — never hand-editing the data. The
+# sim's compiled router does not rebuild itself (it is a Python extension), so
+# reinstall it first or the page will show the last build's behaviour.
+#
+# The export is all-or-nothing. Every scenario writes into a scratch
+# directory, and only when all of them have succeeded does that replace
+# www/sim/data whole — results, and the `inputs.sha256` stamp
+# (`scripts/sim-inputs-hash.py`) that `build-site.sh` checks to refuse
+# publishing results computed from an older router. A run that stops halfway
+# leaves the old data and the old stamp untouched, and a result from a removed
+# scenario cannot linger beside a fresh stamp.
+[doc("Re-run every showcase scenario and refresh www/sim/data (15-25 minutes).")]
+sim-export:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv sync --group sim --reinstall-package wayfinder-py
+    scratch="$(mktemp -d)"
+    trap 'rm -rf "$scratch"' EXIT
+    for s in failover captured_device mountain_relay satellite_relay coverage_per_relay crowded_lora battery_life jammer_map scale; do
+        uv run --group sim python "sim/scenarios/$s.py" --export "$scratch"
+    done
+    scripts/sim-inputs-hash.py > "$scratch/inputs.sha256"
+    rm -f www/sim/data/*.json www/sim/data/inputs.sha256
+    mv "$scratch"/* www/sim/data/
+
 [doc("Deploy the landing page to Cloudflare Pages (needs CLOUDFLARE_API_TOKEN).")]
 site-deploy branch="main": site-build
     npx --yes wrangler@4 pages deploy dist/site \

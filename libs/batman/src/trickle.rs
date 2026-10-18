@@ -43,6 +43,17 @@ pub struct TrickleTimer {
     rng: u32,
 }
 
+/// murmur3's 32-bit finaliser: every input bit flips each output bit with
+/// probability ~1/2, so seeds a few bits apart start unrelated streams.
+const fn fmix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h
+}
+
 impl TrickleTimer {
     /// Build a timer with the given bounds, seeded for jitter, scheduling its
     /// first emission within `[i_min/2, i_min)` after `now`.  `i_max` is clamped
@@ -51,9 +62,13 @@ impl TrickleTimer {
     pub fn new(i_min: Duration, i_max: Duration, now: Duration, seed: u32) -> Self {
         let i_min = i_min.max(Duration::from_nanos(1));
         let i_max = i_max.max(i_min);
-        // A zero seed would make xorshift stick at zero forever; fold in a
-        // non-zero constant so any node identity yields a usable stream.
-        let rng = seed ^ 0x9E37_79B9;
+        // Seeds are node identities, and neighbouring ones differ in a few low
+        // bits (sequential MACs). xorshift's first outputs from such seeds
+        // share their high bits, and the jitter reads the high bits, so the
+        // seed is avalanched first (murmur3's 32-bit finaliser). A zero seed
+        // would make xorshift stick at zero forever; the constant keeps any
+        // identity usable.
+        let rng = fmix32(seed ^ 0x9E37_79B9);
         let mut timer = Self {
             i_min,
             i_max,
@@ -79,10 +94,14 @@ impl TrickleTimer {
     fn jittered(&mut self, span: Duration) -> Duration {
         let span_ns = span.as_nanos() as u64;
         let half = span_ns / 2;
-        // Width of the half-open window; at least 1 ns so the modulo is defined.
+        // Width of the half-open window, at least 1 ns.
         let width = (span_ns - half).max(1);
-        let offset = half + (self.next_rand() as u64) % width;
-        Duration::from_nanos(offset)
+        // Scale the 32-bit word onto the window (multiply-shift) rather than
+        // taking it modulo the width: a u32 counts at most ~4.3 s of
+        // nanoseconds, so a modulo leaves every window longer than that
+        // bunched at its start — exactly the lockstep jitter exists to break.
+        let scaled = ((self.next_rand() as u128 * width as u128) >> 32) as u64;
+        Duration::from_nanos(half + scaled)
     }
 
     /// Record that an emission just happened at `now`: schedule the next fire
@@ -93,12 +112,24 @@ impl TrickleTimer {
         self.interval = (self.interval * 2).min(self.i_max);
     }
 
-    /// Reset to the most aggressive interval after an inconsistency and
-    /// reschedule the next fire within `[i_min/2, i_min)` after `now`.
+    /// Reset to the most aggressive interval after an inconsistency and, if
+    /// the next fire is further out than `i_min`, reschedule it within
+    /// `[i_min/2, i_min)` after `now`.
+    ///
+    /// A fire already due within `i_min` is kept. That generalises RFC 6206
+    /// §4.2's "if I is already Imin, do nothing" (at `I == Imin` the pending
+    /// fire is always within `i_min`) to a backed-off interval whose fire
+    /// happens to be imminent anyway, and it is load-bearing: re-drawing the
+    /// fire on every reset pushes it out each time, so a node meeting a large
+    /// mesh — a new originator every few hundred milliseconds — would never
+    /// emit its own advert until discovery settled. The backoff still restarts
+    /// from `i_min`.
     pub fn reset(&mut self, now: Duration) {
         self.interval = self.i_min;
-        let wait = self.jittered(self.i_min);
-        self.next_fire = now + wait;
+        if self.next_fire > now + self.i_min {
+            let wait = self.jittered(self.i_min);
+            self.next_fire = now + wait;
+        }
     }
 
     /// Time remaining until the next scheduled emission, saturating at zero once
@@ -185,15 +216,17 @@ mod tests {
         assert_eq!(t.interval(), I_MAX);
     }
 
-    /// `reset` collapses a grown interval back to `i_min` and reschedules the
-    /// next fire into the aggressive window.
+    /// `reset` collapses a grown interval back to `i_min` and reschedules a
+    /// backed-off next fire into the aggressive window. (Reset just after an
+    /// emission, while that fire is far out — one already due is kept; see
+    /// `repeated_resets_do_not_postpone_a_fire_already_due_within_i_min`.)
     #[test]
     fn reset_returns_to_i_min() {
         let mut t = TrickleTimer::new(I_MIN, I_MAX, Duration::ZERO, 11);
         let mut now = Duration::ZERO;
         for _ in 0..6 {
-            t.on_emit(now);
             now = t.next_fire;
+            t.on_emit(now);
         }
         assert!(t.interval() > I_MIN, "interval should have grown");
 
@@ -252,5 +285,65 @@ mod tests {
         let clamped = TrickleTimer::new(I_MAX, I_MIN, Duration::ZERO, 5);
         assert_eq!(clamped.i_min(), I_MAX);
         assert_eq!(clamped.i_max(), I_MAX);
+    }
+
+    /// RFC 6206 spreads each fire uniformly over `[interval/2, interval)`, and
+    /// that spread is what keeps neighbours from keying up together on a
+    /// shared medium. A long interval must get the whole window, not the first
+    /// few seconds of it: a 32-bit random word taken modulo a nanosecond width
+    /// covers at most ~4.3 s, so for every interval above ~8.6 s the fires
+    /// bunched at the window's start.
+    #[test]
+    fn jitter_covers_the_whole_window_of_a_long_interval() {
+        let span = Duration::from_secs(60);
+        let mut late = 0;
+        for seed in 1..=200u32 {
+            let t = TrickleTimer::new(span, span, Duration::ZERO, seed);
+            let until = t.time_until(Duration::ZERO);
+            assert!(until >= span / 2 && until < span, "fire {until:?}");
+            if until >= span * 3 / 4 {
+                late += 1;
+            }
+        }
+        // Uniform over [30 s, 60 s): about half land in the back half.
+        assert!(late > 60, "only {late}/200 fires in [45 s, 60 s)");
+    }
+
+    /// A burst of inconsistencies must not starve the node's own emission.
+    /// RFC 6206 §4.2: when `I` is already `I_min`, an inconsistency does
+    /// nothing. Re-drawing the fire on every reset instead pushes it out each
+    /// time, and a node joining a large mesh — which discovers a new originator
+    /// every few hundred milliseconds — never advertised itself until discovery
+    /// settled: 33 s on a 100-node grid with a 1 s `i_min`.
+    #[test]
+    fn repeated_resets_do_not_postpone_a_fire_already_due_within_i_min() {
+        let mut t = TrickleTimer::new(I_MIN, I_MAX, Duration::ZERO, 3);
+        let first = t.time_until(Duration::ZERO);
+        let mut now = Duration::ZERO;
+        while now < first {
+            t.reset(now);
+            now += Duration::from_millis(100);
+        }
+        assert!(t.due(first), "resets pushed the first fire past {first:?}");
+        assert_eq!(t.interval(), I_MIN);
+    }
+
+    /// A reset still pulls a fire scheduled far out (a backed-off interval)
+    /// back to within `[i_min/2, i_min)` — that is what reconvergence needs.
+    #[test]
+    fn reset_still_pulls_a_backed_off_fire_in() {
+        let mut t = TrickleTimer::new(I_MIN, I_MAX, Duration::ZERO, 9);
+        let mut now = Duration::ZERO;
+        for _ in 0..6 {
+            now = t.next_fire;
+            t.on_emit(now);
+        }
+        assert!(t.time_until(now) >= I_MIN, "backed off well past i_min");
+        t.reset(now);
+        let until = t.time_until(now);
+        assert!(
+            until >= I_MIN / 2 && until < I_MIN,
+            "post-reset fire {until:?}"
+        );
     }
 }

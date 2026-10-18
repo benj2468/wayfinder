@@ -1,0 +1,422 @@
+/* Wayfinder — simulation lab (/sim/).
+ *
+ * Layered on /styles.css: the same tokens, type and section rhythm, plus what
+ * a results page needs that the landing page does not — stat tiles, chart
+ * cards, a tooltip, and collapsible method/data blocks.
+ *
+ * Chart colour is the simulator's validated categorical palette
+ * (sim/src/wayfinder_sim/palette.py: blue, aqua, yellow, violet, in that fixed
+ * order), checked against the chart surface (--paper-2) with the dataviz
+ * validator. Aqua and yellow sit below 3:1 there, so identity never rides on
+ * colour alone: every multi-series chart carries a legend and a data table.
+ * Text never wears a series colour.
+ */
+
+:root {
+  --s1: #2a78d6;
+  --s2: #1baf7a;
+  --s3: #eda100;
+  --s4: #4a3aa7;
+  --chart-surface: var(--paper-2);
+  --grid: #dcd8d0;
+  --axis: #b9b4aa;
+}
+
+/* ------------------------------------------------------------------ hero -- */
+
+.lab-hero {
+  padding-block: clamp(3rem, 7vw, 5.5rem) var(--sec-y);
+}
+
+.lab-hero__title {
+  font-family: var(--f-display);
+  font-weight: 600;
+  font-size: clamp(2.4rem, 5.5vw, 4.1rem);
+  line-height: 1.02;
+  letter-spacing: -0.03em;
+  margin: 0 0 1.25rem;
+}
+
+.lab-how {
+  list-style: none;
+  margin: 2rem 0 1.5rem;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.lab-how li {
+  border-top: 1px solid var(--rule);
+  padding-top: 0.9rem;
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.lab-how__k {
+  display: block;
+  font-family: var(--f-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text);
+  margin-bottom: 0.35rem;
+}
+
+.lab-hero__note {
+  font-size: 0.9rem;
+  color: var(--faint);
+  max-width: 70ch;
+  margin: 0;
+}
+
+.lab-noscript {
+  padding-block: 2rem;
+  color: var(--muted);
+}
+
+/* -------------------------------------------------------------- scenario -- */
+
+.lab-scn {
+  padding-block: var(--sec-y);
+  border-top: 1px solid var(--rule-soft);
+}
+
+.lab-scn:nth-child(even) {
+  background: linear-gradient(
+    180deg,
+    rgb(255 255 255 / 40%),
+    rgb(255 255 255 / 0%)
+  );
+}
+
+.lab-scn__q {
+  font-size: clamp(1.02rem, 1.35vw, 1.19rem);
+  color: var(--muted);
+  max-width: 62ch;
+  margin: 0 0 1.75rem;
+}
+
+.lab-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  margin: 0 0 1.75rem;
+}
+
+.lab-stat {
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r);
+  padding: 1.1rem 1.2rem 1rem;
+}
+
+.lab-stat__v {
+  font-family: var(--f-ui);
+  font-weight: 600;
+  font-size: clamp(1.9rem, 3.4vw, 2.6rem);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-variant-numeric: proportional-nums;
+  display: block;
+}
+
+.lab-stat__l {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.95rem;
+  color: var(--text);
+}
+
+.lab-stat__d {
+  display: block;
+  margin-top: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--faint);
+}
+
+.lab-scn__summary {
+  max-width: 72ch;
+  margin: 0 0 2rem;
+}
+
+.lab-charts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.lab-chart {
+  margin: 0;
+  background: var(--chart-surface);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r);
+  padding: 1rem 1.1rem 0.9rem;
+  min-width: 0;
+}
+
+.lab-chart--wide {
+  grid-column: 1 / -1;
+}
+
+.lab-chart__title {
+  font-family: var(--f-ui);
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin: 0 0 0.5rem;
+}
+
+.lab-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin: 0 0 0.4rem;
+  padding: 0;
+  list-style: none;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.lab-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.lab-key {
+  display: inline-block;
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.lab-key--dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.lab-key--bar {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.lab-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.lab-svg text {
+  font-family: var(--f-ui);
+  font-size: 11px;
+  fill: var(--faint);
+}
+
+.lab-svg .lab-axis-label {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.lab-svg .lab-marker-label {
+  fill: var(--muted);
+  font-size: 10.5px;
+}
+
+.lab-chart__cap {
+  margin: 0.55rem 0 0;
+  font-size: 0.82rem;
+  color: var(--faint);
+}
+
+.lab-scale {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0.2rem 0 0.4rem;
+}
+
+.lab-scale__bar {
+  flex: 0 0 140px;
+  height: 8px;
+  border-radius: 4px;
+}
+
+/* ---------------------------------------------------------- details/data -- */
+
+.lab-more {
+  margin-top: 1.5rem;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.lab-details {
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r);
+  background: rgb(255 255 255 / 30%);
+}
+
+.lab-details > summary {
+  cursor: pointer;
+  padding: 0.7rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  list-style-position: inside;
+}
+
+.lab-details__body {
+  padding: 0 1rem 1rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+  overflow-x: auto;
+}
+
+.lab-chart .lab-details {
+  margin-top: 0.6rem;
+  background: transparent;
+}
+
+.lab-chart .lab-details > summary {
+  padding: 0.45rem 0.7rem;
+  font-size: 0.8rem;
+}
+
+.lab-table {
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+  min-width: 100%;
+}
+
+.lab-table th,
+.lab-table td {
+  text-align: right;
+  padding: 0.3rem 0.7rem;
+  border-bottom: 1px solid var(--rule-soft);
+  white-space: nowrap;
+}
+
+.lab-table th:first-child,
+.lab-table td:first-child {
+  text-align: left;
+}
+
+.lab-table th {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.lab-params {
+  font-family: var(--f-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0.75rem 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.lab-src {
+  font-size: 0.85rem;
+  color: var(--faint);
+  margin: 0.25rem 0 0;
+}
+
+/* --------------------------------------------------------------- tooltip -- */
+
+.lab-tip {
+  position: fixed;
+  z-index: 50;
+  pointer-events: none;
+  background: var(--ink-2);
+  color: #f2f0eb;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  max-width: 260px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 18%);
+}
+
+.lab-tip b {
+  font-weight: 600;
+}
+
+.lab-tip__row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* ------------------------------------------------------------- findings -- */
+
+.found {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.found__item {
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r);
+  padding: 1.2rem 1.3rem;
+}
+
+.found__item p {
+  color: var(--muted);
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.found__item .found__k {
+  font-family: var(--f-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 0.5rem;
+}
+
+.found__item--open {
+  border-color: var(--red);
+}
+
+.found__item--open .found__k {
+  color: var(--red);
+}
+
+.found__title {
+  font-family: var(--f-display);
+  font-weight: 600;
+  font-size: 1.2rem;
+  line-height: 1.2;
+  margin: 0 0 0.5rem;
+}
+
+.lab-cmd {
+  margin: 0.5rem 0 0.75rem;
+  font-size: 0.8rem;
+  overflow-x: auto;
+}
+
+.lab-cmd code {
+  display: block;
+  padding: 0.75rem 0.9rem;
+  white-space: pre;
+}
+
+/* ------------------------------------------------------------ responsive -- */
+
+@media (width <= 900px) {
+  .lab-charts,
+  .found,
+  .lab-how,
+  .lab-stats {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -911,6 +911,262 @@ def _scene_panel(placement: str, rec: Recorder, sites: dict[str, Vec3]):
     )
 
 
+# --- results page -------------------------------------------------------------
+
+
+def worst_outage_profile(
+    rec: Recorder, sites: dict[str, Vec3]
+) -> tuple[str, float, Vec3, Vec3] | None:
+    """`(relay, t_s, drone_pos, relay_site)` at the middle of the longest
+    outage, against the relay nearest the drone — the moment and the path
+    `plot_worst_outage_profile` draws. `None` if the flight never lost touch."""
+    stats = stats_for(rec)
+    if not stats.outages or not sites:
+        return None
+    worst = max(stats.outages, key=lambda o: o.duration_s)
+    mid = (worst.start_s + worst.end_s) / 2
+    idx = min(range(len(rec.times_s)), key=lambda i: abs(rec.times_s[i] - mid))
+    drone = rec.column("drone_pos")[idx]
+    name, site = min(sites.items(), key=lambda kv: drone.distance_to(kv[1]))
+    return name, mid, drone, site
+
+
+PLACEMENT_PROSE = {
+    "summits": "relays on the summits",
+    "valley floor": "relays on the valley floor",
+    "mixed": "a summit-and-valley mix",
+    "single summit": "a single summit relay",
+}
+"""How each placement reads in a sentence."""
+
+
+def showcase(results: Sequence[SweepResult[str]], terrain: Terrain) -> Any:
+    """The results-page entry: placements compared, a plan view, the flight's
+    contact over time, and the ground between the drone and the nearest relay
+    at the worst moment — the cross-section that says *why*."""
+    import math
+
+    from wayfinder_sim.showcase import (
+        Chart,
+        Headline,
+        Heatmap,
+        Series,
+        Showcase,
+        downsample,
+    )
+    from wayfinder_sim.terrain import elevation_profile, fresnel_radius_m
+
+    ranked = sorted(
+        results, key=lambda r: stats_for(r.recorder).connected_fraction, reverse=True
+    )
+    best, worst = ranked[0], ranked[-1]
+    best_stats, worst_stats = stats_for(best.recorder), stats_for(worst.recorder)
+    names = [r.param for r in results]
+
+    # Plan view: the ground as a heatmap, the track and the winning sites over it.
+    step = 200.0
+    xs = [
+        WORLD.min_x + i * step
+        for i in range(int((WORLD.max_x - WORLD.min_x) // step) + 1)
+    ]
+    ys = [
+        WORLD.min_y + j * step
+        for j in range(int((WORLD.max_y - WORLD.min_y) // step) + 1)
+    ]
+    ground = [[round(terrain.elevation(x, y), 1) for x in xs] for y in ys]
+    track = best.recorder.column("drone_pos")
+    best_sites = relay_sites(best.param, terrain)
+
+    # Contact over the flight, for the best and the worst placement.
+    def reach_counts(rec: Recorder) -> tuple[list[float], list[int]]:
+        return downsample(rec.times_s, [len(v) for v in rec.column("reachable")])
+
+    bx, by = reach_counts(best.recorder)
+    wx, wy = reach_counts(worst.recorder)
+
+    # The cross-section at the worst outage of the worst placement.
+    profile_chart = None
+    moment = worst_outage_profile(worst.recorder, relay_sites(worst.param, terrain))
+    sep_m = None
+    why = "nothing was out of reach"
+    why_short = ""
+    if moment is not None:
+        relay, t_mid, drone, site = moment
+        prof = elevation_profile(terrain, drone, site, samples=96)
+        total = math.dist((drone.x, drone.y), (site.x, site.y))
+        # The relay was picked as nearest by straight-line distance, so that
+        # is the distance reported; the profile below is drawn over the ground.
+        sep_m = drone.distance_to(site)
+        dist = [0.0, *(p.distance_m for p in prof), total]
+        ground_z = [
+            terrain.elevation(drone.x, drone.y),
+            *(p.position.z for p in prof),
+            terrain.elevation(site.x, site.y),
+        ]
+        los = [drone.z, *(p.los_z_m for p in prof), site.z]
+        fresnel = [
+            z - fresnel_radius_m(d, total - d, FREQ_HZ) for z, d in zip(los, dist)
+        ]
+        # Say what the geometry shows, not what it usually shows.
+        blocked = any(g > los_z for g, los_z in zip(ground_z, los))
+        in_range = sep_m <= MAX_RANGE_M
+        if not in_range:
+            why = f"{relay} was {sep_m / 1000:.1f} km away, beyond the radio's range"
+            why_short = "beyond the radio's range"
+        elif blocked:
+            why = (
+                f"{relay} was only {sep_m / 1000:.1f} km away, inside radio range, but the "
+                "ridge between them rises through the line of sight"
+            )
+            why_short = "close enough by range, hidden behind a ridge"
+        else:
+            why = (
+                f"{relay} was {sep_m / 1000:.1f} km away with a clear line of sight, but the "
+                "ground reaches into the first Fresnel zone"
+            )
+            why_short = "in range and in sight, but the ground crowds the Fresnel zone"
+        profile_chart = Chart(
+            title=f"Why it went dark: the ground between drone and {relay} at t = {t_mid:.0f} s",
+            x_label=f"distance from drone toward {relay} (m)",
+            y_label="elevation (m)",
+            series=[
+                Series("ground", dist, ground_z),
+                Series("line of sight", dist, los),
+                Series("first Fresnel zone, lower edge", dist, fresnel),
+            ],
+            caption=(
+                f"{worst.param} placement, longest outage: {why}. At 900 MHz anything inside "
+                "the first Fresnel zone costs diffraction loss."
+            ),
+        )
+
+    charts = [
+        Chart(
+            title="Share of the transit with a route to the ground",
+            x_label="relay placement",
+            y_label="share of flight",
+            series=[
+                Series(
+                    "connected",
+                    names,
+                    [stats_for(r.recorder).connected_fraction for r in results],
+                    kind="bar",
+                )
+            ],
+            y_range=(0.0, 1.0),
+        ),
+        Chart(
+            title="Longest blackout, by placement",
+            x_label="relay placement",
+            y_label="seconds",
+            series=[
+                Series(
+                    "longest outage",
+                    names,
+                    [stats_for(r.recorder).longest_outage_s for r in results],
+                    kind="bar",
+                )
+            ],
+        ),
+        Chart(
+            title=f"Plan view: terrain, flight track and {PLACEMENT_PROSE.get(best.param, best.param)}",
+            x_label="east (m)",
+            y_label="north (m)",
+            series=[
+                Series(
+                    "flight track",
+                    [p.x for p in track[::10]],
+                    [p.y for p in track[::10]],
+                    kind="line",
+                ),
+                Series(
+                    "relay sites",
+                    [p.x for p in best_sites.values()],
+                    [p.y for p in best_sites.values()],
+                    kind="scatter",
+                ),
+            ],
+            heatmap=Heatmap(xs=xs, ys=ys, values=ground, label="ground elevation (m)"),
+            caption="Darker is higher. The drone flies the valley at a fixed height above the ground.",
+        ),
+        Chart(
+            title="Relays in reach over the flight",
+            x_label="time (s)",
+            y_label="relays reachable",
+            series=[
+                Series(f"{best.param}", bx, by, kind="step"),
+                Series(f"{worst.param}", wx, wy, kind="step"),
+            ],
+            caption="Zero is a blackout: no route to any relay, so no backhaul.",
+        ),
+    ]
+    if profile_chart is not None:
+        charts.append(profile_chart)
+
+    return Showcase(
+        slug="mountain-relay",
+        title="Relays in the mountains",
+        category="range",
+        scenario="sim/scenarios/mountain_relay.py",
+        question="A drone flies a mountain valley. Where do the relays have to go to keep it in touch?",
+        headlines=[
+            Headline(
+                f"{best_stats.connected_fraction:.0%}",
+                f"of the transit in touch, with {PLACEMENT_PROSE.get(best.param, best.param)}",
+                f"longest blackout {best_stats.longest_outage_s:.0f} s",
+            ),
+            Headline(
+                f"{worst_stats.connected_fraction:.0%}",
+                f"with {PLACEMENT_PROSE.get(worst.param, worst.param)}",
+                f"{worst_stats.outage_count} blackouts, the longest {worst_stats.longest_outage_s:.0f} s",
+            ),
+            Headline(
+                f"{sep_m / 1000:.1f} km" if sep_m else "–",
+                "to the nearest relay at the worst moment",
+                why_short,
+            ),
+        ],
+        summary=(
+            f"A drone crosses a mountain range at {AGL_M:.0f} m above the ground, and every relay has "
+            f"its own satellite backhaul, so the drone is in touch whenever it can reach any relay, "
+            f"directly or through another. Radio links are charged knife-edge diffraction loss for the "
+            f"worst ridge between the two ends, so line of sight decides coverage, not distance. With "
+            f"{PLACEMENT_PROSE.get(best.param, best.param)} the drone stays in touch "
+            f"{best_stats.connected_fraction:.0%} of the way; the same flight with "
+            f"{PLACEMENT_PROSE.get(worst.param, worst.param)} manages "
+            f"{worst_stats.connected_fraction:.0%}. The last chart shows why: at the worst moment "
+            f"{why}."
+        ),
+        method=(
+            "Terrain is a sum of Gaussian peaks over 8 × 6 km. Links are 900 MHz free-space loss at "
+            f"{TX_POWER_DBM:.0f} dBm with a {MAX_RANGE_M / 1000:.0f} km hard range, minus single knife-edge "
+            "diffraction (ITU-R P.526) over the worst obstruction on each path. The drone follows the "
+            f"terrain at {AGL_M:.0f} m and {SPEED_M_S:.0f} m/s; relays sit on a {MAST_HEIGHT_M:.0f} m mast; "
+            f"every link runs {KEEPALIVE_MS} ms keep-alives. Connected means any route to any relay, "
+            "sampled every 200 ms over one transit, with the real wayfinder router on every node."
+        ),
+        charts=charts,
+        table=[["placement", "connected", "blackouts", "longest (s)", "dark (s)"]]
+        + [
+            [
+                r.param,
+                round(stats_for(r.recorder).connected_fraction, 3),
+                stats_for(r.recorder).outage_count,
+                round(stats_for(r.recorder).longest_outage_s, 1),
+                round(stats_for(r.recorder).disconnected_s, 1),
+            ]
+            for r in results
+        ],
+        params={
+            "relays": RELAY_COUNT,
+            "freq_mhz": FREQ_HZ / 1e6,
+            "tx_power_dbm": TX_POWER_DBM,
+            "agl_m": AGL_M,
+            "placements": names,
+        },
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     import argparse
 
@@ -923,6 +1179,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "rotate). Needs a GUI session; the run blocks until you close it."
         ),
     )
+    parser.add_argument(
+        "--export",
+        type=Path,
+        help="write the results page's JSON into this directory and skip the charts",
+    )
     args = parser.parse_args(argv)
 
     wf.init_tracing()  # quiet by default; set RUST_LOG to see mesh internals
@@ -931,6 +1192,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     terrain = build_terrain()
 
     results = run_placement_sweep()
+    if args.export:
+        from wayfinder_sim.showcase import write_showcase
+
+        for result in results:
+            print_connectivity_summary(result.param, result.recorder)
+        print_sweep_summary(results)
+        print(f"wrote {write_showcase(showcase(results, terrain), args.export)}")
+        return
     for result in results:
         placement = result.param
         slug = placement.replace(" ", "_")

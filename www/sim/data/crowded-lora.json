@@ -1,0 +1,781 @@
+{
+ "schema": 1,
+ "slug": "crowded-lora",
+ "title": "Sensors on one LoRa channel",
+ "question": "How many battery sensors can share one LoRa channel before the network stops delivering?",
+ "headlines": [
+  {
+   "value": "2",
+   "label": "sensors at adverts every 60 s",
+   "detail": "most that still deliver \u226595% of readings"
+  },
+  {
+   "value": "10",
+   "label": "sensors at adverts every 30 min",
+   "detail": "capacity grows only with the square root of the advert interval"
+  },
+  {
+   "value": "1.3x",
+   "label": "more adverts than a quiet channel would carry",
+   "detail": "lost adverts expire routes, and expiry resets the routers to their fastest rate"
+  }
+ ],
+ "summary": "Each sensor sends one short reading every 2 minutes, which by itself is a trivial load. The limit comes from the mesh itself. Every routing advert is re-broadcast by every node on the channel, so N sensors cost N\u00b2 adverts per round. LoRa radios don't listen before they talk, so readings collide with that advert traffic, and the collisions bite before EU rules' 1% duty cycle does. With adverts every 60 s the channel delivers \u226595% of readings for 2 sensors. Slowing adverts to every 30 minutes lifts that to 10, but only by about the square root of the slowdown, because the advert load grows with N\u00b2. Contention also feeds on itself. Lost adverts let routes expire, and both the expiry and the re-learning that follows reset a router to its fastest advertising rate, so a busy channel carries about 1.3x the adverts a quiet one would. That is why the simulated capacity lands below the closed-form ceiling (the last chart). Use the arithmetic as an upper bound and the simulation for sizing. Slower adverts also mean slower failover, as the relay scenario measures.",
+ "charts": [
+  {
+   "title": "Readings delivered",
+   "x_label": "sensors on the channel",
+   "y_label": "delivery ratio",
+   "series": [
+    {
+     "name": "adverts every 60 s",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      1.0,
+      0.9052,
+      0.6897,
+      0.6207,
+      0.4172,
+      0.3054,
+      0.1931,
+      0.1057
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 5 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      1.0,
+      0.9914,
+      0.9425,
+      0.8534,
+      0.8345,
+      0.7931,
+      0.5414,
+      0.3057
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 15 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      1.0,
+      1.0,
+      0.9885,
+      0.944,
+      0.9517,
+      0.8128,
+      0.2379,
+      0.5724
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 30 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      1.0,
+      1.0,
+      1.0,
+      0.9914,
+      0.9793,
+      0.9261,
+      0.7672,
+      0.354
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": [
+    0.0,
+    1.0
+   ],
+   "caption": null,
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Busiest radio's transmit share",
+   "x_label": "sensors on the channel",
+   "y_label": "share of time transmitting",
+   "series": [
+    {
+     "name": "adverts every 60 s",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      0.0062,
+      0.01,
+      0.01,
+      0.01,
+      0.01,
+      0.01,
+      0.01,
+      0.01
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 5 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      0.0018,
+      0.003,
+      0.0039,
+      0.0057,
+      0.0078,
+      0.009,
+      0.01,
+      0.01
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 15 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      0.001,
+      0.0013,
+      0.0019,
+      0.0029,
+      0.0036,
+      0.0051,
+      0.01,
+      0.0091
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 30 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      0.0008,
+      0.001,
+      0.0012,
+      0.0014,
+      0.0016,
+      0.0041,
+      0.0085,
+      0.01
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": "The legal ceiling is 1%. A radio pinned there is queueing adverts it cannot send.",
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Where the airtime goes (adverts every 60 s)",
+   "x_label": "sensors on the channel",
+   "y_label": "seconds on air per hour",
+   "series": [
+    {
+     "name": "routing adverts",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      59.9936,
+      171.8751,
+      240.7974,
+      311.2773,
+      384.5396,
+      527.9603,
+      741.5473,
+      1104.3
+     ],
+     "kind": "bar"
+    },
+    {
+     "name": "sensor readings",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      4.4692,
+      8.1679,
+      11.019,
+      12.7142,
+      11.5584,
+      11.9437,
+      14.0242,
+      11.3272
+     ],
+     "kind": "bar"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": null,
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Advert load vs. a quiet channel",
+   "x_label": "sensors on the channel",
+   "y_label": "measured \u00f7 steady-state advert airtime",
+   "series": [
+    {
+     "name": "adverts every 60 s",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      0.9545,
+      0.9844,
+      0.7037,
+      0.5503,
+      0.4551,
+      0.336,
+      0.2408,
+      0.1645
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 5 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      1.0002,
+      1.2322,
+      1.1935,
+      1.42,
+      1.6782,
+      1.4426,
+      1.1722,
+      0.8045
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 15 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      1.0002,
+      1.0492,
+      1.3578,
+      1.922,
+      1.7495,
+      2.1204,
+      2.5845,
+      2.0964
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "adverts every 30 min",
+     "x": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      20,
+      30
+     ],
+     "y": [
+      1.059,
+      1.013,
+      1.3056,
+      1.3481,
+      1.3444,
+      2.2927,
+      2.8386,
+      3.7215
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": "Above 1, contention is making the routers re-advertise faster than their schedule would on its own.",
+   "x_log": false,
+   "heatmap": null
+  },
+  {
+   "title": "Measured capacity vs. the arithmetic",
+   "x_label": "advert interval (s)",
+   "y_label": "sensors",
+   "series": [
+    {
+     "name": "simulated (\u226595% delivered)",
+     "x": [
+      60,
+      300,
+      900,
+      1800
+     ],
+     "y": [
+      2.0,
+      4.0,
+      6.0,
+      10.0
+     ],
+     "kind": "line"
+    },
+    {
+     "name": "collision ceiling \u221a(0.025\u00b70.75I/T)",
+     "x": [
+      60,
+      300,
+      900,
+      1800
+     ],
+     "y": [
+      3.636,
+      8.1304,
+      14.0822,
+      19.9152
+     ],
+     "kind": "line"
+    }
+   ],
+   "markers": [],
+   "y_range": null,
+   "caption": "The closed form assumes a quiet channel's advert rate; contention raises it, so the simulation lands below. The duty-cycle ceiling (0.01\u00b70.75I/T) is higher \u2014 5 to 155 sensors over this range \u2014 so collisions bind long before it does.",
+   "x_log": true,
+   "heatmap": null
+  }
+ ],
+ "params": {
+  "phy": "LoRa SF7/125kHz CR4/5",
+  "duty_cycle": 0.01,
+  "report_interval_s": 120.0,
+  "sensor_counts": [
+   2,
+   4,
+   6,
+   8,
+   10,
+   14,
+   20,
+   30
+  ],
+  "advert_i_max_s": [
+   60,
+   300,
+   900,
+   1800
+  ],
+  "measure_s": 3600.0
+ },
+ "method": "One 868 MHz LoRa channel (SF7, 125 kHz, CR 4/5) modelled with real time-on-air, pure-ALOHA collisions with a 6 dB capture margin, half-duplex radios and ETSI-style per-transmission off-time for a 1% duty cycle. Sensors are uniform over a 1.5 km disc at 14 dBm. Each point warms up for two advert rounds and then measures one hour. Routing and data airtime are split by packet type from a wiretap on the channel. Each point is the median-delivery run of 3 seeds.",
+ "table": [
+  [
+   "advert interval (s)",
+   "sensors",
+   "delivered",
+   "busiest radio duty",
+   "routing airtime (s/h)",
+   "data airtime (s/h)",
+   "queue drops"
+  ],
+  [
+   60,
+   2,
+   1.0,
+   0.0062,
+   60.0,
+   4.5,
+   0
+  ],
+  [
+   60,
+   4,
+   0.905,
+   0.01,
+   171.9,
+   8.2,
+   65
+  ],
+  [
+   60,
+   6,
+   0.69,
+   0.01,
+   240.8,
+   11.0,
+   642
+  ],
+  [
+   60,
+   8,
+   0.621,
+   0.01,
+   311.3,
+   12.7,
+   1987
+  ],
+  [
+   60,
+   10,
+   0.417,
+   0.01,
+   384.5,
+   11.6,
+   6443
+  ],
+  [
+   60,
+   14,
+   0.305,
+   0.01,
+   528.0,
+   11.9,
+   10854
+  ],
+  [
+   60,
+   20,
+   0.193,
+   0.01,
+   741.5,
+   14.0,
+   22613
+  ],
+  [
+   60,
+   30,
+   0.106,
+   0.01,
+   1104.3,
+   11.3,
+   49339
+  ],
+  [
+   300,
+   2,
+   1.0,
+   0.0018,
+   12.6,
+   4.5,
+   0
+  ],
+  [
+   300,
+   4,
+   0.991,
+   0.003,
+   43.0,
+   8.9,
+   0
+  ],
+  [
+   300,
+   6,
+   0.943,
+   0.0039,
+   81.7,
+   13.4,
+   0
+  ],
+  [
+   300,
+   8,
+   0.853,
+   0.0057,
+   160.6,
+   17.9,
+   0
+  ],
+  [
+   300,
+   10,
+   0.834,
+   0.0078,
+   283.6,
+   21.4,
+   281
+  ],
+  [
+   300,
+   14,
+   0.793,
+   0.009,
+   453.4,
+   30.2,
+   525
+  ],
+  [
+   300,
+   20,
+   0.541,
+   0.01,
+   722.1,
+   34.2,
+   3679
+  ],
+  [
+   300,
+   30,
+   0.306,
+   0.01,
+   1079.9,
+   35.8,
+   14843
+  ],
+  [
+   900,
+   2,
+   1.0,
+   0.001,
+   4.2,
+   4.5,
+   0
+  ],
+  [
+   900,
+   4,
+   1.0,
+   0.0013,
+   12.2,
+   8.9,
+   0
+  ],
+  [
+   900,
+   6,
+   0.989,
+   0.0019,
+   31.0,
+   13.4,
+   0
+  ],
+  [
+   900,
+   8,
+   0.944,
+   0.0029,
+   72.5,
+   17.9,
+   0
+  ],
+  [
+   900,
+   10,
+   0.952,
+   0.0036,
+   98.6,
+   24.6,
+   0
+  ],
+  [
+   900,
+   14,
+   0.813,
+   0.0051,
+   222.1,
+   33.6,
+   0
+  ],
+  [
+   900,
+   20,
+   0.238,
+   0.01,
+   530.7,
+   88.4,
+   411
+  ],
+  [
+   900,
+   30,
+   0.572,
+   0.0091,
+   938.0,
+   62.9,
+   829
+  ],
+  [
+   1800,
+   2,
+   1.0,
+   0.0008,
+   2.2,
+   4.5,
+   0
+  ],
+  [
+   1800,
+   4,
+   1.0,
+   0.001,
+   5.9,
+   8.9,
+   0
+  ],
+  [
+   1800,
+   6,
+   1.0,
+   0.0012,
+   14.9,
+   13.4,
+   0
+  ],
+  [
+   1800,
+   8,
+   0.991,
+   0.0014,
+   25.4,
+   17.9,
+   0
+  ],
+  [
+   1800,
+   10,
+   0.979,
+   0.0016,
+   37.9,
+   22.3,
+   0
+  ],
+  [
+   1800,
+   14,
+   0.926,
+   0.0041,
+   120.1,
+   35.7,
+   0
+  ],
+  [
+   1800,
+   20,
+   0.767,
+   0.0085,
+   291.4,
+   87.9,
+   0
+  ],
+  [
+   1800,
+   30,
+   0.354,
+   0.01,
+   832.5,
+   105.3,
+   262
+  ]
+ ],
+ "category": "capacity",
+ "scenario": "sim/scenarios/crowded_lora.py"
+}

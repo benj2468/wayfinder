@@ -839,6 +839,67 @@ mod tests {
         );
     }
 
+    /// On a shared medium every member hears every frame, including unicasts
+    /// addressed to someone else — a LoRa or BLE-advertising link hands the
+    /// router whatever it heard, whatever the link `dst`. A node overhearing a
+    /// unicast it is not the next hop for must leave it alone: relaying it
+    /// re-transmits on the same segment, where every other member overhears
+    /// *that* copy too, and the frame multiplies until its TTL runs out.
+    ///
+    /// An authenticated mesh already drops such a frame (`strip_directed`'s
+    /// "directed frame addressed to another hop"); this pins the open mesh.
+    /// Before the fix, 40 copies of the one unicast crossed this three-node
+    /// segment in the 200 ms the test watches.
+    #[test]
+    fn an_overheard_unicast_for_another_hop_is_not_relayed() {
+        let trickle = [TrickleConfig {
+            i_min_ms: 50,
+            i_max_ms: 500,
+        }];
+        let mut nodes: Vec<Driver> = (1..=3)
+            .map(|n| Driver::new(mac(n), &trickle, &[], &[]))
+            .collect();
+
+        // One shared segment: every frame anyone sends, everyone else hears.
+        let shuttle = |nodes: &mut Vec<Driver>, now: Duration| -> Vec<Vec<u8>> {
+            let mut aired = Vec::new();
+            for i in 0..nodes.len() {
+                nodes[i].tick(now);
+                while let Some(frame) = nodes[i].poll_egress(0) {
+                    for (j, rx) in nodes.iter_mut().enumerate() {
+                        if j != i {
+                            let _ = rx.push_rx(0, LinkMetrics::default(), &frame);
+                        }
+                    }
+                    aired.push(frame);
+                }
+            }
+            aired
+        };
+
+        let mut now = Duration::ZERO;
+        for _ in 0..200 {
+            now += Duration::from_millis(10);
+            shuttle(&mut nodes, now);
+        }
+
+        nodes[0].queue_local_send(mac(3), b"for c only");
+        let mut unicasts = 0;
+        for _ in 0..20 {
+            now += Duration::from_millis(10);
+            unicasts += shuttle(&mut nodes, now)
+                .iter()
+                .filter(|f| f.get(14) == Some(&BatmanPacketType::Unicast.as_u8()))
+                .count();
+        }
+
+        assert_eq!(nodes[2].poll_local().as_deref(), Some(&b"for c only"[..]));
+        assert_eq!(
+            unicasts, 1,
+            "a direct unicast crosses the segment once; b overheard it and must not relay it"
+        );
+    }
+
     /// The two periodic schedules must be drivable independently, the same way
     /// the async driver exposes `poll_due` and `poll_due_keepalive` separately.
     ///

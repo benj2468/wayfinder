@@ -215,9 +215,18 @@ def _capture_signed_ogm(mesh: Mesh) -> tuple[bytes, wf.PyMac]:
     )
     tap = sim.wiretap("hq-relay-eve")
     sim.run(until_s=20.0)
-    ogms = [f for f in tap.of_type(forge.PACKET_OGM) if f.src == sim.mac("hq")]
-    assert ogms, "the mesh never converged, so nothing was captured"
-    return ogms[-1].payload, sim.mac("hq")
+    # hq's own OGM as hq itself sent it: originated by hq (the last frame hq
+    # transmitted may be its re-flood of relay's OGM) *and* transmitted by hq
+    # (relay's re-flood of hq's appends a TVLV after the signature, and the
+    # tests below rely on the signature being the body's tail).
+    hq = sim.mac("hq")
+    own = [
+        f
+        for f in tap.of_type(forge.PACKET_OGM)
+        if f.src == hq and f.payload[8:14] == hq.bytes
+    ]
+    assert own, "the mesh never converged, so nothing was captured"
+    return own[-1].payload, hq
 
 
 def test_a_captured_signed_ogm_does_not_route_a_node_with_no_prior_state():
