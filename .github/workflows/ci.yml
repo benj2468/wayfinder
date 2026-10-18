@@ -84,6 +84,46 @@ env:
   # Which store it uses is `.github/actions/sccache`'s choice, per job.
   RUSTC_WRAPPER: sccache
 jobs:
+  # Whether this run changes anything but Markdown. No `.md` file is compiled
+  # (nothing `include_str!`s one), formatted (treefmt's prettier is scoped to
+  # `www/`) or read by a test, so a docs-only change has nothing to build,
+  # lint or test and the whole pipeline is minutes spent proving nothing.
+  #
+  # Gated per job rather than with `on.pull_request.paths-ignore`: a skipped
+  # *workflow* never reports `ci-ok`, which the main ruleset requires, so a
+  # docs PR would block forever. A skipped *job* is something `ci-ok` passes
+  # over. `image` and `lint-nix` are gated here, and every container job
+  # skips with `image` through its `needs`. `secret-scan` and
+  # `lint-pr-title` still run: a secret in a doc is still published, and the
+  # title still becomes the squash commit.
+  #
+  # Fails open: anything it cannot diff (a tag, a dispatch, a new branch, a
+  # base it cannot fetch) counts as a code change.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          code=true
+          if { [ "$EVENT" = pull_request ] || { [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; }; } \
+            && [ -n "$BASE" ] && [ "$BASE" != 0000000000000000000000000000000000000000 ] \
+            && git fetch --no-tags --depth=1 origin "$BASE" \
+            && files=$(git diff --name-only "$BASE" HEAD) && [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            if ! printf '%s\n' "$files" | grep -qv '\.md$'; then
+              code=false
+            fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
   # The tag every container job resolves the rust-ci image by: a hash of
   # containers/testenv.Dockerfile's own content, not a shared mutable
   # "latest". Two branches editing the Dockerfile differently get two tags, so
@@ -97,8 +137,12 @@ jobs:
   # downstream job pulling an image that was never pushed. The manifest check
   # is the real, self-healing gate. `rust-ci:cache` is a floating pointer used
   # only as a `--cache-from` source, never resolved by a job, so branches
-  # racing to update it only race for each other's cache hit rate.
+  # racing to update it only race for each other's cache hit rate. (Skipping
+  # it on a docs-only change is a different thing: then every job that would
+  # pull the image skips too — see `changes`.)
   image:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
@@ -136,6 +180,8 @@ jobs:
   # builds only that check; `main` runs the full `flake check`, which also
   # evaluates every NixOS configuration.
   lint-nix:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v5
@@ -506,8 +552,9 @@ jobs:
   # test jobs below then substitute their driver instead of each compiling the
   # same workspace in parallel (about 30 minutes each, before this job).
   build-nixos-tests:
+    needs: changes
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.nixos)
+      needs.changes.outputs.code == 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.nixos))
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v5
@@ -604,11 +651,14 @@ jobs:
           path: target/criterion/
           retention-days: 30
   # The one check to mark required in branch protection: it fails if any job
-  # it depends on failed or was cancelled, and passes over skipped ones (a PR
-  # skips nothing here, but `lint-pr-title` is skipped off a PR).
+  # it depends on failed or was cancelled, and passes over skipped ones
+  # (`lint-pr-title` off a PR; every build, lint and test job on a docs-only
+  # change). `changes` is listed so that a failure to decide fails the run
+  # rather than passing an unbuilt change.
   ci-ok:
     if: always()
     needs:
+      - changes
       - lint-nix
       - lint-pr-title
       - secret-scan
