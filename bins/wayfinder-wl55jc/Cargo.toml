@@ -93,6 +93,10 @@ embassy-futures = "0.1.2"
 # takes GPIO pins, and here none of those three signals is a pin) — hence
 # `iv.rs`.
 lora-phy = "3.0.1"
+# Already linked through `lora-phy`, named directly for its `time_on_air_us`:
+# the radio task's transmit deadline (#76) is a multiple of a packet's airtime,
+# and `lora-phy` keeps its own modulation fields crate-private.
+lora-modulation = "0.1.5"
 # **Not a logging choice.** `lora-phy` depends on `defmt` non-optionally and
 # calls its macros, so `defmt` must link; this repo logs through `tracing` over
 # the RTT channel `wayfinder-log` owns, and linking `defmt-rtt` would put a

@@ -34,7 +34,10 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Delay;
 use embassy_time::Duration;
+use embassy_time::TimeoutError;
 use embassy_time::Timer;
+use embassy_time::with_timeout;
+use lora_modulation::BaseBandModulationParams;
 use lora_phy::LoRa;
 use lora_phy::RxMode;
 use lora_phy::mod_params::Bandwidth;
@@ -194,6 +197,8 @@ pub async fn radio_task(
     // Consecutive failures to enter receive, for the backoff and so the streak
     // is reported once rather than per attempt.
     let mut rx_failures: u32 = 0;
+    // Consecutive transmits abandoned at their deadline; see `transmit`.
+    let mut tx_timeouts: u32 = 0;
     loop {
         // Re-entered every pass: a transmit leaves the radio in standby, and
         // `rx` refuses to run unless the mode says receive.
@@ -214,7 +219,15 @@ pub async fn radio_task(
             let backoff = Duration::from_millis(10 << rx_failures.min(6));
             if let Either::Second(packet) = select(Timer::after(backoff), TX_QUEUE.receive()).await
             {
-                let sent = transmit(&mut lora, &modulation, &mut tx_params, &config, &packet).await;
+                let sent = transmit(
+                    &mut lora,
+                    &modulation,
+                    &mut tx_params,
+                    &config,
+                    &packet,
+                    &mut tx_timeouts,
+                )
+                .await;
                 TX_DONE.signal(sent);
             }
             continue;
@@ -256,23 +269,65 @@ pub async fn radio_task(
             // `trace!` and never `warn!`.
             Either::First(Err(e)) => trace!(?e, "drop: radio receive error"),
             Either::Second(packet) => {
-                let sent = transmit(&mut lora, &modulation, &mut tx_params, &config, &packet).await;
+                let sent = transmit(
+                    &mut lora,
+                    &modulation,
+                    &mut tx_params,
+                    &config,
+                    &packet,
+                    &mut tx_timeouts,
+                )
+                .await;
                 TX_DONE.signal(sent);
             }
         }
     }
 }
 
+/// Slack added to twice a packet's airtime before [`transmit`] gives up on
+/// TxDone: covers the PA ramp and the command round trips around the packet
+/// itself, which the airtime formula does not count.
+const TX_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+/// How long [`transmit`] waits for TxDone on a packet of `len` bytes.
+///
+/// `lora-phy` starts every transmit with the radio's own timeout disabled and
+/// then waits for TxDone with no deadline, so without this a TxDone that never
+/// comes — a PA or TCXO fault, a lost IRQ edge — holds this task in `tx()`
+/// forever, and with it `LoraLink::send` and the whole driver loop (#76).
+/// Twice the airtime is generous enough that a healthy radio never trips it.
+///
+/// The formula is `lora-modulation`'s (SX127x's), which undercounts SF5/SF6:
+/// two symbols against the SX126x datasheet, plus four more because
+/// `lora-phy` raises the preamble to 12 there while this passes 8. At least
+/// twenty symbols of airtime against six missing, so the doubling absorbs it.
+fn tx_deadline(config: &RadioConfig, len: usize) -> Duration {
+    let airtime_us = BaseBandModulationParams::new(
+        config.spreading_factor,
+        config.bandwidth,
+        config.coding_rate,
+    )
+    .time_on_air_us(Some(PREAMBLE_SYMBOLS as u8), true, len.min(255) as u8);
+    Duration::from_micros(2 * u64::from(airtime_us)) + TX_DEADLINE_MARGIN
+}
+
 /// Put one packet on the air, reporting only whether it made it.
 ///
 /// `LinkT` is deliberately fire-and-forget — no ACK, no retry, no CCA in the
 /// trait — so there is nothing more to report and nothing to retry here.
+///
+/// A transmit that outlives [`tx_deadline`] is abandoned and the radio forced
+/// back to standby, re-initialised if even that fails; the caller's next
+/// `prepare_for_rx` then starts from a known mode. `tx_timeouts` counts the
+/// streak so a radio that has stopped finishing transmits is reported once,
+/// not once per fragment.
 async fn transmit(
     lora: &mut BoardLoRa,
     modulation: &lora_phy::mod_params::ModulationParams,
     tx_params: &mut lora_phy::mod_params::PacketParams,
     config: &RadioConfig,
     packet: &[u8],
+    tx_timeouts: &mut u32,
 ) -> bool {
     if let Err(e) = lora
         .prepare_for_tx(modulation, tx_params, config.output_power, packet)
@@ -281,10 +336,37 @@ async fn transmit(
         trace!(?e, "drop: preparing transmit failed");
         return false;
     }
-    match lora.tx().await {
-        Ok(()) => true,
-        Err(e) => {
+    match with_timeout(tx_deadline(config, packet.len()), lora.tx()).await {
+        Ok(Ok(())) => {
+            if *tx_timeouts > 0 {
+                debug!(tx_timeouts = *tx_timeouts, "radio: transmit recovered");
+                *tx_timeouts = 0;
+            }
+            true
+        }
+        Ok(Err(e)) => {
             trace!(?e, "drop: transmit failed");
+            false
+        }
+        Err(TimeoutError) => {
+            // Node-local (the radio never raised TxDone; nothing a peer sends
+            // causes that), so `warn!` — once per streak.
+            if *tx_timeouts == 0 {
+                warn!(
+                    len = packet.len(),
+                    "radio: transmit never completed; forcing standby"
+                );
+            }
+            *tx_timeouts = tx_timeouts.saturating_add(1);
+            if let Err(e) = lora.enter_standby().await {
+                warn!(
+                    ?e,
+                    "radio: standby after a stuck transmit failed; re-initialising"
+                );
+                if let Err(e) = lora.init().await {
+                    error!(?e, "radio: re-init after a stuck transmit failed");
+                }
+            }
             false
         }
     }
