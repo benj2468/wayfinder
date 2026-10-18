@@ -274,6 +274,17 @@ impl<C: Rylr998Connector> ReconnectingRylr998Link<C> {
 }
 
 impl<C: Rylr998Connector> LinkT for ReconnectingRylr998Link<C> {
+    /// The medium's declaration, not the inner client's: the driver reads
+    /// this once at construction, usually before the first connect.
+    ///
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(
+            rylr998::MAX_REASSEMBLED_LEN,
+        ))
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let client = self.ensure_connected().await?;
         let result = client.send(origin, data).await;
@@ -828,5 +839,31 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert!(link.ensure_connected().await.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// The driver reads `fan_out` once, when it is built, and a reconnecting
+    /// link is usually not connected yet then — so the declaration must be
+    /// the medium's, not delegated to an inner client that may not exist.
+    #[test]
+    fn declares_broadcast_fan_out_before_it_has_connected() {
+        let link = ReconnectingRylr998Link {
+            connector: SimConnector::default(),
+            name: "test".into(),
+            address: 42,
+            network_id: 7,
+            spreading_factor: SpreadingFactory::Sf9,
+            bandwidth: Bandwidth::Khz250,
+            coding_rate: CodingRate::Cr46,
+            preamble: 8,
+            inner: None,
+            broken: false,
+            backoff: Backoff::with_bounds(Duration::from_millis(5), Duration::from_millis(20)),
+        };
+        assert_eq!(
+            link.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(
+                rylr998::MAX_REASSEMBLED_LEN
+            ))
+        );
     }
 }

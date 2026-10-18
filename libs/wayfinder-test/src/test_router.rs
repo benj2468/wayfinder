@@ -151,7 +151,7 @@ impl TestRouter {
     /// Set from the topology: an interface on a shared switch reaches every
     /// other machine on it in one send, so multicast destination groups behind
     /// it collapse onto a single transmission (design 17 §4.5).
-    pub fn set_fan_out(&mut self, idx: usize, fan_out: Option<core::num::NonZeroU8>) {
+    pub fn set_fan_out(&mut self, idx: usize, fan_out: Option<wayfinder::link::FanOut>) {
         self.driver.set_fan_out(idx, fan_out);
     }
 

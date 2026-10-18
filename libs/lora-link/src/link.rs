@@ -84,6 +84,12 @@ impl<'a, M: RawMutex, const RX: usize> ChannelLink<'a, M, RX> {
 }
 
 impl<M: RawMutex + Sync, const RX: usize> LinkT for ChannelLink<'_, M, RX> {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(MAX_REASSEMBLED_LEN))
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let mut frame = [0u8; MAX_REASSEMBLED_LEN];
         let frame_len = crate::assemble_frame(origin, data, &mut frame)?;
@@ -358,5 +364,26 @@ mod tests {
         };
         assert!(matches!(result, Err(LinkError::TransmitFailed)));
         assert!(tx_q.is_empty(), "no second fragment after the first failed");
+    }
+
+    /// A raw LoRa transmission is heard by every receiver in range.
+    #[test]
+    fn declares_broadcast_fan_out() {
+        let rx_q: Channel<CriticalSectionRawMutex, RxPacket, 4> = Channel::new();
+        let tx_q: Channel<CriticalSectionRawMutex, Packet, 1> = Channel::new();
+        let done: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+        let link = ChannelLink::new(
+            RadioPort {
+                rx: &rx_q,
+                tx: &tx_q,
+                tx_done: &done,
+            },
+            NET,
+            crate::short_address_of(mac(1)),
+        );
+        assert_eq!(
+            link.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(MAX_REASSEMBLED_LEN))
+        );
     }
 }

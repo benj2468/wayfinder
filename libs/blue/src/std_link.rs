@@ -642,6 +642,10 @@ async fn read_mesh_report(
 }
 
 impl LinkT for StdBleLink {
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        self.inner.fan_out()
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         self.inner.send(origin, data).await
     }

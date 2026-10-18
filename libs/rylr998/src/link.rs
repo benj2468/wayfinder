@@ -83,6 +83,14 @@ impl<S> LinkT for RylrClient<S>
 where
     S: Read + Write + Send,
 {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(
+            crate::frag::MAX_REASSEMBLED_LEN,
+        ))
+    }
+
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let frame_len = HEADER_LEN + data.payload.len();
         if frame_len > frag::MAX_REASSEMBLED_LEN {
@@ -638,5 +646,18 @@ mod tests {
             decode_base64("YW5", &mut out),
             Err(LinkError::MalformedFrame)
         ));
+    }
+
+    /// `AT+SEND=0` is the module's broadcast address, so every send reaches
+    /// every module on the network id: a broadcast medium, declared as one.
+    #[test]
+    fn declares_broadcast_fan_out() {
+        let client = RylrClient::new(FakeSerial::new(b"")).unwrap();
+        assert_eq!(
+            client.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(
+                crate::frag::MAX_REASSEMBLED_LEN
+            ))
+        );
     }
 }

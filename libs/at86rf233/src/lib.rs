@@ -308,6 +308,14 @@ where
     IRQ: Wait + Send,
     RST: OutputPin + Send,
 {
+    /// A broadcast medium: every `send` reaches every neighbor, whatever
+    /// `data.dst` says. See [`wayfinder::link::FanOut::broadcast`].
+    fn fan_out(&self) -> Option<wayfinder::link::FanOut> {
+        Some(wayfinder::link::FanOut::broadcast(
+            ieee802154::MAX_REASSEMBLED_LEN,
+        ))
+    }
+
     /// Fragment `data` and transmit every fragment, returning the total
     /// on-air bytes.
     ///
@@ -805,5 +813,21 @@ mod tests {
         chip.lock().unwrap().rx_frames.push_back(vec![1]); // phr = 1 < FCS_LEN
 
         assert!(matches!(radio.recv().await, Err(LinkError::MalformedFrame)));
+    }
+
+    /// Every frame goes to the 802.15.4 broadcast address, so one send
+    /// reaches every radio on the channel.
+    #[tokio::test]
+    async fn declares_broadcast_fan_out() {
+        let chip = Arc::new(Mutex::new(FakeChip::new()));
+        let radio = At86Rf233::new(FakeSpi(chip), FakeIrq, FakeReset, 11)
+            .await
+            .unwrap();
+        assert_eq!(
+            radio.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(
+                ieee802154::MAX_REASSEMBLED_LEN
+            ))
+        );
     }
 }
