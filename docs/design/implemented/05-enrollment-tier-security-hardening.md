@@ -1,7 +1,8 @@
 # Design: hardening the enrollment access tier
 
-**Status:** §§3.1–3.5 implemented, on `bjc/harden-enrollment-tier`. The
-findings below came out of the `mr-review` pass on `bjc/unauthenticated-bug-wasm`
+**Status:** Implemented. §§3.1–3.5 merged to `main` as `2cd3c394`
+(fix(server): harden the enrollment access tier), and §4's backlog was closed
+by design 06 as F8. The findings below came out of the `mr-review` pass on `bjc/unauthenticated-bug-wasm`
 (online enrollment via the web dashboard); that branch's own review fixes have
 landed, and everything in this doc was deliberately deferred to this follow-up.
 Each section's own "Implemented" note has the detail; in short — §3.1's

@@ -409,7 +409,7 @@ both the mesh membership and the VPN registration go away.
 
 `bins/wayfinder-web` gets a new panel (likely alongside the existing
 Security-tab area, given that's where enrollment/cert UI already lives per
-`docs/design/06-management-api-authentication.md`'s history) listing
+`docs/design/implemented/06-management-api-authentication.md`'s history) listing
 `VpnPeerStatus` rows with a revoke button. Headplane is linked from an
 "Advanced" or footer area only, framed as a fallback, not a primary action.
 

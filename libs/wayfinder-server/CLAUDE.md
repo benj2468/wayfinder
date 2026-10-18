@@ -363,7 +363,7 @@ escapes is one a search finds.
 no `Authenticate` first-frame requirement, no `decide_access` and no `permits`
 gate — the whole request surface, `SetAuth` and `SetConfig` included, is
 available to anything that can open the port. That is a resolved decision
-(F7 in `docs/design/06-management-api-authentication.md`), not an oversight
+(F7 in `docs/design/implemented/06-management-api-authentication.md`), not an oversight
 waiting to be fixed: the port's threat model is physical access to the device,
 which on these boards also means access to an SWD header that reads flash
 outright, and a challenge-response would be a real protocol on a link with no

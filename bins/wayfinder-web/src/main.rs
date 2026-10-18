@@ -13,7 +13,7 @@
 //! Without it the dashboard runs on a **static credential**: `--identity` and
 //! `--cert`, held by the process and shared by everyone who can reach the port.
 //! That mode is kept deliberately (§8.3 of
-//! `docs/design/06-management-api-authentication.md`) because two deployments
+//! `docs/design/implemented/06-management-api-authentication.md`) because two deployments
 //! have no login available to them and no other way in — an un-enrolled node,
 //! which has no user store, and an embedded node reached over `--serial`, which
 //! has no authentication at all. It is announced at startup as what it is.

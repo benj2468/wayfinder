@@ -33,7 +33,7 @@ doc claims).
   board. A root-workspace member whose tests are all `#[ignore]`d.
 - **`justfile`** — `hil`, `hil-list`, `hil-flash`.
 - **`.config/nextest.toml`** — a test group that serialises access to boards.
-- **`libs/wayfinder-server/CLAUDE.md`, `docs/design/06-...`** — correct §2.4's
+- **`libs/wayfinder-server/CLAUDE.md`, `docs/design/implemented/06-...`** — correct §2.4's
   stale claim.
 
 *Second MR (Tier A):*
@@ -140,7 +140,7 @@ only against an off-board reference, which is precisely what this tier is.
 Recorded here because an implementing session will otherwise trust them:
 
 - `libs/wayfinder-server/CLAUDE.md:373-378` and
-  `docs/design/06-management-api-authentication.md:203-211` both say the nRF
+  `docs/design/implemented/06-management-api-authentication.md:203-211` both say the nRF
   boards' management wiring "was removed during BLE bring-up and has not
   returned". It has returned. `libs/wayfinder-nrf/src/node.rs:278-284` brings
   up the CDC-ACM management port unconditionally whenever USB init succeeds, on
@@ -648,7 +648,7 @@ contains.
 | `justfile` | B | `hil`, `hil-list` |
 | `Cargo.toml` | B | add `libs/wayfinder-hil` to workspace members |
 | `CLAUDE.md:100` | B | replace "not set up in this repo" with a pointer here |
-| `libs/wayfinder-server/CLAUDE.md:376`, `docs/design/06-...:207` | B | correct §2.4's stale claim |
+| `libs/wayfinder-server/CLAUDE.md:376`, `docs/design/implemented/06-...:207` | B | correct §2.4's stale claim |
 | `bins/wayfinder-hil-nrf52840/` | A | **new workspace** — on-target tests, copying `bins/wayfinder-nrf52840`'s shape |
 
 ### Failing tests to write first

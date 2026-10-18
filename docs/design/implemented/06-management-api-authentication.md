@@ -1,7 +1,8 @@
 # Design: management-API security review and user credentials
 
-**Status:** Phases 0–2 implemented in full; **Phase 3 implemented except §6
-item 4** (silent renewal — see §8.5 for why it follows rather than leads).
+**Status:** Implemented. Phases 0–2 in full and Phase 3 except §6 item 4
+(silent renewal — see §8.5 for why it follows rather than leads), which is
+tracked as issue #107 rather than keeping this doc open.
 Every finding F1–F13 is closed or resolved; none remain open. Supersedes
 nothing; extends `05-enrollment-tier-security-hardening.md`, whose §4 backlog
 is folded in below as F8 (also closed — see F8's "Implemented" note).

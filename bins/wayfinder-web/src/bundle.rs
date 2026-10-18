@@ -4,7 +4,7 @@
 //! # What it is for
 //!
 //! Signing in needs the certificate authority; *using* a session does not (§8.3
-//! of `docs/design/06-management-api-authentication.md`). A node verifies a
+//! of `docs/design/implemented/06-management-api-authentication.md`). A node verifies a
 //! session certificate against the trust anchor it already holds, so a
 //! credential minted while the provider was reachable keeps working after the
 //! link to it is gone — but only for as long as the process that holds it

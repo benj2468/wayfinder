@@ -97,7 +97,7 @@ to end — no node in this sim would otherwise hold a viewer certificate.
 
 An *open* node's dashboard is the exception, and is the reason static
 credentials still exist at all (§8.3 of
-``docs/design/06-management-api-authentication.md``): an un-enrolled node has no
+``docs/design/implemented/06-management-api-authentication.md``): an un-enrolled node has no
 user store, so there is nobody to sign in to, and proving the node's own key is
 the only credential there is.
 
