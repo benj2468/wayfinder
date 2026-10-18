@@ -53,6 +53,15 @@ pub enum AuthError {
     /// silently does nothing.  It is also exactly the shape a v1 record has,
     /// so refusing it here is what keeps the two versions from being confused.
     NoRevocationInstant,
+    /// An X25519 public key lies on a low-order point, so any key agreement
+    /// with it yields the all-zero shared secret — which everyone can compute.
+    ///
+    /// A certificate carrying such a key is a *misissuance* like
+    /// [`MacKeyMismatch`](Self::MacKeyMismatch): the mesh root really did sign
+    /// it. Refusing it is what keeps one bad enrollment from making every
+    /// pairwise key its holder shares, and so every directed-frame tag on
+    /// those links, forgeable by anyone in range.
+    NonContributoryKey,
 }
 
 impl core::fmt::Display for AuthError {
@@ -68,6 +77,7 @@ impl core::fmt::Display for AuthError {
             AuthError::ReservedAddress => "certificate binds a reserved address",
             AuthError::MacKeyMismatch => "certificate MAC is not derived from its identity key",
             AuthError::NoRevocationInstant => "revocation carries no instant",
+            AuthError::NonContributoryKey => "x25519 key is a low-order point",
         };
         f.write_str(msg)
     }

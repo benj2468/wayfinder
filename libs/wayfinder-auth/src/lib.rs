@@ -50,6 +50,7 @@ pub use clock::MIN_PLAUSIBLE_UNIX;
 pub use clock::WallClock;
 pub use error::AuthError;
 pub use key::Keypair;
+pub use key::validate_x25519_pubkey;
 pub use key::verify_signature;
 pub use mac::derive_mac;
 pub use mac::force_locally_administered_unicast;

@@ -67,6 +67,23 @@ pub(in crate::auth) fn member(authority: &Authority, seed: u8, m: Mac, valid_to:
     auth
 }
 
+/// A member like [`member`], but whose certificate carries `x_pubkey` in place
+/// of the key its seed derives — a certificate the root really signed, which
+/// is how a low-order X25519 key (issue #103) would reach a node.
+pub(in crate::auth) fn member_with_x_pubkey(
+    authority: &Authority,
+    seed: u8,
+    m: Mac,
+    valid_to: u64,
+    x_pubkey: [u8; 32],
+) -> OgmAuth {
+    let kp = Keypair::from_seed(&[seed; 32]);
+    let cert = authority.issue_cert(m, kp.ed_pubkey(), x_pubkey, 0, valid_to);
+    let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
+    auth.set_time(Duration::from_secs(100), Clocked::At(100));
+    auth
+}
+
 /// A neighbour entry for the identity seeded `seed`, but *addressed* at
 /// `at` — the `derive_mac` collision the §8.9 identity lock now exists for.
 ///
@@ -94,7 +111,10 @@ pub(in crate::auth) fn colliding_neighbor(
     // The collision itself: the same key, reached at another address.
     cert.mac = at;
     NeighborKeys {
-        pairwise_key: holder.keypair.pairwise_key(&cert.x_pubkey),
+        pairwise_key: holder
+            .keypair
+            .pairwise_key(&cert.x_pubkey)
+            .expect("a seeded test key is contributory"),
         cert,
         raw_cert: raw,
         last_ogm: None,

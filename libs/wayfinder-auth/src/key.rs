@@ -10,6 +10,8 @@ use ed25519_dalek::VerifyingKey;
 use x25519_dalek::PublicKey;
 use x25519_dalek::StaticSecret;
 
+use crate::AuthError;
+
 /// Domain-separation label folded into the seed when deriving the X25519 secret,
 /// so the agreement key is independent of the Ed25519 signing key even though
 /// both come from the same seed.
@@ -114,19 +116,28 @@ impl Keypair {
     /// public key — no handshake.  The raw Diffie-Hellman output is hashed
     /// (with domain separation) into the returned key, which feeds
     /// [`frame_tag`](crate::frame_tag).
+    ///
+    /// Fails with [`AuthError::NonContributoryKey`] when `peer_x_pubkey` is a
+    /// low-order point: the shared secret is then all-zero whatever our own
+    /// secret is, so the "pairwise" key would be public. That certificate's
+    /// holder must not be admitted as a neighbor.
+    ///
     /// `#[inline(never)]` for the reason spelled out on [`verify_signature`]:
     /// a multi-kilobyte curve25519 frame must not be folded into a caller's
     /// coroutine poll frame. This one runs once per neighbour, at the point
     /// its certificate first verifies.
     #[inline(never)]
-    pub fn pairwise_key(&self, peer_x_pubkey: &[u8; 32]) -> [u8; 32] {
+    pub fn pairwise_key(&self, peer_x_pubkey: &[u8; 32]) -> Result<[u8; 32], AuthError> {
         let shared = self
             .x_secret
             .diffie_hellman(&PublicKey::from(*peer_x_pubkey));
+        if !shared.was_contributory() {
+            return Err(AuthError::NonContributoryKey);
+        }
         let mut h = Blake2s256::new();
         h.update(b"wayfinder-pairwise-v1");
         h.update(shared.as_bytes());
-        h.finalize().into()
+        Ok(h.finalize().into())
     }
 }
 
@@ -149,6 +160,29 @@ pub fn verify_signature(ed_pubkey: &[u8; 32], msg: &[u8], signature: &[u8; 64]) 
     };
     vk.verify_strict(msg, &Signature::from_bytes(signature))
         .is_ok()
+}
+
+/// Refuse an X25519 public key on a low-order point, for the places a key
+/// enters from outside — a CA's enrollment and renewal paths, offline issuance
+/// — where there is no keypair of our own to run a real agreement with.
+///
+/// Any scalar can probe it: X25519 clamps every scalar to a multiple of the
+/// curve's cofactor, so a low-order point maps to the identity under all of
+/// them, and to a non-identity point under none. A fixed probe therefore
+/// decides exactly what [`Keypair::pairwise_key`] would.
+///
+/// `#[inline(never)]` for [`verify_signature`]'s reason.
+#[inline(never)]
+pub fn validate_x25519_pubkey(x_pubkey: &[u8; 32]) -> Result<(), AuthError> {
+    let probe = StaticSecret::from([1u8; 32]);
+    if probe
+        .diffie_hellman(&PublicKey::from(*x_pubkey))
+        .was_contributory()
+    {
+        Ok(())
+    } else {
+        Err(AuthError::NonContributoryKey)
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +304,59 @@ mod tests {
             assert_eq!(kp.ed_pubkey(), hex::<32>(public), "public key for {seed}");
             assert_eq!(kp.sign(&msg), sig, "signature for {seed}");
             assert!(verify_signature(&kp.ed_pubkey(), &msg, &sig));
+        }
+    }
+
+    /// Every low-order point on Curve25519, in the encodings an X25519
+    /// implementation accepts: the identity and the order-2, -4 and -8
+    /// points, the non-canonical values `p − 1`, `p` and `p + 1`, and the
+    /// all-zero point with the ignored top bit set. Any of them, as a peer's
+    /// public key, makes the shared secret all-zero whatever our secret is.
+    const LOW_ORDER_POINTS: [&str; 8] = [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+        "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "0000000000000000000000000000000000000000000000000000000000000080",
+    ];
+
+    /// A peer key on a low-order point gives an all-zero shared secret anyone
+    /// can compute, so the "pairwise" key derived from it would be public.
+    /// `pairwise_key` refuses it rather than returning that key (issue #103).
+    #[test]
+    fn pairwise_key_refuses_every_low_order_peer_key() {
+        let a = Keypair::from_seed(&[10u8; 32]);
+        for point in LOW_ORDER_POINTS {
+            assert_eq!(
+                a.pairwise_key(&hex::<32>(point)),
+                Err(crate::AuthError::NonContributoryKey),
+                "low-order point {point}"
+            );
+        }
+    }
+
+    /// The same check as a standalone validator, for the places a key enters
+    /// from outside (the CA's enrollment paths) where there is no keypair of
+    /// our own to run a real agreement with.
+    #[test]
+    fn validate_x25519_pubkey_accepts_a_real_key_and_refuses_low_order_ones() {
+        for seed in [1u8, 20, 99, 255] {
+            let kp = Keypair::from_seed(&[seed; 32]);
+            assert_eq!(
+                validate_x25519_pubkey(&kp.x_pubkey()),
+                Ok(()),
+                "seed {seed}"
+            );
+        }
+        for point in LOW_ORDER_POINTS {
+            assert_eq!(
+                validate_x25519_pubkey(&hex::<32>(point)),
+                Err(crate::AuthError::NonContributoryKey),
+                "low-order point {point}"
+            );
         }
     }
 }

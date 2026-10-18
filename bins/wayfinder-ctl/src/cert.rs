@@ -361,6 +361,13 @@ fn issue_with_flags(
     if admin && viewer {
         bail!("--admin and --viewer are mutually exclusive; a cert cannot carry both");
     }
+    // The live authority refuses the same keys at its own doors (issue #103).
+    if wayfinder_auth::validate_x25519_pubkey(&x_pubkey).is_err() {
+        bail!(
+            "the x25519 key is a low-order point, so any key agreement with it is public; \
+             a certificate carrying it cannot be issued"
+        );
+    }
     Ok(if admin {
         authority.issue_user_cert(mac, ed_pubkey, x_pubkey, not_before, not_after, true)
     } else if viewer {
@@ -687,6 +694,28 @@ fn parse_u32(s: &str) -> Result<u32, std::num::ParseIntError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Offline issuance refuses an X25519 key on a low-order point, for the
+    /// same reason the live authority does (issue #103). `issue_with_flags` is
+    /// the one path both `issue` and `approve` sign through, so this covers
+    /// a hand-carried request that was built wrong or edited in transit.
+    #[test]
+    fn issuing_refuses_a_low_order_x25519_key() {
+        let authority = Authority::from_seed(&[7u8; 32], 42);
+        let node = Keypair::from_seed(&[9u8; 32]);
+        let err = issue_with_flags(
+            &authority,
+            node.derived_mac(),
+            node.ed_pubkey(),
+            [0u8; 32],
+            0,
+            1000,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("x25519"), "got: {err}");
+    }
 
     /// A truncated/corrupt seed file must surface a clean `Err`, not panic —
     /// `read_seed` is reused on the `enroll` retry path, which reads whatever
