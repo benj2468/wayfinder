@@ -11,7 +11,7 @@
 //!
 //! Passwords cannot fill that gap at the node, for four reasons that are all
 //! structural rather than incidental (§4 of
-//! `docs/design/06-management-api-authentication.md`): a password verifier
+//! `docs/design/implemented/06-management-api-authentication.md`): a password verifier
 //! worth having is memory-hard by construction, and this crate's `embedded`
 //! build targets a board whose whole heap is 32 KiB against the 64 MiB
 //! [`ARGON2_MEMORY_KIB`] asks for; a password would be the only *fleet-wide*

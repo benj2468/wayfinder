@@ -15,7 +15,7 @@
 //! node. No session, no node access.
 //!
 //! [`Access::Static`] does not go away, and §8.3 of
-//! `docs/design/06-management-api-authentication.md` is why. Dropping it is
+//! `docs/design/implemented/06-management-api-authentication.md` is why. Dropping it is
 //! cleaner on paper and costs two deployments their dashboard entirely, both of
 //! them ones where a dashboard is the *only* way in:
 //!

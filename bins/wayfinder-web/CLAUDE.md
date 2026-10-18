@@ -436,7 +436,7 @@ bytes per second — and the scale stays anchored at zero.
 ## Security posture
 
 **Two credential modes, chosen once at startup by `--provider`** (`session.rs`,
-and §8.3 of `docs/design/06-management-api-authentication.md`):
+and §8.3 of `docs/design/implemented/06-management-api-authentication.md`):
 
 - **Login mode** (`--provider <addr>`) — the process holds *no* credential. A
   viewer signs in, the provider issues a short-lived session certificate bound
