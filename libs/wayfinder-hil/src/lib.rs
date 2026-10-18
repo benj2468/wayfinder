@@ -52,10 +52,12 @@
 
 pub mod board;
 pub mod diagnostics;
+pub mod firmware;
 pub mod inventory;
 pub mod mesh;
 pub mod node;
 pub mod probe;
+pub mod radio;
 pub mod rig;
 pub mod usb;
 
@@ -66,5 +68,7 @@ pub use inventory::BoardSpec;
 pub use inventory::Inventory;
 pub use inventory::InventoryError;
 pub use inventory::Missing;
+pub use inventory::RadioKind;
+pub use inventory::RadioSpec;
 pub use node::Node;
 pub use rig::Rig;

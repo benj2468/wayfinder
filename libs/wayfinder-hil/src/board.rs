@@ -5,13 +5,15 @@
 //! and is what a human at the bench would run — so a harness failure stays
 //! reproducible by hand.
 //!
-//! **Flashing is deliberately not here.** `cargo run` in a board's own
-//! directory already does it, and does more: its configured runner is
-//! `probe-rs run … --allow-erase-all`, which flashes *and* attaches RTT so the
-//! boot output is visible. The only thing this crate could add is picking a
-//! probe by serial, which matters only once two are attached — so it belongs
-//! with the second board, not before it.
+//! **Flashing a node is not here.** `cargo run` in a board's own directory
+//! already does it, and does more: its configured runner is `probe-rs run …`,
+//! which flashes *and* attaches RTT so the boot output is visible.
+//! [`Board::flash`] exists for the other case — a test whose subject needs
+//! firmware no operator would flash by hand, like the WL55's REYAX echo image
+//! (`tests/reyax_interop.rs`). Such a test leaves that image on the board, and
+//! says so.
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -93,7 +95,73 @@ impl Board {
             .arg("reset")
             .args(["--chip", self.spec.kind.chip()])
             .args(["--probe", &self.probe()?]))
+        .map(drop)
     }
+
+    /// Flash `elf` onto this board, reset it, and confirm it booted the image.
+    ///
+    /// `probe-rs download` leaves the core halted in its flash loader in RAM,
+    /// so the reset is what starts the image. The check after it catches the
+    /// one way a correct flash still never runs: a part that boots its ROM
+    /// bootloader instead (see [`BoardKind::boot_remap_register`]), which
+    /// presents as firmware that does nothing at all.
+    ///
+    /// [`BoardKind::boot_remap_register`]: crate::BoardKind::boot_remap_register
+    pub fn flash(&self, elf: &Path) -> anyhow::Result<()> {
+        if !self.spec.kind.has_probe() {
+            anyhow::bail!(
+                "board {:?} is a {:?}, which has no probe and so cannot be flashed from the host",
+                self.spec.role,
+                self.spec.kind
+            );
+        }
+        let probe = self.probe()?;
+        let chip = self.spec.kind.chip();
+        run(Command::new("probe-rs")
+            .arg("download")
+            .args(["--chip", chip])
+            .args(["--probe", &probe])
+            .arg("--non-interactive")
+            .arg(elf))?;
+        self.reset()?;
+
+        let Some(register) = self.spec.kind.boot_remap_register() else {
+            return Ok(());
+        };
+        let stdout = run(Command::new("probe-rs")
+            .arg("read")
+            .args(["--chip", chip])
+            .args(["--probe", &probe])
+            .arg("b32")
+            .arg(format!("{register:#010x}"))
+            .arg("1"))?;
+        let value = parse_read_word(&stdout).ok_or_else(|| {
+            anyhow::anyhow!("could not read the boot remap register from {stdout:?}")
+        })?;
+        if !booted_from_main_flash(value) {
+            anyhow::bail!(
+                "board {:?} booted its ROM bootloader, not the image just flashed \
+                 (boot remap register {register:#010x} = {value:#010x}). This part decides what to \
+                 boot at power-on and a reset does not revisit it: unplug and replug the board once",
+                self.spec.role
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The word in a `probe-rs read b32 <addr> 1` line, `"40010000: 00000001"`.
+fn parse_read_word(stdout: &str) -> Option<u32> {
+    let line = stdout.lines().find(|l| l.contains(':'))?;
+    let word = line.split(':').nth(1)?.trim();
+    u32::from_str_radix(word, 16).ok()
+}
+
+/// Whether an STM32 `SYSCFG_MEMRMP` value says main flash is mapped at `0`.
+/// `MEM_MODE` is the low three bits; `000` is main flash, and every other
+/// value — system flash (`001`) above all — means the image is not running.
+fn booted_from_main_flash(memrmp: u32) -> bool {
+    memrmp & 0b111 == 0
 }
 
 /// Run a command, turning a non-zero exit into an error carrying its stderr.
@@ -101,17 +169,50 @@ impl Board {
 /// The stderr matters more than the status: `probe-rs` reports a permissions
 /// problem, a probe that is not attached, and a chip that did not respond with
 /// three quite different messages and one exit code.
-fn run(command: &mut Command) -> anyhow::Result<()> {
+///
+/// Returns stdout, for the one caller that reads a value back.
+fn run(command: &mut Command) -> anyhow::Result<String> {
     let rendered = format!("{command:?}");
     let output = command
         .output()
         .map_err(|e| anyhow::anyhow!("running {rendered}: {e}"))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     Err(anyhow::anyhow!(
         "{rendered} exited {}: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape `probe-rs read` prints, including the warning it emits on a
+    /// dual-core part — which goes to stderr, but is tolerated here anyway.
+    #[test]
+    fn reads_the_word_from_probe_rs_output() {
+        assert_eq!(parse_read_word("40010000: 00000001\n"), Some(1));
+        assert_eq!(parse_read_word("e000ed08: 1fff0000\n"), Some(0x1FFF_0000));
+        assert_eq!(parse_read_word(""), None);
+        assert_eq!(parse_read_word("40010000: zz\n"), None);
+    }
+
+    /// The two values seen on the bench: main flash after a power cycle, the
+    /// ROM bootloader before one.
+    #[test]
+    fn only_main_flash_counts_as_booted() {
+        assert!(booted_from_main_flash(0b000));
+        assert!(
+            !booted_from_main_flash(0b001),
+            "system flash: the ROM bootloader"
+        );
+        assert!(!booted_from_main_flash(0b011), "SRAM");
+        assert!(
+            booted_from_main_flash(0xFFFF_FF00),
+            "only MEM_MODE's three bits count"
+        );
+    }
 }

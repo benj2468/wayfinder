@@ -18,6 +18,7 @@ use crate::inventory::Inventory;
 use crate::inventory::InventoryError;
 use crate::inventory::Missing;
 use crate::node::Node;
+use crate::radio::Radio;
 
 /// The boards this machine has, and how tests reach them.
 #[derive(Debug, Clone)]
@@ -71,6 +72,18 @@ impl Rig {
             .board(role)
             .map(|spec| Board::new(spec.clone()))
             .map_err(|missing| missing.clone())
+    }
+
+    /// The radio module playing `role`, or `None` — having printed why, as
+    /// [`board`](Self::board) does.
+    pub fn radio(&self, role: &str) -> Option<Radio> {
+        match self.inventory.radio(role) {
+            Ok(spec) => Some(Radio::new(spec.clone())),
+            Err(missing) => {
+                eprintln!("SKIP: {missing}");
+                None
+            }
+        }
     }
 
     /// Attach to the board playing `role`, or `None` — having said why.

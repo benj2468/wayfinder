@@ -5510,11 +5510,15 @@ name = "wayfinder-hil"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "embedded-io-adapters",
  "rand 0.10.2",
+ "rylr998",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-serial",
  "toml",
  "wayfinder-auth",
  "wayfinder-client",

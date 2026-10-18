@@ -53,8 +53,9 @@ use wayfinder::interfaces::link::LinkMetrics;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 
-use crate::iv::Stm32wlInterfaceVariant;
-use crate::spi_device::SubghzSpiDevice;
+use wayfinder_wl55jc::PREAMBLE_SYMBOLS;
+use wayfinder_wl55jc::iv::Stm32wlInterfaceVariant;
+use wayfinder_wl55jc::spi_device::SubghzSpiDevice;
 
 /// Concrete radio type this board builds: the on-die SX126x over `SUBGHZSPI`,
 /// with the STM32WL's register-backed control lines.
@@ -261,10 +262,6 @@ pub async fn radio_task(
         }
     }
 }
-
-/// Preamble length in symbols. Both ends must agree; 8 is the SX126x default
-/// and what every other LoRa stack on this band uses.
-const PREAMBLE_SYMBOLS: u16 = 8;
 
 /// Put one packet on the air, reporting only whether it made it.
 ///

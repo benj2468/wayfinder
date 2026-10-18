@@ -51,6 +51,15 @@ toml = { version = "=1.1.1", default-features = false, features = [
     "std",
 ] }
 
+# A REYAX RYLR998 on the rig (`radio.rs`): the AT client and its on-air framing,
+# over a real serial port. No default features -- the `link` adapter pulls in
+# the router, and the harness only talks AT commands.
+rylr998.workspace = true
+tokio-serial.workspace = true
+embedded-io-adapters.workspace = true
+# Reading cargo's `--message-format=json` when a test builds firmware.
+serde_json.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 

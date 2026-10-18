@@ -27,19 +27,13 @@
 #![no_std]
 #![no_main]
 
-mod defmt_logger;
-mod iv;
 mod radio;
-mod spi_device;
 
 use embassy_executor::Spawner;
-use embassy_stm32::Config;
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::gpio::Level;
 use embassy_stm32::gpio::Output;
 use embassy_stm32::gpio::Speed;
-use embassy_stm32::interrupt::InterruptExt;
-use embassy_stm32::rcc::Sysclk;
 use embassy_stm32::spi::Spi;
 use embassy_time::Duration as EmbassyDuration;
 use embassy_time::Instant;
@@ -48,9 +42,6 @@ use embedded_alloc::LlffHeap as Heap;
 use lora_phy::mod_params::Bandwidth;
 use lora_phy::mod_params::CodingRate;
 use lora_phy::mod_params::SpreadingFactor;
-use lora_phy::sx126x::Config as Sx126xConfig;
-use lora_phy::sx126x::Stm32wl;
-use lora_phy::sx126x::TcxoCtrlVoltage;
 use panic_halt as _;
 use tracing::error;
 use tracing::info;
@@ -59,10 +50,9 @@ use wayfinder_embedded_driver::Clock;
 use wayfinder_embedded_driver::Driver;
 use wayfinder_embedded_driver::TrickleParams;
 
-use crate::iv::Stm32wlInterfaceVariant;
 use crate::radio::LoraLink;
 use crate::radio::RadioConfig;
-use crate::spi_device::SubghzSpiDevice;
+use wayfinder_wl55jc::RadioParts;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
@@ -89,13 +79,6 @@ const NODE_MAC: Mac = Mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]);
 /// co-located mesh out of this one's reassembly table — **not** a security
 /// boundary, which is `wayfinder-auth`'s job above `LinkT`.
 const LORA_NET_ID: u8 = 18;
-
-/// Which of the SX126x's two power amplifiers transmit uses. This board brings
-/// out RFO_HP. Named once because two consumers must agree on it: `lora-phy`'s
-/// `Stm32wl` variant (PA configuration) and the antenna switch, whose transmit
-/// truth table inverts FE_CTRL1 by PA — a disagreement transmits into the
-/// wrong path and presents as a radio with no range.
-const USE_HIGH_POWER_PA: bool = true;
 
 /// The radio settings every node on this mesh must agree on.
 ///
@@ -159,40 +142,12 @@ const _: () = assert!(lora_link::MAX_REASSEMBLED_LEN == wl55jc::MAX_FRAME_LEN);
 bind_interrupts!(struct Irqs {
     // The radio's own interrupt. `Stm32wlInterfaceVariant::await_irq` unmasks it and waits on the
     // signal this handler sets; it must not touch the SPI bus.
-    SUBGHZ_RADIO => crate::SubghzIrqHandler;
+    SUBGHZ_RADIO => wayfinder_wl55jc::SubghzIrqHandler;
     // `SUBGHZSPI` transfers over DMA, so both channels' completion interrupts
     // have to be bound or `Spi::new_subghz` will not accept `Irqs`.
     DMA1_CHANNEL1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
     DMA1_CHANNEL2 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH2>;
 });
-
-/// `embassy-stm32`'s cross-core handshake area.
-///
-/// Required by [`embassy_stm32::init_primary`] because this is a dual-core
-/// part — there is no single-core `init` for it. **Where it lives does not
-/// matter here**, unlike on a board that runs both cores: this firmware never
-/// releases the CM0+ (it does not set `C2BOOT`), so nothing else ever reads
-/// this, and a plain `static` in `.bss` is enough. Placing it in a section
-/// both cores agree on becomes necessary the day that changes — and so does
-/// re-doing `memory.x`'s RAM budget, which spends the CM0+'s bank.
-static SHARED_DATA: core::mem::MaybeUninit<embassy_stm32::SharedData> =
-    core::mem::MaybeUninit::uninit();
-
-/// Wakes [`iv::IRQ_SIGNAL`] and nothing else.
-struct SubghzIrqHandler;
-
-impl embassy_stm32::interrupt::typelevel::Handler<embassy_stm32::interrupt::typelevel::SUBGHZ_RADIO>
-    for SubghzIrqHandler
-{
-    unsafe fn on_interrupt() {
-        // Mask the line before signalling: the radio's IRQ status is cleared
-        // by `lora-phy` over SPI, which cannot happen from here, so leaving it
-        // unmasked would re-enter this handler forever.
-        // `Stm32wlInterfaceVariant::await_irq` unmasks it again before each wait.
-        embassy_stm32::interrupt::SUBGHZ_RADIO.disable();
-        iv::IRQ_SIGNAL.signal(());
-    }
-}
 
 /// An `embassy-time`-backed [`Clock`] for the embedded driver.
 struct EmbassyClock;
@@ -242,45 +197,11 @@ async fn main(spawner: Spawner) {
         "build",
     );
 
-    // Radio bring-up, not performance tuning: HSE32 is the reference the
-    // transceiver itself runs from, so the radio does not work without it.
-    //
-    // **`Bypass`, not `Oscillator`.** On this board HSE is fed by the radio's
-    // TCXO output rather than a plain crystal across OSC_IN/OSC_OUT, so
-    // driving it as an oscillator leaves the clock dead — and a board whose
-    // HSE never starts looks like a board that hung in `init`.
-    //
-    // Sysclk then comes from the PLL (32 / 2 * 6 / 2 = 48 MHz, the part's
-    // maximum) rather than straight off HSE, which would run the core at
-    // 32 MHz for no reason.
-    let mut config = Config::default();
-    {
-        use embassy_stm32::rcc::Hse;
-        use embassy_stm32::rcc::HseMode;
-        use embassy_stm32::rcc::HsePrescaler;
-        use embassy_stm32::rcc::Pll;
-        use embassy_stm32::rcc::PllMul;
-        use embassy_stm32::rcc::PllPreDiv;
-        use embassy_stm32::rcc::PllQDiv;
-        use embassy_stm32::rcc::PllRDiv;
-        use embassy_stm32::rcc::PllSource;
-
-        config.rcc.hse = Some(Hse {
-            freq: embassy_stm32::time::Hertz(32_000_000),
-            mode: HseMode::Bypass,
-            prescaler: HsePrescaler::DIV1,
-        });
-        config.rcc.sys = Sysclk::PLL1_R;
-        config.rcc.pll = Some(Pll {
-            source: PllSource::HSE,
-            prediv: PllPreDiv::DIV2,
-            mul: PllMul::MUL6,
-            divp: None,
-            divq: Some(PllQDiv::DIV2),
-            divr: Some(PllRDiv::DIV2),
-        });
-    }
-    let p = embassy_stm32::init_primary(config, &SHARED_DATA);
+    // See `clock_config`: HSE32 off the radio's TCXO, which the radio needs.
+    let p = embassy_stm32::init_primary(
+        wayfinder_wl55jc::clock_config(),
+        &wayfinder_wl55jc::SHARED_DATA,
+    );
 
     // LD2, the green user LED, lit = firmware booted and reached the run loop.
     // Active high, and **PB9** — this board has three user LEDs (LD1 blue on
@@ -289,31 +210,16 @@ async fn main(spawner: Spawner) {
     // test. Per Zephyr's `nucleo_wl55jc.dts`, whose `led0` alias is this pin.
     let mut led = Output::new(p.PB9, Level::Low, Speed::Low);
 
-    // The NUCLEO-WL55JC1's antenna switch: FE_CTRL1/2/3. Getting these wrong
-    // presents as a working radio with no range, which is indistinguishable
-    // from a routing bug from anywhere above `LinkT`.
-    let fe_ctrl1 = Output::new(p.PC4, Level::Low, Speed::High);
-    let fe_ctrl2 = Output::new(p.PC5, Level::Low, Speed::High);
-    // FE_CTRL3 is the switch enable and idles high on this board.
-    let fe_ctrl3 = Output::new(p.PC3, Level::High, Speed::High);
-
-    // A bare `SpiBus`; `lora-phy` wants a `SpiDevice`, and the chip-select is
-    // a `PWR` register bit rather than a pin — hence the wrapper.
-    let spi = SubghzSpiDevice::new(Spi::new_subghz(p.SUBGHZSPI, p.DMA1_CH1, p.DMA1_CH2, Irqs));
-
-    let interface = Stm32wlInterfaceVariant::new(USE_HIGH_POWER_PA, fe_ctrl1, fe_ctrl2, fe_ctrl3);
-
-    let sx_config = Sx126xConfig {
-        chip: Stm32wl {
-            use_high_power_pa: USE_HIGH_POWER_PA,
-        },
-        // This board *does* have a TCXO, on the radio's DIO3 supply. It is the
-        // same 32 MHz reference `config.rcc.hse` bypasses in on, so leaving
-        // this `None` gives the radio no reference at all.
-        tcxo_ctrl: Some(TcxoCtrlVoltage::Ctrl1V7),
-        use_dcdc: true,
-        rx_boost: false,
-    };
+    let RadioParts {
+        spi,
+        interface,
+        sx_config,
+    } = wayfinder_wl55jc::radio_parts(
+        Spi::new_subghz(p.SUBGHZSPI, p.DMA1_CH1, p.DMA1_CH2, Irqs),
+        p.PC3,
+        p.PC4,
+        p.PC5,
+    );
 
     // The radio's own task, which must outlive every `recv` — see `radio.rs`'s
     // module docs for why this is not a mutex. It is handed the *parts* and

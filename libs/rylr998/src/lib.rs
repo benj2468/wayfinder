@@ -119,6 +119,8 @@ pub struct ReceivedPacket {
     pub snr: i32,
 }
 
+pub mod air;
+
 #[cfg(feature = "link")]
 mod link;
 
