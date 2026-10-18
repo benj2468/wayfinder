@@ -365,4 +365,25 @@ mod tests {
         assert!(matches!(result, Err(LinkError::TransmitFailed)));
         assert!(tx_q.is_empty(), "no second fragment after the first failed");
     }
+
+    /// A raw LoRa transmission is heard by every receiver in range.
+    #[test]
+    fn declares_broadcast_fan_out() {
+        let rx_q: Channel<CriticalSectionRawMutex, RxPacket, 4> = Channel::new();
+        let tx_q: Channel<CriticalSectionRawMutex, Packet, 1> = Channel::new();
+        let done: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+        let link = ChannelLink::new(
+            RadioPort {
+                rx: &rx_q,
+                tx: &tx_q,
+                tx_done: &done,
+            },
+            NET,
+            crate::short_address_of(mac(1)),
+        );
+        assert_eq!(
+            link.fan_out(),
+            Some(wayfinder::link::FanOut::broadcast(MAX_REASSEMBLED_LEN))
+        );
+    }
 }
