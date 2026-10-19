@@ -18,19 +18,18 @@ Three things grow with N, and the scenario measures each:
   the boards build — holds 128 others (`wayfinder::default`); the `host`
   profile a gateway or server builds holds 4,096.
 
-**The edge is a cliff, not a slope.** Up to 129 nodes (128 others) everything
-scales as expected. Past it, a default-profile router must evict an
-originator to admit one, the evicted one is heard again within a round, and
-re-learning it counts as a new originator — which resets that router's
-Trickle timers. With every router evicting and re-learning continuously,
-every Trickle timer is pinned at `i_min`, the advert
-rate jumps to `N²/(0.75·i_min)`, and the channel collapses in both
-directions. (Beyond ~150 nodes the storm is large enough that the simulation
-itself runs out of memory, which is why the sweep stops there.) So the
-default profile is a hard ceiling to size under, not a soft one to drift
-past; a larger mesh needs the host profile on every node — and arguably the
-router should not treat re-learning an evicted originator as an
-inconsistency at all.
+**Past the edge, a slope rather than a cliff.** Up to 129 nodes (128 others)
+everything scales as expected. Past it, a default-profile router must evict an
+originator to admit one, and hears the evicted one again within a round. Until
+#104 that re-learn counted as a new originator — and a re-learned neighbor as a
+new neighbor — which reset Trickle on every churning router, pinned every
+timer at `i_min`, and collapsed the channel in both directions (6x the control
+traffic and 36% delivery at 144 nodes). The router now remembers the
+sequence-number state of originators it evicted for room and treats the
+re-learn as a continuation, so control traffic stays flat across the edge and
+delivery degrades only by what the table genuinely cannot hold: a router can
+route to at most 128 others. A mesh meant to run past the default profile
+still needs the host profile (4,096) on every node.
 
 Run: `uv run --group sim python sim/scenarios/scale.py [--export DIR]`
 """
