@@ -61,6 +61,7 @@ fn as_millis_u32(d: core::time::Duration) -> u32 {
 
 use crate::BatmanEngine;
 use crate::BroadcastSeqnoEntry;
+use crate::EvictedSeqno;
 use crate::KeepAliveStats;
 use crate::MAX_MCAST_DESTS;
 use crate::NeighborStats;
@@ -635,6 +636,13 @@ impl<
         // An originator reachable on no live path is gone; drop the record.
         self.originator_table.retain(|_, r| !r.paths.is_empty());
 
+        // And forget an evicted originator once it has been gone as long as a
+        // record whose interval was never learned would survive (#104). Not a
+        // topology change: nothing routable was held.
+        let now_ms = Millis::from_duration(now);
+        let budget_ms = seed_ms.saturating_mul(crate::MAX_MISSED_OGMS);
+        self.retain_evicted(|e| now_ms.elapsed_since(e.evicted_at) <= budget_ms);
+
         if self.originator_table.len() != before || pruned_path {
             self.topology_changed = true;
         }
@@ -1102,6 +1110,7 @@ impl<
     /// re-learned.
     pub fn reset(&mut self) {
         self.originator_table.clear();
+        self.evicted_seqnos.clear();
         self.broadcast_seqno.clear();
         self.mcast_members.clear();
         // A proof answered (or a challenge issued) under the previous auth
@@ -1174,6 +1183,7 @@ impl<
         for revoked_mac in revoked {
             debug!(revoked = ?revoked_mac, "revoking originator");
             self.originator_table.retain(|mac, _| revoked_mac != *mac);
+            self.retain_evicted(|e| e.orig != revoked_mac);
             for record in self.originator_table.values_mut() {
                 record
                     .paths
@@ -1185,6 +1195,50 @@ impl<
             self.proven.remove(&revoked_mac);
             self.challenged.remove(&revoked_mac);
         }
+    }
+
+    /// Remember the sequence-number state of an originator evicted for room,
+    /// dropping the oldest remembered one when the memory is full (#104).
+    fn remember_evicted(&mut self, orig: Mac, record: &OriginatorRecord, now: Millis) {
+        if self.evicted_seqnos.is_full() {
+            let _ = self.evicted_seqnos.pop_front();
+        }
+        let _ = self.evicted_seqnos.push_back(EvictedSeqno {
+            orig,
+            last_seqno: record.last_seqno,
+            resync_watch: record.resync_watch,
+            evicted_at: now,
+        });
+    }
+
+    /// Keep only the remembered evictions `keep` accepts, preserving order.
+    fn retain_evicted(&mut self, keep: impl Fn(&EvictedSeqno) -> bool) {
+        for _ in 0..self.evicted_seqnos.len() {
+            let Some(entry) = self.evicted_seqnos.pop_front() else {
+                break;
+            };
+            if keep(&entry) {
+                let _ = self.evicted_seqnos.push_back(entry);
+            }
+        }
+    }
+
+    /// Take the remembered state of `orig`, if it was evicted for room recently
+    /// enough to still be held. Linear over [`EVICTED_SEQNO_MEMORY`] entries,
+    /// and only on the path that admits an originator new to the table.
+    fn take_evicted(&mut self, orig: Mac) -> Option<EvictedSeqno> {
+        let mut found = None;
+        for _ in 0..self.evicted_seqnos.len() {
+            let Some(entry) = self.evicted_seqnos.pop_front() else {
+                break;
+            };
+            if found.is_none() && entry.orig == orig {
+                found = Some(entry);
+            } else {
+                let _ = self.evicted_seqnos.push_back(entry);
+            }
+        }
+        found
     }
 
     /// If a topology change was latched, clear it and reset all Trickle timers
@@ -1300,7 +1354,15 @@ impl<
         // Find or create the originator's record, keyed by its MAC.
         // A freshly discovered originator is itself a topology change.
         let is_new_orig = !self.originator_table.contains_key(&orig_ident);
+        // Whether making room for it meant evicting someone. Past the table's
+        // capacity this is what churn looks like, and it decides whether the
+        // arrival resets Trickle below (#104).
+        let mut evicted_for_room = false;
+        // The sequence-number state it had when last evicted for room, if this
+        // is a re-learn rather than a first sighting (#104).
+        let mut restored: Option<EvictedSeqno> = None;
         if is_new_orig {
+            restored = self.take_evicted(orig_ident);
             // Table full: evict the least-recently-heard originator to make room
             // rather than dropping this newly heard one.
             // Least-recently-heard is the *largest* elapsed, not the smallest
@@ -1313,7 +1375,10 @@ impl<
                     .map(|r| r.neighbor_ident)
             {
                 trace!(orig = ?oldest, "originator table full, evicting least-recently-heard");
-                self.originator_table.remove(&oldest);
+                if let Some(evicted) = self.originator_table.remove(&oldest) {
+                    self.remember_evicted(oldest, &evicted, now_ms);
+                }
+                evicted_for_room = true;
             }
             let new_record = OriginatorRecord {
                 last_heard: now_ms,
@@ -1324,13 +1389,20 @@ impl<
                 // if — and only if — the path is selectable.
                 best_next_hop: None,
                 max_tq: 0,
-                // Seeded from this OGM's own sequence number below; a first
-                // sighting has no high-water to judge against.
-                last_seqno: 0,
-                resync_watch: None,
+                // A re-learn continues the evicted record's high-water, so a
+                // copy of a seqno already flooded is a stale copy below. A first
+                // sighting has none, and is seeded from this OGM's own number.
+                last_seqno: restored.map_or(0, |r| r.last_seqno),
+                resync_watch: restored.and_then(|r| r.resync_watch),
                 paths: heapless::Vec::new(),
             };
-            info!(orig = ?orig_ident, "discovered new originator");
+            // Past capacity the same originators are evicted and re-learned
+            // every round, which must not be an `info!` line per OGM.
+            if evicted_for_room || restored.is_some() {
+                debug!(orig = ?orig_ident, "learned originator into a full table");
+            } else {
+                info!(orig = ?orig_ident, "discovered new originator");
+            }
             let _ = self.originator_table.insert(orig_ident, new_record);
         }
 
@@ -1377,12 +1449,16 @@ impl<
         // the originator claims rather than something this node observed, so
         // they follow the freshest OGM and no other: an out-of-date copy must
         // not be able to revert a live member's groups.
-        let admission = if is_new_orig {
+        // A re-learn is judged against the high-water it continues, exactly as
+        // if the record had never left; only a first sighting is seeded.
+        let admission = if is_new_orig && restored.is_none() {
             // Taken on trust, exactly as `BroadcastSeqnoEntry::seeded` takes a
             // first broadcast, and safe for the same reason rather than in
-            // spite of it: a wrong seed — including one an outsider forced by
-            // evicting the live record — is corrected by the originator's own
-            // next OGMs within `OGM_SEQNO_RESET_PROTECTION`.
+            // spite of it: a wrong seed is corrected by the originator's own
+            // next OGMs within `OGM_SEQNO_RESET_PROTECTION`. An outsider can no
+            // longer force one by evicting the live record: within the
+            // eviction memory's horizon the re-learn continues the real
+            // high-water and is judged by `admit_seqno` below (#104).
             record.last_seqno = incoming_seqno;
             crate::SeqnoAdmission::Advanced
         } else {
@@ -1424,8 +1500,11 @@ impl<
             // attacker's stream of non-advancing frames must not be able to pin
             // a record at the top of the eviction order. Leaving it alone while
             // a high-water is under correction is also the useful direction —
-            // a jammed record then sorts old, and being evicted reseeds it,
-            // which cures the jam outright. Path liveness is tracked separately
+            // a jammed record then sorts old. Being evicted no longer reseeds
+            // it (#104): the eviction memory carries the high-water *and* its
+            // resync watch across, so the watch corrects the jam on its
+            // original deadline, the same bound a record that stayed in the
+            // table gets. Path liveness is tracked separately
             // in `NeighborStats::last_heard` below and is what routing reads.
             if admission.contents_are_current() {
                 record.last_heard = now_ms;
@@ -1546,9 +1625,24 @@ impl<
             //   handled where it happens, in `set_local_mcast_groups`,
             //   which resets the timers directly.
             //
+            // * An originator learned into a *full* table (#104). Past capacity
+            //   a node evicts the least-recently-heard originator to make room
+            //   and hears it again a round later; counting each re-learn as
+            //   new reset every churning node, pinned the whole mesh at
+            //   `i_min`, and collapsed it — 6x the control traffic and 36%
+            //   delivery at 144 nodes against a 128-entry table. Capacity
+            //   churn says nothing about us. A genuinely new *neighbor* is the
+            //   exception, since gaining one is exactly the change above, full
+            //   table or not — but a neighbor *re-learned* from the eviction
+            //   memory is not new: eviction ranks neighbors like any other
+            //   originator, so past the edge they churn as well.
+            //
             // A genuinely lost route still resets via [`purge_stale`], and
             // forwarding always follows the current best live path regardless.
-            if is_new_orig {
+            let is_relearn = restored.is_some();
+            let is_new_neighbor = orig_ident == frame.src && !is_relearn;
+            let is_first_sighting = !is_relearn && !evicted_for_room;
+            if is_new_orig && (is_first_sighting || is_new_neighbor) {
                 self.topology_changed = true;
             }
 
@@ -2493,6 +2587,342 @@ mod tests {
         data
     }
 
+    // ── a full originator table and the Trickle backoff (#104) ────────────────
+
+    /// An OGM for originator `orig`, relayed to us by the neighbor `via` — the
+    /// shape of every OGM about a node more than one hop away.
+    fn relayed_ogm_frame(orig: u8, via: u8, dst: u8, seqno: u32) -> Vec<u8> {
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 5,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(orig),
+            reserved: 0,
+            tq: 200,
+            tvlv_len: 0,
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(dst).as_bytes());
+        data.extend_from_slice(mac(via).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(ogm.as_bytes());
+        data
+    }
+
+    /// Feed one OGM frame to `engine` at `at_ms`, reporting whether it was
+    /// re-flooded (the caller forwards `reply` only when its protocol is set).
+    fn rx_at<const N: usize>(engine: &mut BatmanEngine<N>, at_ms: u64, frame: &[u8]) -> bool {
+        let mut tx = [0u8; 256];
+        let parsed = LinkFrame::ref_from_prefix(frame).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(
+            core::time::Duration::from_millis(at_ms),
+            parsed,
+            None,
+            &mut reply,
+            &mut (),
+        );
+        assert_originator_invariants(engine);
+        reply.protocol != 0
+    }
+
+    /// Back interface 0's Trickle timer off past `I_MIN` and return the
+    /// interval it settled at.
+    fn back_off<const N: usize>(engine: &mut BatmanEngine<N>, at_ms: u64) -> core::time::Duration {
+        for _ in 0..4 {
+            engine.ogm_timers[0].on_emit(core::time::Duration::from_millis(at_ms));
+        }
+        let backed_off = engine.ogm_timers[0].interval();
+        assert!(backed_off > I_MIN);
+        backed_off
+    }
+
+    /// A 4-entry table holding neighbor 2 and the three originators it relays
+    /// (10, 11, 12), with 2 heard most recently so it is never the eviction
+    /// victim. Returns the time of the last OGM fed in.
+    fn full_table(engine: &mut BatmanEngine<4>) -> u64 {
+        engine.configure_interface_ogm(0, I_MIN, I_MAX, core::time::Duration::ZERO);
+        rx_at(engine, 0, &ogm_frame(2, 1, 1));
+        for (i, orig) in [10u8, 11, 12].into_iter().enumerate() {
+            rx_at(
+                engine,
+                10 * (i as u64 + 1),
+                &relayed_ogm_frame(orig, 2, 1, 1),
+            );
+        }
+        rx_at(engine, 100, &ogm_frame(2, 1, 2));
+        assert_eq!(engine.originator_table.len(), 4, "the table is full");
+        100
+    }
+
+    /// **#104.** Past the originator table's capacity a node evicts the
+    /// least-recently-heard originator to make room, then hears it again a
+    /// round later. Treating that re-learn as a new originator reset Trickle on
+    /// every node that churned, which pinned the whole mesh at `i_min`: the sim
+    /// measured 6x the control traffic and 36% delivery at 144 nodes against a
+    /// 128-entry table. Capacity churn tells our neighbors nothing new about
+    /// us, so it must not reset the backoff.
+    #[test]
+    fn relearning_an_originator_evicted_for_room_does_not_reset_trickle() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+        let backed_off = back_off(&mut engine, t);
+
+        // A fourth relayed originator: makes room by evicting 10, the oldest.
+        rx_at(&mut engine, t + 10, &relayed_ogm_frame(13, 2, 1, 1));
+        assert!(
+            !engine.originator_table.contains_key(&mac(10)),
+            "10 was evicted"
+        );
+        // 10 again, a round later: re-learned, evicting the next-oldest.
+        rx_at(&mut engine, t + 20, &relayed_ogm_frame(10, 2, 1, 2));
+        assert!(
+            engine.originator_table.contains_key(&mac(10)),
+            "10 was re-learned"
+        );
+
+        assert_eq!(
+            engine.ogm_timers[0].interval(),
+            backed_off,
+            "capacity churn must not reset our backoff"
+        );
+    }
+
+    /// **#104, the flood half.** Re-learning an originator used to seed its
+    /// high-water from whatever copy arrived first, as for a stranger — so
+    /// after a capacity eviction, the next copy of a sequence number this node
+    /// had *already* flooded looked new and was flooded again. Past the edge
+    /// every node thrashes its table every round, so each of a node's
+    /// neighbors' copies became another flood. Re-learning must continue the
+    /// evicted record's high-water instead.
+    #[test]
+    fn a_seqno_already_flooded_is_not_reflooded_after_its_originator_was_evicted() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+
+        // Evict 10 (the oldest) by admitting a fourth relayed originator.
+        rx_at(&mut engine, t + 10, &relayed_ogm_frame(13, 2, 1, 1));
+        assert!(!engine.originator_table.contains_key(&mac(10)));
+
+        // Another neighbor's copy of 10's seqno 1, which we flooded already.
+        assert!(
+            !rx_at(&mut engine, t + 20, &relayed_ogm_frame(10, 3, 1, 1)),
+            "a seqno this node already flooded must not be flooded again"
+        );
+    }
+
+    /// The eviction memory is bounded: past [`crate::EVICTED_SEQNO_MEMORY`]
+    /// evictions the oldest is forgotten, and re-learning a forgotten
+    /// originator is a first sighting again, exactly as before #104.
+    #[test]
+    fn the_eviction_memory_keeps_only_the_most_recent_evictions() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut t = full_table(&mut engine);
+        let evictions = crate::EVICTED_SEQNO_MEMORY + 8;
+        for orig in 0..evictions {
+            t += 10;
+            // Keep neighbor 2 the most recently heard, so it is never evicted.
+            rx_at(&mut engine, t, &ogm_frame(2, 1, 3 + orig as u32));
+            rx_at(
+                &mut engine,
+                t + 1,
+                &relayed_ogm_frame(100 + orig as u8, 2, 1, 1),
+            );
+        }
+
+        assert_eq!(engine.evicted_seqnos.len(), crate::EVICTED_SEQNO_MEMORY);
+        assert!(
+            !engine.evicted_seqnos.iter().any(|e| e.orig == mac(10)),
+            "the earliest eviction has been forgotten"
+        );
+
+        // A forgotten originator is a first sighting again: the seqno it was
+        // flooded at is seeded and flooded anew.
+        t += 10;
+        rx_at(&mut engine, t, &ogm_frame(2, 1, 1000));
+        assert!(rx_at(&mut engine, t + 1, &relayed_ogm_frame(100, 3, 1, 1)));
+        // A remembered one still continues its high-water. The table holds
+        // neighbor 2 and the three newest relays, so the newest eviction was
+        // the one four back.
+        let last = 100 + evictions as u8 - 4;
+        assert!(engine.evicted_seqnos.iter().any(|e| e.orig == mac(last)));
+        assert!(!rx_at(
+            &mut engine,
+            t + 2,
+            &relayed_ogm_frame(last, 3, 1, 1)
+        ));
+    }
+
+    /// An entry in the eviction memory lasts no longer than the record would
+    /// have: once an originator has been silent past the purge budget it is
+    /// gone, and when it returns — perhaps rebooted, at a low seqno — it is a
+    /// first sighting, not held to a high-water it left behind (#104 review).
+    #[test]
+    fn an_eviction_memory_entry_expires_when_its_record_would_have() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+        rx_at(&mut engine, t + 10, &relayed_ogm_frame(13, 2, 1, 1));
+        assert!(engine.evicted_seqnos.iter().any(|e| e.orig == mac(10)));
+
+        let budget_ms = u64::from(crate::MAX_MISSED_OGMS) * I_MAX.as_millis() as u64;
+        let later = t + 10 + budget_ms + 1;
+        engine.purge_stale(core::time::Duration::from_millis(later));
+
+        assert!(
+            !engine.evicted_seqnos.iter().any(|e| e.orig == mac(10)),
+            "a silent originator's memory expires with it"
+        );
+    }
+
+    /// `reset` drops all learned routing state, the eviction memory with it.
+    #[test]
+    fn reset_clears_the_eviction_memory() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+        rx_at(&mut engine, t + 10, &relayed_ogm_frame(13, 2, 1, 1));
+        assert!(!engine.evicted_seqnos.is_empty());
+
+        engine.reset();
+
+        assert!(engine.evicted_seqnos.is_empty());
+    }
+
+    /// A revoked originator is forgotten from the eviction memory as well as
+    /// from the table, so nothing it left behind outlives the revocation.
+    #[test]
+    fn revoking_an_originator_forgets_its_eviction_memory() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+        rx_at(&mut engine, t + 10, &relayed_ogm_frame(13, 2, 1, 1));
+        assert!(engine.evicted_seqnos.iter().any(|e| e.orig == mac(10)));
+
+        engine.revoke_originators(core::iter::once(mac(10)));
+
+        assert!(!engine.evicted_seqnos.iter().any(|e| e.orig == mac(10)));
+    }
+
+    /// A resync under way when an originator is evicted completes on its
+    /// original deadline after the re-learn, rather than restarting — or an
+    /// originator that churns through the table every round would never
+    /// resynchronise, and this node would stop forwarding it for good.
+    #[test]
+    fn a_restored_resync_watch_completes_on_its_original_deadline() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+        // 10's counter jumps far out of band (a restart, seen from the other
+        // side): not flooded, but a watch opens on the new run.
+        let watch_opened = t + 2;
+        assert!(!rx_at(
+            &mut engine,
+            watch_opened,
+            &relayed_ogm_frame(10, 2, 1, 9_000)
+        ));
+        assert!(engine.originator_table[&mac(10)].resync_watch.is_some());
+
+        // Refresh everyone else so 10 is the oldest, then evict it.
+        rx_at(&mut engine, t + 3, &relayed_ogm_frame(11, 2, 1, 2));
+        rx_at(&mut engine, t + 4, &relayed_ogm_frame(12, 2, 1, 2));
+        rx_at(&mut engine, t + 5, &ogm_frame(2, 1, 3));
+        rx_at(&mut engine, t + 6, &relayed_ogm_frame(13, 2, 1, 1));
+        assert!(
+            !engine.originator_table.contains_key(&mac(10)),
+            "10 was evicted"
+        );
+
+        // Re-learned before the deadline: still under correction.
+        assert!(!rx_at(
+            &mut engine,
+            t + 7,
+            &relayed_ogm_frame(10, 2, 1, 9_001)
+        ));
+        // At the original deadline the run has persisted, and flooding resumes.
+        let deadline = watch_opened + crate::OGM_SEQNO_RESET_PROTECTION.as_millis() as u64;
+        assert!(
+            rx_at(&mut engine, deadline, &relayed_ogm_frame(10, 2, 1, 9_002)),
+            "the watch kept its original deadline across the eviction"
+        );
+    }
+
+    /// The guard on the half above: a re-learned originator's genuinely newer
+    /// OGM is still flooded, so continuing the high-water costs no reach.
+    #[test]
+    fn a_newer_seqno_is_still_flooded_after_its_originator_was_evicted() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+        rx_at(&mut engine, t + 10, &relayed_ogm_frame(13, 2, 1, 1));
+
+        assert!(rx_at(&mut engine, t + 20, &relayed_ogm_frame(10, 3, 1, 2)));
+    }
+
+    /// The other side of #104: with room in the table, a genuinely new
+    /// originator still resets Trickle, which is what makes a growing mesh
+    /// converge quickly.
+    #[test]
+    fn a_new_originator_with_room_in_the_table_still_resets_trickle() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        engine.configure_interface_ogm(0, I_MIN, I_MAX, core::time::Duration::ZERO);
+        rx_at(&mut engine, 0, &ogm_frame(2, 1, 1));
+        let _ = back_off(&mut engine, 0);
+
+        rx_at(&mut engine, 10, &relayed_ogm_frame(10, 2, 1, 1));
+
+        assert_eq!(engine.ogm_timers[0].interval(), I_MIN);
+    }
+
+    /// A neighbor *re-learned* after a capacity eviction is not a new neighbor.
+    /// Eviction ranks a neighbor no differently from a far originator, so past
+    /// the edge neighbors churn through the table too; counting each re-learn
+    /// as gaining one reset Trickle 4.4 times per node per second at 144 nodes
+    /// in the sim, which kept the storm going after the first half of #104.
+    #[test]
+    fn a_neighbor_relearned_after_eviction_does_not_reset_trickle() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut t = full_table(&mut engine);
+        // Neighbor 3 joins (evicting 10), then is itself evicted by relays
+        // heard after it.
+        t += 10;
+        rx_at(&mut engine, t, &ogm_frame(3, 1, 1));
+        for orig in [20u8, 21, 22] {
+            t += 10;
+            rx_at(&mut engine, t, &ogm_frame(2, 1, 10 + u32::from(orig)));
+            rx_at(&mut engine, t + 1, &relayed_ogm_frame(orig, 2, 1, 1));
+        }
+        assert!(
+            !engine.originator_table.contains_key(&mac(3)),
+            "3 was evicted"
+        );
+        let backed_off = back_off(&mut engine, t);
+
+        rx_at(&mut engine, t + 10, &ogm_frame(3, 1, 2));
+
+        assert!(
+            engine.originator_table.contains_key(&mac(3)),
+            "3 was re-learned"
+        );
+        assert_eq!(
+            engine.ogm_timers[0].interval(),
+            backed_off,
+            "a re-learned neighbor must not reset our backoff"
+        );
+    }
+
+    /// Gaining a *neighbor* changes what we advertise (we are likely newly
+    /// reachable through it), so it resets Trickle even when making room for
+    /// it meant evicting someone.
+    #[test]
+    fn a_new_neighbor_resets_trickle_even_when_the_table_is_full() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = full_table(&mut engine);
+        let _ = back_off(&mut engine, t);
+
+        rx_at(&mut engine, t + 10, &ogm_frame(7, 1, 1));
+
+        assert!(engine.originator_table.contains_key(&mac(7)));
+        assert_eq!(engine.ogm_timers[0].interval(), I_MIN);
+    }
+
     // ── multicast membership and the Trickle backoff ──────────────────────────
 
     /// An OGM from `neighbor` announcing interest in `groups`, so the engine
@@ -3367,6 +3797,17 @@ mod tests {
     /// Called after each `feed` below, per the repo's convention for stateful
     /// structures.
     fn assert_originator_invariants<const N: usize>(engine: &BatmanEngine<N>) {
+        // An originator is either in the table or remembered as evicted, never
+        // both, and is remembered at most once (#104).
+        let mut remembered: Vec<Mac> = Vec::new();
+        for entry in engine.evicted_seqnos.iter() {
+            assert!(
+                !engine.originator_table.contains_key(&entry.orig),
+                "a re-learned originator must have been taken out of the eviction memory"
+            );
+            assert!(!remembered.contains(&entry.orig), "remembered twice");
+            remembered.push(entry.orig);
+        }
         for (orig, record) in engine.originator_table.iter() {
             assert_ne!(*orig, engine.self_ident, "own ident must never be tracked");
             if let Some(watch) = record.resync_watch {

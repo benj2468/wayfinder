@@ -276,6 +276,44 @@ pub struct BroadcastSeqnoEntry {
     pub resync_watch: Option<SeqnoResyncWatch>,
 }
 
+/// How many originators evicted *for room* the engine remembers the OGM
+/// sequence-number state of (#104).
+///
+/// Past the originator table's capacity a node evicts the least-recently-heard
+/// originator to admit another, and hears the evicted one again within a round.
+/// Remembering its high-water lets that re-learn continue where the record left
+/// off, so a copy of a sequence number this node already flooded is recognised
+/// as stale rather than flooded again.
+///
+/// It only has to hold the originators currently pushed *out* of the table, so
+/// it protects a mesh up to its table's capacity plus this many other nodes:
+/// 145 nodes on the default 128-entry profile, 33 on a 16-entry board. A mesh further past
+/// its profile than that degrades to the old behaviour for the excess, never
+/// worse. Fixed rather than a capacity-profile parameter, and kept small
+/// because every board pays it: at 28 bytes an entry it is ~0.45 KiB.
+pub const EVICTED_SEQNO_MEMORY: usize = 16;
+
+/// The OGM sequence-number state of an originator evicted for room, kept so a
+/// re-learn continues it (see [`EVICTED_SEQNO_MEMORY`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictedSeqno {
+    /// The originator whose record was evicted.
+    pub orig: Mac,
+    /// Its high-water at eviction, [`OriginatorRecord::last_seqno`].
+    pub last_seqno: u32,
+    /// Its resync evidence at eviction, [`OriginatorRecord::resync_watch`].
+    /// Kept as well as the high-water, or an originator that restarted and
+    /// churns through the table every round would restart its watch on each
+    /// re-learn and never resynchronise.
+    pub resync_watch: Option<SeqnoResyncWatch>,
+    /// When it was evicted. An entry lasts no longer than the record would
+    /// have, so an originator that has since gone silent — and may return
+    /// rebooted, at a low seqno — is a first sighting again rather than being
+    /// held to a high-water it left behind. Swept by `purge_stale`, which also
+    /// keeps the stamp inside `Millis`'s comparable range.
+    pub evicted_at: Millis,
+}
+
 /// The band widths and dwell time one sequence-number space is judged by.
 ///
 /// Two spaces need the same three-arm decision on different numbers — flooded
@@ -731,6 +769,10 @@ pub struct BatmanEngine<
     /// newly heard originator evicts the least-recently-refreshed entry rather
     /// than being dropped.
     pub originator_table: FnvIndexMap<Mac, OriginatorRecord, MAX_ORIGINATORS>,
+    /// Sequence-number state of the originators most recently evicted from
+    /// [`Self::originator_table`] to make room, oldest first, so re-learning
+    /// one continues its high-water (#104, [`EVICTED_SEQNO_MEMORY`]).
+    pub evicted_seqnos: heapless::Deque<EvictedSeqno, EVICTED_SEQNO_MEMORY>,
     /// Highest broadcast sequence number seen per originator, used to drop
     /// duplicate flooded broadcasts.  Broadcast and OGM sequence numbers are
     /// independent number spaces, so this is tracked separately from
@@ -929,6 +971,7 @@ impl<
             sequence_number: 0,
             broadcast_sequence_number: 0,
             originator_table: FnvIndexMap::new(),
+            evicted_seqnos: heapless::Deque::new(),
             broadcast_seqno: FnvIndexMap::new(),
             local_mcast: HVec::new(),
             mcast_members: HVec::new(),
