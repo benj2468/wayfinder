@@ -547,7 +547,7 @@
                 ldproxy
                 esp-generate
               ]
-              ++ (pkgs.lib.optionals pkgs.stdenv.isLinux onlyLinuxPkgs);
+              ++ (pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux onlyLinuxPkgs);
 
             buildInputs = with pkgs; [
               dbus
@@ -611,7 +611,7 @@
               }''${NIX_LD_LIBRARY_PATH:+:''${NIX_LD_LIBRARY_PATH}}"
 
               export PATH=/run/wrappers/bin:$PATH
-              ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
                 # The `rust-lld` fenix ships for darwin is linked against
                 # `@rpath/libLLVM.dylib`, but its only usable `LC_RPATH` is
                 # `@loader_path/../lib` — and the binary lives in
