@@ -33,12 +33,20 @@ def test_the_honest_control_delivers(runs):
 def test_selective_forwarding_is_not_routed_around(runs):
     run = runs["selective forwarding"]
     assert run.delivery_after < 0.1
-    assert run.on_route_share > 0.9
+    assert run.carried_share > 0.9
     assert run.tq_after >= run.tq_before - 5
 
 
 def test_a_silent_relay_is_routed_around(runs):
     assert runs["blackhole"].delivery_after > 0.8
+    assert runs["blackhole"].carried_share < 0.2
+
+
+def test_what_the_relay_swallows_is_what_goes_missing(runs):
+    """The carried share is read off the air, so under selective forwarding it
+    accounts for the loss: what was handed to the relay did not arrive."""
+    run = runs["selective forwarding"]
+    assert run.delivery_after <= 1.0 - run.carried_share + 0.02
 
 
 def test_the_export_covers_every_behaviour(runs):
