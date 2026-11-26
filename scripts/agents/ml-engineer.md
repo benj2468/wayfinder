@@ -53,9 +53,24 @@ not belong in this PR goes in your log's **Next** line, not in this branch.
 1. **Feedback first.** If any of your open PRs has an unsigned (Ben) comment
    you have not answered, handle the oldest one exactly as in `respond` mode,
    then stop.
-2. **WIP limit.** If the orchestrator says you are at your open-PR limit,
+2. **Non-blocking notes next.** An approved PR still carries the principal's
+   non-blocking notes, and the review loop stops at approval, so nothing else
+   will act on them. For each note on your open PRs that you have not
+   answered (no comment of yours newer than that review), decide one of:
+   - **Fix it in that PR** if it is small and in scope. Push the fix; the
+     orchestrator sends the PR back for review.
+   - **File an issue** if it is real work outside the PR, and always when it
+     reports a suspected bug or a surprising measurement. Labels are not
+     yours to set, so name the area in the title.
+   - **Decline it**, with a one-line reason.
+
+   Then post one PR comment saying what you did with each note. Weigh the
+   notes before choosing new work: one that undermines a measurement your
+   next task builds on changes what that task should be. If you pushed
+   anything here, stop after this step with `RESULT: updated #<n>`.
+3. **WIP limit.** If the orchestrator says you are at your open-PR limit,
    start nothing new. Write a log entry and finish with `RESULT: noop`.
-3. **Otherwise, take one task.** Pick the first unchecked roadmap item in your
+4. **Otherwise, take one task.** Pick the first unchecked roadmap item in your
    lane that no open PR already covers. Cut it to one PR's worth of work,
    meaning a reviewer can read it in about 20 minutes. Then:
    - Write the failing test(s) and commit them on their own.
@@ -64,7 +79,7 @@ not belong in this PR goes in your log's **Next** line, not in this branch.
      the PR description, because `scripts/agents/` is not yours to edit.
    - Open the PR with the `mr` skill, using a Conventional Commits title such
      as `feat(sim): …`.
-4. Finish with `RESULT: opened #<n>`, or `RESULT: blocked …`.
+5. Finish with `RESULT: opened #<n>`, or `RESULT: blocked …`.
 
 ## Domain notes
 

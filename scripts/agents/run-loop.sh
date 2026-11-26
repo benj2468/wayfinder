@@ -66,11 +66,15 @@ esac
 
 # Cron gives a bare environment.
 export PATH="$HOME/.npm-packages/bin:/run/current-system/sw/bin:/etc/profiles/per-user/$USER/bin:$HOME/.nix-profile/bin:$PATH"
+# A caller's activated venv (direnv) must not leak into the agents' shells.
+unset VIRTUAL_ENV
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 # ---------------------------------------------------------------- stage
-# First pass: snapshot scripts/agents at AGENT_REF and re-exec it inside that
-# commit's devShell (which supplies gh, cargo, uv, just, nix fmt).
+# First pass: snapshot scripts/agents at AGENT_REF and re-exec it with gh on
+# PATH. The orchestrator needs only gh, jq and git. Each agent gets the repo's
+# devShell entered *in its own worktree* (see run_agent), so the shell hook
+# syncs that worktree's .venv rather than whichever checkout cron started in.
 if [[ -z ${AGENT_STAGED:-} ]]; then
   REPO_ROOT=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
   git -C "$REPO_ROOT" fetch -q origin
@@ -80,9 +84,8 @@ if [[ -z ${AGENT_STAGED:-} ]]; then
   git -C "$REPO_ROOT" cat-file -e "$rev:scripts/agents/run-loop.sh" 2>/dev/null ||
     { echo "scripts/agents is not on $AGENT_REF yet; try AGENT_REF=HEAD" >&2; exit 1; }
   git -C "$REPO_ROOT" archive "$rev" scripts/agents | tar -x -C "$stage"
-  cd "$REPO_ROOT"
   exec env AGENT_STAGED="$stage/scripts/agents" REPO_ROOT="$REPO_ROOT" AGENT_REV="$rev" \
-    nix develop "git+file://$REPO_ROOT?rev=$rev" --command \
+    nix shell nixpkgs#gh nixpkgs#jq --command \
     bash "$stage/scripts/agents/run-loop.sh" "$@"
 fi
 AGENTS=$AGENT_STAGED
@@ -230,7 +233,10 @@ run_agent() { # <role> <worktree> <model> <budget> <task>
     LAST_RESULT="RESULT: noop"
     return
   fi
-  (cd "$wt" && "${SCOPE[@]}" timeout --kill-after=60 "$RUN_TIMEOUT" \
+  # The devShell hook prints to stdout, so the transcript is parsed leniently
+  # (`fromjson?`) below.
+  (cd "$wt" && "${SCOPE[@]}" nix develop "$wt" --command \
+    timeout --kill-after=60 "$RUN_TIMEOUT" \
     claude -p "$task" \
     --append-system-prompt "$sys" \
     --model "$model" \
@@ -238,11 +244,11 @@ run_agent() { # <role> <worktree> <model> <budget> <task>
     --settings "$AGENTS/settings.json" \
     --max-budget-usd "$budget" \
     --output-format stream-json --verbose) >"$out.jsonl" 2>"$out.stderr" || status=$?
-  LAST_RESULT=$(jq -r 'select(.type == "result") | .result // empty' "$out.jsonl" 2>/dev/null |
+  LAST_RESULT=$(jq -rR 'fromjson? | select(.type == "result") | .result // empty' "$out.jsonl" 2>/dev/null |
     grep -E '^RESULT:' | tail -1 || true)
   local cost
-  cost=$(jq -r 'select(.type == "result") | .total_cost_usd // empty' "$out.jsonl" 2>/dev/null | tail -1)
-  log "← $role exit=$status cost=\$${cost:-?} ${LAST_RESULT:-<no RESULT line>}"
+  cost=$(jq -rR 'fromjson? | select(.type == "result") | .total_cost_usd // empty' "$out.jsonl" 2>/dev/null | tail -1)
+  log "← $role exit=$status api-equiv=\$${cost:-?} ${LAST_RESULT:-<no RESULT line>}"
 }
 
 context() { # <role> → the shared preamble every task message starts with

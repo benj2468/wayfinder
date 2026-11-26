@@ -91,15 +91,17 @@ the principal sweeps late at night.
 ```
 
 The cron path only has to locate *a* checkout. The script fetches and re-execs
-the `origin/main` copy inside `origin/main`'s devShell. That means whatever
-branch the checkout happens to be on does not matter, and `gh`, `cargo` and
-`uv` come from the flake rather than from cron's bare `PATH`.
+the `origin/main` copy of itself, so whatever branch the checkout happens to be
+on does not matter. Each agent then starts inside `nix develop`, entered in its
+own worktree. That gives it the flake's `cargo`, `uv`, `just` and `nix fmt`
+rather than cron's bare `PATH`, and the shell hook syncs that worktree's `.venv`
+with the `dev` and `sim` groups.
 
 ## Logs
 
 `~/.local/state/wayfinder-agents/runs/<date>/<time>-<cmd>/` holds:
 
-- `loop.log`: the orchestrator's decisions and the cost of each run;
+- `loop.log`: the orchestrator's decisions and each run's API-equivalent cost;
 - `*.task`: the exact task message sent;
 - `*.jsonl`: the full stream-json transcript;
 - `*.stderr`.
@@ -109,11 +111,15 @@ On GitHub, every run also leaves a Done/Next/Blocked comment on its agent's
 
 ## Billing: check before turning cron on
 
-It is unclear whether headless `claude -p` usage draws from the subscription
-or from a separate monthly credit. A move to a separate credit was announced
-for 2026-06-15, and reports say it was later paused. Check the current terms
-on support.claude.com and the usage page. `--max-budget-usd` caps each
-invocation either way.
+The runs authenticate with the claude.ai subscription (`apiKeySource: none`),
+not an API key. The `$` figure in `loop.log` is Claude Code's API-equivalent
+estimate (`total_cost_usd`), not a charge.
+
+Whether headless `claude -p` draws from the plan's normal limits or from a
+separate monthly credit was announced to change on 2026-06-15, and reports say
+the change was later paused. The usage page in claude.ai settings is the
+authority: check it after a run. `--max-budget-usd` caps each invocation's
+estimate either way.
 
 ## Adding a role
 
