@@ -42,10 +42,15 @@ only Ben merges.
    two values:
 
    ```
-   <!-- agent-review verdict=approve sha=<head sha you reviewed> -->
+   <!-- agent-review verdict=approve sha=<head sha you reviewed> notes=<N> -->
    ```
 
-   Use `verdict=changes` instead when something must change. The second line
+   Use `verdict=changes` instead when something must change. `notes=<N>` is the
+   number of items on your non-blocking list. When `N > 0` on an approval, the
+   orchestrator immediately has the author act on them and then sends the PR
+   back to you, until the round cap. **So list a note only if it is worth
+   another round.** Anything you would be content never to see addressed
+   belongs in the review prose, not in the counted list. The second line
    is `🤖 **principal-engineer**: round <k>/<max>`. After that, a numbered list
    of required changes, each with a `file:line` and a short reason, then an
    optional "non-blocking" list.

@@ -42,7 +42,7 @@ set -euo pipefail
 : "${PERMISSION_MODE:=auto}"
 : "${MEMORY_MAX:=4500M}"                # cgroup cap so cargo can't OOM the box
 : "${MIN_FREE_GB:=6}"
-: "${LOCK_WAIT_S:=14400}"               # a sweep waits behind a running ML loop
+: "${LOCK_WAIT_S:=}"                    # default: ml/review 0 (next hour retries), sweep 4 h
 : "${DRY_RUN:=0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
@@ -183,13 +183,35 @@ escalate() { # <pr> <reason>
   ghw pr comment "$1" -R "$REPO" --body "🤖 **orchestrator**: stopping the agent loop on this PR — $2. Remove \`$L_BEN\` to hand it back to the loop."
 }
 
-markers() { # <pr> → one `verdict=… sha=…` line per principal review, oldest first
+markers() { # <pr> → one `verdict=… sha=… [notes=N]` line per principal review, oldest first
   gh api "repos/$REPO/pulls/$1/reviews" --paginate --jq '.[].body' |
-    grep -oE '<!-- agent-review verdict=(approve|changes) sha=[0-9a-f]+ -->' |
+    grep -oE '<!-- agent-review verdict=(approve|changes) sha=[0-9a-f]+( notes=[0-9]+)? -->' |
     sed -E 's/<!-- agent-review (.*) -->/\1/' || true
 }
 rounds() { markers "$1" | grep -c . || true; }
 last_marker() { markers "$1" | tail -1; }
+marker_notes() { # <marker line> → its non-blocking note count (0 if absent)
+  local n
+  n=$(sed -nE 's/.* notes=([0-9]+).*/\1/p' <<<"$1")
+  echo "${n:-0}"
+}
+
+# True when Ben (an unsigned comment, review or inline comment) has the last
+# word on any open ML PR, so the ML agent has something to answer.
+ml_has_feedback() {
+  local pr
+  for pr in $(ml_prs); do
+    {
+      gh api "repos/$REPO/issues/$pr/comments" --paginate \
+        --jq '.[] | [.created_at, (.body | test("^\\s*🤖"))] | @tsv'
+      gh api "repos/$REPO/pulls/$pr/reviews" --paginate \
+        --jq '.[] | select(.body != "") | [.submitted_at, (.body | test("^(<!--[^\\n]*-->\\s*)?🤖"))] | @tsv'
+      gh api "repos/$REPO/pulls/$pr/comments" --paginate \
+        --jq '.[] | [.created_at, (.body | test("^\\s*🤖"))] | @tsv'
+    } | sort | tail -1 | grep -q $'\tfalse$' && return 0
+  done
+  return 1
+}
 
 # Newly opened ML PRs join the loop; out-of-lane ones go straight to Ben.
 adopt_new_prs() {
@@ -261,6 +283,10 @@ Today: $(date -u +%F). Review round cap: $MAX_ROUNDS.
 Open PRs:
 $(gh pr list -R "$REPO" --state open --limit 50 --json number,title,headRefName,labels \
     --jq '.[] | "  #\(.number) [\(.headRefName)] \(.title)  {\([.labels[].name] | join(", "))}"')
+
+Open issues (agent logs excluded):
+$(gh issue list -R "$REPO" --state open --limit 60 --json number,title,labels \
+    --jq '.[] | select([.labels[].name] | index("'"$L_LOG"'") | not) | "  #\(.number) \(.title)  {\([.labels[].name] | join(", "))}"')
 EOF
 }
 
@@ -268,6 +294,20 @@ ml_respond() { # <pr>
   local wt
   wt=$(prep_worktree ml)
   run_agent ml-engineer "$wt" "$ML_MODEL" "$ML_BUDGET_USD" "Mode: respond $1
+Check the branch out with \`gh pr checkout $1\`.
+
+$(context ml-engineer)"
+}
+
+ml_notes() { # <pr> <final: 0|1>
+  local wt how
+  wt=$(prep_worktree ml)
+  if (($2)); then
+    how="final=yes — this was the last review round: do not push; file an issue or decline each note."
+  else
+    how="final=no — fix small in-scope notes on the branch and push; the principal reviews again."
+  fi
+  run_agent ml-engineer "$wt" "$ML_MODEL" "$ML_BUDGET_USD" "Mode: notes $1 $how
 Check the branch out with \`gh pr checkout $1\`.
 
 $(context ml-engineer)"
@@ -286,7 +326,7 @@ $(context principal-engineer)"
 # Drive one PR through review ⇄ response until it is approved, escalated or
 # waiting on someone outside the loop. Bounded: every pass adds a review.
 review_cycle() { # <pr>
-  local pr=$1 state before after m
+  local pr=$1 state before after m final head
   while :; do
     state=$(pr_state "$pr")
     case $state in
@@ -299,6 +339,18 @@ review_cycle() { # <pr>
       ((after > before)) || { escalate "$pr" "the principal's run posted no verdict marker"; return; }
       m=$(last_marker "$pr")
       if [[ $m == verdict=approve* ]]; then
+        # Approved, but with non-blocking notes: have the author act on them
+        # now rather than a run later. A push re-enters review, until the
+        # round cap; on the last round the author may only file or decline.
+        if (($(marker_notes "$m") > 0)); then
+          final=$((after >= MAX_ROUNDS))
+          head=$(pr_head "$pr")
+          ml_notes "$pr" "$final"
+          if ((!final)) && [[ $(pr_head "$pr") != "$head" ]]; then
+            set_state "$pr" "$L_REVIEW"
+            continue
+          fi
+        fi
         set_state "$pr" "$L_APPROVED"
         return
       fi
@@ -336,6 +388,12 @@ cmd_ml() {
   review_all
   local open wt
   open=$(ml_prs | grep -c . || true)
+  # Hourly runs: at the WIP limit with nothing of Ben's to answer, a session
+  # could only conclude `noop`, so don't start one.
+  if ((open >= ML_WIP_LIMIT)) && ! ml_has_feedback; then
+    log "at the WIP limit ($open/$ML_WIP_LIMIT) with no unanswered feedback; nothing to do"
+    return
+  fi
   wt=$(prep_worktree ml)
   run_agent ml-engineer "$wt" "$ML_MODEL" "$ML_BUDGET_USD" "Mode: work
 Open-PR limit: you have $open open of $ML_WIP_LIMIT allowed$( ((open >= ML_WIP_LIMIT)) && echo ' — AT LIMIT, start nothing new').
@@ -356,6 +414,9 @@ $(context principal-engineer)"
 
 [[ $cmd == status ]] && { cmd_status; exit 0; }
 
+if [[ -z $LOCK_WAIT_S ]]; then
+  [[ $cmd == sweep ]] && LOCK_WAIT_S=14400 || LOCK_WAIT_S=0
+fi
 exec 9>"$AGENT_HOME/lock"
 flock -w "$LOCK_WAIT_S" 9 || { log "another run still holds the lock after ${LOCK_WAIT_S}s; skipping"; exit 0; }
 preflight

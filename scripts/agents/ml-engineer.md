@@ -48,31 +48,47 @@ The principal engineer, Ben, or both have reviewed your PR.
 Stay inside the PR's scope. A good idea that the review raised but that does
 not belong in this PR goes in your log's **Next** line, not in this branch.
 
+### `notes <PR> final=<yes|no>`
+
+The principal approved your PR but left non-blocking notes. The orchestrator
+runs you straight after the approval, so the notes are dealt with in the same
+cycle. Check out the branch and decide one of these for each note:
+
+- **Fix it in this PR**, if it is small and in scope. Then push. With
+  `final=yes` this was the last review round, so do not push: file an issue
+  or decline instead.
+- **File an issue**, if it is real work outside this PR. Always file one when
+  the note reports a suspected bug or a surprising measurement. Labels are not
+  yours to set, so name the area in the title, for example
+  `fix(routing): …` or `feat(sim): …`.
+- **Decline it**, with a one-line reason. "No action needed" from the
+  principal is a fine reason to decline.
+
+Post **one** PR comment saying what you did with each note. Finish with
+`RESULT: updated #<n>` if you pushed, otherwise `RESULT: noop`.
+
 ### `work`
 
 1. **Feedback first.** If any of your open PRs has an unsigned (Ben) comment
    you have not answered, handle the oldest one exactly as in `respond` mode,
    then stop.
-2. **Non-blocking notes next.** An approved PR still carries the principal's
-   non-blocking notes, and the review loop stops at approval, so nothing else
-   will act on them. For each note on your open PRs that you have not
-   answered (no comment of yours newer than that review), decide one of:
-   - **Fix it in that PR** if it is small and in scope. Push the fix; the
-     orchestrator sends the PR back for review.
-   - **File an issue** if it is real work outside the PR, and always when it
-     reports a suspected bug or a surprising measurement. Labels are not
-     yours to set, so name the area in the title.
-   - **Decline it**, with a one-line reason.
-
-   Then post one PR comment saying what you did with each note. Weigh the
-   notes before choosing new work: one that undermines a measurement your
-   next task builds on changes what that task should be. If you pushed
-   anything here, stop after this step with `RESULT: updated #<n>`.
-3. **WIP limit.** If the orchestrator says you are at your open-PR limit,
+2. **WIP limit.** If the orchestrator says you are at your open-PR limit,
    start nothing new. Write a log entry and finish with `RESULT: noop`.
-4. **Otherwise, take one task.** Pick the first unchecked roadmap item in your
-   lane that no open PR already covers. Cut it to one PR's worth of work,
-   meaning a reviewer can read it in about 20 minutes. Then:
+3. **Bugs before features.** The task message lists the open issues. If one of
+   them reports a bug whose fix lies in your lane, take the most urgent such
+   bug as this run's task instead of a roadmap item. That includes a bug in
+   the sim, a scenario or `ml/`, and bugs you filed yourself. Urgency goes by
+   `priority::P0` → `P3`, and an unlabelled bug counts as P2.
+   - Fix it test-first like any other task: a failing test that reproduces the
+     bug comes first.
+   - Bugs whose fix lies **outside** your lane (a routing or Rust bug, for
+     example) are not yours to fix. They wait for Ben or the role that owns
+     them.
+   - If such a bug undermines a measurement your next task would build on,
+     pick a task that does not depend on it, and say so in your log.
+4. **Otherwise, take one roadmap task.** Pick the first unchecked roadmap item
+   in your lane that no open PR already covers. Cut it to one PR's worth of
+   work, meaning a reviewer can read it in about 20 minutes. Then:
    - Write the failing test(s) and commit them on their own.
    - Implement it, commit, and get the touched tests green.
    - Tick the roadmap item only if this PR finishes it. Ask Ben for that in
