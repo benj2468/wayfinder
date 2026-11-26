@@ -27,8 +27,10 @@ run-loop.sh ml                                   (hourly)
                               → approve, notes>0 ─ML fixes─→ needs-review …
                                                  └ML files/declines only─→ approved
                               → changes ─────────ML responds→ needs-review …
-       round cap 3: changes → needs-ben; on the last round, notes are filed
-       or declined, never pushed
+       round 3 still with changes → the principal decides on a 4th round:
+           next=restart → rounds reset, its review is the brief (MAX_RESTARTS=1)
+           next=ben     → needs-ben, with what Ben has to decide
+       on the last round, notes are filed or declined, never pushed
 run-loop.sh sweep    principal comments on whatever the loop missed (daily)
 run-loop.sh review   step 5 only
 run-loop.sh status   agent PRs with their state and round count
@@ -74,7 +76,7 @@ Merging is gated twice:
 | A runaway session | `RUN_TIMEOUT` (90 min) and `--max-budget-usd` on each invocation |
 | Overlapping runs | `flock`. An hourly ML run that finds the lock taken just skips (the next hour retries), and a sweep waits up to 4 h. |
 | Hourly sessions with nothing to do | At the WIP limit, with no unanswered comment of Ben's, `ml` ends before starting a session. |
-| A review loop that never converges | Three rounds, then `needs-ben`. The principal is told not to raise new nits on code it has already accepted. |
+| A review loop that never converges | Three rounds per cycle. After the third, the principal must either restart the cycle (at most `MAX_RESTARTS`, default 1) or hand the PR to Ben. It is told not to raise new nits on code it has already accepted. |
 | PR churn spending Actions minutes | Open-PR limit (`ML_WIP_LIMIT=2`). Agents open PRs only when they are merge-ready. |
 
 Every knob is an environment variable at the top of [`run-loop.sh`](run-loop.sh).

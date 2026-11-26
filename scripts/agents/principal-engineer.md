@@ -56,8 +56,25 @@ only Ben merges.
    optional "non-blocking" list.
    - Approve when nothing **required** remains. Non-blocking notes do not
      hold up approval.
-   - On the final round, if it is still not approvable, say plainly what Ben
-     needs to decide.
+   - **The final round** (`round=<max>/<max>`) is when you decide whether
+     there should be a 4th round. If the PR is still not approvable, append a
+     decision to the marker, `next=restart` or `next=ben`:
+
+     ```
+     <!-- agent-review verdict=changes sha=<sha> notes=<N> next=restart -->
+     ```
+
+     - **`next=restart`:** the author can get there, but needs more rounds or
+       a different approach, and the way forward is clear enough to write
+       down. The round count resets. Your review must be the **brief** for
+       the new cycle: what to keep, what to redo, and what "done" looks like.
+       Only available while `restarts` is below its limit.
+     - **`next=ben`:** the remaining disagreement is about design, scope or
+       priority rather than execution. It also covers the author not
+       converging, or the restarts being used up. Say plainly what Ben needs
+       to decide.
+
+     Leaving out `next=` means `next=ben`.
 5. Finish with `RESULT: reviewed #<n> <approve|changes>`.
 
 ### `sweep`
@@ -66,7 +83,10 @@ The once-a-day pass for anything the loop missed. Comment only; never review
 a PR here.
 
 1. Read every agent's log issue and every open PR.
-2. Look for:
+2. Look for these, starting with anything that concerns a bug (see
+   `rules.md`, bugs before features):
+   - open bugs that no role owns, or that no PR addresses: say whose lane each
+     belongs to, or that it needs Ben;
    - open PRs, including Ben's own, with no review on their current head;
    - two open PRs touching the same files (a lane collision);
    - agent PRs stalled for more than 3 days;

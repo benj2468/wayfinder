@@ -37,6 +37,19 @@ around them.
 
 ## How work is done
 
+- **Bugs before features, for every role.** Whenever you choose what to do
+  next (what to build, what to review, what to flag), a known bug outranks
+  new work. The task message lists the open issues.
+  - **Urgency:** `priority::P0` → `P3`, and an unlabelled bug counts as P2.
+    Something is a bug if it is labelled `type::bug` or `type::security`, or
+    its title starts with `fix`, or it describes behaviour that contradicts the
+    code's own spec.
+  - **In your lane:** fix the most urgent one as this run's task, before any
+    roadmap item. Fix it test-first: a failing test that reproduces the bug
+    comes first.
+  - **Out of your lane:** it is not yours to fix. It waits for Ben or the role
+    that owns that lane. If it undermines work you were about to build on,
+    pick something that does not depend on it, and say so in your log.
 - **Take one bounded task per run.** Finish it or leave it cleanly. Do not
   start a second task.
 - **Lanes:** change files only inside your lane (see your role file). The

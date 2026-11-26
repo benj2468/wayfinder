@@ -37,7 +37,8 @@ set -euo pipefail
 : "${ML_BUDGET_USD:=15}"                # per claude invocation
 : "${PRINCIPAL_BUDGET_USD:=10}"
 : "${RUN_TIMEOUT:=90m}"                 # per claude invocation
-: "${MAX_ROUNDS:=3}"
+: "${MAX_ROUNDS:=3}"                    # review rounds per cycle
+: "${MAX_RESTARTS:=1}"                  # cycles the principal may restart before Ben must decide
 : "${ML_WIP_LIMIT:=2}"                  # open, un-merged ML PRs before it stops
 : "${PERMISSION_MODE:=auto}"
 : "${MEMORY_MAX:=4500M}"                # cgroup cap so cargo can't OOM the box
@@ -183,12 +184,16 @@ escalate() { # <pr> <reason>
   ghw pr comment "$1" -R "$REPO" --body "🤖 **orchestrator**: stopping the agent loop on this PR — $2. Remove \`$L_BEN\` to hand it back to the loop."
 }
 
-markers() { # <pr> → one `verdict=… sha=… [notes=N]` line per principal review, oldest first
+markers() { # <pr> → one `verdict=… sha=… [notes=N] [next=…]` line per principal review, oldest first
   gh api "repos/$REPO/pulls/$1/reviews" --paginate --jq '.[].body' |
-    grep -oE '<!-- agent-review verdict=(approve|changes) sha=[0-9a-f]+( notes=[0-9]+)? -->' |
+    grep -oE '<!-- agent-review verdict=(approve|changes) sha=[0-9a-f]+( notes=[0-9]+)?( next=(restart|ben))? -->' |
     sed -E 's/<!-- agent-review (.*) -->/\1/' || true
 }
-rounds() { markers "$1" | grep -c . || true; }
+reviews() { markers "$1" | grep -c . || true; }
+# Rounds in the current cycle: a `next=restart` review closes a cycle, so
+# only the reviews after the last one count.
+rounds() { markers "$1" | awk '/next=restart/ { n = 0; next } { n++ } END { print n + 0 }'; }
+restarts() { markers "$1" | grep -c 'next=restart' || true; }
 last_marker() { markers "$1" | tail -1; }
 marker_notes() { # <marker line> → its non-blocking note count (0 if absent)
   local n
@@ -313,11 +318,11 @@ Check the branch out with \`gh pr checkout $1\`.
 $(context ml-engineer)"
 }
 
-principal_review() { # <pr> <round>
+principal_review() { # <pr> <round> <restarts used>
   local wt
   wt=$(prep_worktree principal)
   run_agent principal-engineer "$wt" "$PRINCIPAL_MODEL" "$PRINCIPAL_BUDGET_USD" \
-    "Mode: review $1 round=$2/$MAX_ROUNDS
+    "Mode: review $1 round=$2/$MAX_ROUNDS restarts=$3/$MAX_RESTARTS
 Head commit to review: $(pr_head "$1"). Check it out with \`gh pr checkout $1\`.
 
 $(context principal-engineer)"
@@ -326,24 +331,24 @@ $(context principal-engineer)"
 # Drive one PR through review ⇄ response until it is approved, escalated or
 # waiting on someone outside the loop. Bounded: every pass adds a review.
 review_cycle() { # <pr>
-  local pr=$1 state before after m final head
+  local pr=$1 state round total m final head used
   while :; do
     state=$(pr_state "$pr")
     case $state in
     "$L_REVIEW")
-      before=$(rounds "$pr")
-      ((before < MAX_ROUNDS)) || { escalate "$pr" "it has had $MAX_ROUNDS review rounds"; return; }
-      principal_review "$pr" $((before + 1))
+      round=$(($(rounds "$pr") + 1))
+      ((round <= MAX_ROUNDS)) || { escalate "$pr" "it has had $MAX_ROUNDS review rounds"; return; }
+      total=$(reviews "$pr")
+      principal_review "$pr" "$round" "$(restarts "$pr")"
       [[ $DRY_RUN == 1 ]] && return
-      after=$(rounds "$pr")
-      ((after > before)) || { escalate "$pr" "the principal's run posted no verdict marker"; return; }
+      (($(reviews "$pr") > total)) || { escalate "$pr" "the principal's run posted no verdict marker"; return; }
       m=$(last_marker "$pr")
       if [[ $m == verdict=approve* ]]; then
         # Approved, but with non-blocking notes: have the author act on them
         # now rather than a run later. A push re-enters review, until the
         # round cap; on the last round the author may only file or decline.
         if (($(marker_notes "$m") > 0)); then
-          final=$((after >= MAX_ROUNDS))
+          final=$((round >= MAX_ROUNDS))
           head=$(pr_head "$pr")
           ml_notes "$pr" "$final"
           if ((!final)) && [[ $(pr_head "$pr") != "$head" ]]; then
@@ -354,7 +359,22 @@ review_cycle() { # <pr>
         set_state "$pr" "$L_APPROVED"
         return
       fi
-      ((after < MAX_ROUNDS)) || { escalate "$pr" "changes still requested after $MAX_ROUNDS rounds"; return; }
+      # Changes still required on the last round: a 4th round is the
+      # principal's call. It either restarts the cycle (rounds reset, with a
+      # brief for the author) or hands the PR to Ben. Saying neither means Ben.
+      if ((round >= MAX_ROUNDS)); then
+        used=$(restarts "$pr")
+        if [[ $m == *next=restart* ]] && ((used <= MAX_RESTARTS)); then
+          log "#$pr: principal restarted the review cycle ($used/$MAX_RESTARTS)"
+          ghw pr comment "$pr" -R "$REPO" --body "🤖 **orchestrator**: the principal restarted the review cycle (restart $used of $MAX_RESTARTS). The round count resets; its latest review is the brief."
+        elif [[ $m == *next=restart* ]]; then
+          escalate "$pr" "the principal asked to restart again, but all $MAX_RESTARTS restart(s) are used, so Ben decides"
+          return
+        else
+          escalate "$pr" "the principal handed it to Ben after $MAX_ROUNDS rounds. Its latest review says what needs deciding"
+          return
+        fi
+      fi
       set_state "$pr" "$L_CHANGES"
       ;;
     "$L_CHANGES")
@@ -368,10 +388,18 @@ review_cycle() { # <pr>
   done
 }
 
+fix_first() { # <pr>… → the same PRs, bug fixes (title `fix…`) first
+  local pr
+  for pr in "$@"; do
+    gh pr view "$pr" -R "$REPO" --json title --jq '"\(if (.title | test("^fix")) then 0 else 1 end) \(.number)"'
+  done | sort -n -k1,1 -k2,2 | cut -d' ' -f2
+}
+
 review_all() {
   reconcile
   local pr
-  for pr in $(ml_prs "$L_CHANGES") $(ml_prs "$L_REVIEW"); do review_cycle "$pr"; done
+  # shellcheck disable=SC2046  # PR numbers: word-splitting is intended
+  for pr in $(fix_first $(ml_prs "$L_CHANGES") $(ml_prs "$L_REVIEW")); do review_cycle "$pr"; done
 }
 
 # ---------------------------------------------------------------- commands
@@ -379,7 +407,7 @@ cmd_status() {
   local pr m
   for pr in $(ml_prs); do
     m=$(last_marker "$pr")
-    printf '#%-5s %-26s rounds=%s last=%s\n' "$pr" "$(pr_state "$pr")" "$(rounds "$pr")" "${m:-none}"
+    printf '#%-5s %-26s rounds=%s restarts=%s last=%s\n' "$pr" "$(pr_state "$pr")" "$(rounds "$pr")" "$(restarts "$pr")" "${m:-none}"
   done
 }
 

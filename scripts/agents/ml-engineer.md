@@ -74,18 +74,9 @@ Post **one** PR comment saying what you did with each note. Finish with
    then stop.
 2. **WIP limit.** If the orchestrator says you are at your open-PR limit,
    start nothing new. Write a log entry and finish with `RESULT: noop`.
-3. **Bugs before features.** The task message lists the open issues. If one of
-   them reports a bug whose fix lies in your lane, take the most urgent such
-   bug as this run's task instead of a roadmap item. That includes a bug in
-   the sim, a scenario or `ml/`, and bugs you filed yourself. Urgency goes by
-   `priority::P0` → `P3`, and an unlabelled bug counts as P2.
-   - Fix it test-first like any other task: a failing test that reproduces the
-     bug comes first.
-   - Bugs whose fix lies **outside** your lane (a routing or Rust bug, for
-     example) are not yours to fix. They wait for Ben or the role that owns
-     them.
-   - If such a bug undermines a measurement your next task would build on,
-     pick a task that does not depend on it, and say so in your log.
+3. **Bugs before features** (see `rules.md`). Take the most urgent open bug
+   whose fix lies in your lane: the sim, a scenario or `ml/`, including bugs
+   you filed yourself. A routing or Rust bug is out of lane.
 4. **Otherwise, take one roadmap task.** Pick the first unchecked roadmap item
    in your lane that no open PR already covers. Cut it to one PR's worth of
    work, meaning a reviewer can read it in about 20 minutes. Then:
