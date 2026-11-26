@@ -419,7 +419,8 @@ class Simulation:
         """From `at_s`, have `node` withhold the frames `insider` drops (see
         `insider.py`). Its router runs unchanged and never learns that they
         did not go out. The behaviour is the firmware, so it survives a
-        reboot; a later call replaces an earlier one.
+        reboot. Of several calls for a node, the one with the latest `at_s`
+        wins, whatever order they were made in (a tie goes to the later call).
 
         Only what the router emits is filtered — `inject` bypasses it."""
         if node not in self._states:

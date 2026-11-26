@@ -5,10 +5,13 @@ so the only thing that can lose a packet is the relay itself."""
 
 from __future__ import annotations
 
+from random import Random
+
 import pytest
 
 pytest.importorskip("simpy")
 
+from wayfinder_sim import forge
 from wayfinder_sim.channel import PerfectWire
 from wayfinder_sim.insider import Insider
 from wayfinder_sim.node import Node
@@ -72,6 +75,33 @@ def test_a_blackhole_forwards_nothing_so_the_route_through_it_ages_out():
 def test_a_drop_fraction_outside_zero_to_one_is_refused(fraction):
     with pytest.raises(ValueError):
         Insider.grayhole(fraction)
+
+
+def link_frame(packet_type: int | None, protocol: int = forge.BATMAN_ETHERTYPE):
+    """A link header of `protocol`, then the packet-type byte if there is one."""
+    header = bytes(12) + protocol.to_bytes(2, "big")
+    return header if packet_type is None else header + bytes([packet_type])
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        link_frame(forge.PACKET_UNICAST, protocol=0x0800),
+        link_frame(None),
+        link_frame(forge.PACKET_OGM),
+    ],
+    ids=["not-batman", "header-only", "control"],
+)
+def test_selective_forwarding_passes_what_is_not_batman_data(frame):
+    assert not Insider.selective_forwarding().drops(frame, Random(0))
+
+
+@pytest.mark.parametrize("packet_type", [forge.PACKET_OGM, forge.PACKET_UNICAST])
+def test_the_drop_fraction_bounds_are_accepted_and_absolute(packet_type):
+    frame = link_frame(packet_type)
+    rng = Random(0)
+    assert not any(Insider(None, 0.0).drops(frame, rng) for _ in range(100))
+    assert all(Insider(None, 1.0).drops(frame, rng) for _ in range(100))
 
 
 def test_misbehaving_an_unknown_node_is_refused():

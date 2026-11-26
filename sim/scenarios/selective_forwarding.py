@@ -66,6 +66,7 @@ PICK_AT_S = 35.0
 ATTACK_AT_S = 40.0
 END_S = 100.0
 SAMPLE_MS = 100
+MIN_DELIVERY_BEFORE = 0.9
 SWEEP_SEEDS = tuple(range(10))
 
 
@@ -176,7 +177,7 @@ def run_attack(behaviour: str, seed: int = 0) -> AttackRun:
         if frame.dst == relay
         and (seq := _stream_seq(frame.raw, flow.flow_id)) is not None
     )
-    return AttackRun(
+    run = AttackRun(
         behaviour=behaviour,
         seed=seed,
         captured=captured,
@@ -186,6 +187,13 @@ def run_attack(behaviour: str, seed: int = 0) -> AttackRun:
         carried=carried,
         drops=drops,
     )
+    # A stream already failing before the onset would pass off the radio as the
+    # attacker.
+    if run.delivery_before < MIN_DELIVERY_BEFORE:
+        raise RuntimeError(
+            f"seed {seed}: only {run.delivery_before:.0%} delivered before the attack"
+        )
+    return run
 
 
 Sweep = Mapping[str, Sequence[AttackRun]]
