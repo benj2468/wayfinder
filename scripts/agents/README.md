@@ -5,7 +5,7 @@ using `claude -p`, scheduled by cron. Two roles are live:
 
 | Role | Prompt | Lane | Model |
 |---|---|---|---|
-| AI/ML + sim engineer | [`ml-engineer.md`](ml-engineer.md) | `sim/`, `ml/`, proposed design docs | Sonnet |
+| AI/ML + simulation engineer (all sim: adversarial, characterisation, modelling) | [`ml-engineer.md`](ml-engineer.md) | `sim/`, `ml/`, proposed design docs | Sonnet |
 | Principal engineer | [`principal-engineer.md`](principal-engineer.md) | reviews everything; writes no code | Opus |
 
 - [`rules.md`](rules.md) is appended to every role's prompt.

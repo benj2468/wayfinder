@@ -30,6 +30,18 @@ Gaps in the attacker model:
 
 ## Phase 1 — sim (lane: ml-engineer)
 
+The ml-engineer owns *all* simulation: adversarial work, characterisation and
+modelling alike. The items below are the current adversarial priority. When
+none of them is actionable (all in flight, or blocked), the next work is
+characterisation or modelling that the sim lacks, for example:
+
+- convergence and reroute time versus topology size, density and mobility;
+- OGM overhead versus Trickle parameters;
+- validating the channel and terrain models against real-radio numbers.
+
+Propose such work as a new roadmap item in the PR description, because this
+file is Ben's to edit.
+
 - [ ] **1.1 Insider misbehaviour** on captured nodes: blackhole, grayhole
   (drop %), **selective forwarding** (relay OGMs, drop data — TQ stays
   perfect, so BATMAN routes *into* the attacker), delay, **wormhole** (two
