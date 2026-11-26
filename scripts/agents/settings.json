@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr close:*)",
+      "Bash(gh pr reopen:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr edit:*--add-label*)",
+      "Bash(gh pr edit:*--remove-label*)",
+      "Bash(gh issue close:*)",
+      "Bash(gh issue reopen:*)",
+      "Bash(gh issue edit:*label*)",
+      "Bash(gh issue delete:*)",
+      "Bash(gh label:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh release:*)",
+      "Bash(gh secret:*)",
+      "Bash(gh variable:*)",
+      "Bash(gh workflow:*)",
+      "Bash(gh run rerun:*)",
+      "Bash(gh api:*merge*)",
+      "Bash(gh api:*-X DELETE*)",
+      "Bash(gh api:*--method DELETE*)",
+      "Bash(git push:*--force*)",
+      "Bash(git push:*-f *)",
+      "Bash(git push:*+*)",
+      "Bash(git push:*main*)",
+      "Bash(git push:*--delete*)",
+      "Bash(cargo clean:*)",
+      "Bash(just clean:*)",
+      "Bash(sudo:*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Edit(scripts/agents/**)",
+      "Write(scripts/agents/**)",
+      "Edit(.github/**)",
+      "Write(.github/**)"
+    ]
+  }
+}
