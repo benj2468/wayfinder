@@ -672,6 +672,11 @@ pub struct OriginatorRecord {
     /// the immediate neighbor of the best path — or `None` when no path is
     /// currently usable.
     ///
+    /// A cache of [`BatmanEngine::next_hop`]'s selection, for reporting. It is
+    /// refreshed on this originator's OGMs, on proof and keep-alive recovery,
+    /// and by [`BatmanEngine::purge_stale`], so something that lapses by time
+    /// alone shows here only at the next of those.
+    ///
     /// `None` is not merely "no paths known": on an authenticated mesh a path
     /// whose neighbor has not proven itself is deliberately not selectable, so
     /// a freshly discovered originator sits here with `None` and a populated

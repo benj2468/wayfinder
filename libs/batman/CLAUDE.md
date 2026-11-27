@@ -80,7 +80,10 @@ Quality, 0–255), and `paths` (up to 4 alternate paths via different neighbors)
 1. Drops own OGMs (loop prevention).
 2. Creates or updates the originator record.
 3. Computes path quality (TQ −= 10 per hop).
-4. Selects the best path (highest TQ).
+4. Selects the best path (highest TQ). One selection, with no hysteresis,
+   serves both forwarding (`next_hop`) and the reported `best_next_hop`/
+   `max_tq` cache; a second rule for either lets a node report a route its
+   traffic does not take (#117).
 5. Folds the OGM's multicast TVLV into `mcast_members` (authoritative per
    originator, so dropped groups are pruned).
 6. Forwards the OGM with decremented TTL and updated prev_sender, preserving the
