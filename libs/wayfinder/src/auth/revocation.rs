@@ -1091,3 +1091,143 @@ mod tests {
         assert_eq!(b.revoked_macs().count(), 0);
     }
 }
+
+/// Installing a certificate must not forget who was revoked (issue #131).
+///
+/// Driven through [`CentralRouter::set_auth`](crate::CentralRouter::set_auth),
+/// the call an operator's `SetAuth` and a host's own certificate renewal both
+/// end in.
+#[cfg(test)]
+mod carried_across_set_auth {
+    use super::super::testutil::*;
+    use super::*;
+    use crate::CentralRouter;
+    use wayfinder_auth::Authority;
+
+    /// Whether the router's next OGM still carries a revocation record.
+    fn next_ogm_floods_a_revocation(router: &mut CentralRouter, seqno: u32) -> bool {
+        let own = mac(2);
+        let (mut buf, len) = bare_ogm(own, seqno);
+        let auth = router.auth_mut().expect("auth is installed");
+        let len = auth.augment_ogm(&mut buf, len).expect("augment");
+        find_tvlv(&buf[OGM_HDR..len], TvlvType::Revoke).is_some()
+    }
+
+    #[test]
+    fn a_revoked_peer_stays_refused_after_a_certificate_install() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member(&authority, 2, mac(2), 1000));
+        let record = authority.revoke(mac(3), 50, 1000);
+        assert!(router.ingest_revocation(&record, Duration::from_secs(100)));
+
+        // The renewed certificate, same mesh.
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            90,
+            2000,
+            Clocked::At(100),
+        ));
+
+        let auth = router.auth_mut().expect("auth is installed");
+        assert_eq!(auth.revocations().count(), 1);
+        let mut peer = member(&authority, 3, mac(3), 1000);
+        let (mut buf, len) = bare_ogm(mac(3), 7);
+        let len = peer.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(auth.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+    }
+
+    #[test]
+    fn a_move_to_another_mesh_drops_the_old_meshs_records() {
+        let old = Authority::from_seed(&[1; 32], 0xABCD);
+        let new = Authority::from_seed(&[7; 32], 0x1234);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member(&old, 2, mac(2), 1000));
+        assert!(router.ingest_revocation(&old.revoke(mac(3), 50, 1000), Duration::from_secs(100)));
+
+        router.set_auth(member(&new, 2, mac(2), 1000));
+
+        let auth = router.auth().expect("auth is installed");
+        assert_eq!(auth.revocations().count(), 0);
+    }
+
+    /// A renewal is not a new purge: the record keeps what is left of its
+    /// flood budget, neither silenced nor re-armed.
+    #[test]
+    fn a_certificate_install_keeps_the_remaining_flood_budget() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member(&authority, 2, mac(2), 1000));
+        let record = authority.revoke(mac(9), 50, 1000);
+        assert!(router.ingest_revocation(&record, Duration::from_secs(100)));
+        let spent = 2;
+        for seqno in 0..spent {
+            assert!(next_ogm_floods_a_revocation(&mut router, seqno));
+        }
+
+        router.set_auth(member(&authority, 2, mac(2), 1000));
+
+        for seqno in spent..u32::from(REVOKE_FLOOD_BUDGET) {
+            assert!(
+                next_ogm_floods_a_revocation(&mut router, seqno),
+                "emission {seqno} should still carry the revocation"
+            );
+        }
+        assert!(!next_ogm_floods_a_revocation(&mut router, 99));
+    }
+
+    /// A revocation of *this* node that is latched but not yet in force must
+    /// not be shed by installing a certificate it cancels.
+    #[test]
+    fn a_pending_self_revocation_survives_a_certificate_install() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let cert_issued_at_zero =
+            || member_issued_at(&authority, 2, mac(2), 0, 100_000, Clocked::At(100));
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(cert_issued_at_zero());
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, Duration::from_secs(100));
+
+        router.set_auth(cert_issued_at_zero());
+
+        router.set_auth_time(Duration::from_secs(500), Clocked::At(500));
+        let mut tx = [0u8; 1500];
+        router.poll(Duration::from_secs(500), &mut tx);
+        assert!(router.take_self_revocation().is_some());
+    }
+
+    /// The control: a re-admission, a certificate issued after the record's
+    /// instant, is not cancelled by the pending record.
+    #[test]
+    fn a_pending_self_revocation_does_not_follow_a_re_admission() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            0,
+            100_000,
+            Clocked::At(100),
+        ));
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, Duration::from_secs(100));
+
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            600,
+            100_000,
+            Clocked::At(700),
+        ));
+
+        router.set_auth_time(Duration::from_secs(700), Clocked::At(700));
+        let mut tx = [0u8; 1500];
+        router.poll(Duration::from_secs(700), &mut tx);
+        assert!(router.take_self_revocation().is_none());
+        assert!(router.auth().is_some());
+    }
+}
