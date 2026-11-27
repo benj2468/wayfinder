@@ -1,7 +1,7 @@
 """A captured node that misbehaves at forwarding (`wayfinder_sim.insider`).
 
-Every case is an authenticated `hq — relay — team` chain over a perfect wire,
-so the only thing that can lose a packet is the relay itself."""
+Every case is an `hq — relay — team` chain over a perfect wire, authenticated
+unless it says otherwise, so only what the relay does can lose a packet."""
 
 from __future__ import annotations
 
@@ -23,11 +23,12 @@ ATTACK_AT_S = 20.0
 END_S = 40.0
 
 
-def chain(insider: Insider | None, seed: int = 0):
+def chain(insider: Insider | None, seed: int = 0, authenticated: bool = True):
     """Converge the chain, stream team→hq across the attack, and return the
     simulation and the flow."""
-    mesh = Mesh(mesh_id=1, root_seed=bytes([7]) * 32)
-    nodes = [Node(n, credential=Credential()) for n in ("hq", "relay", "team")]
+    mesh = Mesh(mesh_id=1, root_seed=bytes([7]) * 32) if authenticated else None
+    credential = Credential() if authenticated else None
+    nodes = [Node(n, credential=credential) for n in ("hq", "relay", "team")]
     sim = Simulation(
         nodes, path(["hq", "relay", "team"], PerfectWire()), seed=seed, mesh=mesh
     )
@@ -112,10 +113,14 @@ def test_holding_everything_keeps_the_order_so_nothing_is_lost():
 def test_holding_data_alone_loses_what_newer_control_traffic_overtakes():
     """The next hop refuses a directed frame whose replay counter is behind one
     it has accepted, so data overtaken by the relay's own control traffic is
-    dropped on arrival: nothing the insider withheld."""
+    dropped on arrival: nothing the insider withheld. An open mesh has no replay
+    counter, and the same delay costs it nothing."""
     sim, flow = chain(Insider.delaying(DELAY_MS))
     assert 0.75 < flow.delivery_ratio(ATTACK_AT_S, SETTLED_S) < 0.95
     assert sim.insider_drops("relay") == 0
+    open_sim, open_flow = chain(Insider.delaying(DELAY_MS), authenticated=False)
+    assert open_sim.insider_delays("relay") > 0
+    assert open_flow.delivery_ratio(ATTACK_AT_S, SETTLED_S) == 1.0
 
 
 def test_a_frame_held_across_a_reboot_is_lost():

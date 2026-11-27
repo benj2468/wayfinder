@@ -4,9 +4,9 @@ red-team scenario.
 `forge` and `Simulation.inject` model an attacker with no credentials. This
 models one holding a captured radio: its router, certificate and keys are all
 genuine, and its firmware simply declines to put some of what the router
-produced on the air, or puts it there late. `Simulation.misbehave` applies an `Insider` to a node's
-egress, so nothing is forged and there is nothing for a signature check to
-refuse.
+produced on the air, or puts it there late. `Simulation.misbehave` applies an
+`Insider` to a node's egress, so nothing is forged and there is nothing for a
+signature check to refuse.
 
 The filter reads only the BATMAN packet-type byte. It therefore cannot tell a
 frame the node relays from one it originated: a node dropping data drops its
