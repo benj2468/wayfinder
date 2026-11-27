@@ -100,7 +100,7 @@ BASELINE = {
     "attack_broadcast_evict_then_reseed": red_team.HELD,
     "attack_broadcast_dedup_table_exhaustion": red_team.HELD,
     "attack_relayed_tq_inflation": red_team.HELD,
-    # --- relay attacks: no keys, no forging --- (not yet in the design doc)
+    # --- relay attacks: no keys, no forging --- (#121, not yet in the design doc)
     "attack_wormhole_blackhole": red_team.GAP,
 }
 """Expected verdict per attack — the baseline the ``09-mesh-auth-gaps.md`` design
