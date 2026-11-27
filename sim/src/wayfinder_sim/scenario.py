@@ -285,6 +285,7 @@ class Simulation:
         # Forwarding misbehaviour by node name, with the stream it draws from.
         self._insiders: dict[str, tuple[Insider, Random]] = {}
         self._insider_drops: dict[str, int] = {}
+        self._insider_delays: dict[str, int] = {}
 
         for name in self._states:
             self.env.process(self._tick_proc(name))
@@ -419,9 +420,10 @@ class Simulation:
         return self._compromise_discards.get(node, 0)
 
     def misbehave(self, node: str, insider: Insider, *, at_s: float = 0.0) -> None:
-        """From `at_s`, have `node` withhold the frames `insider` drops (see
-        `insider.py`). Its router runs unchanged and never learns that they
-        did not go out. The behaviour is the firmware, so it survives a
+        """From `at_s`, have `node` withhold the frames `insider` drops and
+        send late the ones it holds (see `insider.py`). Its router runs
+        unchanged and never learns of either. A held frame is lost if the node
+        goes down before sending it. The behaviour is the firmware, so it survives a
         reboot. Of several calls for a node, the one with the latest `at_s`
         wins, whatever order they were made in (a tie goes to the later call).
 
@@ -434,6 +436,11 @@ class Simulation:
         """How many frames `node`'s misbehaviour has withheld. A scenario
         blaming an outage on it should check this is non-zero."""
         return self._insider_drops.get(node, 0)
+
+    def insider_delays(self, node: str) -> int:
+        """How many frames `node`'s misbehaviour has held back, whether or not
+        they were later sent."""
+        return self._insider_delays.get(node, 0)
 
     def knows_revoked(self, node: str, target: str) -> bool:
         """Whether `node` holds a revocation naming `target` right now."""
@@ -969,12 +976,14 @@ class Simulation:
         for iface, link in state.interfaces.items():
             frame = state.driver.poll_egress(iface)
             while frame is not None:
-                if self._withheld(name, frame):
-                    frame = state.driver.poll_egress(iface)
-                    continue
-                state.tx_frames += 1
-                state.tx_bytes += len(frame)
-                self._schedule_delivery(link, name, iface, frame)
+                if not self._withheld(name, frame):
+                    hold_ms = self._held_ms(name, frame)
+                    if hold_ms:
+                        self.env.process(
+                            self._held_proc(hold_ms, link, name, iface, frame)
+                        )
+                    else:
+                        self._send_on(link, name, iface, frame)
                 frame = state.driver.poll_egress(iface)
         self._drain_local(state, name)
 
@@ -984,6 +993,29 @@ class Simulation:
             return False
         self._insider_drops[name] = self._insider_drops.get(name, 0) + 1
         return True
+
+    def _held_ms(self, name: str, frame: bytes) -> float:
+        entry = self._insiders.get(name)
+        hold_ms = 0.0 if entry is None else entry[0].holds_ms(frame)
+        if hold_ms:
+            self._insider_delays[name] = self._insider_delays.get(name, 0) + 1
+        return hold_ms
+
+    def _held_proc(
+        self, hold_ms: float, link: Link, name: str, iface: int, frame: bytes
+    ):
+        state = self._states[name]
+        boot = state.boot
+        yield self.env.timeout(hold_ms)
+        if state.up and state.boot == boot:
+            self._send_on(link, name, iface, frame)
+
+    def _send_on(self, link: Link, name: str, iface: int, frame: bytes) -> None:
+        """Put a frame `name`'s router emitted on the air, and count it."""
+        state = self._states[name]
+        state.tx_frames += 1
+        state.tx_bytes += len(frame)
+        self._schedule_delivery(link, name, iface, frame)
 
     def _misbehave_proc(self, node: str, insider: Insider, at_s: float):
         yield from self._wait_until(at_s)

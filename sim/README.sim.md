@@ -234,12 +234,19 @@ tap.containing(b"MEETING AT DAWN")   # readable: payloads are never encrypted
 **`Simulation.misbehave`** is the insider: a member whose router, certificate
 and keys are genuine, whose firmware withholds some of what the router emits
 (`wayfinder_sim.insider.Insider`: `selective_forwarding`, `grayhole(share)`,
-`blackhole`).
+`blackhole`, `delaying(ms)`).
 
 ```python
 sim.misbehave("n12", Insider.selective_forwarding(), at_s=40.0)
 sim.insider_drops("n12")     # non-zero, or the attack never bit
+
+sim.misbehave("n12", Insider.delaying(500.0), at_s=40.0)   # data arrives late
+sim.insider_delays("n12")
 ```
+
+Delaying data alone also loses some: the relay's control traffic overtakes the
+held frames, and the next hop refuses their older replay counters. Pass
+`Insider.delaying(ms, None)` to hold every frame, which keeps the order.
 
 `sim/scenarios/selective_forwarding.py` measures it on the field grid. Dropping
 only data leaves every advert-derived metric unchanged, so the mesh keeps

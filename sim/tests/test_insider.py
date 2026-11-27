@@ -1,7 +1,7 @@
 """A captured node that misbehaves at forwarding (`wayfinder_sim.insider`).
 
-Every case is an authenticated `hq — relay — team` chain over a perfect wire,
-so the only thing that can lose a packet is the relay itself."""
+Every case is an `hq — relay — team` chain over a perfect wire, authenticated
+unless it says otherwise, so only what the relay does can lose a packet."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ pytest.importorskip("simpy")
 
 from wayfinder_sim import forge
 from wayfinder_sim.channel import PerfectWire
-from wayfinder_sim.insider import Insider
+from wayfinder_sim.insider import DATA_PACKET_TYPES, Insider
 from wayfinder_sim.node import Node
 from wayfinder_sim.scenario import Simulation
 from wayfinder_sim.security import Credential, Mesh
@@ -23,11 +23,12 @@ ATTACK_AT_S = 20.0
 END_S = 40.0
 
 
-def chain(insider: Insider | None, seed: int = 0):
+def chain(insider: Insider | None, seed: int = 0, authenticated: bool = True):
     """Converge the chain, stream team→hq across the attack, and return the
     simulation and the flow."""
-    mesh = Mesh(mesh_id=1, root_seed=bytes([7]) * 32)
-    nodes = [Node(n, credential=Credential()) for n in ("hq", "relay", "team")]
+    mesh = Mesh(mesh_id=1, root_seed=bytes([7]) * 32) if authenticated else None
+    credential = Credential() if authenticated else None
+    nodes = [Node(n, credential=credential) for n in ("hq", "relay", "team")]
     sim = Simulation(
         nodes, path(["hq", "relay", "team"], PerfectWire()), seed=seed, mesh=mesh
     )
@@ -77,6 +78,70 @@ def test_a_drop_fraction_outside_zero_to_one_is_refused(fraction):
         Insider.grayhole(fraction)
 
 
+DELAY_MS = 300.0
+
+
+def latencies(flow, start_s: float, end_s: float) -> list[float]:
+    return [
+        flow.received[seq] - t
+        for seq, t in flow.sent
+        if seq in flow.received and start_s <= t <= end_s
+    ]
+
+
+# A second and more short of the end: later packets are still held when it stops.
+SETTLED_S = END_S - 1.5
+
+
+@pytest.mark.parametrize("packet_types", [DATA_PACKET_TYPES, None], ids=["data", "all"])
+def test_a_delaying_relay_delivers_late_while_the_route_looks_perfect(packet_types):
+    honest, _ = chain(None)
+    sim, flow = chain(Insider.delaying(DELAY_MS, packet_types))
+    assert max(latencies(flow, 10.0, ATTACK_AT_S - 0.5)) < DELAY_MS / 1000.0
+    assert min(latencies(flow, ATTACK_AT_S, SETTLED_S)) >= DELAY_MS / 1000.0
+    assert sim.insider_delays("relay") > 0
+    assert sim.insider_drops("relay") == 0
+    assert sim.route_path("team", "hq") == ("team", "relay", "hq")
+    assert sim.tq_to("team", "hq") == honest.tq_to("team", "hq")
+
+
+def test_holding_everything_keeps_the_order_so_nothing_is_lost():
+    _, flow = chain(Insider.delaying(DELAY_MS, None))
+    assert flow.delivery_ratio(ATTACK_AT_S, SETTLED_S) == 1.0
+
+
+def test_holding_data_alone_loses_what_newer_control_traffic_overtakes():
+    """The next hop refuses a directed frame whose replay counter is behind one
+    it has accepted, so data overtaken by the relay's own control traffic is
+    dropped on arrival: nothing the insider withheld. An open mesh has no replay
+    counter, and the same delay costs it nothing."""
+    sim, flow = chain(Insider.delaying(DELAY_MS))
+    assert 0.75 < flow.delivery_ratio(ATTACK_AT_S, SETTLED_S) < 0.95
+    assert sim.insider_drops("relay") == 0
+    open_sim, open_flow = chain(Insider.delaying(DELAY_MS), authenticated=False)
+    assert open_sim.insider_delays("relay") > 0
+    assert open_flow.delivery_ratio(ATTACK_AT_S, SETTLED_S) == 1.0
+
+
+def test_a_frame_held_across_a_reboot_is_lost():
+    mesh = Mesh(mesh_id=1, root_seed=bytes([7]) * 32)
+    nodes = [Node(n, credential=Credential()) for n in ("hq", "relay", "team")]
+    sim = Simulation(nodes, path(["hq", "relay", "team"], PerfectWire()), mesh=mesh)
+    flow = sim.stream("team", "hq", rate_hz=20.0, start_s=10.0, duration_s=5.0)
+    # Held far longer than the stream, with the relay rebooting in between.
+    sim.misbehave("relay", Insider.delaying(20_000.0), at_s=9.0)
+    sim.fail_node("relay", at_s=16.0, recover_s=17.0)
+    sim.run(until_s=40.0)
+    assert sim.insider_delays("relay") > 0
+    assert flow.delivery_ratio() == 0.0
+
+
+@pytest.mark.parametrize("delay_ms", [0.0, -1.0, float("nan"), float("inf")])
+def test_a_delay_that_is_not_a_positive_time_is_refused(delay_ms):
+    with pytest.raises(ValueError):
+        Insider.delaying(delay_ms)
+
+
 def link_frame(packet_type: int | None, protocol: int = forge.BATMAN_ETHERTYPE):
     """A link header of `protocol`, then the packet-type byte if there is one."""
     header = bytes(12) + protocol.to_bytes(2, "big")
@@ -108,3 +173,15 @@ def test_misbehaving_an_unknown_node_is_refused():
     sim = Simulation([Node("a")], [])
     with pytest.raises(KeyError):
         sim.misbehave("nobody", Insider.blackhole())
+
+
+def test_delaying_holds_data_only_unless_told_otherwise():
+    data, control = link_frame(forge.PACKET_UNICAST), link_frame(forge.PACKET_OGM)
+    rng = Random(0)
+    insider = Insider.delaying(DELAY_MS)
+    assert insider.holds_ms(data) == DELAY_MS
+    assert insider.holds_ms(control) == 0.0
+    assert not insider.drops(data, rng)
+    everything = Insider.delaying(DELAY_MS, packet_types=None)
+    assert everything.holds_ms(control) == DELAY_MS
+    assert Insider.selective_forwarding().holds_ms(data) == 0.0
