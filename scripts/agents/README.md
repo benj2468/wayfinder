@@ -1,39 +1,56 @@
 # Agent team
 
 This directory runs wayfinder's autonomous agents headlessly on Ben's server
-using `claude -p`, scheduled by cron. Two roles are live:
+using `claude -p`, scheduled by systemd user timers. Three roles are live:
 
 | Role | Prompt | Lane | Model |
 |---|---|---|---|
-| AI/ML + simulation engineer (all sim: adversarial, characterisation, modelling) | [`ml-engineer.md`](ml-engineer.md) | `sim/`, `ml/`, proposed design docs | Sonnet |
+| AI/ML + simulation engineer (all sim: adversarial, characterisation, modelling) | [`ml-engineer.md`](ml-engineer.md) | `sim/` (except `red_team.py`), `ml/`, proposed design docs | Sonnet |
+| Security engineer | [`security-engineer.md`](security-engineer.md) | `libs/wayfinder-auth`, `libs/wayfinder-linksec`, `sim/scenarios/red_team.py` | Sonnet |
 | Principal engineer | [`principal-engineer.md`](principal-engineer.md) | reviews everything; writes no code | Opus |
 
-- [`rules.md`](rules.md) is appended to every role's prompt.
+- Every prompt is [`rules.md`](rules.md), then (for authors)
+  [`author.md`](author.md), the run modes they share, then the role file.
 - [`roadmap.md`](roadmap.md) is the backlog. Edit it to steer the team.
-- The security and firmware roles are listed at the bottom of the roadmap and
-  are not running yet.
+- The firmware role is listed at the bottom of the roadmap and is not running
+  yet.
+- Roles are declared in one table at the top of `run-loop.sh`: name, model,
+  budget, lane and exclusions.
+
+**Ben's sign-off, on top of the principal's approval,** is required by the
+orchestrator (`needs-ben` alongside `agent::approved`) for any PR that:
+
+- touches keys, credentials or the wire (`wayfinder-auth`, `wayfinder-linksec`,
+  `wayfinder-tls-mgmt`, `wayfinder-protos`), whoever wrote it, which means
+  every security PR; or
+- changes files outside its author's lane.
+
+Such a PR is still reviewed through the full loop first, so it reaches Ben in
+its best state.
 
 ## The loop
 
 ```
-run-loop.sh ml                                   (hourly)
-  1. review loop over agent PRs already waiting
+run-loop.sh work <role>                          (hourly per role, staggered)
+  1. review loop over every agent PR already waiting
   2. at the WIP limit with nothing of Ben's to answer → stop, no session started
-  3. ML "work" run: answer Ben's comments, else fix an in-lane bug,
-     else take one roadmap task → PR
-  4. new agent/ml/* PRs get labels; out-of-lane ones go straight to needs-ben
+  3. the role's "work" run: answer Ben's comments, else fix an in-lane bug,
+     else take one backlog task → PR on agent/<role>/…
+  4. new agent/* PRs get their role label and needs-review
   5. review loop, per PR, all in this one run:
        needs-review ─principal→ approve, notes=0 ──────────→ approved (Ben's turn)
-                              → approve, notes>0 ─ML fixes─→ needs-review …
-                                                 └ML files/declines only─→ approved
-                              → changes ─────────ML responds→ needs-review …
+                              → approve, notes>0 ─author fixes─→ needs-review …
+                                                 └author files/declines only─→ approved
+                              → changes ─────────author responds→ needs-review …
+       approved + (keys/wire or out-of-lane files) → also needs-ben
        round 3 still with changes → the principal decides on a 4th round:
            next=restart → rounds reset, its review is the brief (MAX_RESTARTS=1)
            next=ben     → needs-ben, with what Ben has to decide
        on the last round, notes are filed or declined, never pushed
 run-loop.sh sweep    principal comments on whatever the loop missed (daily)
-run-loop.sh review   step 5 only
-run-loop.sh status   agent PRs with their state and round count
+run-loop.sh review   steps 4 and 5 only
+run-loop.sh status   agent PRs with author, state and round count
+run-loop.sh ml       alias for `work ml`
 ```
 
 A PR therefore leaves the loop only once every review point has been answered,
@@ -78,7 +95,7 @@ Merging is gated twice:
 | Overlapping runs | `flock`. An hourly ML run that finds the lock taken just skips (the next hour retries), and a sweep waits up to 4 h. |
 | Hourly sessions with nothing to do | At the WIP limit, with no unanswered comment of Ben's, `ml` ends before starting a session. |
 | A review loop that never converges | Three rounds per cycle. After the third, the principal must either restart the cycle (at most `MAX_RESTARTS`, default 1) or hand the PR to Ben. It is told not to raise new nits on code it has already accepted. |
-| PR churn spending Actions minutes | Open-PR limit (`ML_WIP_LIMIT=2`). Agents open PRs only when they are merge-ready. |
+| PR churn spending Actions minutes | Open-PR limit per role (`WIP_LIMIT=2`). Agents open PRs only when they are merge-ready. |
 
 Every knob is an environment variable at the top of [`run-loop.sh`](run-loop.sh).
 
@@ -92,20 +109,25 @@ loginctl enable-linger "$USER"     # a user manager with nobody logged in (timer
 Before this directory is on `main`, try it from the branch:
 
 ```bash
-AGENT_REF=HEAD DRY_RUN=1 scripts/agents/run-loop.sh ml   # prints what it would do
+AGENT_REF=HEAD DRY_RUN=1 scripts/agents/run-loop.sh work security   # prints what it would do
 AGENT_REF=HEAD scripts/agents/run-loop.sh status
 ```
 
 ## Scheduling
 
-`ml` runs hourly and `sweep` runs daily. On Ben's NixOS server (`gantz`) these
-are systemd **user timers** declared in `~/nixconf/host/gantz/default.nix`,
-with linger on.
+Each authoring role runs hourly, staggered so they rarely meet: `ml` at :00
+and `security` at :20. `sweep` runs daily at 23:30. On Ben's NixOS server
+(`gantz`) these are systemd **user timers** declared in
+`~/nixconf/host/gantz/default.nix`, with linger on.
+
+- Runs share one lock. An authoring run that finds it taken skips, and its
+  next hourly slot retries.
 
 - `Persistent=true` runs a slot that was missed while the VM slept, once it
   wakes.
 - A timer never starts a second copy of a still-running oneshot.
-- Output goes to `journalctl --user -u wayfinder-agents-ml`.
+- Output goes to `journalctl --user -u wayfinder-agents-<ml|security|sweep>`.
+- To pause one role: `systemctl --user stop wayfinder-agents-security.timer`.
 
 ```bash
 systemctl --user list-timers 'wayfinder-agents-*'
@@ -115,7 +137,8 @@ systemctl --user start wayfinder-agents-ml     # run one now
 On a host without that config, use cron instead:
 
 ```cron
-0 * * * *   $HOME/sources/wayfinder/scripts/agents/run-loop.sh ml    >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
+0 * * * *   $HOME/sources/wayfinder/scripts/agents/run-loop.sh work ml       >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
+20 * * * *  $HOME/sources/wayfinder/scripts/agents/run-loop.sh work security >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 30 23 * * * $HOME/sources/wayfinder/scripts/agents/run-loop.sh sweep >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 ```
 
@@ -152,8 +175,11 @@ estimate either way.
 
 ## Adding a role
 
-1. Write `<role>.md`, following the existing two.
-2. Give it a branch prefix and a lane regex in `run-loop.sh`.
-3. Add its log issue to `setup.sh`.
-4. Generalise `ml_prs`/`adopt_new_prs` over the roles. They are ML-specific
-   today on purpose, to stay simple while there is a single author.
+1. Write `<name>.md`: lane, backlog, and domain rules. The run modes come
+   from `author.md`.
+2. Add its key to `AUTHORS` in `run-loop.sh`, with its `NAME`, `MODEL`,
+   `BUDGET`, `LANE` and `EXCLUDE`. If it takes files from another lane, add
+   them to that role's `EXCLUDE`.
+3. Add its `agent::<key>` label and its log issue to `setup.sh`, and run it.
+4. Give it a backlog section in `roadmap.md`.
+5. Add a staggered hourly timer for `run-loop.sh work <key>`.
