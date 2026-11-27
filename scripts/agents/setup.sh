@@ -8,6 +8,7 @@ set -euo pipefail
 label() { gh label create "$1" -R "$REPO" --color "$2" --description "$3" --force >/dev/null && echo "label $1"; }
 label agent::ml 00A6A6 "PR authored by the ml-engineer agent"
 label agent::security 8E44AD "PR authored by the security-engineer agent"
+label agent::routing 1D76DB "PR authored by the routing-engineer agent"
 label agent::needs-review FBCA04 "Agent loop: waiting for the principal-engineer agent"
 label agent::changes-requested D93F0B "Agent loop: waiting for the authoring agent"
 label agent::approved 0E8A16 "Agent loop: principal agent satisfied; waiting for Ben"
@@ -25,5 +26,6 @@ log_issue() { # <role> <lane summary>
 Each run appends one comment: **Done / Next / Blocked**. Every agent reads all logs before choosing work. Driven by \`scripts/agents/run-loop.sh\`; see \`scripts/agents/README.md\`."
 }
 log_issue ml-engineer "lane: sim/, ml/, proposed design docs"
-log_issue security-engineer "lane: wayfinder-auth, wayfinder-linksec, red_team.py"
+log_issue security-engineer "lane: wayfinder-auth, wayfinder-linksec, the router's auth/, red_team.py"
+log_issue routing-engineer "lane: the routing core: batman, wayfinder (less auth/), interfaces, wayfinder-test"
 log_issue principal-engineer "reviews every agent PR; daily sweep"

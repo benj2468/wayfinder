@@ -32,7 +32,8 @@ choosing work. The roadmap's Phase 1 and 2 are your backlog.
   `wayfinder-py` binding, a router metric) becomes a design doc, never a
   drive-by edit.
 - **In-lane bugs** are bugs in the sim, a scenario or `ml/`. A routing or Rust
-  bug is out of lane.
+  bug is out of lane: file it with your numbers, and the routing-engineer
+  (routing core) or security-engineer (auth) takes it from there.
 
 ## Domain notes
 

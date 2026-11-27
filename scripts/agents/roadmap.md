@@ -97,7 +97,10 @@ file is Ben's to edit.
 ## Security (lane: security-engineer)
 
 `type::security` and bug issues in the lane come first (`rules.md`): #105,
-persisting the revocation list, outranks everything below.
+persisting the revocation list, outranks everything below. The router's
+credential plane (`libs/wayfinder/src/auth/`) is in this lane, so #127 (the
+pairwise replay check has no reorder window) and #121 (the next-hop proof
+passes through a wormhole) are too.
 
 - [ ] **S.1 Design 27 §10 gate spike, part 1: the AEAD.**
   ChaCha20-Poly1305 with the 8-byte-ICV construction, pinned to RFC 8439
@@ -117,6 +120,25 @@ persisting the revocation list, outranks everything below.
 - [ ] **S.4 Red-team battery upkeep:** a case for each new attack primitive
   the ml-engineer builds (insider forwarding, wormhole, …). Keep every
   verdict backed by a test.
+
+## Routing core (lane: routing-engineer)
+
+Routing bugs come first (`rules.md`): today that is #117 (the reported
+`best_next_hop` is not the hop frames go to) and #120 (a keyless delayed OGM
+repeat makes a persistent two-node loop), both found and measured by the
+ml-engineer's sim scenarios.
+
+- [ ] **R.1 Land the `handle_frame_with_metrics` split** (#25): the refactor
+  in ebd60ce that never got a review. Rebase it onto `main`, keep it
+  behaviour-preserving, and show that with the existing tests and
+  `just bench-against main` on the packet path.
+- [ ] **R.2 Router halves of accepted designs.** When another lane's design
+  doc is accepted and needs router state (for example 2.1's data-plane
+  signal), build the `CentralRouter` part and its accessor. Ask the owning
+  role for the rest in an issue.
+- [ ] **R.3 Design doc: the routing core's footprint** (#72): where
+  `CentralRouter`'s RAM and flash go per capacity profile, measured, and
+  which levers are left. A design doc, not code.
 
 ## Later roles (not yet running)
 

@@ -1,12 +1,13 @@
 # Agent team
 
 This directory runs wayfinder's autonomous agents headlessly on Ben's server
-using `claude -p`, scheduled by systemd user timers. Three roles are live:
+using `claude -p`, scheduled by systemd user timers. Four roles are live:
 
 | Role | Prompt | Lane | Model |
 |---|---|---|---|
 | AI/ML + simulation engineer (all sim: adversarial, characterisation, modelling) | [`ml-engineer.md`](ml-engineer.md) | `sim/` (except `red_team.py`), `ml/`, proposed design docs | Sonnet |
-| Security engineer | [`security-engineer.md`](security-engineer.md) | `libs/wayfinder-auth`, `libs/wayfinder-linksec`, `sim/scenarios/red_team.py` | Sonnet |
+| Security engineer | [`security-engineer.md`](security-engineer.md) | `libs/wayfinder-auth`, `libs/wayfinder-linksec`, the router's `libs/wayfinder/src/auth/`, `sim/scenarios/red_team.py` | Sonnet |
+| Routing engineer (the routing core only) | [`routing-engineer.md`](routing-engineer.md) | `libs/batman`, `libs/wayfinder` (except `src/auth/`), `libs/interfaces`, `libs/wayfinder-test` | Sonnet |
 | Principal engineer | [`principal-engineer.md`](principal-engineer.md) | reviews everything; writes no code | Opus |
 
 - Every prompt is [`rules.md`](rules.md), then (for authors)
@@ -21,8 +22,8 @@ using `claude -p`, scheduled by systemd user timers. Three roles are live:
 orchestrator (`needs-ben` alongside `agent::approved`) for any PR that:
 
 - touches keys, credentials or the wire (`wayfinder-auth`, `wayfinder-linksec`,
-  `wayfinder-tls-mgmt`, `wayfinder-protos`), whoever wrote it, which means
-  every security PR; or
+  `wayfinder-tls-mgmt`, `wayfinder-protos`, the router's `auth/`), whoever
+  wrote it, which means every security PR; or
 - changes files outside its author's lane.
 
 Such a PR is still reviewed through the full loop first, so it reaches Ben in
@@ -90,7 +91,7 @@ Merging is gated twice:
 | Merge, force-push, closing things | `settings.json` deny rules, plus `--permission-mode auto` for everything else |
 | Reach beyond the repo (Gmail, Drive, Calendar, browser) | Sessions load **no MCP servers**: `--strict-mcp-config` with an empty config, plus `ENABLE_CLAUDEAI_MCP_SERVERS=false`. Without them a headless session inherits Ben's claude.ai connectors and plugin MCP servers. `loop.log` warns if any server loads anyway. |
 | OOM on a 7.7 GB, no-swap box | Each `claude` runs in a `systemd-run --user --scope` capped at `MEMORY_MAX` (4.5 GB), at `nice 10` and `CARGO_BUILD_JOBS=2` |
-| Disk | Preflight refuses to start with less than `MIN_FREE_GB` (6 GB) free. Each agent reuses one persistent worktree (`~/sources/wt-agent-{ml,principal}`), so `target/` and `.venv` are built once. |
+| Disk | Preflight refuses to start with less than `MIN_FREE_GB` (6 GB) free. Each agent reuses one persistent worktree (`~/sources/wt-agent-{ml,security,routing,principal}`), so `target/` and `.venv` are built once. |
 | A runaway session | `RUN_TIMEOUT` (90 min) and `--max-budget-usd` on each invocation |
 | Overlapping runs | `flock`. An hourly ML run that finds the lock taken just skips (the next hour retries), and a sweep waits up to 4 h. |
 | Hourly sessions with nothing to do | At the WIP limit, with no unanswered comment of Ben's, `ml` ends before starting a session. |
@@ -102,7 +103,7 @@ Every knob is an environment variable at the top of [`run-loop.sh`](run-loop.sh)
 ## Setup (once)
 
 ```bash
-scripts/agents/setup.sh            # labels + the two agent-log issues (idempotent)
+scripts/agents/setup.sh            # labels + one agent-log issue per role (idempotent)
 loginctl enable-linger "$USER"     # a user manager with nobody logged in (timers + the memory cap)
 ```
 
@@ -115,8 +116,8 @@ AGENT_REF=HEAD scripts/agents/run-loop.sh status
 
 ## Scheduling
 
-Each authoring role runs hourly, staggered so they rarely meet: `ml` at :00
-and `security` at :20. `sweep` runs daily at 23:30. On Ben's NixOS server
+Each authoring role runs hourly, staggered so they rarely meet: `ml` at :00,
+`security` at :20 and `routing` at :40. `sweep` runs daily at 23:30. On Ben's NixOS server
 (`gantz`) these are systemd **user timers** declared in
 `~/nixconf/host/gantz/default.nix`, with linger on.
 
@@ -126,7 +127,7 @@ and `security` at :20. `sweep` runs daily at 23:30. On Ben's NixOS server
 - `Persistent=true` runs a slot that was missed while the VM slept, once it
   wakes.
 - A timer never starts a second copy of a still-running oneshot.
-- Output goes to `journalctl --user -u wayfinder-agents-<ml|security|sweep>`.
+- Output goes to `journalctl --user -u wayfinder-agents-<ml|security|routing|sweep>`.
 - To pause one role: `systemctl --user stop wayfinder-agents-security.timer`.
 
 ```bash
@@ -139,6 +140,7 @@ On a host without that config, use cron instead:
 ```cron
 0 * * * *   $HOME/sources/wayfinder/scripts/agents/run-loop.sh work ml       >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 20 * * * *  $HOME/sources/wayfinder/scripts/agents/run-loop.sh work security >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
+40 * * * *  $HOME/sources/wayfinder/scripts/agents/run-loop.sh work routing  >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 30 23 * * * $HOME/sources/wayfinder/scripts/agents/run-loop.sh sweep >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 ```
 

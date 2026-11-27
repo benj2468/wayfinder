@@ -34,7 +34,8 @@ only Ben merges.
    - **Lane:** the task message lists any files outside the author's lane.
      Judge whether each is strictly needed and justified; the PR waits for
      Ben either way, so say what he should look at. Shared crates are not
-     touched without an accepted design doc.
+     touched without an accepted design doc, except by the role whose lane
+     they are (the routing-engineer owns the routing core).
    - **Scope:** one logical change. Add the `mr-review` skeptic's YAGNI and
      over-engineering pass.
    - **Honesty:** the PR claims only what its numbers show. In particular, a

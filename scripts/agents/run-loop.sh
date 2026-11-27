@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Orchestrates wayfinder's agent team on this machine.
 #
-#   run-loop.sh work <role>  one authoring run for <role> (ml, security): the
+#   run-loop.sh work <role>  one authoring run for <role> (ml, security, routing): the
 #                            review loop, then that role's work run, then the
 #                            review loop again (`ml` is an alias for `work ml`)
 #   run-loop.sh review       only the review loop, over every agent PR
@@ -57,21 +57,27 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 # matches LANE and not EXCLUDE (ERE has no negative lookahead). A PR with files
 # outside its lane is still reviewed, but ends at needs-ben with those files
 # listed.
-AUTHORS=(ml security)
-declare -A NAME=([ml]=ml-engineer [security]=security-engineer)
-declare -A MODEL=([ml]="${ML_MODEL:-sonnet}" [security]="${SECURITY_MODEL:-sonnet}")
-declare -A BUDGET=([ml]="${ML_BUDGET_USD:-15}" [security]="${SECURITY_BUDGET_USD:-15}")
+AUTHORS=(ml security routing)
+declare -A NAME=([ml]=ml-engineer [security]=security-engineer [routing]=routing-engineer)
+declare -A MODEL=([ml]="${ML_MODEL:-sonnet}" [security]="${SECURITY_MODEL:-sonnet}" [routing]="${ROUTING_MODEL:-sonnet}")
+declare -A BUDGET=([ml]="${ML_BUDGET_USD:-15}" [security]="${SECURITY_BUDGET_USD:-15}" [routing]="${ROUTING_BUDGET_USD:-15}")
+# The router's credential plane (libs/wayfinder/src/auth/ and the fuzz target
+# that drives it) sits inside the routing core's crate but is the security
+# engineer's: it is keys and the wire, not path selection.
+ROUTER_AUTH='^(libs/wayfinder/src/auth/|libs/wayfinder/fuzz/fuzz_targets/verify_ogm\.rs$)'
 declare -A LANE=(
   [ml]='^(sim/|ml/|uv\.lock$|docs/design/[0-9]{2}-[^/]+\.md$)'
-  [security]='^(libs/wayfinder-auth/|libs/wayfinder-linksec/|sim/scenarios/red_team\.py$|docs/design/[0-9]{2}-[^/]+\.md$|Cargo\.lock$)'
+  [security]='^(libs/wayfinder-auth/|libs/wayfinder-linksec/|libs/wayfinder/src/auth/|libs/wayfinder/fuzz/fuzz_targets/verify_ogm\.rs$|sim/scenarios/red_team\.py$|docs/design/[0-9]{2}-[^/]+\.md$|Cargo\.lock$)'
+  [routing]='^(libs/batman/|libs/wayfinder/|libs/interfaces/|libs/wayfinder-test/|docs/design/[0-9]{2}-[^/]+\.md$|Cargo\.lock$)'
 )
 declare -A EXCLUDE=(
   [ml]='^sim/scenarios/red_team\.py$' # the security engineer's
   [security]='^$'
+  [routing]=$ROUTER_AUTH # the security engineer's
 )
 # Keys, credentials and the wire: whoever touches these, Ben reviews before
 # merge even after the principal approves (needs-ben on top of approved).
-SENSITIVE='^(libs/wayfinder-auth/|libs/wayfinder-linksec/|libs/wayfinder-tls-mgmt/|libs/wayfinder-protos/)'
+SENSITIVE='^(libs/wayfinder-auth/|libs/wayfinder-linksec/|libs/wayfinder-tls-mgmt/|libs/wayfinder-protos/|libs/wayfinder/src/auth/)'
 
 L_REVIEW=agent::needs-review
 L_CHANGES=agent::changes-requested
