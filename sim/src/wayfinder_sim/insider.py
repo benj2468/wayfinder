@@ -10,8 +10,7 @@ refuse.
 
 The filter reads only the BATMAN packet-type byte. It therefore cannot tell a
 frame the node relays from one it originated: a node dropping data drops its
-own data too, or sends it late. The wormhole, which needs no captured radio,
-is in `wormhole.py`.
+own data too, or sends it late. A wormhole is not modelled here.
 """
 
 from __future__ import annotations
