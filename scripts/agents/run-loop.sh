@@ -264,10 +264,28 @@ markers() { # <pr> → one `verdict=… sha=… [notes=N] [next=…]` line per p
     sed -E 's/<!-- agent-review (.*) -->/\1/' || true
 }
 reviews() { markers "$1" | grep -c . || true; }
+# When Ben last removed needs-ben (empty if never). The script never removes
+# that label itself, so every such event is Ben handing the PR back.
+handback_at() { # <pr> → ISO timestamp
+  gh api "repos/$REPO/issues/$1/timeline" --paginate \
+    --jq ".[] | select(.event == \"unlabeled\" and .label.name == \"$L_BEN\") | .created_at" |
+    tail -1 || true
+}
+# Markers since Ben's last hand-back: removing needs-ben starts a fresh
+# budget of rounds and restarts, or a PR stopped by the round cap would be
+# escalated again on the very next pass and the hand-back would do nothing.
+cycle_markers() { # <pr>
+  local since
+  since=$(handback_at "$1")
+  gh api "repos/$REPO/pulls/$1/reviews" --paginate \
+    --jq ".[] | select(.submitted_at > \"$since\") | .body" |
+    grep -oE '<!-- agent-review verdict=(approve|changes) sha=[0-9a-f]+( notes=[0-9]+)?( next=(restart|ben))? -->' |
+    sed -E 's/<!-- agent-review (.*) -->/\1/' || true
+}
 # Rounds in the current cycle: a `next=restart` review closes a cycle, so
 # only the reviews after the last one count.
-rounds() { markers "$1" | awk '/next=restart/ { n = 0; next } { n++ } END { print n + 0 }'; }
-restarts() { markers "$1" | grep -c 'next=restart' || true; }
+rounds() { cycle_markers "$1" | awk '/next=restart/ { n = 0; next } { n++ } END { print n + 0 }'; }
+restarts() { cycle_markers "$1" | grep -c 'next=restart' || true; }
 last_marker() { markers "$1" | tail -1; }
 # Only the sha: the marker goes on to `notes=` and `next=`, so a suffix strip
 # like `${m##*sha=}` would never equal the head and re-queues every approval.
