@@ -68,11 +68,33 @@ uses. Call the answer `via`.
 | field of the re-flood | today | proposed, `via` is `Some` | `via` is `None` |
 |---|---|---|---|
 | `PrevSender` | `frame.src` | `via` | `frame.src` |
-| `tq` | `computed_tq` | `min(computed_tq, last_tq of the via path)` | `computed_tq` |
+| `tq` | `computed_tq` | `min(computed_tq, effective_tq of the via path)` | `computed_tq` |
 
 Which copies are re-flooded, and when, does not change. In the common case the
-first copy comes from the selected next hop, so `via == frame.src` and the
-frame is byte-for-byte what is sent today.
+first copy comes from the selected next hop, so `via == frame.src` and, unless
+that neighbour has missed its keep-alive budget, the frame is byte-for-byte what
+is sent today.
+
+**The clamp is `effective_tq`, not `last_tq`.** `next_hop` ranks paths by
+`effective_tq`, which is zero for a neighbour that has missed its keep-alive
+budget. When every proven, unexpired path has missed it, `next_hop` still
+returns one of them. Its `last_tq` would advertise a better path than the one
+the relay ranks it as.
+
+**A resulting `tq = 0` is sent, not suppressed.** This holds for
+`via == frame.src` too.
+
+- A receiver that hears it stores 0 for the path through this relay, so any
+  alternative with a non-zero TQ wins at once. Suppression would leave the old,
+  higher TQ in place until the path aged out.
+- A receiver with no alternative keeps the route, as the relay itself does.
+  A missed keep-alive deprioritises a path and does not evict it; suppression
+  would let it expire downstream.
+- Suppression would also withhold the rest of the originator's OGM, such as its
+  multicast groups, from every node behind the relay.
+
+`tq = 0` needs no special case: attenuation already saturates to it, and the
+receive path treats it as any other value.
 
 `PrevSender` then means "the neighbour the forwarder's path to `orig` runs
 through", which is what Rule 1b (drop an OGM that names me) was reaching for:
@@ -81,8 +103,9 @@ sender's *route* to `orig` runs through us".
 
 ## 3. Goals and non-goals
 
-Goal: a re-flood never offers a neighbour a better path than the relay has, and
-never hides from a neighbour that the path runs back through it.
+Goal: a relay that has a usable route (`via` is `Some`) never offers a neighbour
+a better path than that route, and never hides from a neighbour that the route
+runs back through it.
 
 Not covered:
 
@@ -127,7 +150,9 @@ against an insider.
 
 ## 6. Prototype results
 
-Same setup as §1.
+Same setup as §1. The prototype clamped with `last_tq`, not `effective_tq`. The
+two are equal unless a keep-alive has been missed, and no keep-alives are
+configured in these runs, but the `effective_tq` form itself has not been run.
 
 - One-way link, authenticated: delivery 0.00 -> 1.00 (seeds 0-1).
 - Either half alone (only the TQ clamp, or only the stamp) also gives 1.00 here
@@ -145,8 +170,7 @@ Same setup as §1.
 | 2000 | 1.00 | 1.00 |
 
 The 800 ms row is worse. At that latency the proof through the tunnel sits at
-the edge of succeeding. Why delivery falls there has not been traced, and the
-implementing session should trace it before merging.
+the edge of succeeding. Why delivery falls there has not been traced (§9).
 
 Not measured: the other prototype seeds, convergence time, OGM airtime, the
 red-team battery and the benchmarks.
@@ -173,11 +197,33 @@ node cannot tell one from an ordinary second path.
   trigger in §1 step 2 but not the cause: a lost or delayed chain copy reaches
   the same state.
 
-## 9. Open decisions for the implementing session
+## 9. Acceptance bar and open decision
 
-- Whether `via == None` on an authenticated mesh should suppress the re-flood
-  once any neighbour has been proven.
-- The 800 ms result in §6.
+The change affects every re-flood, on open and authenticated meshes, whose first
+copy did not come from the best path. That is common wherever paths are
+redundant, and §1 and §6 cover only one chain. The implementing PR merges only
+when all of these hold, with the numbers in its description. "`main`" means the
+commit the PR branches from, measured in the same way.
+
+1. **§1 and §6, seeds 0-4**, both columns of the latency table:
+   - authenticated, with and without the one-way link: delivery 1.00;
+   - open: 1.00 without the link. With it, 0.00 is expected (§3);
+   - latencies 500, 1000, 1200, 1500 and 2000 ms: delivery 1.00;
+   - latency 800 ms: item 3.
+2. **Red team:** `sim/tests/test_red_team.py` passes with no new `GAP`. The
+   baseline is not all clear today: `attack_wormhole_blackhole` is a recorded
+   `GAP` (#121). If its verdict flips, the PR says why and updates the baseline.
+3. **800 ms:** the cause of the lower delivery is traced. It is either fixed
+   (no seed below `main`) or explained in this document, and accepting a
+   remaining loss is Ben's decision.
+4. **Convergence on redundant meshes** (both scenarios are open meshes), median over seeds 0-4 no higher than on
+   `main`: `converged_s` from `sim/scenarios/scale.py` `run_size(49)`, and
+   `recovered_s` and `rejoin_s` from `sim/scenarios/failover.py`
+   `run_failover`, both without keep-alives and with `keepalive_ms=250`. A run
+   that never converges or recovers fails the bar.
+
+Open for the implementing session: whether `via == None` on an authenticated
+mesh should suppress the re-flood once any neighbour has been proven.
 
 ## 10. Key file map
 
@@ -185,6 +231,8 @@ node cannot tell one from an ordinary second path.
   block; Rule 1b's comment.
 - `libs/batman/src/wire.rs`: `TvlvType::PrevSender`, `stamp_prev_sender` docs.
 - Tests first: an engine test (proof required, selected next hop Y, newer
-  sequence number from unproven X: the re-flood names Y and carries Y's TQ), and
+  sequence number from unproven X: the re-flood names Y and carries Y's TQ); a
+  second where Y has missed its keep-alive budget and is still the only usable
+  path (the re-flood is sent, names Y, and carries `tq = 0`); and
   a `wayfinder-test` scenario with a one-way link on an authenticated mesh.
   `TestSwitchConfig` has no one-way fabric yet.
