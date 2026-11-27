@@ -32,7 +32,7 @@ class NoLinkError(ValueError):
 
 
 if TYPE_CHECKING:
-    from .adversary import CapturedFrame, Wiretap
+    from .adversary import Adversary, CapturedFrame, Wiretap
     from .channel import (
         Channel,
         ChannelSample,
@@ -102,6 +102,7 @@ __all__ = [
     "GAP",
     "HELD",
     "VERDICTS",
+    "Adversary",
     "Bounds",
     "CapturedFrame",
     "Channel",
@@ -180,6 +181,7 @@ _EXPORTS = {
     "terrain_scene": "interactive",
     "track_scene": "interactive",
     "write_html": "interactive",
+    "Adversary": "adversary",
     "CapturedFrame": "adversary",
     "Wiretap": "adversary",
     "Link": "link",

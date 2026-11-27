@@ -5,6 +5,11 @@ crosses it is recorded, exactly as it appeared on the medium. There is no
 node behind it and nothing for a router to reject: a radio link is a shared
 medium, and anyone in range hears it.
 
+"In range" is only modelled when the tap is given an `Adversary`
+(`wiretap(link, at=...)`), a listener with a position. Without one the tap
+hears every frame: the worst case, which suits a protocol attack and
+overstates a physical one.
+
 That is worth stating plainly, because a successful wiretap is not a
 finding. Wayfinder authenticates and segregates; it never encrypts. A
 listener reading application payloads off an authenticated mesh has
@@ -21,6 +26,22 @@ import dataclasses
 import wayfinder_py as wf
 
 from .forge import BATMAN_ETHERTYPE, LINK_HEADER_LEN
+from .mobility import Mobility
+
+
+@dataclasses.dataclass(frozen=True)
+class Adversary:
+    """An attacker with a place in the world. `name` identifies it within one
+    `Simulation` and seeds its own random stream; `mobility` is where it is.
+
+    Its receiver is the link's own channel model evaluated from the
+    transmitter to its position, so range, terrain and the horizon apply to it
+    as to a mesh member. That also gives it the members' antenna: a
+    high-gain receiver is not modelled.
+    """
+
+    name: str
+    mobility: Mobility
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,11 +103,18 @@ class Wiretap:
 
     link: str
     frames: list[CapturedFrame] = dataclasses.field(default_factory=list)
+    at: Adversary | None = None
+    """Who is listening, from where. `None` hears everything on the link."""
+    missed: int = 0
+    """Frames transmitted on the link that a positioned listener failed to
+    receive: out of range, lost to noise, jammed or collided. Always zero for
+    a tap with no `at`."""
 
     def reset(self) -> None:
         """Drop everything captured so far — for measuring one phase of a
         scenario without the previous phase's traffic in the total."""
         self.frames.clear()
+        self.missed = 0
 
     def by_source(self, src: wf.PyMac) -> list[CapturedFrame]:
         """Only the frames claiming to come from `src`."""

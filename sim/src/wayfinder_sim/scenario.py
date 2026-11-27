@@ -26,12 +26,13 @@ import simpy
 import wayfinder_py as wf
 
 from . import NoLinkError
-from .adversary import Wiretap
+from .adversary import Adversary, Wiretap
+from .channel import Channel, ChannelSample, PerfectWire
 from .insider import Insider
 from .interference import DEFAULT_CAPTURE_DB, Jammer, sum_dbm
 from .link import Link
 from .medium import EnergyModel, RadioStats
-from .mobility import Static, Vec3
+from .mobility import Mobility, Static, Vec3
 from .node import Node
 from .recorder import Recorder
 from .security import Mesh
@@ -79,6 +80,22 @@ class _Reception:
     iface: int
     boot: int
     latency_ms: float
+
+
+@dataclasses.dataclass
+class _Listener:
+    """A positioned wiretap and what it needs to judge a reception."""
+
+    tap: Wiretap
+    mobility: Mobility
+    rng: Random
+    """Its own stream, so listening never shifts the channel's draws."""
+    on_air: list[tuple[float, float, float]] = dataclasses.field(default_factory=list)
+    """`(start_ms, end_ms, rssi_dbm)` of every signal reaching it on a
+    contended link, for judging collisions."""
+
+    def sample(self, channel: Channel, tx_pos: Vec3, t_s: float) -> ChannelSample:
+        return channel.evaluate(tx_pos, self.mobility.position(t_s), t_s, self.rng)
 
 
 @dataclasses.dataclass
@@ -170,6 +187,8 @@ class Simulation:
         self._links = list(links)
         self._mesh = mesh
         self._taps: dict[str, list[Wiretap]] = {}
+        self._listeners: dict[str, list[_Listener]] = {}
+        self._adversaries: dict[str, Adversary] = {}
         node_by_name = {n.name: n for n in node_list}
 
         # Assign each node's interface indices and per-interface trickle
@@ -520,9 +539,17 @@ class Simulation:
 
     # --- red team ---------------------------------------------------------
 
-    def wiretap(self, link: str) -> Wiretap:
+    def wiretap(self, link: str, *, at: Adversary | None = None) -> Wiretap:
         """Attach a passive listener to `link` and return it. Every frame
         transmitted on that link from now on is recorded verbatim.
+
+        With `at`, only what an adversary at that position receives is
+        recorded and the rest is counted in `Wiretap.missed`: each frame
+        crosses the link's channel from the transmitter to the listener, and
+        must survive jammers there and, on a contended link, whatever overlaps
+        it there. A wired link (`PerfectWire`) has no position to listen from
+        and raises `ValueError`, as does reusing an adversary's name for a
+        different one or tapping one link twice with it.
 
         There is no node behind this and nothing for a router to reject: a
         shared medium is audible to anyone in range. A wiretap that reads
@@ -530,10 +557,23 @@ class Simulation:
         model rather than broken it — authenticity and segregation are what
         the mesh provides, and confidentiality is left to the layer above.
         """
-        if not any(existing.name == link for existing in self._links):
+        target = next((each for each in self._links if each.name == link), None)
+        if target is None:
             raise KeyError(f"no link named {link!r}")
-        tap = Wiretap(link=link)
-        self._taps.setdefault(link, []).append(tap)
+        tap = Wiretap(link=link, at=at)
+        if at is None:
+            self._taps.setdefault(link, []).append(tap)
+            return tap
+        wired = isinstance(target.channel, PerfectWire)
+        if wired:
+            raise ValueError(f"link {link!r} is a wire: nothing to overhear")
+        listeners = self._listeners.setdefault(link, [])
+        if self._adversaries.setdefault(at.name, at) != at or any(
+            each.tap.at == at for each in listeners
+        ):
+            raise ValueError(f"adversary {at.name!r} is already in use")
+        rng = Random(f"{self._seed}:listener:{at.name}:{link}")
+        listeners.append(_Listener(tap, at.mobility, rng))
         return tap
 
     def inject(
@@ -1070,6 +1110,8 @@ class Simulation:
         for tap in self._taps.get(link.name or "", ()):
             tap.capture(t_s, frame)
         tx_pos = self._states[src_name].node.mobility.position(t_s)
+        for listener in self._listeners.get(link.name or "", ()):
+            self._overhear(listener, link, tx_pos, frame, t_s)
         for dst_name in self._receivers_for(link, src_name):
             dst_state = self._states[dst_name]
             if not dst_state.up:
@@ -1097,6 +1139,72 @@ class Simulation:
                         sample.metrics,
                     )
                 )
+
+    def _overhear(
+        self, listener: _Listener, link: Link, tx_pos: Vec3, frame: bytes, t_s: float
+    ) -> None:
+        """Whether a positioned wiretap receives this frame on an uncontended
+        link: the same jamming test and delivery draw a member gets."""
+        sample = listener.sample(link.channel, tx_pos, t_s)
+        rssi = sample.metrics.rssi_dbm
+        if self._jammers and rssi is not None:
+            jam_mw = self._jamming_mw(link, listener.mobility.position(t_s), t_s, t_s)
+            if jam_mw > 0.0 and rssi - 10.0 * math.log10(jam_mw) < DEFAULT_CAPTURE_DB:
+                listener.tap.missed += 1
+                return
+        if listener.rng.random() < sample.delivery_probability:
+            listener.tap.capture(t_s, frame)
+        else:
+            listener.tap.missed += 1
+
+    def _overhear_proc(
+        self,
+        listener: _Listener,
+        link: Link,
+        src: str,
+        sample: ChannelSample,
+        frame: bytes,
+        airtime_ms: float,
+    ):
+        """The contended-link form of `_overhear`, judged when the frame ends:
+        everything overlapping it at the listener interferes. A listener never
+        transmits, so half-duplex does not apply."""
+        assert link.medium is not None
+        start_ms = self.env.now
+        end_ms = start_ms + airtime_ms
+        boot = self._states[src].boot
+        rssi = sample.metrics.rssi_dbm
+        heard_dbm = 0.0 if rssi is None else float(rssi)
+        mine = (start_ms, end_ms, heard_dbm)
+        if rssi is not None or sample.delivery_probability > 0.0:
+            listener.on_air = [
+                each for each in listener.on_air if each[1] > start_ms - _HISTORY_MS
+            ]
+            listener.on_air.append(mine)
+        yield self.env.timeout(airtime_ms)
+        if self._states[src].boot != boot:
+            listener.tap.missed += 1  # the transmitter powered off mid-frame
+            return
+        interference_mw = sum(
+            10.0 ** (other[2] / 10.0)
+            for other in listener.on_air
+            if other is not mine and other[0] < end_ms and other[1] > start_ms
+        )
+        if self._jammers and rssi is not None:
+            interference_mw += self._jamming_mw(
+                link,
+                listener.mobility.position(start_ms / 1000.0),
+                start_ms / 1000.0,
+                end_ms / 1000.0,
+            )
+        drowned = (
+            interference_mw > 0.0
+            and heard_dbm - 10.0 * math.log10(interference_mw) < link.medium.capture_db
+        )
+        if not drowned and listener.rng.random() < sample.delivery_probability:
+            listener.tap.capture(start_ms / 1000.0, frame)
+        else:
+            listener.tap.missed += 1
 
     def _deliver(
         self,
@@ -1267,6 +1375,11 @@ class Simulation:
         for tap in self._taps.get(link.name or "", ()):
             tap.capture(t_s, frame)
         tx_pos = self._states[src].node.mobility.position(t_s)
+        for listener in self._listeners.get(link.name or "", ()):
+            sample = listener.sample(link.channel, tx_pos, t_s)
+            self.env.process(
+                self._overhear_proc(listener, link, src, sample, frame, airtime_ms)
+            )
         for dst in self._receivers_for(link, src):
             dst_state = self._states[dst]
             if not dst_state.up:

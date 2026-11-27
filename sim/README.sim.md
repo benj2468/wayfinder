@@ -137,6 +137,22 @@ Heights are drawn with a vertical exaggeration (`VERTICAL_EXAGGERATION`) —
 real terrain is far wider than it is tall, and a true-to-scale box renders as
 a flat plate. Read heights off the axis, not off the picture.
 
+### Eavesdropping from a position
+
+`Simulation.wiretap(link)` hears every frame on the link. Give it an
+`adversary.Adversary` (a name and a `Mobility`) and it hears only what reaches
+that position: the link's own channel from the transmitter to the listener, so
+range, terrain and the horizon apply, then jammers and (on a `Medium` link)
+collisions there. `Wiretap.missed` counts the rest. The listener has the same
+antenna as a mesh member, so a high-gain eavesdropper is not modelled yet.
+
+```python
+eve = Adversary("eve", Static(Vec3(0.0, 600.0, 2.0)))
+tap = sim.wiretap("a-b", at=eve)
+sim.run(until_s=60)
+print(len(tap), "heard,", tap.missed, "missed")
+```
+
 ### Red-teaming an authenticated mesh
 
 `sim/scenarios/red_team.py` stands up a real authenticated mesh — a mesh
