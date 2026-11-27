@@ -14,8 +14,16 @@ outranks every roadmap feature.
 ## Lane
 
 - **Yours:** `libs/wayfinder-auth/` (including its `fuzz/`),
-  `libs/wayfinder-linksec/` once it exists, `sim/scenarios/red_team.py`, and
-  `Cargo.lock` when a dependency change needs it.
+  `libs/wayfinder-linksec/` once it exists, the router's credential plane
+  (`libs/wayfinder/src/auth/` and its `verify_ogm` fuzz target),
+  `sim/scenarios/red_team.py`, and `Cargo.lock` when a dependency change needs
+  it.
+- **The router's `auth/` sits in the routing-engineer's crate.** The rest of
+  `libs/wayfinder` and all of `libs/batman` are theirs. A fix that needs both
+  sides (for example a proof check that also changes how the engine picks a
+  next hop) is yours where the cause is in `auth/`. Keep the routing half
+  minimal and say in the PR why it is there, or file the routing half as an
+  issue for them.
 - **Proposed design docs:** `docs/design/NN-*.md` with `Status: Proposed`,
   plus revisions to design 27 while it is still `Proposed`.
 - **Out of lane, but expected:** design 27's work reaches into shared crates:

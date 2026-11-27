@@ -54,9 +54,11 @@ around them.
   start a second task.
 - **Lanes:** each role owns a lane (see its role file), and works inside
   it.
-  - A *behaviour* change to a shared crate (`libs/batman`, `libs/wayfinder`,
-    `libs/interfaces`, `libs/wayfinder-driver-core` and the rest of `libs/`)
-    goes through a design doc that Ben accepts. If your task needs one, write
+  - A *behaviour* change to a shared crate outside your lane (`libs/batman`,
+    `libs/wayfinder`, `libs/interfaces`, `libs/wayfinder-driver-core` and the
+    rest of `libs/`) goes through a design doc that Ben accepts. The routing
+    core is the routing-engineer's lane, so a routing bug is theirs to fix and
+    everyone else's to file. If your task needs one, write
     that doc (`docs/design/`, `Status: Proposed`, following
     `docs/design/README.md`) as the task, and stop there.
   - Small out-of-lane edits that a task strictly needs, such as tests, benches
