@@ -242,6 +242,11 @@ data plane has no pairwise key for it, so the frame is dropped rather than
 emitted in the clear), but reading that resolution as membership reports an
 intruder as admitted.
 
+`Simulation.wormhole(a, b)` models two colluding keyless radios that repeat
+each other's frames verbatim (`wayfinder_sim.wormhole`); pass
+`passes=control_only` for one that swallows the data it attracts. The battery's
+wormhole case is a **GAP**.
+
 ### Reports
 
 `wayfinder_sim.report` collects a whole run of the simulator into one

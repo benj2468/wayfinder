@@ -89,6 +89,21 @@ def test_the_route_recovers_once_the_wormhole_closes():
     assert flow.delivery_ratio() == 1.0
 
 
+@pytest.mark.parametrize(
+    ("latency_ms", "captured"),
+    [(200.0, True), (2000.0, False)],
+    ids=["quick-tunnel", "slow-tunnel"],
+)
+def test_the_tunnels_latency_decides_whether_it_captures_the_route(
+    latency_ms, captured
+):
+    sim = _mesh_sim()
+    sim.wormhole("eve_a", "eve_b", latency_ms=latency_ms, at_s=ONSET_S)
+    sim.run(until_s=90.0)
+
+    assert (sim.next_hop("field", "hq") == "hq") is captured
+
+
 def test_a_wormhole_run_repeats_for_a_seed():
     def run() -> tuple[int, int]:
         sim = _mesh_sim(seed=3)
