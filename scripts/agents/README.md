@@ -51,6 +51,7 @@ run-loop.sh work <role>                          (hourly per role, staggered)
 run-loop.sh sweep    principal comments on whatever the loop missed (daily)
 run-loop.sh review   steps 4 and 5 only
 run-loop.sh status   agent PRs with author, state and round count
+run-loop.sh poke     start a role's unit now for a new comment of Ben's (every 3 min)
 run-loop.sh ml       alias for `work ml`
 ```
 
@@ -125,6 +126,13 @@ Each authoring role runs hourly, staggered so they rarely meet: `ml` at :00,
 
 - Runs share one lock. An authoring run that finds it taken skips, and its
   next hourly slot retries.
+- **A comment from Ben doesn't wait for the hour.** `wayfinder-agents-poke`
+  runs `run-loop.sh poke` every 3 minutes. It starts no claude session, only
+  reads GitHub: when Ben has the last word on a role's PR, it starts that
+  role's unit (the one its timer starts) straight away. It starts a role once
+  per comment, kept in `poke-<role>`, so a run that chose not to reply is not
+  restarted every tick. It does nothing while any run holds the lock, and the
+  next tick tries again. It logs only what it starts, to `poke.log`.
 
 - `Persistent=true` runs a slot that was missed while the VM slept, once it
   wakes.
@@ -143,6 +151,7 @@ On a host without that config, use cron instead:
 0 * * * *   $HOME/sources/wayfinder/scripts/agents/run-loop.sh work ml       >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 20 * * * *  $HOME/sources/wayfinder/scripts/agents/run-loop.sh work security >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 40 * * * *  $HOME/sources/wayfinder/scripts/agents/run-loop.sh work routing  >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
+*/3 * * * * $HOME/sources/wayfinder/scripts/agents/run-loop.sh poke  >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 30 23 * * * $HOME/sources/wayfinder/scripts/agents/run-loop.sh sweep >>$HOME/.local/state/wayfinder-agents/cron.log 2>&1
 ```
 

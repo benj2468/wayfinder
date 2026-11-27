@@ -7,6 +7,9 @@
 #   run-loop.sh review       only the review loop, over every agent PR
 #   run-loop.sh sweep        the principal engineer's daily sweep
 #   run-loop.sh status       agent PRs and their loop state; changes nothing
+#   run-loop.sh poke         start a role's unit now if Ben left it a comment it
+#                            hasn't been started for yet (every few minutes;
+#                            starts no claude session itself)
 #
 # The script owns all orchestration state, and that state lives on GitHub, so
 # every run is stateless and a crash loses nothing:
@@ -45,6 +48,7 @@ set -euo pipefail
 : "${MIN_FREE_GB:=6}"
 : "${LOCK_WAIT_S:=}"                    # default: work/review 0 (next hour retries), sweep 4 h
 : "${DRY_RUN:=0}"
+: "${POKE_UNIT_PREFIX:=wayfinder-agents-}" # poke starts <prefix><role>.service
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
 # ---------------------------------------------------------------- roles
@@ -94,7 +98,7 @@ work)
   role=${2:-}
   [[ -n $role && -n ${NAME[$role]:-} ]] || { echo "usage: run-loop.sh work <${AUTHORS[*]}>" >&2; exit 2; }
   ;;
-review | sweep | status) ;;
+review | sweep | status | poke) ;;
 *)
   sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
@@ -135,9 +139,15 @@ export GIT_CONFIG_COUNT=2
 export GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=git@github.com:
 export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1='!gh auth git-credential'
 
-RUN_DIR=$AGENT_HOME/runs/$(date +%F)/$(date +%H%M%S)-${cmd}${role:+-$role}
+# A poke runs every few minutes and usually does nothing, so it appends to one
+# log instead of leaving a run directory behind each time.
+if [[ $cmd == poke ]]; then
+  RUN_DIR=$AGENT_HOME LOG_FILE=$AGENT_HOME/poke.log
+else
+  RUN_DIR=$AGENT_HOME/runs/$(date +%F)/$(date +%H%M%S)-${cmd}${role:+-$role} LOG_FILE=$RUN_DIR/loop.log
+fi
 mkdir -p "$RUN_DIR"
-log() { printf '%s [%s] %s\n' "$(date -Is)" "${cmd}${role:+ $role}" "$*" | tee -a "$RUN_DIR/loop.log" >&2; }
+log() { printf '%s [%s] %s\n' "$(date -Is)" "${cmd}${role:+ $role}" "$*" | tee -a "$LOG_FILE" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
 # Every GitHub write goes through here, so DRY_RUN is honest.
@@ -296,22 +306,29 @@ marker_notes() { # <marker line> → its non-blocking note count (0 if absent)
   echo "${n:-0}"
 }
 
-# True when Ben (an unsigned comment, review or inline comment) has the last
-# word on any open PR of <role>, so that role has something to answer.
-has_feedback() { # <role>
-  local pr
+# The newest comment of Ben's (an unsigned comment, review or inline comment)
+# that is still the last word on an open PR of <role>, as an ISO timestamp, or
+# empty when that role has nothing of Ben's to answer.
+latest_feedback() { # <role>
+  local pr last newest=
   for pr in $(role_prs "$1"); do
-    {
+    last=$({
       gh api "repos/$REPO/issues/$pr/comments" --paginate \
         --jq '.[] | [.created_at, (.body | test("^\\s*🤖"))] | @tsv'
       gh api "repos/$REPO/pulls/$pr/reviews" --paginate \
         --jq '.[] | select(.body != "") | [.submitted_at, (.body | test("^(<!--[^\\n]*-->\\s*)?🤖"))] | @tsv'
       gh api "repos/$REPO/pulls/$pr/comments" --paginate \
         --jq '.[] | [.created_at, (.body | test("^\\s*🤖"))] | @tsv'
-    } | sort | tail -1 | grep -q $'\tfalse$' && return 0
+    } | sort | tail -1)
+    [[ $last == *$'\t'false ]] || continue
+    last=${last%%$'\t'*}
+    [[ $last > $newest ]] && newest=$last
   done
-  return 1
+  printf '%s' "$newest"
 }
+
+# True when Ben has the last word on any open PR of <role>.
+has_feedback() { [[ -n $(latest_feedback "$1") ]]; }
 
 # Newly opened agent PRs join the loop.
 adopt_new_prs() {
@@ -575,7 +592,45 @@ cmd_sweep() {
 $(context principal-engineer)"
 }
 
+# Every few minutes: for each role Ben has left a comment for, start that
+# role's systemd unit now rather than at its hourly slot. It is the unit the
+# timer starts, so the run is exactly a scheduled one, lock and all.
+#
+# A role is started once per comment, not once per tick: the timestamp of the
+# comment it was last started for is kept in poke-<role>. Otherwise a run that
+# chose not to reply would be started again every tick. That file is only a
+# debounce, so losing it costs at most one extra run.
+cmd_poke() {
+  local r ts seen unit
+  for r in "${AUTHORS[@]}"; do
+    ts=$(latest_feedback "$r")
+    [[ -n $ts ]] || continue
+    seen=$(cat "$AGENT_HOME/poke-$r" 2>/dev/null || true)
+    [[ $ts > $seen ]] || continue
+    unit=$POKE_UNIT_PREFIX$r.service
+    if [[ $DRY_RUN == 1 ]]; then
+      log "dry-run: would start $unit for Ben's comment at $ts"
+      continue
+    fi
+    log "Ben commented on a ${NAME[$r]} PR at $ts; starting $unit"
+    # --no-block: the unit is a oneshot that can run for hours.
+    systemctl --user start --no-block "$unit" || { log "warn: could not start $unit"; continue; }
+    printf '%s\n' "$ts" >"$AGENT_HOME/poke-$r"
+  done
+}
+
 [[ $cmd == status ]] && { cmd_status; exit 0; }
+
+# A poke only probes the lock, never holds it. While any run is going, a unit
+# started now would just skip on the lock and its comment would wait for the
+# hourly slot, so wait instead: the debounce is untouched and the next tick
+# tries again.
+if [[ $cmd == poke ]]; then
+  gh auth status >/dev/null 2>&1 || die "gh is not authenticated"
+  flock -n "$AGENT_HOME/lock" true || exit 0
+  cmd_poke
+  exit 0
+fi
 
 if [[ -z $LOCK_WAIT_S ]]; then
   [[ $cmd == sweep ]] && LOCK_WAIT_S=14400 || LOCK_WAIT_S=0
