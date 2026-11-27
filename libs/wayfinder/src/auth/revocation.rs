@@ -1304,3 +1304,293 @@ mod carried_across_set_auth {
         assert!(router.auth().is_some());
     }
 }
+
+/// What a shell needs from the router to keep the revocation list across a
+/// restart (design 03 §3.1.2): knowing when the list changed, giving stored
+/// records back, and knowing when to do that again.
+#[cfg(test)]
+mod durability {
+    use super::super::testutil::*;
+    use super::*;
+    use crate::CentralRouter;
+    use crate::DEFAULT_BATMAN_ETHER_TYPE;
+    use interfaces::frame::LinkFrame;
+    use wayfinder_auth::Authority;
+    use zerocopy::FromBytes;
+
+    const NOW: Duration = Duration::from_secs(100);
+
+    fn authority() -> Authority {
+        Authority::from_seed(&[1; 32], 0xABCD)
+    }
+
+    /// A router enrolled in `authority`s mesh as node 2, its clock at 100.
+    fn enrolled(authority: &Authority) -> CentralRouter {
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member(authority, 2, mac(2), 100_000));
+        router
+    }
+
+    fn generation(router: &CentralRouter) -> u32 {
+        router
+            .auth()
+            .expect("auth is installed")
+            .revocations_generation()
+    }
+
+    /// An OGM originated and signed by node `n`.
+    fn signed_ogm(authority: &Authority, n: u8) -> ([u8; 512], usize) {
+        let mut peer = member(authority, n, mac(n), 100_000);
+        let (mut buf, len) = bare_ogm(mac(n), 7);
+        let len = peer.augment_ogm(&mut buf, len).expect("augment");
+        (buf, len)
+    }
+
+    fn refuses(router: &mut CentralRouter, authority: &Authority, n: u8) -> bool {
+        let (buf, len) = signed_ogm(authority, n);
+        let auth = router.auth_mut().expect("auth is installed");
+        auth.verify_ogm(&buf[..len]) == OgmVerdict::Rejected
+    }
+
+    /// How many of the next OGMs this router signs carry a revocation.
+    fn floods(router: &mut CentralRouter) -> u32 {
+        let auth = router.auth_mut().expect("auth is installed");
+        let mut count = 0;
+        for seqno in 0..u32::from(REVOKE_FLOOD_BUDGET) * 2 {
+            let (mut buf, len) = bare_ogm(mac(2), seqno);
+            let len = auth.augment_ogm(&mut buf, len).expect("augment");
+            if find_tvlv(&buf[OGM_HDR..len], TvlvType::Revoke).is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn a_new_and_a_superseding_record_each_change_the_generation() {
+        let authority = authority();
+        let mut router = enrolled(&authority);
+        let before = generation(&router);
+
+        assert!(router.ingest_revocation(&authority.revoke(mac(3), 50, 1000), NOW));
+        let added = generation(&router);
+        assert_ne!(added, before);
+
+        assert!(router.ingest_revocation(&authority.revoke(mac(3), 60, 1000), NOW));
+        assert_ne!(generation(&router), added);
+    }
+
+    /// A shell writes flash when the generation moves, so nothing that leaves
+    /// the stored list alone may move it.
+    #[test]
+    fn what_leaves_the_list_alone_leaves_the_generation_alone() {
+        let authority = authority();
+        let other = Authority::from_seed(&[7; 32], 0x1234);
+        let mut router = enrolled(&authority);
+        let record = authority.revoke(mac(3), 50, 1000);
+        assert!(router.ingest_revocation(&record, NOW));
+        let held = generation(&router);
+
+        // A replay, an older record, a forgery and one naming this node.
+        router.ingest_revocation(&record, NOW);
+        router.ingest_revocation(&authority.revoke(mac(3), 40, 1000), NOW);
+        router.ingest_revocation(&other.revoke(mac(4), 50, 1000), NOW);
+        router.ingest_revocation(&authority.revoke(mac(2), 500, 1000), NOW);
+        // Spending the flood budget, and a clock tick that expires nothing.
+        floods(&mut router);
+        router.set_auth_time(NOW, Clocked::At(200));
+
+        assert_eq!(generation(&router), held);
+    }
+
+    #[test]
+    fn pruning_an_expired_record_changes_the_generation() {
+        let authority = authority();
+        let mut router = enrolled(&authority);
+        assert!(router.ingest_revocation(&authority.revoke(mac(3), 50, 1000), NOW));
+        let held = generation(&router);
+
+        router.set_auth_time(NOW, Clocked::At(1000));
+
+        assert_ne!(generation(&router), held);
+    }
+
+    #[test]
+    fn evicting_from_a_full_set_changes_the_generation() {
+        let authority = authority();
+        let kp = Keypair::from_seed(&[2; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 100_000);
+        let mut auth = OgmAuth::<8, 1, 2, 2>::with_capacities(kp, cert, authority.trust_anchor());
+        assert!(auth.ingest_revocation(&authority.revoke(mac(3), 50, 1000)));
+        let full = auth.revocations_generation();
+
+        assert!(auth.ingest_revocation(&authority.revoke(mac(4), 50, 1000)));
+
+        assert_ne!(auth.revocations_generation(), full);
+    }
+
+    /// A count restarted by a new `OgmAuth` could equal the last one saved
+    /// while the list differs, here after a move to another mesh.
+    #[test]
+    fn every_certificate_install_advances_the_generation() {
+        let authority = authority();
+        let other = Authority::from_seed(&[7; 32], 0x1234);
+        let mut router = enrolled(&authority);
+        assert!(router.ingest_revocation(&authority.revoke(mac(3), 50, 1000), NOW));
+        let saved = generation(&router);
+
+        router.set_auth(member(&authority, 2, mac(2), 100_000));
+        let renewed = generation(&router);
+        assert!(renewed > saved);
+
+        router.set_auth(member(&other, 2, mac(2), 100_000));
+        assert!(generation(&router) > renewed);
+    }
+
+    /// Going inert drops the `OgmAuth` and its count with it.
+    #[test]
+    fn the_generation_does_not_restart_after_a_re_admission() {
+        let authority = authority();
+        let mut router = enrolled(&authority);
+        assert!(router.ingest_revocation(&authority.revoke(mac(3), 50, 1000), NOW));
+        let saved = generation(&router);
+        router.ingest_revocation(&authority.revoke(mac(2), 50, 1000), NOW);
+        assert!(router.auth().is_none(), "setup: revoked, so inert");
+
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            60,
+            100_000,
+            Clocked::At(100),
+        ));
+
+        assert!(generation(&router) > saved);
+    }
+
+    #[test]
+    fn a_restored_record_is_enforced() {
+        let authority = authority();
+        let mut router = enrolled(&authority);
+        assert!(!refuses(&mut router, &authority, 3), "control");
+        let before = generation(&router);
+        let stored = [authority.revoke(mac(3), 50, 1000)];
+
+        assert_eq!(router.restore_revocations(&stored, NOW), 1);
+
+        assert!(refuses(&mut router, &authority, 3));
+        assert_ne!(generation(&router), before);
+    }
+
+    /// A route learned between the install and the restore goes with it.
+    #[test]
+    fn restoring_purges_what_was_learned_about_the_revoked_node() {
+        let authority = authority();
+        let mut router = enrolled(&authority);
+        let (ogm, len) = signed_ogm(&authority, 3);
+        let mut bytes = std::vec::Vec::new();
+        bytes.extend_from_slice(Mac::BROADCAST.as_bytes());
+        bytes.extend_from_slice(mac(3).as_bytes());
+        bytes.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes());
+        bytes.extend_from_slice(&ogm[..len]);
+        let frame = LinkFrame::ref_from_bytes(&bytes).expect("frame");
+        let mut tx = [0u8; 1500];
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
+        assert_eq!(router.originator_count(), 1, "setup: node 3 was learned");
+
+        router.restore_revocations(&[authority.revoke(mac(3), 50, 1000)], NOW);
+
+        assert_eq!(router.originator_count(), 0);
+    }
+
+    /// Design 03 §10.6: a few emissions, so a node that crash-looped through
+    /// its flood window does not hold a silent copy, and no Trickle reset.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_restored_record_is_not_a_new_purge() {
+        let authority = authority();
+        let mut router = enrolled(&authority);
+
+        router.restore_revocations(&[authority.revoke(mac(3), 50, 1000)], NOW);
+
+        let auth = router.auth_mut().expect("auth is installed");
+        assert!(!auth.take_trickle_reset_hint());
+        assert_eq!(floods(&mut router), 2);
+        assert!(!logs_contain("ingested new revocation"));
+    }
+
+    #[test]
+    fn restoring_verifies_as_ingest_does() {
+        let authority = authority();
+        let other = Authority::from_seed(&[7; 32], 0x1234);
+        let mut router = enrolled(&authority);
+        let stored = [
+            other.revoke(mac(3), 50, 1000),
+            // Expired at this routers clock of 100.
+            authority.revoke(mac(4), 50, 90),
+        ];
+
+        assert_eq!(router.restore_revocations(&stored, NOW), 0);
+
+        let auth = router.auth().expect("auth is installed");
+        assert_eq!(auth.revocations().count(), 0);
+    }
+
+    /// Waiting for a clock would let a power cut switch enforcement off.
+    #[test]
+    fn a_node_with_no_clock_enforces_what_it_restores() {
+        let authority = authority();
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            0,
+            100_000,
+            Clocked::Unknown,
+        ));
+
+        router.restore_revocations(&[authority.revoke(mac(3), 50, 90)], NOW);
+
+        assert!(refuses(&mut router, &authority, 3));
+    }
+
+    #[test]
+    fn a_router_with_no_auth_state_restores_nothing() {
+        let authority = authority();
+        let mut router = CentralRouter::new(mac(2));
+
+        let restored = router.restore_revocations(&[authority.revoke(mac(3), 50, 1000)], NOW);
+
+        assert_eq!(restored, 0);
+        assert!(router.auth().is_none());
+    }
+
+    #[test]
+    fn installing_auth_on_a_router_without_it_asks_for_a_restore() {
+        let authority = authority();
+        let mut router = CentralRouter::new(mac(2));
+        assert!(!router.take_revocation_restore_needed());
+
+        router.set_auth(member(&authority, 2, mac(2), 100_000));
+        assert!(router.take_revocation_restore_needed());
+        assert!(!router.take_revocation_restore_needed(), "taken once");
+
+        // A renewal carries the list over, so there is nothing to restore.
+        router.set_auth(member(&authority, 2, mac(2), 100_000));
+        assert!(!router.take_revocation_restore_needed());
+
+        router.ingest_revocation(&authority.revoke(mac(2), 50, 1000), NOW);
+        assert!(router.auth().is_none(), "setup: revoked, so inert");
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            60,
+            100_000,
+            Clocked::At(100),
+        ));
+        assert!(router.take_revocation_restore_needed());
+    }
+}
