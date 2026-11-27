@@ -2,10 +2,12 @@
 
 **Status:** Proposed. Grew out of issue #5's still-open "revocation
 re-propagation" question, generalized beyond CA restart to any node restart.
+§3.1 (local persistence, issue #105) was rewritten against the shipped code and
+can be accepted and built on its own; §3.2–§3.7 are unchanged.
 
-**Scope:** `libs/wayfinder-auth` (`RevocationRecord`; the durable-cache trait
-lives in a to-be-designed generic store crate, see Prerequisites),
-`libs/wayfinder/src/auth.rs` (`OgmAuth`: load/save hooks, the reconciliation
+**Scope:** `libs/wayfinder-auth` (`RevocationRecord`, the revocation log's byte
+layout), `libs/wayfinder-driver-core`, the drivers and the boards (§3.1),
+`libs/wayfinder/src/auth/` (`OgmAuth`: restore, change tracking, the reconciliation
 trigger, the peer-catch-up burst + strip-on-re-flood + overhear-and-answer
 path, per-requester rate limiter), `libs/batman/src/wire.rs` (two new routed
 control packets mirroring `CertReq`/`CertReply`, and a new OGM-tail TVLV
@@ -18,16 +20,9 @@ which is retained unchanged as the steady-state propagation path.
 
 **Prerequisites — raised in MR review, not resolved in this document:**
 
-1. **A generic persistent-record-store abstraction, designed separately
-   (proposed as design 04) before §3.1 is implemented.** `RevocationStore`
-   below is written as its own bespoke trait, but this is the *second*
-   near-identical persistence pattern in this codebase (`CaLog` in
-   `wayfinder-server/src/persistence.rs` is the first) — a sign a shared
-   no_std/std abstraction is warranted now rather than letting ad-hoc copies
-   accumulate. §3.1 should be rewritten to build on that shared abstraction
-   once it exists, including retrofitting `CaLog` onto it. This also folds in
-   the embedded flash story more coherently than treating it as a one-off
-   non-goal (§2) — see the updated non-goal bullet.
+1. ~~**A generic persistent-record-store abstraction**~~ — **done.** It is
+   design 04, shipped as `wayfinder-storage`'s `DurableStore` and `Persisted`.
+   §3.1 builds on it.
 2. ~~**`BATADV_*` packet-type constants need to become a proper enum**~~ —
    **done.** They are now the `BatmanPacketType` `#[repr(u8)]` enum in
    `libs/batman/src/wire.rs`, mirroring `TvlvType` (`as_u8()`, plus a
@@ -108,78 +103,160 @@ backstop that alone clears a node's "stale" flag (§3.4, §3.7).
 - **Fine-grained delta/epoch cursors** (a `CaLog` schema migration adding a
   revocation sequence number, letting the CA send only records newer than a
   client-presented watermark). Rejected as unnecessary complexity — see §9.
-- Embedded (flash-backed) `RevocationStore` implementation, **and the
-  bespoke `RevocationStore` trait itself, pending the generic-store design
-  (prerequisite #1, above).** No `embedded-storage` usage exists anywhere in
-  this repo today, and neither embedded bin wires up `OgmAuth` yet. Once the
-  generic store design lands, an embedded revocation-cache backend becomes
-  "just another backend of that store," not a bespoke flash driver written
-  for this feature alone — a materially different (and better) scope than
-  writing a one-off embedded impl here.
 - Any change to the in-mesh flood mechanism (`REVOKE_FLOOD_BUDGET`,
   `MAX_REVOKE_PER_OGM`, `prune_expired`) — it remains the steady-state
   propagation path, unchanged.
 
 ## 3. Design
 
-### 3.1 Local persistence: `RevocationStore`
+### 3.1 Local persistence: the revocation log
 
-**This section is provisional, pending prerequisite #1 (Scope).** The trait
-below sketches the shape this design needs; the actual implementation should
-sit on top of a generic persistent-record-store abstraction shared with
-`CaLog` (a separate design, proposed as 04), not stand alone as a second
-bespoke persistence trait. Treat what follows as "what `RevocationStore`
-needs to be able to do," not a final API to build against.
+**Threat.** A revoked member whose certificate has not expired waits for a node
+to forget the revocation, or makes it forget (cutting power is enough). After
+this slice, a node that held a record and saved it enforces it again after a
+restart. It does **not** help a node that never heard the record (§3.4, §3.7).
 
-A small `no_std` trait in `libs/wayfinder-auth`, next to `RevocationRecord`
-(which already derives `FromBytes`/`IntoBytes`/`Immutable`/`KnownLayout`/
-`Unaligned` — a fixed 92-byte POD struct, so persisting it is raw bytes, no
-serde, no alloc):
+**The list is lost in two ways today.**
 
-```rust
-/// Local durable cache of this node's own revocation enforcement state, so a
-/// restart doesn't erase what it already knew. Not an authoritative source —
-/// see `RevocationRecord`'s docs for the CA-pull reconciliation path that
-/// covers what a restart-persisted cache cannot: revocations issued entirely
-/// during a downtime window.
-pub trait RevocationStore {
-    type Error;
-    /// Load persisted records into `out`, returning how many were read, plus
-    /// the last successful CA-reconciliation instant (0 if never reconciled).
-    fn load(&mut self, out: &mut [RevocationRecord]) -> Result<(usize, u64), Self::Error>;
-    /// Overwrite the persisted set and last-reconciled instant.
-    fn save(&mut self, records: &[RevocationRecord], last_reconciled_unix: u64)
-        -> Result<(), Self::Error>;
-}
+- A restart drops it.
+- A node that is revoked itself goes inert, which drops the whole `OgmAuth`.
+  When it is re-admitted, `set_auth` has no previous list and starts empty.
+
+A certificate install on a running member (an operator's `SetAuth`, or the host
+driver's renewal) does **not** lose it. `set_auth` carries the list into the new
+`OgmAuth` (#134):
+
+- each record is re-verified, so a move to another mesh drops the old mesh's
+  records;
+- a record keeps what is left of its flood budget, asks for no Trickle reset
+  and is not logged as new;
+- a pending self-revocation is carried too, and still latches only if it cancels
+  the new certificate.
+
+#### 3.1.1 What is stored
+
+A **blob of its own**, holding only the other-node records (a record naming this
+node stays in `self_revocation`, design 16). One limit follows: a
+self-revocation that is not yet in force is held only in `OgmAuth`, so a restart
+still forgets this node's copy of it.
+
+```
+version: u8 = 1 | count: u16 (big-endian) | count × RevocationRecord (92 bytes)
 ```
 
-`OgmAuth` takes an `Option<impl RevocationStore>` at construction, loads at
-startup, and calls `save()` after every mutation to `revocations` (new ingest,
-prune-on-expiry) — the same persist-inside-a-mutation shape `CaLog` already uses
-via `mutate_issued`/`mutate_held` in `wayfinder-server/src/persistence.rs`, for
-consistency. `last_reconciled_unix` is written only after a *successful CA-pull*
-completes (§3.4), never on ordinary flood ingestion **nor on a peer answer**
-(§3.7) — those prove one record is known, not that the node's whole view is
-current.
+Encode and decode live in `libs/wayfinder-auth`, `no_std` and heap-free.
+Decoding is strict: an unknown version, or a length that disagrees with `count`,
+is an error. It gets a fuzz target. `floods_left` is not stored.
 
-**What's persisted, deliberately not `floods_left`.** Only the raw
-`RevocationRecord`s and `last_reconciled_unix`. On restore, records are
-re-armed with a small nonzero flood budget (open decision, §10) rather than 0
-— a node that crash-looped through its original flood window would otherwise
-sit on a permanently-silent copy, unable to help a neighbor who also missed
-it, even though the record's signature is still independently valid forever.
+The records are root-signed and re-verified on every load, so editing the store
+cannot forge a revocation. It can remove one, which takes filesystem or flash
+access, and whoever has that already holds the node's seed.
 
-**`std` implementation:** now superseded by prerequisite #1 — this should be
-the same `DurableStore` file backend design 04 defines for `CaLog`, reused
-rather than reimplemented (`persistence.rs`'s `save_atomic`: write a `.tmp`
-sibling, `sync_all` the file, `rename` over the target — note it's a free
-function today, not a `CaLog` method, and it deliberately does *not* `fsync`
-the parent directory, an accepted lower-severity gap per its own doc comment,
-not an oversight to silently "fix" while reusing it).
+| Node | Where | Profile `revoked` | Largest blob |
+|---|---|---|---|
+| host (`wayfinder-tap`) | file beside `runtime_state_path`, suffix `.revocations` | 1024 | 94,211 B |
+| nRF52840, ESP32 | a second A/B page pair (`FlashStore`) | 8 | 739 B |
+| WL55 | a second A/B page pair | 4 | 371 B |
+| STM32F411 | none: it has no durable store | 4 | in memory only |
 
-**Embedded implementation:** out of scope for this design (§2's non-goals);
-the trait is shaped to support an `embedded-storage`-backed flash-sector impl
-later without changing `OgmAuth`'s side of the contract.
+A node with no `runtime_state_path` or no store keeps today's behaviour
+(`Option<S>` = `None`), and says so once at startup.
+
+**Why not a field of the settings file or of `NodeRecord`.**
+
+- A host's 1024 records exceed the settings file's 64 KiB read bound before any
+  JSON overhead.
+- `NodeRecord`'s flags byte is full, so a new field needs a version bump, and
+  `load_or_init_record` treats an unknown version as damage: it erases the
+  record and mints a new seed. A firmware **downgrade** would then destroy the
+  board's identity.
+- A revocation write should not rewrite the page that holds the seed.
+
+The cost is two erase pages: 8 KiB on nRF52840 and ESP32, 4 KiB of the WL55's
+flash. On the nRF boards the new pair goes below the identity pair, which does
+not move. The ESP32's `wayfinder` partition already has unused sectors. **WL55
+flash headroom has not been measured**; if the pair does not fit, that board
+stays in memory only and the gap is documented.
+
+#### 3.1.2 Who does what
+
+The router keeps owning the list and gains no I/O:
+
+- `OgmAuth` counts changes to the list (`revocations_generation`): a new record,
+  a superseded one, an eviction, a prune.
+- `set_auth` carries that count into the new `OgmAuth` and advances it. A count
+  restarted from zero could equal the last one saved while the list differs, for
+  example after a move to another mesh.
+- A restore entry point verifies exactly as `ingest_revocation` does, but arms a
+  small flood budget, requests no Trickle reset and is not logged as new. #134's
+  carry-over already does this with a record's remaining budget, so both share
+  that path.
+- `set_auth` on a router with **no** auth state raises a take-and-clear "restore
+  needed" flag (like `trickle_reset_hint`), so a shell cannot miss such an
+  install.
+
+One synchronous `RevocationLog<S>` in `wayfinder-driver-core` wraps a
+`Persisted` list, so every shell shares the rules. The `Persisted` value is what
+is **on the medium**: a failed save rolls it back, and the difference from the
+router's list stays visible and is retried.
+
+1. **Load** at startup, before the first frame. A missing blob is an empty list.
+2. **Offer** the stored records to the router before the first frame, under
+   whatever `Clocked` posture the node has. It never waits for a clock. A node
+   with no auth state has no anchor to verify against, so its offer happens as
+   soon as auth is installed. The same applies to every later install on a node
+   that had none, including a re-admission after self-revocation.
+3. **Save** when the generation changes, but only **after** the offer (a pending
+   "restore needed" is served first), and **never while the router has no auth
+   state**. Otherwise a node that boots unenrolled, or goes inert, overwrites
+   its list with nothing.
+
+A node that goes inert keeps what was already saved. A change still waiting on
+the write budget (§3.1.4) at that moment is lost with the `OgmAuth`.
+
+**The clock posture.** Waiting for a clock would reopen the power-cut attack
+above: a board can sit at `Clocked::Unknown` after a reboot, enforcing nothing
+it saved and, because of step 3, saving nothing it newly hears. So `Unknown`
+enforces every stored record, which is what `RevocationRecord::cancels_under`
+already does. The cost is that a spent record may be enforced for a while. Even
+then it only refuses what it was aimed at: that MAC's certificates issued no
+later than its `not_before`.
+
+An expired record is refused at offer time if the posture can prove it expired
+(`At` or `AtLeast`). Otherwise the ordinary prune drops it once the clock
+improves. Both reach the medium through step 3. A persisted prune is permanent,
+so a clock that reads too far ahead and is later corrected has lost the record.
+
+#### 3.1.3 Failures
+
+- **Save fails:** the router keeps enforcing the record. The node raises a new
+  `RevocationNotDurable` alarm, logs `warn!` with no record bytes, and retries
+  within the write budget below.
+- **Blob does not decode:** a host refuses to start, as it does for a corrupt
+  settings file. A board must not brick, so it starts with an empty list and
+  raises the alarm (open decision, §10.8).
+- **Power cut during a save:** `DurableStore` yields the old list or the new one.
+
+#### 3.1.4 Flash wear
+
+A replay of a held record changes nothing, so it writes nothing. But when more
+live revocations exist than the profile holds (4 or 8 on boards), each evicted
+record counts as new when it is heard again, and the list churns. The OGM tail
+that carries records is not signed, so captured records can also be replayed on
+purpose. Unbounded, that is one erase per frame.
+
+So saves are budgeted: a **burst of 8**, refilled at **one per 6 hours** (design
+22's checkpoint cadence). Changes inside an empty budget are coalesced into the
+next save. The exposure is the reverse of the usual one: a reboot while the
+budget is empty loses the newest changes.
+
+#### 3.1.5 Order of work
+
+1. Blob encode/decode and its fuzz target (`wayfinder-auth`).
+2. Router: change counter, restore and the "restore needed" flag. The
+   carry-over in `set_auth` already shipped (#134).
+3. `RevocationLog` and the host driver.
+4. Boards.
 
 ### 3.2 Addressing the CA
 
@@ -357,7 +434,8 @@ This is the crux of the CA-pull path, so it gets its own section rather than
 being implied.
 
 **State:** one persisted `u64`, `last_reconciled_unix` (0 = never), living
-alongside the revocation cache in `RevocationStore` (§3.1).
+alongside the revocation cache in the revocation log (§3.1), which takes a new
+blob version for it.
 
 **Staleness predicate.** Once the driver sets a real wall-clock time (mirroring
 `OgmAuth::set_time`'s existing "first real time" semantics — `now_unix == 0`
@@ -651,10 +729,19 @@ payload logging of reply contents beyond metadata.
 
 ## 7. Testing strategy (TDD)
 
-- **Unit — `RevocationStore`**: round-trip save/load including
-  `last_reconciled_unix`; the `std` file impl's atomic-write behavior
-  (crash-mid-write leaves the old file intact), mirroring `CaLog`'s existing
-  tests.
+- **Unit — revocation log (§3.1), red first:**
+  - a revocation survives a restart, through the tick driver's router and
+    through the embedded driver's store;
+  - a node restored under `Clocked::Unknown` refuses the revoked cert;
+  - an expired record is pruned and the prune reaches the store;
+  - a failed save is alarmed, leaves the record enforced, and is retried;
+  - an install that changes the list (a move to another mesh) reaches the
+    store;
+  - a node with no auth state never overwrites a stored list;
+  - a node re-admitted after self-revocation gets its stored list back, and does
+    not save over it first;
+  - a record that fails verification on load is not enforced;
+  - churn past capacity stays within the write budget.
 - **Unit — CA-pull trigger logic**: `stale` computed correctly for
   `last_reconciled == 0`, just-under-threshold, just-over-threshold; the hint
   fires exactly once per staleness detection (take-and-clear, like
@@ -706,10 +793,10 @@ payload logging of reply contents beyond metadata.
 
 ## 8. Migration / versioning
 
-`RevocationStore`'s on-disk schema (the `std` impl) needs its own version byte,
-independent of `CaLog`'s `CURRENT_STATE_VERSION` — different data, different
-lifecycle, don't couple them. The wire packets and the `RevSyncReq` marker carry
-the same `version` field convention already used elsewhere (e.g.
+The revocation log's blob has its own version byte (§3.1.1), independent of
+`CaLog`'s `CURRENT_STATE_VERSION`. It is a new file or page pair, so an upgrade
+starts empty and a downgrade ignores it. The wire packets and the `RevSyncReq`
+marker carry the same `version` field convention already used elsewhere (e.g.
 `REVOKE_VERSION`); a version mismatch is dropped, not crashed on, per this mesh's
 existing all-or-nothing-per-segment convention (see design 02 §4.4 for the same
 posture on a different wire format). The new `RevSyncReq` TVLV is additive: an
@@ -790,15 +877,16 @@ breakage, just no peer catch-up from those nodes.
    re-checked periodically during steady-state or only at boot — the latter is
    simpler; the former is stronger defense against a long-lived partition on a
    node that never restarts.
-6. **Flood budget on restore** (§3.1): restore persisted records with
-   `floods_left` at some small nonzero value (propose 1–2) rather than 0 or the
-   full `REVOKE_FLOOD_BUDGET`.
+6. **Flood budget on restore** (§3.1.2): propose 2, rather than 0 (a node that
+   crash-looped through its flood window would hold a silent copy) or the full
+   `REVOKE_FLOOD_BUDGET`.
 7. **Per-page record cap** (proposed 4, matching `MAX_REVOKE_PER_OGM`) — shared
    by the CA reply and the peer reply; confirm against real on-air budgets once
    this runs on hardware.
-8. **Where the `std` `RevocationStore` impl lives** — superseded by
-   prerequisite #1 (Scope): this is now a question for the generic-store
-   design (04), not this document.
+8. **A board whose revocation blob does not decode** (§3.1.3): propose start
+   empty and alarm. The alternative, staying inert until re-enrolled, fails
+   closed but lets one bad page take a remote relay off the mesh. Also confirm
+   the write budget in §3.1.4 (burst 8, one per 6 hours).
 9. **Sign off on §3.2's on-demand discovery approach** for addressing the CA,
    replacing this document's original static-`ca_mac`-config proposal —
    raised in review as a security-posture trade-off requiring explicit
@@ -813,16 +901,16 @@ breakage, just no peer catch-up from those nodes.
 
 ## 11. Key file map
 
-**Blocked on, in order: design 04 (generic store) landing far enough to know
-`RevocationStore`'s real shape; the `BATADV_*` enum refactor MR (prerequisite
-#2); sign-off on §3.2 (open decision #9).** The file map below assumes both
-land first.
+§3.1 is blocked on nothing but acceptance. The CA-pull half is blocked on
+sign-off of §3.2 (open decision #9).
 
 - `libs/wayfinder-auth/src/revoke.rs` — `RevocationRecord` unchanged (92-byte
-  POD, `Unaligned`); the durable-cache trait now lives wherever design 04
-  lands it, not here.
-- `libs/wayfinder/src/auth.rs` — `OgmAuth`: load-at-construction,
-  save-on-mutation, `last_reconciled_unix`/staleness check, `needs_reconciliation`
+  POD, `Unaligned`); beside it, the log blob's encode/decode (§3.1.1).
+- `libs/wayfinder-driver-core` — `RevocationLog<S>` (§3.1.2–§3.1.4).
+- `libs/wayfinder-driver`, `libs/wayfinder-embedded-driver`, `bins/wayfinder-tap`
+  and the board crates — open the store and call it; `libs/wayfinder-alarm` (and
+  its management-API mapping) for `RevocationNotDurable`.
+- `libs/wayfinder/src/auth/` — `OgmAuth`: restore and change counter (§3.1.2), `last_reconciled_unix`/staleness check, `needs_reconciliation`
   hint (mirror `trickle_reset_hint`), in-flight CA-pull tracking (mirror
   `InFlightCertRequest`/`PendingReply`/`CERT_REQUEST_RETRY_SECS`); the
   `RevSyncReq` emission budget (mirror `floods_left`/`REVOKE_FLOOD_BUDGET` in
