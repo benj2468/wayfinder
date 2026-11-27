@@ -182,14 +182,27 @@ is **on the medium**: a failed save rolls it back, and the difference from the
 router's list stays visible and is retried.
 
 1. **Load** at startup, before the first frame. A missing blob is an empty list.
-2. **Offer** the stored records to the router after the clock is anchored, and
-   again whenever auth is installed on a node that had none.
+2. **Offer** the stored records to the router before the first frame, under
+   whatever `Clocked` posture the node has. It never waits for a clock. A node
+   with no auth state has no anchor to verify against, so its offer happens as
+   soon as auth is installed, and again on every later install on a node that
+   had none.
 3. **Save** when the generation changes, but only **after** the offer, and
    **never while the router has no auth state**. Otherwise a node that boots
    unenrolled, or goes inert, overwrites its list with nothing.
 
-An expired record is refused at offer time (when the node can judge windows) and
-pruned while running; both reach the medium through step 3.
+**The clock posture.** Waiting for a clock would reopen the power-cut attack
+above: a board can sit at `Clocked::Unknown` after a reboot, enforcing nothing
+it saved and, because of step 3, saving nothing it newly hears. So `Unknown`
+enforces every stored record, which is what `RevocationRecord::cancels_under`
+already does. The cost is that a spent record may be enforced for a while. Even
+then it only refuses what it was aimed at: that MAC's certificates issued no
+later than its `not_before`.
+
+An expired record is refused at offer time if the posture can prove it expired
+(`At` or `AtLeast`). Otherwise the ordinary prune drops it once the clock
+improves. Both reach the medium through step 3. A persisted prune is permanent,
+so a clock that reads too far ahead and is later corrected has lost the record.
 
 #### 3.1.3 Failures
 
@@ -220,6 +233,8 @@ budget is empty loses the newest changes.
 2. Router: change counter, restore, carry-over in `set_auth` (fixes #131).
 3. `RevocationLog` and the host driver.
 4. Boards.
+
+Step 2 does not depend on step 1, so #131's fix can ship first on its own.
 
 ### 3.2 Addressing the CA
 
@@ -695,6 +710,7 @@ payload logging of reply contents beyond metadata.
 - **Unit — revocation log (§3.1), red first:**
   - a revocation survives a restart, through the tick driver's router and
     through the embedded driver's store;
+  - a node restored under `Clocked::Unknown` refuses the revoked cert;
   - an expired record is pruned and the prune reaches the store;
   - a failed save is alarmed, leaves the record enforced, and is retried;
   - `set_auth` under the same anchor keeps the list; under another, drops it;
