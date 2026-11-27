@@ -19,12 +19,19 @@ is a round trip.
 ## 2. Goals and non-goals
 
 Goal: on an open mesh, select a path through neighbour N only on evidence that
-N hears this node, and send to N only on an interface where it does.
+N hears this node, and send to N only on an interface where it does. This holds
+on interfaces where this node transmits OGMs (`tx_ogm` on).
 
 Not covered:
 
 - **Lossy asymmetry.** The check is yes or no. A reverse direction that loses
-  90% of frames passes if one in six gets through. TQ is unchanged.
+  90% of frames passes if one in sixteen gets through. TQ is unchanged.
+- **Interfaces with `tx_ogm` off.** This node sends nothing there that could be
+  echoed, so requiring evidence would end the documented "ground station
+  fronting a LoRa mesh" setup (`LinkFeatures`: `tx_ogm` off, `tx_data` on,
+  edge nodes reachable). Such an interface keeps today's behaviour, including
+  the black hole if its link is one way. Only an operator who turns the gate
+  off is exposed.
 - **Forgery.** An open mesh has no authentication, and anyone can send the
   evidence below. This handles radios, not attackers.
 - **Authenticated meshes.** `require_proof` keeps its own gate, and everything
@@ -49,7 +56,7 @@ be A.
 
 Each emission on each interface already takes its own sequence number.
 `on_interface_emitted(k)` pushes that number onto `ring[k]`, a ring of the last
-`MAX_MISSED_ECHOES = 6` numbers sent on interface `k`, when it has changed
+`MAX_MISSED_ECHOES = 16` numbers sent on interface `k`, when it has changed
 since the last push (a suppressed emission pushes nothing).
 
 An echo of seqno `s` found in `ring[k]` proves that A's transmissions on `k`
@@ -63,9 +70,23 @@ reach N, whichever interface the echo arrived on. Store
 - A verification that turns a route on re-runs selection
   (`recompute_all_best`). It does not reset Trickle: A's advertised state has
   not changed.
-- On an interface with `tx_ogm` off, A sends nothing to be echoed. An OGM heard
-  there from N marks N verified on it, which is today's behaviour. Those marks
-  last as long as the path does.
+- On an interface with `tx_ogm` off, an OGM heard there from N marks N *exempt*
+  on it, which counts as verified (§2). The router passes the gate to the engine
+  with the OGM. The mark lasts while any path through N does, and turning
+  `tx_ogm` on at runtime clears that interface's exempt marks.
+
+**Where the evidence lives.** `echoed` is its own table in the engine, keyed by
+neighbour MAC, like `proven`. It is not a field of `OriginatorRecord`: it
+describes a neighbour, not a destination. Evicting an originator, N included,
+leaves it alone, so a re-learned originator is routable at once and a full
+originator table does not reset any verification.
+
+It holds `MAX_ORIGINATORS` entries. An entry has *lapsed* when none of its
+seqnos is still in a ring and it has no exempt mark with a live path. When the
+table is full, a new neighbour replaces a lapsed entry. If none has lapsed, the
+new neighbour is **not admitted** and stays unverified. Evicting a live entry
+instead, as `proven` does, would flap routes on every emission once neighbours
+outnumber entries.
 
 ### 3.3 The relay has to echo before it has a route
 
@@ -80,8 +101,14 @@ OgmEcho (BatmanPacketType 0x0e), 12 bytes, link dst = broadcast
   packet_type u8 | version u8 (6) | orig [u8; 6] | seqno be32
 ```
 
-`orig` and `seqno` are copied from the OGM. It is never relayed, and a receiver that is not `orig` ignores it. It
-teaches no path, no sequence number and no membership.
+`orig` and `seqno` are copied from the OGM. It is never relayed, and a receiver
+that is not `orig` ignores it. It teaches no path, no sequence number and no
+membership, so `rx_ogm` does not gate its receipt.
+
+**Egress.** An echo leaves on **every interface whose `tx_ogm` is on**, as a
+re-flood does (`Egress::Auto` with a broadcast `dst`). The ingress interface is
+not enough: if A reaches N on `k` but N reaches A only on another interface, an
+echo sent back on the ingress one is lost and A never verifies a usable link.
 
 "Not going to re-flood" covers:
 
@@ -92,13 +119,20 @@ teaches no path, no sequence number and no membership.
 | the high-water refuses it (stale, or `orig` rebooted) | sequence number rules |
 | ingress link has `tx_data` off | the router suppresses re-advertisement |
 | ingress link has `rx_ogm` off | the engine never sees the OGM |
+| the stamped re-flood does not fit the reply buffer | oversize drop |
 
 Each record keeps the last seqno echoed, so one direct copy is answered once.
 With `rx_ogm` off there is no record, and each direct OGM gets one echo, which
 is one frame out per frame in.
 
-`OgmEcho` transmits under the `tx_ogm` gate, named in `link_may_tx`. An OGM
-that takes the normal re-flood sends nothing extra.
+`OgmEcho` is named under the `tx_ogm` gate in `link_may_tx`.
+
+**Airtime.** An OGM that takes the normal re-flood sends nothing extra. In the
+other cases a neighbour sends at most one 12-byte payload per `tx_ogm`
+interface per direct OGM. On a shared segment of N nodes that is at most N-1
+echoes per emission and N(N-1) per round, the same order as the re-floods
+already cost. It reaches that bound when echoes replace re-floods (cold start)
+or add to them (every relayed copy arrives first).
 
 ## 4. Compatibility and edge cases
 
@@ -117,16 +151,23 @@ type by its link `dst`; broadcast has no route, so it is consumed.
   through it into the black hole. The fix is complete only once the receiving
   end of each one-way link is upgraded.
 
-**A link turning one-way** is dropped after six emissions on that interface
-without an echo. At `i_max` that is up to `6 × i_max`, the same order as path
-ageing today. Not measured.
+**A link turning one-way** is dropped after sixteen emissions on that interface
+without an echo. At the default `i_max` of 32 s that is up to about 8.5
+minutes, longer than path ageing (six intervals). `main` never drops it. Not
+measured.
 
-**Loss.** Verification needs the OGM and its echo both delivered once in six
-tries. At 50% loss each way, six misses in a row has probability
-`0.75^6 = 0.18` per window, so such a link flaps. Today it is selected steadily
-at a TQ that does not reflect the loss. The implementation PR measures delivery
-over a 50% link before and after, and `MAX_MISSED_ECHOES` is the constant to
-raise if it is worse.
+**Loss.** Verification needs the OGM and its echo both delivered once in
+sixteen tries. At 50% independent loss each way, sixteen misses in a row has
+probability `0.75^16 = 0.01` per window. A window of six would give 0.18 and a
+flapping link, which is why the constant is not `MAX_MISSED_OGMS`. This is
+arithmetic; burst loss would be worse.
+
+**Acceptance bar for the implementation PR.** Two open-mesh nodes, one link
+losing 50% independently each way, a unicast stream, 40 seeds, `main` and the
+branch on the same seeds, counted over the same window starting 120 s after
+cold start. It passes if mean delivery on the branch is **at least 0.95 times**
+`main`'s. If it fails, the PR does not merge: this doc is revised first, and the
+implementer does not retune the constant.
 
 **Configurations.** `tx_ogm: false` is handled in §3.2, `rx_ogm: false` and
 `tx_data: false` in §3.3. With both OGM gates off no paths exist, as today.
@@ -135,9 +176,9 @@ raise if it is worse.
 state an unproven one is in on an authenticated mesh.
 
 **Footprint.** `echoed` is a sidecar table of at most `MAX_ORIGINATORS` entries
-of `MAX_INTERFACES` sequence numbers, plus the rings. By arithmetic, not
-measurement: about 5 KB at 128 originators and 8 interfaces, about 300 B at 16
-and 2. The implementation PR reports `size_of::<CentralRouter>` per profile and
+of `MAX_INTERFACES` sequence numbers and two interface bitmasks (held, exempt),
+plus the rings. By arithmetic, not measurement: about 6 KB at 128 originators
+and 8 interfaces, about 400 B at 16 and 2. The implementation PR reports `size_of::<CentralRouter>` per profile and
 runs `just stack-budget` for the WL55. If it does not fit, `u16` emission
 counts halve it.
 
@@ -157,12 +198,26 @@ every 10 ms sample from 120 s to 600 s. The one-way link delivers only
 | filter + design 29 relay rule, no echo | 0/40 | 0/40 |
 | filter + design 29 relay rule + echo | 40/40 | 40/40 |
 
+**Why the filter alone fails** (read from the code and design 29 §2; the
+prototype only counted the outcome). `field` hears `hq` directly and, under
+today's relay rule, re-floods that copy with the direct path's TQ and
+`PrevSender = hq`, although the filter stops `field` itself using that path.
+`r3` has verified `field`, prefers this offer, and routes to `hq` through
+`field`. `r3`'s own re-floods then carry `PrevSender = field`, which `field`
+drops (Rule 1b), so `field` never gets a path through `r3` and has no route to
+`hq` at all.
+
+So this design needs a relay never to advertise a path it would not use. If
+design 29 were rejected, its replacement would have to do that: withhold the
+re-flood when `next_hop` is `None`, and otherwise stamp and clamp from the
+selected path, not from the copy just heard.
+
 Cold start to a two-way route: median 810 ms, max 1000 ms on `main`; median
 1520 ms, max 1810 ms with the full design. Frames sent from 120 s were the same
 (999 and 998-999 per seed).
 
 The prototype differs from §3: the echo was a flagged OGM, not `OgmEcho`; a
-verification expired after a fixed 60 s, not by the ring; one interface only;
+verification expired after a fixed 60 s, not by a ring of sixteen; one interface only;
 and no echo for duplicates or gated links. The sim in #136 was not re-run.
 
 **Test cost.** With the prototype enabled, 59 of 233 `batman` library tests
@@ -202,9 +257,17 @@ Tests, each failing first:
 - two engines on a one-way link never select it, and a two-way pair does;
 - a cold chain converges (guards the deadlock);
 - an echo of an interface-0 seqno does not verify interface 1;
-- verification lapses after six unechoed emissions;
+- verification lapses after `MAX_MISSED_ECHOES` unechoed emissions;
+- an echo goes out on every `tx_ogm` interface, not only the ingress one;
+- evicting and re-learning an originator keeps its neighbour verified;
+- a full evidence table replaces only a lapsed entry;
+- a `tx_ogm`-off interface exempts, and turning the gate on ends that;
 - each row of the §3.3 table produces one `OgmEcho`;
 - an authenticated engine sends none and ignores any received.
+
+The TTL check names the emitted TTL as a constant (`EMIT_TTL`) and compares with
+`EMIT_TTL - 1`, in code and tests. The delivery measurement in §4 is part of the
+implementation PR.
 
 Files: `libs/batman/src/engine.rs` (`handle_ogm`, `select_path`,
 `on_interface_emitted`), `libs/batman/src/wire.rs`, `libs/wayfinder/src/lib.rs`
