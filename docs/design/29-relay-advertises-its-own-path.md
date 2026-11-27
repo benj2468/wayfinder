@@ -243,7 +243,62 @@ assume the old behaviour:
 - `test_revocation_floods_and_shuns_node` expects an authenticated line of three
   to converge in one OGM round. It needs a second.
 
-Not measured: lazy distribution in the sim, OGM airtime and the benchmarks.
+Not measured: lazy distribution in the sim and the benchmarks.
+
+### Over-the-air cost
+
+**B sends more on redundant meshes.** The frame layout and size do not change,
+and each node still re-floods an OGM at most once. What rises is how often
+nodes originate: re-floods per originated OGM are the same as on `main` (11.0
+on the 3x4 grid, about 48 on the 7x7), so the extra traffic is extra
+originations. That points to more Trickle resets; what triggers them has not
+been traced.
+
+Measured on `main` at `d86abd6f`. **D** is the narrower rule of §8: B's
+withholding and clamp, with `PrevSender` left as `frame.src`. The grids are
+those of `failover.py` (3x4, 200/2000 ms Trickle, seeds 0-9) and `scale.py`
+(7x7, 1/10 s, seeds 0-2), with no data traffic. Figures are everything the
+nodes transmit, per node per second, as frames / frame bytes (no PHY overhead).
+
+Long steady window (3x4: 60-600 s; 7x7: 60-300 s):
+
+| mesh | `main` | B | D |
+|---|---|---|---|
+| 3x4 open | 7.91 / 326 | 8.08 / 333 (+2%) | 7.91 / 326 (0%) |
+| 3x4 authenticated | 12.48 / 2379 | 12.71 / 2439 (+3%) | 12.49 / 2379 (0%) |
+| 7x7 open | 6.64 / 277 | 7.29 / 305 (+10%) | 6.64 / 277 (0%) |
+| 7x7 authenticated | 7.83 / 1851 | 8.70 / 2086 (+13%) | 8.23 / 1960 (+6%) |
+
+B, change in bytes against `main` around start-up and a failure (3x4: seeds
+0-9; 7x7: seeds 0-2; one relay off at 60 s, back at 120 s). D was not measured
+in these windows.
+
+| mesh | 0-20 s | 20-60 s | 60-180 s |
+|---|---|---|---|
+| 3x4 open | +24% | +5% | +12% |
+| 3x4 authenticated | +19% | +4% | +7% |
+| 7x7 open | +43% | +28% | +12% |
+| 7x7 authenticated | +49% | +41% | +18% |
+
+Where the loop of §1 exists, B saves far more than it costs. On the
+authenticated one-way chain, with `field -> hq` at 10 packets/s, each node
+sends 110.7 frames / 8444 bytes per second on `main` (and delivers nothing),
+against 18.1 / 2648 under B (delivering everything).
+
+D on the other measurements, authenticated:
+
+| measurement | `main` | B | D |
+|---|---|---|---|
+| §1 one-way link, seeds 0-39, lowest delivery | 0.00 | 1.00 | 1.00 |
+| wormhole 500 ms, seeds 0-4 | 1.00 | 1.00 | 1.00 |
+| wormhole 800 ms | 1.00 | 0.90-0.91 | 1.00 |
+| wormhole 1000-1500 ms | 0.00 | 1.00 | 1.00 |
+| wormhole 2000 ms | 1.00 | 1.00 | 1.00 |
+| failover, no keep-alives, mean / max (s) | 2.85 / 5.3 | 3.54 / 5.2 | 3.57 / 5.2 |
+| failover, `keepalive_ms=250`, mean / max (s) | 0.54 / 0.8 | 0.51 / 0.7 | 0.49 / 0.8 |
+
+Under D, `test_red_team.py` and `test_wormhole.py` pass (64 tests), and the
+same six tests fail as under B. Cold-start times were not measured for D.
 
 ## 7. Observability
 
@@ -268,6 +323,17 @@ node cannot tell one from an ordinary second path.
 - **Re-flood only copies from the selected next hop** (batman-adv's rule). Also
   needs that second field, and during failover the relay stays silent until it
   switches, while its downstream neighbours age the route out.
+- **D: keep `PrevSender = frame.src`; add only the withholding and the clamp.**
+  It fixes every case measured in §6, including 800 ms, and costs less airtime.
+  What it gives up is the second goal of §3: the `via` neighbour is not told
+  that the relay's route runs through it, so it records a path back through the
+  relay. The clamp makes that path worse than the neighbour's own, but the
+  neighbour can still fall back to it when its own path dies, as it can today.
+  That would be a two-node loop until the path ages out. It is an argument from
+  the code; no measured scenario shows it. §10 puts the choice to Ben.
+- **Name `via` only when `frame.src` is unproven.** Measured the same as D on
+  the one-way link, the wormhole latencies and the authenticated grids. It adds
+  a condition for no measured gain over D.
 - **A second `PrevSender` record naming `via`.** Keeps X protected as today, at
   10 more bytes on every such OGM, and old receivers read only the first.
 - **Per-originator instead of per-interface sequence numbers.** Would remove the
@@ -303,15 +369,40 @@ measured in the same way.
    recovers, and with and without keep-alives the worst `recovered_s` is no
    more than 0.2 s above `main`'s. The PR reports the mean and the cold-start
    table beside `main`'s.
+6. **Airtime**, the long steady windows of §6: no row's frames or bytes exceed
+   the accepted design's column (B or D) by more than 2% of `main`'s.
 
-Accepting this design accepts the two costs measured in §6: a few hundred
+Accepting this design accepts the costs measured in §6: a few hundred
 milliseconds of cold start, and a slower *mean* failover on an authenticated
 mesh without keep-alives (3.5 s against 2.9 s; the worst case is no higher). The
 recommendation is to accept both: they are bounded, and what they buy is a
 mesh that a single one-way link otherwise cuts permanently. The alternative is
 to hold the design until the failover cost is traced.
+The airtime cost depends on the choice in §10.
 
-## 10. Key file map
+## 10. Decision for Ben: B or D
+
+§2 describes B. The airtime measurements were taken after it was written, and
+they change the recommendation.
+
+| | B (§2) | D (§8) |
+|---|---|---|
+| fixes #120 and the §1 loop in every measured case | yes, but 0.90 at 800 ms | yes |
+| steady airtime, open mesh | up to +10% | unchanged |
+| steady airtime, authenticated mesh | up to +13% | up to +6% |
+| tells the `via` neighbour not to route back | yes | no, as today |
+
+**Recommendation: D.** It is the smaller change, and B's extra protection did
+not show in any measurement, while its airtime cost did, on the open meshes
+that gain least from this fix. Choose B if ruling out the two-node fallback
+loop by construction is worth that airtime; the extra originations should then
+be traced first.
+
+If D is chosen, §2 to §5 and the tests of §11 are rewritten for it before this
+design is marked Accepted: `PrevSender` keeps its meaning, and item 3 of §9
+(the 800 ms trace) is dropped.
+
+## 11. Key file map
 
 - `libs/batman/src/engine.rs`: `handle_ogm`, the `is_new_seqno && ogm.ttl > 1`
   block; Rule 1b's comment.
