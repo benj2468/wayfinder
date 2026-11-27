@@ -262,15 +262,27 @@ run_agent() { # <role> <worktree> <model> <budget> <task>
   fi
   # The devShell hook prints to stdout, so the transcript is parsed leniently
   # (`fromjson?`) below.
+  #
+  # No MCP at all. Left alone, a headless session loads Ben's whole MCP setup:
+  # his plugins' servers and his claude.ai connectors (Gmail, Drive, Calendar,
+  # Docs). That is far too much reach for an unattended agent in auto mode.
+  # `--strict-mcp-config` with an empty config drops every server, connectors
+  # included. The env var drops the connectors on its own as well, in case a
+  # future CLI changes what "strict" covers.
   (cd "$wt" && "${SCOPE[@]}" nix develop "$wt" --command \
+    env ENABLE_CLAUDEAI_MCP_SERVERS=false \
     timeout --kill-after=60 "$RUN_TIMEOUT" \
     claude -p "$task" \
     --append-system-prompt "$sys" \
     --model "$model" \
     --permission-mode "$PERMISSION_MODE" \
     --settings "$AGENTS/settings.json" \
+    --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
     --max-budget-usd "$budget" \
     --output-format stream-json --verbose) >"$out.jsonl" 2>"$out.stderr" || status=$?
+  local mcp
+  mcp=$(jq -rR 'fromjson? | select(.type == "system" and .subtype == "init") | [.mcp_servers[]?.name] | join(", ")' "$out.jsonl" 2>/dev/null | head -1)
+  [[ -z $mcp ]] || log "WARN: $role session loaded MCP servers despite --strict-mcp-config: $mcp"
   LAST_RESULT=$(jq -rR 'fromjson? | select(.type == "result") | .result // empty' "$out.jsonl" 2>/dev/null |
     grep -E '^RESULT:' | tail -1 || true)
   local cost
@@ -391,7 +403,7 @@ review_cycle() { # <pr>
 fix_first() { # <pr>… → the same PRs, bug fixes (title `fix…`) first
   local pr
   for pr in "$@"; do
-    gh pr view "$pr" -R "$REPO" --json title --jq '"\(if (.title | test("^fix")) then 0 else 1 end) \(.number)"'
+    gh pr view "$pr" -R "$REPO" --json number,title --jq '"\(if (.title | test("^fix")) then 0 else 1 end) \(.number)"'
   done | sort -n -k1,1 -k2,2 | cut -d' ' -f2
 }
 
