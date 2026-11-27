@@ -65,7 +65,9 @@ disk, so a crashed or killed run loses nothing, and the next run picks up
 where it stopped.
 
 **`needs-ben` is the off switch for a PR.** Remove the label and the PR goes
-back into the loop.
+back into the loop with a fresh cycle: rounds and restarts are counted only
+from the last time `needs-ben` was removed, so a PR stopped by the round cap is
+reviewed again instead of being escalated straight back.
 
 The script owns every label. The agents own only content: code, comments and
 reviews.
