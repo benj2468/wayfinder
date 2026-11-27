@@ -64,6 +64,18 @@ impl<
     /// recorded — `false` for an invalid record or one already known — so a
     /// caller can flood it exactly once and avoid amplification loops.
     pub fn ingest_revocation(&mut self, record: &RevocationRecord) -> bool {
+        self.ingest(record, None)
+    }
+
+    /// [`ingest_revocation`](Self::ingest_revocation), for a record that is
+    /// either arriving or being carried over from a replaced state.
+    ///
+    /// `carried_floods_left` is `None` for an arrival, which is announced in the
+    /// log and gets a full flood budget. `Some` is a record this node already
+    /// held: it keeps that budget and is not announced again.
+    fn ingest(&mut self, record: &RevocationRecord, carried_floods_left: Option<u8>) -> bool {
+        let arrival = carried_floods_left.is_none();
+        let floods_left = carried_floods_left.unwrap_or(REVOKE_FLOOD_BUDGET);
         // Verification takes the clock: an already-expired record is refused by
         // the anchor itself (`AuthError::Expired`), so this loop never has to
         // remember to check the half of validity that bounds the set's size. A
@@ -116,11 +128,13 @@ impl<
                 .self_revocation
                 .is_some_and(|held| held.not_before.get() >= record.not_before.get());
             if !known {
-                tracing::error!(
-                    node_mac = ?Mac(record.node_mac),
-                    not_before = record.not_before.get(),
-                    "auth: this node's mesh membership has been revoked"
-                );
+                if arrival {
+                    tracing::error!(
+                        node_mac = ?Mac(record.node_mac),
+                        not_before = record.not_before.get(),
+                        "auth: this node's mesh membership has been revoked"
+                    );
+                }
                 // A later instant supersedes a held record; an earlier one must
                 // not pull the arming instant backwards, which would arm this
                 // node early and black-hole the peers still routing through it.
@@ -155,21 +169,25 @@ impl<
             // re-arming the flood budget so the mesh learns of it.  That cannot
             // loop: `not_before` only ever increases here, so each re-flood is
             // driven by a record no peer has seen.
-            tracing::info!(
-                ?record,
-                "auth: superseding a revocation with a later instant"
-            );
+            if arrival {
+                tracing::info!(
+                    ?record,
+                    "auth: superseding a revocation with a later instant"
+                );
+            }
             slot.record = *record;
-            slot.floods_left = REVOKE_FLOOD_BUDGET;
+            slot.floods_left = floods_left;
             self.evict_neighbor(mac);
             self.trickle_reset_hint = true;
             return true;
         }
         let known = KnownRevocation {
             record: *record,
-            floods_left: REVOKE_FLOOD_BUDGET,
+            floods_left,
         };
-        tracing::info!(?record, "auth: ingested new revocation");
+        if arrival {
+            tracing::info!(?record, "auth: ingested new revocation");
+        }
         if self.revocations.push(known).is_err() {
             // Set full.  Prefer evicting an already-expired entry (passive expiry
             // covers it); otherwise overwrite the most-quiescent live entry
@@ -192,6 +210,30 @@ impl<
         // promptly (set last, so only a genuinely new record triggers it).
         self.trickle_reset_hint = true;
         true
+    }
+
+    /// Take over the revocations `prev` held, so installing a certificate does
+    /// not forget who was revoked.
+    ///
+    /// Every record goes back through the same checks as
+    /// [`ingest_revocation`](Self::ingest_revocation), so it is verified against
+    /// *this* state's trust anchor: a move to another mesh drops the old mesh's
+    /// records. A pending self-revocation is offered the same way, and latches
+    /// only if it cancels the certificate this state runs under, so a
+    /// re-admission sheds it.
+    ///
+    /// A carried record is not a new purge. It keeps what was left of its flood
+    /// budget, asks for no Trickle reset and is not announced in the log again.
+    pub(crate) fn adopt_revocations(&mut self, prev: &Self) {
+        let reset_hint = self.trickle_reset_hint || prev.trickle_reset_hint;
+        for known in &prev.revocations {
+            self.ingest(&known.record, Some(known.floods_left));
+        }
+        if let Some(record) = prev.self_revocation.as_ref() {
+            // A self-revocation is never flooded, so it has no budget.
+            self.ingest(record, Some(0));
+        }
+        self.trickle_reset_hint = reset_hint;
     }
 
     /// Whether `cert` is currently cancelled by a known revocation: a record
@@ -1089,5 +1131,176 @@ mod tests {
         let record = authority.revoke(mac(2), 50, 1000); // not_after 1000 < now 2000
         assert!(!b.ingest_revocation(&record));
         assert_eq!(b.revoked_macs().count(), 0);
+    }
+}
+
+/// Installing a certificate must not forget who was revoked (issue #131).
+///
+/// Driven through [`CentralRouter::set_auth`](crate::CentralRouter::set_auth),
+/// the call an operator's `SetAuth` and a host's own certificate renewal both
+/// end in.
+#[cfg(test)]
+mod carried_across_set_auth {
+    use super::super::testutil::*;
+    use super::*;
+    use crate::CentralRouter;
+    use wayfinder_auth::Authority;
+
+    /// Whether the router's next OGM still carries a revocation record.
+    fn next_ogm_floods_a_revocation(router: &mut CentralRouter, seqno: u32) -> bool {
+        let own = mac(2);
+        let (mut buf, len) = bare_ogm(own, seqno);
+        let auth = router.auth_mut().expect("auth is installed");
+        let len = auth.augment_ogm(&mut buf, len).expect("augment");
+        find_tvlv(&buf[OGM_HDR..len], TvlvType::Revoke).is_some()
+    }
+
+    #[test]
+    fn a_revoked_peer_stays_refused_after_a_certificate_install() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member(&authority, 2, mac(2), 1000));
+        let record = authority.revoke(mac(3), 50, 1000);
+        assert!(router.ingest_revocation(&record, Duration::from_secs(100)));
+
+        // The renewed certificate, same mesh.
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            90,
+            2000,
+            Clocked::At(100),
+        ));
+
+        let auth = router.auth_mut().expect("auth is installed");
+        assert_eq!(auth.revocations().count(), 1);
+        let mut peer = member(&authority, 3, mac(3), 1000);
+        let (mut buf, len) = bare_ogm(mac(3), 7);
+        let len = peer.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(auth.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+    }
+
+    #[test]
+    fn a_move_to_another_mesh_drops_the_old_meshs_records() {
+        let old = Authority::from_seed(&[1; 32], 0xABCD);
+        let new = Authority::from_seed(&[7; 32], 0x1234);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member(&old, 2, mac(2), 1000));
+        assert!(router.ingest_revocation(&old.revoke(mac(3), 50, 1000), Duration::from_secs(100)));
+
+        router.set_auth(member(&new, 2, mac(2), 1000));
+
+        let auth = router.auth().expect("auth is installed");
+        assert_eq!(auth.revocations().count(), 0);
+    }
+
+    /// A renewal is not a new purge: the record keeps what is left of its
+    /// flood budget, neither silenced nor re-armed.
+    #[test]
+    fn a_certificate_install_keeps_the_remaining_flood_budget() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member(&authority, 2, mac(2), 1000));
+        let record = authority.revoke(mac(9), 50, 1000);
+        assert!(router.ingest_revocation(&record, Duration::from_secs(100)));
+        let spent = 2;
+        for seqno in 0..spent {
+            assert!(next_ogm_floods_a_revocation(&mut router, seqno));
+        }
+
+        router.set_auth(member(&authority, 2, mac(2), 1000));
+
+        for seqno in spent..u32::from(REVOKE_FLOOD_BUDGET) {
+            assert!(
+                next_ogm_floods_a_revocation(&mut router, seqno),
+                "emission {seqno} should still carry the revocation"
+            );
+        }
+        assert!(!next_ogm_floods_a_revocation(&mut router, 99));
+    }
+
+    /// A revocation of *this* node that is latched but not yet in force must
+    /// not be shed by installing a certificate it cancels.
+    #[test]
+    fn a_pending_self_revocation_survives_a_certificate_install() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let cert_issued_at_zero =
+            || member_issued_at(&authority, 2, mac(2), 0, 100_000, Clocked::At(100));
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(cert_issued_at_zero());
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, Duration::from_secs(100));
+
+        router.set_auth(cert_issued_at_zero());
+
+        router.set_auth_time(Duration::from_secs(500), Clocked::At(500));
+        let mut tx = [0u8; 1500];
+        router.poll(Duration::from_secs(500), &mut tx);
+        assert!(router.take_self_revocation().is_some());
+    }
+
+    /// Carried records are not news. An operator reading the log after a
+    /// routine renewal must see each purge, and this node's own revocation,
+    /// announced once: when it arrived.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_certificate_install_does_not_announce_carried_records_again() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let cert_issued_at_zero =
+            || member_issued_at(&authority, 2, mac(2), 0, 100_000, Clocked::At(100));
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(cert_issued_at_zero());
+        let now = Duration::from_secs(100);
+        assert!(router.ingest_revocation(&authority.revoke(mac(9), 50, 100_000), now));
+        router.ingest_revocation(&authority.revoke(mac(2), 500, 100_000), now);
+
+        router.set_auth(cert_issued_at_zero());
+
+        logs_assert(|lines: &[&str]| {
+            for message in [
+                "ingested new revocation",
+                "mesh membership has been revoked",
+            ] {
+                let count = lines.iter().filter(|l| l.contains(message)).count();
+                if count != 1 {
+                    return Err(format!("{message:?} logged {count} times, expected once"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// The control: a re-admission, a certificate issued after the record's
+    /// instant, is not cancelled by the pending record.
+    #[test]
+    fn a_pending_self_revocation_does_not_follow_a_re_admission() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            0,
+            100_000,
+            Clocked::At(100),
+        ));
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, Duration::from_secs(100));
+
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            600,
+            100_000,
+            Clocked::At(700),
+        ));
+
+        router.set_auth_time(Duration::from_secs(700), Clocked::At(700));
+        let mut tx = [0u8; 1500];
+        router.poll(Duration::from_secs(700), &mut tx);
+        assert!(router.take_self_revocation().is_none());
+        assert!(router.auth().is_some());
     }
 }

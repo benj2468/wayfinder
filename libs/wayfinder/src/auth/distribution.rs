@@ -501,10 +501,12 @@ impl<
     /// cert-cache churn, and a mesh that is churning would read as idle for a
     /// full decay window each time a certificate is installed.
     ///
-    /// The distinction to keep if more state is added here: everything else
-    /// `set_auth` discards is *scoped to the credential* and is genuinely stale
+    /// The distinction to keep if more state is added here: what `set_auth`
+    /// discards should be *scoped to the credential*, and so genuinely stale
     /// under a new one. A count of frames this node put on the wire is not — it
-    /// is node observability that happens to live here.
+    /// is node observability that happens to live here. Neither is the
+    /// revocation list, which [`adopt_revocations`](Self::adopt_revocations)
+    /// carries.
     pub(crate) fn adopt_control_rates(&mut self, prev: &Self) {
         self.cert_req_tx_rate = prev.cert_req_tx_rate;
         self.cert_reply_tx_rate = prev.cert_reply_tx_rate;
