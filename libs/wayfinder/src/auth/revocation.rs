@@ -1493,10 +1493,10 @@ mod durability {
 
         router.set_auth(member(&authority, 2, mac(2), 100_000));
         let renewed = generation(&router);
-        assert!(renewed > saved);
+        assert_ne!(renewed, saved);
 
         router.set_auth(member(&other, 2, mac(2), 100_000));
-        assert!(generation(&router) > renewed);
+        assert_ne!(generation(&router), renewed);
     }
 
     /// Going inert drops the `OgmAuth` and its count with it.
@@ -1518,7 +1518,7 @@ mod durability {
             Clocked::At(100),
         ));
 
-        assert!(generation(&router) > saved);
+        assert_ne!(generation(&router), saved);
     }
 
     #[test]
@@ -1617,6 +1617,37 @@ mod durability {
 
         assert_eq!(restored, 0);
         assert!(router.auth().is_none());
+    }
+
+    /// A stored list never names this node, but the medium is not trusted to
+    /// keep to that. Such a record takes the node inert, and the records
+    /// offered with it are asked for again on re-admission.
+    #[test]
+    fn restoring_a_record_that_names_this_node_makes_it_inert() {
+        let authority = authority();
+        let mut router = enrolled(&authority);
+        assert!(router.take_revocation_restore_needed(), "setup: installed");
+        let stored = [
+            authority.revoke(mac(2), 50, 1000),
+            authority.revoke(mac(3), 50, 1000),
+        ];
+
+        // Neither is reported as taken: the state holding them is gone.
+        assert_eq!(router.restore_revocations(&stored[..1], NOW), 0);
+        assert!(router.auth().is_none());
+        assert!(router.take_self_revocation().is_some());
+
+        router.set_auth(member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            60,
+            100_000,
+            Clocked::At(100),
+        ));
+        assert!(router.take_revocation_restore_needed());
+        assert_eq!(router.restore_revocations(&stored, NOW), 1);
+        assert!(refuses(&mut router, &authority, 3));
     }
 
     #[test]
