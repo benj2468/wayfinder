@@ -94,9 +94,32 @@ file is Ben's to edit.
 - Order: model it in the sim first (1.3) → design doc → WL55 implementation
   validated by HIL (Ben).
 
+## Security (lane: security-engineer)
+
+`type::security` and bug issues in the lane come first (`rules.md`): #105,
+persisting the revocation list, outranks everything below.
+
+- [ ] **S.1 Design 27 §10 gate spike, part 1: the AEAD.**
+  ChaCha20-Poly1305 with the 8-byte-ICV construction, pinned to RFC 8439
+  vectors. Its flash cost and cycles/byte in `wayfinder-bench` on
+  `thumbv7em-none-eabihf` and `thumbv7em-none-eabi` (the WL55 image). The
+  bench is out of lane: keep it to the measurement.
+- [ ] **S.2 Gate spike, part 2: fragment counts with the overhead.** Extend
+  `extended_format_collapses_realistic_ogm_fragment_counts`
+  (`libs/blue/src/frame.rs`), and add the equivalents for `ieee802154` and
+  `lora-link`, covering every message §10 lists at SecTAG versions 0 and 1.
+  Then apply §10's decision rule, and write the verdict into design 27. Ben
+  decides whether the gate passes.
+- [ ] **S.3 `wayfinder-linksec`** (only after Ben passes the gate): SecTAG,
+  AEAD, replay window, the exchange messages and their state machine, with
+  §11's tests and fuzz targets. Creating the crate needs Ben's OK on the
+  workspace edit.
+- [ ] **S.4 Red-team battery upkeep:** a case for each new attack primitive
+  the ml-engineer builds (insider forwarding, wormhole, …). Keep every
+  verdict backed by a test.
+
 ## Later roles (not yet running)
 
 | Role | Lane | Notes |
 |---|---|---|
-| Security engineer | `libs/wayfinder-auth`, future `wayfinder-linksec`, `sim/scenarios/red_team.py` | Starts at design 27 §10 gate; Ben reviews anything touching keys or the wire |
 | Firmware engineer | `bins/wayfinder-*`, radio drivers | Board portability (shared driver crates, a `just new-board` scaffold, bring-up doc), fitting small parts (design 28), per-board benches; radio-timing changes need Ben's HIL run |
