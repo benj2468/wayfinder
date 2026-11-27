@@ -31,7 +31,9 @@ only Ben merges.
      scenarios are seeded and deterministic.
    - **Docs:** every public item is documented.
    - **Logging:** `tracing` only, following the rules on levels and payloads.
-   - **Lane:** files stay within the author's lane, and shared crates are not
+   - **Lane:** the task message lists any files outside the author's lane.
+     Judge whether each is strictly needed and justified; the PR waits for
+     Ben either way, so say what he should look at. Shared crates are not
      touched without an accepted design doc.
    - **Scope:** one logical change. Add the `mr-review` skeptic's YAGNI and
      over-engineering pass.

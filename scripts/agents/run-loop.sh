@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Orchestrates wayfinder's agent team on this machine.
 #
-#   run-loop.sh ml       ML run (respond to reviews, then one task), then the
-#                        principal review loop on every agent PR it produced
-#   run-loop.sh review   only the review loop, over agent PRs awaiting it
-#   run-loop.sh sweep    the principal engineer's daily sweep
-#   run-loop.sh status   print agent PRs and their loop state; changes nothing
+#   run-loop.sh work <role>  one authoring run for <role> (ml, security): the
+#                            review loop, then that role's work run, then the
+#                            review loop again (`ml` is an alias for `work ml`)
+#   run-loop.sh review       only the review loop, over every agent PR
+#   run-loop.sh sweep        the principal engineer's daily sweep
+#   run-loop.sh status       agent PRs and their loop state; changes nothing
 #
 # The script owns all orchestration state, and that state lives on GitHub, so
 # every run is stateless and a crash loses nothing:
-#   agent::ml                  PR authored by the ML agent (branch agent/ml/*)
+#   agent::<role>              PR authored by that role (branch agent/<role>/*)
 #   agent::needs-review        waiting for the principal
 #   agent::changes-requested   waiting for the author
 #   agent::approved            principal is satisfied; waiting for Ben
-#   needs-ben                  loop stopped (round cap, out of lane, failure);
-#                              remove the label to hand the PR back to the loop
+#   needs-ben                  loop stopped, or Ben must look before merge
+#                              (round cap, out of lane, keys/wire, failure).
+#                              Remove it to hand the PR back to the loop.
 # A review round is one principal review carrying an `<!-- agent-review … -->`
 # marker. GitHub cannot record a real verdict, because every agent runs as
 # Ben's account, so the marker carries it.
@@ -23,7 +25,7 @@
 # never from a working tree: an agent cannot change its own rules until Ben
 # merges the change. Set AGENT_REF=HEAD to try a local commit first.
 #
-# See scripts/agents/README.md for setup and the cron lines.
+# See scripts/agents/README.md for setup and scheduling.
 set -euo pipefail
 
 # ---------------------------------------------------------------- config
@@ -31,41 +33,69 @@ set -euo pipefail
 : "${AGENT_REF:=origin/main}"           # where prompts + this script come from
 : "${AGENT_BASE:=origin/main}"          # what agent worktrees start from
 : "${AGENT_HOME:=$HOME/.local/state/wayfinder-agents}"
-: "${WT_BASE:=$HOME/sources/wt-agent}"  # → wt-agent-ml, wt-agent-principal
-: "${ML_MODEL:=sonnet}"                 # CLAUDE.md: Sonnet builds,
-: "${PRINCIPAL_MODEL:=opus}"            #            Opus reviews
-: "${ML_BUDGET_USD:=15}"                # per claude invocation
-: "${PRINCIPAL_BUDGET_USD:=10}"
+: "${WT_BASE:=$HOME/sources/wt-agent}"  # → wt-agent-<role>, wt-agent-principal
+: "${PRINCIPAL_MODEL:=opus}"            # CLAUDE.md: Opus reviews
+: "${PRINCIPAL_BUDGET_USD:=10}"         # per claude invocation
 : "${RUN_TIMEOUT:=90m}"                 # per claude invocation
 : "${MAX_ROUNDS:=3}"                    # review rounds per cycle
 : "${MAX_RESTARTS:=1}"                  # cycles the principal may restart before Ben must decide
-: "${ML_WIP_LIMIT:=2}"                  # open, un-merged ML PRs before it stops
+: "${WIP_LIMIT:=2}"                     # open PRs per authoring role before it stops starting work
 : "${PERMISSION_MODE:=auto}"
 : "${MEMORY_MAX:=4500M}"                # cgroup cap so cargo can't OOM the box
 : "${MIN_FREE_GB:=6}"
-: "${LOCK_WAIT_S:=}"                    # default: ml/review 0 (next hour retries), sweep 4 h
+: "${LOCK_WAIT_S:=}"                    # default: work/review 0 (next hour retries), sweep 4 h
 : "${DRY_RUN:=0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
-L_ML=agent::ml
+# ---------------------------------------------------------------- roles
+# Authoring roles. Each has its prompt `<name>.md`, its label `agent::<key>`,
+# its branches `agent/<key>/*`, its worktree `$WT_BASE-<key>`, and its log
+# issue titled "Agent log: <name>".
+#
+# A lane is what a role may change without Ben's explicit sign-off, as an
+# extended regex over repo paths. A path counts as in a role's lane when it
+# matches LANE and not EXCLUDE (ERE has no negative lookahead). A PR with files
+# outside its lane is still reviewed, but ends at needs-ben with those files
+# listed.
+AUTHORS=(ml security)
+declare -A NAME=([ml]=ml-engineer [security]=security-engineer)
+declare -A MODEL=([ml]="${ML_MODEL:-sonnet}" [security]="${SECURITY_MODEL:-sonnet}")
+declare -A BUDGET=([ml]="${ML_BUDGET_USD:-15}" [security]="${SECURITY_BUDGET_USD:-15}")
+declare -A LANE=(
+  [ml]='^(sim/|ml/|uv\.lock$|docs/design/[0-9]{2}-[^/]+\.md$)'
+  [security]='^(libs/wayfinder-auth/|libs/wayfinder-linksec/|sim/scenarios/red_team\.py$|docs/design/[0-9]{2}-[^/]+\.md$|Cargo\.lock$)'
+)
+declare -A EXCLUDE=(
+  [ml]='^sim/scenarios/red_team\.py$' # the security engineer's
+  [security]='^$'
+)
+# Keys, credentials and the wire: whoever touches these, Ben reviews before
+# merge even after the principal approves (needs-ben on top of approved).
+SENSITIVE='^(libs/wayfinder-auth/|libs/wayfinder-linksec/|libs/wayfinder-tls-mgmt/|libs/wayfinder-protos/)'
+
 L_REVIEW=agent::needs-review
 L_CHANGES=agent::changes-requested
 L_APPROVED=agent::approved
 L_BEN=needs-ben
 L_LOG=agent-log
 STATE_LABELS=("$L_REVIEW" "$L_CHANGES" "$L_APPROVED" "$L_BEN")
-ML_BRANCH_PREFIX=agent/ml/
-# What the ML agent may change without a design doc being accepted first.
-ML_LANE='^(sim/|ml/|uv\.lock$|docs/design/[0-9]{2}-[^/]+\.md$)'
 
 cmd=${1:-}
-case $cmd in ml | review | sweep | status) ;; *)
-  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+role=
+case $cmd in
+ml) cmd=work role=ml ;;
+work)
+  role=${2:-}
+  [[ -n $role && -n ${NAME[$role]:-} ]] || { echo "usage: run-loop.sh work <${AUTHORS[*]}>" >&2; exit 2; }
+  ;;
+review | sweep | status) ;;
+*)
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
   ;;
 esac
 
-# Cron gives a bare environment.
+# Cron and systemd give a bare environment.
 export PATH="$HOME/.npm-packages/bin:/run/current-system/sw/bin:/etc/profiles/per-user/$USER/bin:$HOME/.nix-profile/bin:$PATH"
 # A caller's activated venv (direnv) must not leak into the agents' shells.
 unset VIRTUAL_ENV
@@ -80,7 +110,9 @@ if [[ -z ${AGENT_STAGED:-} ]]; then
   REPO_ROOT=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
   git -C "$REPO_ROOT" fetch -q origin
   rev=$(git -C "$REPO_ROOT" rev-parse "$AGENT_REF^{commit}")
-  stage=$AGENT_HOME/staged
+  # One staging dir per command, so a starting run can't delete the files of
+  # one still running (staggered units overlap while one waits on the lock).
+  stage=$AGENT_HOME/staged-${cmd}${role:+-$role}
   rm -rf "$stage" && mkdir -p "$stage"
   git -C "$REPO_ROOT" cat-file -e "$rev:scripts/agents/run-loop.sh" 2>/dev/null ||
     { echo "scripts/agents is not on $AGENT_REF yet; try AGENT_REF=HEAD" >&2; exit 1; }
@@ -97,9 +129,9 @@ export GIT_CONFIG_COUNT=2
 export GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=git@github.com:
 export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1='!gh auth git-credential'
 
-RUN_DIR=$AGENT_HOME/runs/$(date +%F)/$(date +%H%M%S)-$cmd
+RUN_DIR=$AGENT_HOME/runs/$(date +%F)/$(date +%H%M%S)-${cmd}${role:+-$role}
 mkdir -p "$RUN_DIR"
-log() { printf '%s [%s] %s\n' "$(date -Is)" "$cmd" "$*" | tee -a "$RUN_DIR/loop.log" >&2; }
+log() { printf '%s [%s] %s\n' "$(date -Is)" "${cmd}${role:+ $role}" "$*" | tee -a "$RUN_DIR/loop.log" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
 # Every GitHub write goes through here, so DRY_RUN is honest.
@@ -108,10 +140,11 @@ ghw() {
 }
 
 # ---------------------------------------------------------------- preflight
+declare -A LOGS=()
 preflight() {
   command -v claude >/dev/null || die "claude not on PATH"
   gh auth status >/dev/null 2>&1 || die "gh is not authenticated"
-  local free_gb
+  local free_gb r name missing=()
   free_gb=$(df -BG --output=avail "$(dirname "$WT_BASE")" | tail -1 | tr -dc 0-9)
   ((free_gb >= MIN_FREE_GB)) || die "only ${free_gb}G free (< ${MIN_FREE_GB}G); run 'just clean' in a worktree"
   if systemd-run --user --scope --quiet true 2>/dev/null; then
@@ -120,11 +153,13 @@ preflight() {
     log "warn: no systemd user manager (enable linger); running without a memory cap"
     SCOPE=(nice -n 10)
   fi
-  ML_LOG=$(log_issue ml-engineer)
-  PRINCIPAL_LOG=$(log_issue principal-engineer)
-  if [[ -z $ML_LOG || -z $PRINCIPAL_LOG ]]; then
-    [[ $DRY_RUN == 1 ]] || die "agent log issues missing; run scripts/agents/setup.sh"
-    log "dry-run: agent log issues missing (run setup.sh before a real run)"
+  for name in principal-engineer $(for r in "${AUTHORS[@]}"; do echo "${NAME[$r]}"; done); do
+    LOGS[$name]=$(log_issue "$name")
+    [[ -n ${LOGS[$name]} ]] || missing+=("$name")
+  done
+  if ((${#missing[@]})); then
+    [[ $DRY_RUN == 1 ]] || die "agent log issues missing for ${missing[*]}; run scripts/agents/setup.sh"
+    log "dry-run: log issues missing for ${missing[*]} (run setup.sh before a real run)"
   fi
   log "agents from $AGENT_REF ($AGENT_REV), logs in $RUN_DIR"
 }
@@ -142,23 +177,42 @@ prep_worktree() { # <name> → prints path; resets it to AGENT_BASE
 }
 
 # ---------------------------------------------------------------- GitHub state
-log_issue() { # <role>
+log_issue() { # <role name>
   gh issue list -R "$REPO" --label "$L_LOG" --state open --json number,title \
-    --jq ".[] | select(.title | contains(\"$1\")) | .number" | head -1
+    --jq ".[] | select(.title == \"Agent log: $1\") | .number" | head -1
 }
 
-ml_prs() { # [label] → PR numbers authored by the ML agent
-  local filter='select(.headRefName | startswith("'$ML_BRANCH_PREFIX'"))'
-  [[ -n ${1:-} ]] && filter+=" | select([.labels[].name] | index(\"$1\"))"
+role_prs() { # <role|all> [label] → open PR numbers authored by that role
+  local prefix filter
+  if [[ $1 == all ]]; then prefix=agent/; else prefix=agent/$1/; fi
+  filter='select(.headRefName | startswith("'$prefix'"))'
+  [[ -n ${2:-} ]] && filter+=" | select([.labels[].name] | index(\"$2\"))"
   gh pr list -R "$REPO" --state open --limit 100 --json number,headRefName,labels \
     --jq "[.[] | $filter | .number] | sort | .[]"
 }
 
+author_of() { # <pr> → role key, from the branch prefix
+  local r branch
+  branch=$(gh pr view "$1" -R "$REPO" --json headRefName --jq .headRefName)
+  for r in "${AUTHORS[@]}"; do
+    [[ $branch == agent/$r/* ]] && { echo "$r"; return; }
+  done
+  return 0
+}
+
 pr_labels() { gh pr view "$1" -R "$REPO" --json labels --jq '.labels[].name'; }
 pr_head() { gh pr view "$1" -R "$REPO" --json headRefOid --jq .headRefOid; }
+pr_files() { gh pr diff "$1" -R "$REPO" --name-only; }
+
+# GitHub's PR reads lag its writes by seconds: a label set here can be
+# missing from a `gh pr list` or `gh pr view` issued right after. This script
+# is the only writer of state labels during a run, so the states it set are
+# cached and believed over GitHub's answer.
+declare -A STATE=()
 
 pr_state() { # → one of STATE_LABELS, or empty
   local labels s
+  [[ -n ${STATE[$1]+x} ]] && { echo "${STATE[$1]}"; return; }
   labels=$(pr_labels "$1")
   for s in "$L_BEN" "$L_APPROVED" "$L_CHANGES" "$L_REVIEW"; do
     grep -qxF "$s" <<<"$labels" && { echo "$s"; return; }
@@ -173,15 +227,29 @@ set_state() { # <pr> <label>
     [[ $s != "$want" ]] && grep -qxF "$s" <<<"$have" && args+=(--remove-label "$s")
   done
   grep -qxF "$want" <<<"$have" || args+=(--add-label "$want")
+  STATE[$pr]=$want
   ((${#args[@]})) || return 0
   log "#$pr → $want"
   ghw pr edit "$pr" -R "$REPO" "${args[@]}"
 }
 
-escalate() { # <pr> <reason>
+escalate() { # <pr> <reason>: stop the loop on this PR
   log "#$1 escalated: $2"
   set_state "$1" "$L_BEN"
-  ghw pr comment "$1" -R "$REPO" --body "🤖 **orchestrator**: stopping the agent loop on this PR — $2. Remove \`$L_BEN\` to hand it back to the loop."
+  ghw pr comment "$1" -R "$REPO" --body "🤖 **orchestrator**: stopping the agent loop on this PR: $2. Remove \`$L_BEN\` to hand it back to the loop."
+}
+
+flag_ben() { # <pr> <reason>: approved, but Ben must look before merging
+  log "#$1 flagged for Ben: $2"
+  set_state "$1" "$L_APPROVED"
+  ghw pr edit "$1" -R "$REPO" --add-label "$L_BEN"
+  STATE[$1]=$L_BEN
+  ghw pr comment "$1" -R "$REPO" --body "🤖 **orchestrator**: the principal approved this, but it needs Ben's review before merging: $2."
+}
+
+out_of_lane() { # <pr> <role> → files outside that role's lane, one per line
+  pr_files "$1" | grep -vE "${LANE[$2]}" || true
+  pr_files "$1" | grep -E "${LANE[$2]}" | grep -E "${EXCLUDE[$2]}" || true
 }
 
 markers() { # <pr> → one `verdict=… sha=… [notes=N] [next=…]` line per principal review, oldest first
@@ -202,10 +270,10 @@ marker_notes() { # <marker line> → its non-blocking note count (0 if absent)
 }
 
 # True when Ben (an unsigned comment, review or inline comment) has the last
-# word on any open ML PR, so the ML agent has something to answer.
-ml_has_feedback() {
+# word on any open PR of <role>, so that role has something to answer.
+has_feedback() { # <role>
   local pr
-  for pr in $(ml_prs); do
+  for pr in $(role_prs "$1"); do
     {
       gh api "repos/$REPO/issues/$pr/comments" --paginate \
         --jq '.[] | [.created_at, (.body | test("^\\s*🤖"))] | @tsv'
@@ -218,28 +286,32 @@ ml_has_feedback() {
   return 1
 }
 
-# Newly opened ML PRs join the loop; out-of-lane ones go straight to Ben.
+# Newly opened agent PRs join the loop.
 adopt_new_prs() {
-  local pr stray
-  for pr in $(ml_prs); do
-    grep -qxF "$L_ML" <<<"$(pr_labels "$pr")" && continue
-    log "adopting #$pr"
-    ghw pr edit "$pr" -R "$REPO" --add-label "$L_ML"
-    stray=$(gh pr diff "$pr" -R "$REPO" --name-only | grep -vE "$ML_LANE" || true)
-    if [[ -n $stray ]]; then
-      escalate "$pr" "it changes files outside the ml-engineer lane: $(paste -sd, <<<"$stray")"
-    else
-      set_state "$pr" "$L_REVIEW"
-    fi
+  local pr r
+  for pr in $(role_prs all); do
+    r=$(author_of "$pr")
+    [[ -n $r ]] || continue
+    grep -qxF "agent::$r" <<<"$(pr_labels "$pr")" && continue
+    log "adopting #$pr (${NAME[$r]})"
+    ghw pr edit "$pr" -R "$REPO" --add-label "agent::$r"
+    set_state "$pr" "$L_REVIEW"
   done
 }
 
-# A PR whose head moved past the last reviewed commit (Ben asked for a change
-# and the author pushed it, say) goes back for review.
+# Put every agent PR back where the loop can see it:
+#  - no state label (Ben removed needs-ben after an escalation) → review;
+#  - approved or changes-requested, but the head moved past the last reviewed
+#    commit (Ben asked for a change and the author pushed it) → review.
 reconcile() {
   local pr state m
-  for pr in $(ml_prs "$L_ML"); do
+  for pr in $(role_prs all); do
+    [[ -n $(author_of "$pr") ]] || continue
     state=$(pr_state "$pr")
+    if [[ -z $state ]]; then
+      grep -q '^agent::' <<<"$(pr_labels "$pr")" && set_state "$pr" "$L_REVIEW"
+      continue
+    fi
     [[ $state == "$L_APPROVED" || $state == "$L_CHANGES" ]] || continue
     m=$(last_marker "$pr")
     [[ -n $m && ${m##*sha=} != "$(pr_head "$pr")" ]] && set_state "$pr" "$L_REVIEW"
@@ -249,13 +321,13 @@ reconcile() {
 
 # ---------------------------------------------------------------- agents
 LAST_RESULT=
-run_agent() { # <role> <worktree> <model> <budget> <task>
-  local role=$1 wt=$2 model=$3 budget=$4 task=$5
+run_agent() { # <role name> <worktree> <model> <budget> <task> [extra prompt file]
+  local name=$1 wt=$2 model=$3 budget=$4 task=$5 extra=${6:-}
   local out sys status=0
-  out=$RUN_DIR/$(date +%H%M%S)-$role
-  sys=$(cat "$AGENTS/rules.md" "$AGENTS/$role.md")
+  out=$RUN_DIR/$(date +%H%M%S)-$name
+  sys=$(cat "$AGENTS/rules.md" ${extra:+"$AGENTS/$extra"} "$AGENTS/$name.md")
   printf '%s\n' "$task" >"$out.task"
-  log "→ $role ($model): $(head -1 <<<"$task")"
+  log "→ $name ($model): $(head -1 <<<"$task")"
   if [[ $DRY_RUN == 1 ]]; then
     LAST_RESULT="RESULT: noop"
     return
@@ -280,20 +352,21 @@ run_agent() { # <role> <worktree> <model> <budget> <task>
     --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
     --max-budget-usd "$budget" \
     --output-format stream-json --verbose) >"$out.jsonl" 2>"$out.stderr" || status=$?
-  local mcp
+  local mcp cost
   mcp=$(jq -rR 'fromjson? | select(.type == "system" and .subtype == "init") | [.mcp_servers[]?.name] | join(", ")' "$out.jsonl" 2>/dev/null | head -1)
-  [[ -z $mcp ]] || log "WARN: $role session loaded MCP servers despite --strict-mcp-config: $mcp"
+  [[ -z $mcp ]] || log "WARN: $name session loaded MCP servers despite --strict-mcp-config: $mcp"
   LAST_RESULT=$(jq -rR 'fromjson? | select(.type == "result") | .result // empty' "$out.jsonl" 2>/dev/null |
     grep -E '^RESULT:' | tail -1 || true)
-  local cost
   cost=$(jq -rR 'fromjson? | select(.type == "result") | .total_cost_usd // empty' "$out.jsonl" 2>/dev/null | tail -1)
-  log "← $role exit=$status api-equiv=\$${cost:-?} ${LAST_RESULT:-<no RESULT line>}"
+  log "← $name exit=$status api-equiv=\$${cost:-?} ${LAST_RESULT:-<no RESULT line>}"
 }
 
-context() { # <role> → the shared preamble every task message starts with
+context() { # <role name> → the shared preamble every task message starts with
+  local n logs=""
+  for n in "${!LOGS[@]}"; do logs+="$n #${LOGS[$n]}, "; done
   cat <<EOF
 You are: $1
-Agent log issues: ml-engineer #$ML_LOG, principal-engineer #$PRINCIPAL_LOG (yours is the $1 one).
+Agent log issues: ${logs%, } (yours is the $1 one).
 Repository: $REPO. Your worktree is checked out at $AGENT_BASE ($(git -C "$REPO_ROOT" rev-parse --short "$AGENT_BASE")).
 Today: $(date -u +%F). Review round cap: $MAX_ROUNDS.
 
@@ -307,43 +380,63 @@ $(gh issue list -R "$REPO" --state open --limit 60 --json number,title,labels \
 EOF
 }
 
-ml_respond() { # <pr>
-  local wt
-  wt=$(prep_worktree ml)
-  run_agent ml-engineer "$wt" "$ML_MODEL" "$ML_BUDGET_USD" "Mode: respond $1
-Check the branch out with \`gh pr checkout $1\`.
+author_run() { # <role> <task first line> → runs that role's author session
+  local r=$1 wt
+  wt=$(prep_worktree "$r")
+  run_agent "${NAME[$r]}" "$wt" "${MODEL[$r]}" "${BUDGET[$r]}" "$2
 
-$(context ml-engineer)"
+$(context "${NAME[$r]}")" author.md
 }
 
-ml_notes() { # <pr> <final: 0|1>
-  local wt how
-  wt=$(prep_worktree ml)
-  if (($2)); then
-    how="final=yes — this was the last review round: do not push; file an issue or decline each note."
+author_respond() { # <pr> <role>
+  author_run "$2" "Mode: respond $1
+Check the branch out with \`gh pr checkout $1\`."
+}
+
+author_notes() { # <pr> <role> <final: 0|1>
+  local how
+  if (($3)); then
+    how="final=yes. This was the last review round: do not push; file an issue or decline each note."
   else
-    how="final=no — fix small in-scope notes on the branch and push; the principal reviews again."
+    how="final=no. Fix small in-scope notes on the branch and push; the principal reviews again."
   fi
-  run_agent ml-engineer "$wt" "$ML_MODEL" "$ML_BUDGET_USD" "Mode: notes $1 $how
-Check the branch out with \`gh pr checkout $1\`.
-
-$(context ml-engineer)"
+  author_run "$2" "Mode: notes $1 $how
+Check the branch out with \`gh pr checkout $1\`."
 }
 
-principal_review() { # <pr> <round> <restarts used>
-  local wt
+principal_review() { # <pr> <round> <restarts used> <author role>
+  local wt lane_note="" stray sensitive
   wt=$(prep_worktree principal)
+  stray=$(out_of_lane "$1" "$4")
+  sensitive=$(pr_files "$1" | grep -E "$SENSITIVE" || true)
+  [[ -z $stray ]] || lane_note+="
+Files outside the ${NAME[$4]} lane (Ben signs off on these regardless; judge whether each is justified by an accepted design doc or the task):
+  ${stray//$'\n'/$'\n'  }"
+  [[ -z $sensitive ]] || lane_note+="
+This PR touches keys, credentials or the wire. Use the full \`mr-review\` skill, and review it as security-sensitive."
   run_agent principal-engineer "$wt" "$PRINCIPAL_MODEL" "$PRINCIPAL_BUDGET_USD" \
     "Mode: review $1 round=$2/$MAX_ROUNDS restarts=$3/$MAX_RESTARTS
-Head commit to review: $(pr_head "$1"). Check it out with \`gh pr checkout $1\`.
+Author: ${NAME[$4]}. Head commit to review: $(pr_head "$1"). Check it out with \`gh pr checkout $1\`.$lane_note
 
 $(context principal-engineer)"
+}
+
+# After the principal approves: does Ben have to look before merging anyway?
+gate_for_ben() { # <pr> <role> → reason, or empty
+  local stray sensitive reason=""
+  stray=$(out_of_lane "$1" "$2")
+  sensitive=$(pr_files "$1" | grep -E "$SENSITIVE" || true)
+  [[ -z $stray ]] || reason+="it changes files outside the ${NAME[$2]} lane ($(paste -sd, <<<"$stray")); "
+  [[ -z $sensitive ]] || reason+="it touches keys, credentials or the wire ($(paste -sd, <<<"$sensitive")); "
+  printf '%s' "${reason%; }"
 }
 
 # Drive one PR through review ⇄ response until it is approved, escalated or
 # waiting on someone outside the loop. Bounded: every pass adds a review.
 review_cycle() { # <pr>
-  local pr=$1 state round total m final head used
+  local pr=$1 r state round total m final head used why
+  r=$(author_of "$pr")
+  [[ -n $r ]] || return 0
   while :; do
     state=$(pr_state "$pr")
     case $state in
@@ -351,7 +444,7 @@ review_cycle() { # <pr>
       round=$(($(rounds "$pr") + 1))
       ((round <= MAX_ROUNDS)) || { escalate "$pr" "it has had $MAX_ROUNDS review rounds"; return; }
       total=$(reviews "$pr")
-      principal_review "$pr" "$round" "$(restarts "$pr")"
+      principal_review "$pr" "$round" "$(restarts "$pr")" "$r"
       [[ $DRY_RUN == 1 ]] && return
       (($(reviews "$pr") > total)) || { escalate "$pr" "the principal's run posted no verdict marker"; return; }
       m=$(last_marker "$pr")
@@ -362,13 +455,14 @@ review_cycle() { # <pr>
         if (($(marker_notes "$m") > 0)); then
           final=$((round >= MAX_ROUNDS))
           head=$(pr_head "$pr")
-          ml_notes "$pr" "$final"
+          author_notes "$pr" "$r" "$final"
           if ((!final)) && [[ $(pr_head "$pr") != "$head" ]]; then
             set_state "$pr" "$L_REVIEW"
             continue
           fi
         fi
-        set_state "$pr" "$L_APPROVED"
+        why=$(gate_for_ben "$pr" "$r")
+        if [[ -n $why ]]; then flag_ben "$pr" "$why"; else set_state "$pr" "$L_APPROVED"; fi
         return
       fi
       # Changes still required on the last round: a 4th round is the
@@ -390,7 +484,7 @@ review_cycle() { # <pr>
       set_state "$pr" "$L_CHANGES"
       ;;
     "$L_CHANGES")
-      ml_respond "$pr"
+      author_respond "$pr" "$r"
       [[ $DRY_RUN == 1 ]] && return
       [[ $LAST_RESULT == "RESULT: blocked"* ]] && { escalate "$pr" "the author is blocked (${LAST_RESULT#RESULT: blocked })"; return; }
       set_state "$pr" "$L_REVIEW"
@@ -408,39 +502,41 @@ fix_first() { # <pr>… → the same PRs, bug fixes (title `fix…`) first
 }
 
 review_all() {
+  adopt_new_prs
   reconcile
   local pr
+  # Every agent PR, not a label search: the search would lag the labels that
+  # adopt/reconcile just set. review_cycle skips the ones not waiting.
   # shellcheck disable=SC2046  # PR numbers: word-splitting is intended
-  for pr in $(fix_first $(ml_prs "$L_CHANGES") $(ml_prs "$L_REVIEW")); do review_cycle "$pr"; done
+  for pr in $(fix_first $(role_prs all)); do review_cycle "$pr"; done
 }
 
 # ---------------------------------------------------------------- commands
 cmd_status() {
-  local pr m
-  for pr in $(ml_prs); do
+  local pr m r
+  for pr in $(role_prs all); do
+    r=$(author_of "$pr")
     m=$(last_marker "$pr")
-    printf '#%-5s %-26s rounds=%s restarts=%s last=%s\n' "$pr" "$(pr_state "$pr")" "$(rounds "$pr")" "$(restarts "$pr")" "${m:-none}"
+    printf '#%-5s %-18s %-26s rounds=%s restarts=%s last=%s\n' "$pr" "${NAME[$r]:-?}" \
+      "$(pr_labels "$pr" | grep -xF "$L_BEN" || pr_state "$pr")" "$(rounds "$pr")" "$(restarts "$pr")" "${m:-none}"
   done
 }
 
-cmd_ml() {
-  # Reviews already waiting on the author come first, so they don't go stale.
+cmd_work() { # <role>
+  local r=$1 open
+  # Reviews already waiting come first, so they don't go stale.
   review_all
-  local open wt
-  open=$(ml_prs | grep -c . || true)
+  open=$(role_prs "$r" | grep -c . || true)
   # Hourly runs: at the WIP limit with nothing of Ben's to answer, a session
   # could only conclude `noop`, so don't start one.
-  if ((open >= ML_WIP_LIMIT)) && ! ml_has_feedback; then
-    log "at the WIP limit ($open/$ML_WIP_LIMIT) with no unanswered feedback; nothing to do"
+  if ((open >= WIP_LIMIT)) && ! has_feedback "$r"; then
+    log "${NAME[$r]} is at the WIP limit ($open/$WIP_LIMIT) with no unanswered feedback; nothing to do"
     return
   fi
-  wt=$(prep_worktree ml)
-  run_agent ml-engineer "$wt" "$ML_MODEL" "$ML_BUDGET_USD" "Mode: work
-Open-PR limit: you have $open open of $ML_WIP_LIMIT allowed$( ((open >= ML_WIP_LIMIT)) && echo ' — AT LIMIT, start nothing new').
-
-$(context ml-engineer)"
+  author_run "$r" "Mode: work
+Open-PR limit: you have $open open of $WIP_LIMIT allowed$( ((open >= WIP_LIMIT)) && echo '. AT LIMIT: start nothing new').
+Your branch prefix: agent/$r/"
   [[ $DRY_RUN == 1 ]] && return
-  adopt_new_prs
   review_all
 }
 
@@ -461,7 +557,7 @@ exec 9>"$AGENT_HOME/lock"
 flock -w "$LOCK_WAIT_S" 9 || { log "another run still holds the lock after ${LOCK_WAIT_S}s; skipping"; exit 0; }
 preflight
 case $cmd in
-ml) cmd_ml ;;
+work) cmd_work "$role" ;;
 review) review_all ;;
 sweep) cmd_sweep ;;
 esac
