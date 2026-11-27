@@ -403,7 +403,7 @@ review_cycle() { # <pr>
 fix_first() { # <pr>… → the same PRs, bug fixes (title `fix…`) first
   local pr
   for pr in "$@"; do
-    gh pr view "$pr" -R "$REPO" --json title --jq '"\(if (.title | test("^fix")) then 0 else 1 end) \(.number)"'
+    gh pr view "$pr" -R "$REPO" --json number,title --jq '"\(if (.title | test("^fix")) then 0 else 1 end) \(.number)"'
   done | sort -n -k1,1 -k2,2 | cut -d' ' -f2
 }
 
