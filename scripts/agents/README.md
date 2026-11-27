@@ -71,6 +71,7 @@ Merging is gated twice:
 |---|---|
 | An agent edits its own rules | Prompts and this script are run from `origin/main`, staged by `git archive`, never from a working tree. `scripts/agents/**` is also edit-denied. |
 | Merge, force-push, closing things | `settings.json` deny rules, plus `--permission-mode auto` for everything else |
+| Reach beyond the repo (Gmail, Drive, Calendar, browser) | Sessions load **no MCP servers**: `--strict-mcp-config` with an empty config, plus `ENABLE_CLAUDEAI_MCP_SERVERS=false`. Without them a headless session inherits Ben's claude.ai connectors and plugin MCP servers. `loop.log` warns if any server loads anyway. |
 | OOM on a 7.7 GB, no-swap box | Each `claude` runs in a `systemd-run --user --scope` capped at `MEMORY_MAX` (4.5 GB), at `nice 10` and `CARGO_BUILD_JOBS=2` |
 | Disk | Preflight refuses to start with less than `MIN_FREE_GB` (6 GB) free. Each agent reuses one persistent worktree (`~/sources/wt-agent-{ml,principal}`), so `target/` and `.venv` are built once. |
 | A runaway session | `RUN_TIMEOUT` (90 min) and `--max-budget-usd` on each invocation |
