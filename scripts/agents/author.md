@@ -59,6 +59,11 @@ Post **one** PR comment saying what you did with each note. Finish with
    - Implement it, commit, and get the touched tests green.
    - Tick a roadmap item only if this PR finishes it. Ask Ben for that in the
      PR description, because `scripts/agents/` is not yours to edit.
+   - Leave no open questions. Make each decision the PR raises and give the
+     reasoning, or take it out of scope with a filed issue that the PR links.
+     For a decision that is Ben's to make, write the options and your
+     recommendation. The principal will not approve a PR that leaves a
+     choice for "the implementer" or "later".
    - Open the PR with the `mr` skill, using a Conventional Commits title.
 5. Finish with `RESULT: opened #<n>`, or `RESULT: blocked …`.
 
