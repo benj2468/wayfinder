@@ -64,6 +64,18 @@ impl<
     /// recorded — `false` for an invalid record or one already known — so a
     /// caller can flood it exactly once and avoid amplification loops.
     pub fn ingest_revocation(&mut self, record: &RevocationRecord) -> bool {
+        self.ingest(record, None)
+    }
+
+    /// [`ingest_revocation`](Self::ingest_revocation), for a record that is
+    /// either arriving or being carried over from a replaced state.
+    ///
+    /// `carried_floods_left` is `None` for an arrival, which is announced in the
+    /// log and gets a full flood budget. `Some` is a record this node already
+    /// held: it keeps that budget and is not announced again.
+    fn ingest(&mut self, record: &RevocationRecord, carried_floods_left: Option<u8>) -> bool {
+        let arrival = carried_floods_left.is_none();
+        let floods_left = carried_floods_left.unwrap_or(REVOKE_FLOOD_BUDGET);
         // Verification takes the clock: an already-expired record is refused by
         // the anchor itself (`AuthError::Expired`), so this loop never has to
         // remember to check the half of validity that bounds the set's size. A
@@ -116,11 +128,13 @@ impl<
                 .self_revocation
                 .is_some_and(|held| held.not_before.get() >= record.not_before.get());
             if !known {
-                tracing::error!(
-                    node_mac = ?Mac(record.node_mac),
-                    not_before = record.not_before.get(),
-                    "auth: this node's mesh membership has been revoked"
-                );
+                if arrival {
+                    tracing::error!(
+                        node_mac = ?Mac(record.node_mac),
+                        not_before = record.not_before.get(),
+                        "auth: this node's mesh membership has been revoked"
+                    );
+                }
                 // A later instant supersedes a held record; an earlier one must
                 // not pull the arming instant backwards, which would arm this
                 // node early and black-hole the peers still routing through it.
@@ -155,21 +169,25 @@ impl<
             // re-arming the flood budget so the mesh learns of it.  That cannot
             // loop: `not_before` only ever increases here, so each re-flood is
             // driven by a record no peer has seen.
-            tracing::info!(
-                ?record,
-                "auth: superseding a revocation with a later instant"
-            );
+            if arrival {
+                tracing::info!(
+                    ?record,
+                    "auth: superseding a revocation with a later instant"
+                );
+            }
             slot.record = *record;
-            slot.floods_left = REVOKE_FLOOD_BUDGET;
+            slot.floods_left = floods_left;
             self.evict_neighbor(mac);
             self.trickle_reset_hint = true;
             return true;
         }
         let known = KnownRevocation {
             record: *record,
-            floods_left: REVOKE_FLOOD_BUDGET,
+            floods_left,
         };
-        tracing::info!(?record, "auth: ingested new revocation");
+        if arrival {
+            tracing::info!(?record, "auth: ingested new revocation");
+        }
         if self.revocations.push(known).is_err() {
             // Set full.  Prefer evicting an already-expired entry (passive expiry
             // covers it); otherwise overwrite the most-quiescent live entry
@@ -197,7 +215,7 @@ impl<
     /// Take over the revocations `prev` held, so installing a certificate does
     /// not forget who was revoked.
     ///
-    /// Every record goes back through
+    /// Every record goes back through the same checks as
     /// [`ingest_revocation`](Self::ingest_revocation), so it is verified against
     /// *this* state's trust anchor: a move to another mesh drops the old mesh's
     /// records. A pending self-revocation is offered the same way, and latches
@@ -205,21 +223,15 @@ impl<
     /// re-admission sheds it.
     ///
     /// A carried record is not a new purge. It keeps what was left of its flood
-    /// budget and asks for no Trickle reset.
+    /// budget, asks for no Trickle reset and is not announced in the log again.
     pub(crate) fn adopt_revocations(&mut self, prev: &Self) {
         let reset_hint = self.trickle_reset_hint || prev.trickle_reset_hint;
         for known in &prev.revocations {
-            if self.ingest_revocation(&known.record)
-                && let Some(slot) = self
-                    .revocations
-                    .iter_mut()
-                    .find(|r| r.record.node_mac == known.record.node_mac)
-            {
-                slot.floods_left = known.floods_left;
-            }
+            self.ingest(&known.record, Some(known.floods_left));
         }
         if let Some(record) = prev.self_revocation.as_ref() {
-            self.ingest_revocation(record);
+            // A self-revocation is never flooded, so it has no budget.
+            self.ingest(record, Some(0));
         }
         self.trickle_reset_hint = reset_hint;
     }
