@@ -1090,13 +1090,15 @@ impl<
         mut auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
     ) {
         debug!("updating auth state; resetting learned routing state");
-        // Everything this method discards below is scoped to the credential and
-        // is genuinely stale under a new one. The cert-control *send rates* are
-        // not: they count frames this node put on the wire, which a fresh
-        // certificate does not undo. Carried over explicitly rather than left
-        // to the wholesale replacement — see `OgmAuth::adopt_control_rates`.
+        // Most of what this method discards below is scoped to the credential
+        // and is genuinely stale under a new one. Two things are not, and are
+        // carried over explicitly rather than left to the wholesale
+        // replacement: the cert-control *send rates*, which count frames this
+        // node put on the wire, and the revocations, which are the mesh's
+        // statement about *other* certificates.
         if let Some(prev) = self.auth.as_ref() {
             auth.adopt_control_rates(prev);
+            auth.adopt_revocations(prev);
         }
         // A re-admission clears the self-revoked latch, but only if the
         // certificate being installed actually survives the record. One the

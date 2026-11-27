@@ -194,6 +194,36 @@ impl<
         true
     }
 
+    /// Take over the revocations `prev` held, so installing a certificate does
+    /// not forget who was revoked.
+    ///
+    /// Every record goes back through
+    /// [`ingest_revocation`](Self::ingest_revocation), so it is verified against
+    /// *this* state's trust anchor: a move to another mesh drops the old mesh's
+    /// records. A pending self-revocation is offered the same way, and latches
+    /// only if it cancels the certificate this state runs under, so a
+    /// re-admission sheds it.
+    ///
+    /// A carried record is not a new purge. It keeps what was left of its flood
+    /// budget and asks for no Trickle reset.
+    pub(crate) fn adopt_revocations(&mut self, prev: &Self) {
+        let reset_hint = self.trickle_reset_hint || prev.trickle_reset_hint;
+        for known in &prev.revocations {
+            if self.ingest_revocation(&known.record)
+                && let Some(slot) = self
+                    .revocations
+                    .iter_mut()
+                    .find(|r| r.record.node_mac == known.record.node_mac)
+            {
+                slot.floods_left = known.floods_left;
+            }
+        }
+        if let Some(record) = prev.self_revocation.as_ref() {
+            self.ingest_revocation(record);
+        }
+        self.trickle_reset_hint = reset_hint;
+    }
+
     /// Whether `cert` is currently cancelled by a known revocation: a record
     /// naming the same MAC, whose enforcement window (`not_before ..
     /// not_after`, half-open) contains this node's clock, **and** which was issued at or
