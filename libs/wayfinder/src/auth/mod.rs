@@ -616,6 +616,10 @@ pub struct OgmAuth<
     /// the cert has not yet expired, and each is re-advertised on this node's
     /// own OGMs while its flood budget lasts.
     revocations: HVec<KnownRevocation, MAX_REVOKED>,
+    /// Bumped whenever the set of records in
+    /// [`revocations`](Self::revocations) changes. See
+    /// [`revocations_generation`](Self::revocations_generation).
+    revocations_generation: u32,
     /// Keys of neighbors whose OGMs have verified, for pairwise-key derivation
     /// and security observability.
     neighbors: HVec<NeighborKeys, MAX_NEIGHBOR_KEYS>,
@@ -899,6 +903,7 @@ impl<
             wall: Clocked::Unknown,
             now: Duration::ZERO,
             revocations: HVec::new(),
+            revocations_generation: 0,
             neighbors: HVec::new(),
             sign_scratch: [0u8; SIGN_SCRATCH_LEN],
             send_counter: 0,
@@ -1010,6 +1015,7 @@ impl<
         while i < self.revocations.len() {
             if self.revocations[i].record.not_after.get() <= now {
                 self.revocations.swap_remove(i);
+                self.note_revocations_changed();
             } else {
                 i += 1;
             }
