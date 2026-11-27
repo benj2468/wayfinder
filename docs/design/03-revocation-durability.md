@@ -186,7 +186,9 @@ The router keeps owning the list and gains no I/O:
   a superseded one, an eviction, a prune.
 - `set_auth` carries that count into the new `OgmAuth` and advances it. A count
   restarted from zero could equal the last one saved while the list differs, for
-  example after a move to another mesh.
+  example after a move to another mesh. For the same reason the router keeps the
+  count when it drops `OgmAuth` to go inert, so a re-admission carries on from
+  it.
 - A restore entry point verifies exactly as `ingest_revocation` does, but arms a
   small flood budget, requests no Trickle reset and is not logged as new. #134's
   carry-over already does this with a record's remaining budget, so both share

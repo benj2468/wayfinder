@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// Emissions a restored record gets (design 03 §10.6). Not zero, or a node that
+/// crash-looped through its flood window would hold a silent copy; not the full
+/// [`REVOKE_FLOOD_BUDGET`], since the mesh has most likely heard it already.
+const RESTORE_FLOOD_BUDGET: u8 = 2;
+
 impl<
     const MAX_NEIGHBOR_KEYS: usize,
     const MAX_REVOKED: usize,
@@ -67,15 +72,60 @@ impl<
         self.ingest(record, None)
     }
 
-    /// [`ingest_revocation`](Self::ingest_revocation), for a record that is
-    /// either arriving or being carried over from a replaced state.
+    /// A count that moves whenever the set of records
+    /// [`revocations`](Self::revocations) yields changes: one added,
+    /// superseded, evicted or pruned. A shell that persists the list compares
+    /// it with the count it last saved.
     ///
-    /// `carried_floods_left` is `None` for an arrival, which is announced in the
+    /// Compare for equality only: it wraps. A router never hands out the same
+    /// value for two different lists across certificate installs, see
+    /// [`CentralRouter::set_auth`](crate::CentralRouter::set_auth).
+    pub fn revocations_generation(&self) -> u32 {
+        self.revocations_generation
+    }
+
+    /// Record that the enforcement set changed.
+    pub(super) fn note_revocations_changed(&mut self) {
+        self.revocations_generation = self.revocations_generation.wrapping_add(1);
+    }
+
+    /// Continue the count from `last`, the newest value any earlier state of
+    /// this router held. Always a step past it, since the list this state
+    /// holds need not be the one counted there.
+    pub(crate) fn advance_revocations_generation_past(&mut self, last: u32) {
+        self.revocations_generation = last.wrapping_add(1);
+    }
+
+    /// Take back a record this node stored before a restart. It is verified
+    /// exactly as [`ingest_revocation`](Self::ingest_revocation) does, but it
+    /// is not a new purge: a small flood budget, no Trickle reset and no
+    /// announcement in the log.
+    ///
+    /// Reached through
+    /// [`CentralRouter::restore_revocations`](crate::CentralRouter::restore_revocations),
+    /// which also drops the routing state the record condemns.
+    pub(crate) fn restore_revocation(&mut self, record: &RevocationRecord) -> bool {
+        self.ingest_quietly(record, RESTORE_FLOOD_BUDGET)
+    }
+
+    /// Ingest a record this node already held, leaving any pending Trickle
+    /// reset as it was.
+    fn ingest_quietly(&mut self, record: &RevocationRecord, floods_left: u8) -> bool {
+        let reset_hint = self.trickle_reset_hint;
+        let newly = self.ingest(record, Some(floods_left));
+        self.trickle_reset_hint = reset_hint;
+        newly
+    }
+
+    /// [`ingest_revocation`](Self::ingest_revocation), for a record that is
+    /// either arriving or one this node already held.
+    ///
+    /// `held_floods_left` is `None` for an arrival, which is announced in the
     /// log and gets a full flood budget. `Some` is a record this node already
-    /// held: it keeps that budget and is not announced again.
-    fn ingest(&mut self, record: &RevocationRecord, carried_floods_left: Option<u8>) -> bool {
-        let arrival = carried_floods_left.is_none();
-        let floods_left = carried_floods_left.unwrap_or(REVOKE_FLOOD_BUDGET);
+    /// held: it gets that budget and is not announced again.
+    fn ingest(&mut self, record: &RevocationRecord, held_floods_left: Option<u8>) -> bool {
+        let arrival = held_floods_left.is_none();
+        let floods_left = held_floods_left.unwrap_or(REVOKE_FLOOD_BUDGET);
         // Verification takes the clock: an already-expired record is refused by
         // the anchor itself (`AuthError::Expired`), so this loop never has to
         // remember to check the half of validity that bounds the set's size. A
@@ -177,6 +227,7 @@ impl<
             }
             slot.record = *record;
             slot.floods_left = floods_left;
+            self.note_revocations_changed();
             self.evict_neighbor(mac);
             self.trickle_reset_hint = true;
             return true;
@@ -205,6 +256,7 @@ impl<
                 *slot = known;
             }
         }
+        self.note_revocations_changed();
         self.evict_neighbor(mac);
         // A new purge: ask the router to accelerate OGM emission so it floods
         // promptly (set last, so only a genuinely new record triggers it).
@@ -225,15 +277,15 @@ impl<
     /// A carried record is not a new purge. It keeps what was left of its flood
     /// budget, asks for no Trickle reset and is not announced in the log again.
     pub(crate) fn adopt_revocations(&mut self, prev: &Self) {
-        let reset_hint = self.trickle_reset_hint || prev.trickle_reset_hint;
+        // A purge `prev` had not yet been drained of is still owed its reset.
+        self.trickle_reset_hint |= prev.trickle_reset_hint;
         for known in &prev.revocations {
-            self.ingest(&known.record, Some(known.floods_left));
+            self.ingest_quietly(&known.record, known.floods_left);
         }
         if let Some(record) = prev.self_revocation.as_ref() {
             // A self-revocation is never flooded, so it has no budget.
-            self.ingest(record, Some(0));
+            self.ingest_quietly(record, 0);
         }
-        self.trickle_reset_hint = reset_hint;
     }
 
     /// Whether `cert` is currently cancelled by a known revocation: a record
@@ -1324,7 +1376,7 @@ mod durability {
         Authority::from_seed(&[1; 32], 0xABCD)
     }
 
-    /// A router enrolled in `authority`s mesh as node 2, its clock at 100.
+    /// A router enrolled in `authority`'s mesh as node 2, its clock at 100.
     fn enrolled(authority: &Authority) -> CentralRouter {
         let mut router = CentralRouter::new(mac(2));
         router.set_auth(member(authority, 2, mac(2), 100_000));
@@ -1527,7 +1579,7 @@ mod durability {
         let mut router = enrolled(&authority);
         let stored = [
             other.revoke(mac(3), 50, 1000),
-            // Expired at this routers clock of 100.
+            // Expired at this router's clock of 100.
             authority.revoke(mac(4), 50, 90),
         ];
 

@@ -592,6 +592,14 @@ pub struct CentralRouter<
     /// zero, but that path clears `proven` outright, so there is nothing for a
     /// missed sweep to leave behind.
     swept_key_generation: u32,
+    /// The [`revocations_generation`](auth::OgmAuth::revocations_generation)
+    /// of the last auth state this router dropped to go inert, so the next
+    /// install carries on from it instead of restarting at zero.
+    dropped_revocations_generation: u32,
+    /// Set when auth is installed on a router that had none, which therefore
+    /// carried no revocations over. Drained by
+    /// [`take_revocation_restore_needed`](Self::take_revocation_restore_needed).
+    revocation_restore_needed: bool,
     /// Fail-closed policy: when `true`, this node must not act as a mesh router
     /// (process, forward, deliver, or originate any mesh traffic) until a valid
     /// membership cert is installed via [`set_auth`](CentralRouter::set_auth).
@@ -749,6 +757,8 @@ impl<
             iface_count: 0,
             auth: None,
             swept_key_generation: 0,
+            dropped_revocations_generation: 0,
+            revocation_restore_needed: false,
             require_auth: false,
             self_revocation: None,
             pending_self_revocation: None,
@@ -1085,6 +1095,13 @@ impl<
     /// this node's identity/anchor changes. A route can therefore sit unusable
     /// for one challenge/response round trip immediately after this call, even
     /// to an already-known neighbor.
+    ///
+    /// Revocations are carried over from the state being replaced. A router
+    /// with no state to carry them from raises
+    /// [`take_revocation_restore_needed`](Self::take_revocation_restore_needed)
+    /// instead. Either way the new state's
+    /// [`revocations_generation`](auth::OgmAuth::revocations_generation) is
+    /// past every value this router has reported before.
     pub fn set_auth(
         &mut self,
         mut auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
@@ -1096,10 +1113,18 @@ impl<
         // replacement: the cert-control *send rates*, which count frames this
         // node put on the wire, and the revocations, which are the mesh's
         // statement about *other* certificates.
-        if let Some(prev) = self.auth.as_ref() {
-            auth.adopt_control_rates(prev);
-            auth.adopt_revocations(prev);
-        }
+        let last_generation = match self.auth.as_ref() {
+            Some(prev) => {
+                auth.adopt_control_rates(prev);
+                auth.adopt_revocations(prev);
+                prev.revocations_generation()
+            }
+            None => {
+                self.revocation_restore_needed = true;
+                self.dropped_revocations_generation
+            }
+        };
+        auth.advance_revocations_generation_past(last_generation);
         // A re-admission clears the self-revoked latch, but only if the
         // certificate being installed actually survives the record. One the
         // record still cancels leaves the node latched: peers would drop it
@@ -1292,7 +1317,14 @@ impl<
     /// restarts it.
     pub fn note_self_revoked(&mut self, record: wayfinder_auth::RevocationRecord) {
         self.self_revocation = Some(record);
-        self.auth = None;
+        self.drop_auth();
+    }
+
+    /// Drop the auth state to go inert, keeping its revocation count.
+    fn drop_auth(&mut self) {
+        if let Some(auth) = self.auth.take() {
+            self.dropped_revocations_generation = auth.revocations_generation();
+        }
     }
 
     /// Act on a latched self-revocation, if one is now in force: drop this
@@ -1308,7 +1340,7 @@ impl<
             return false;
         };
         error!("this node's mesh membership has been revoked; going inert until re-enrolled");
-        self.auth = None;
+        self.drop_auth();
         self.self_revocation = Some(record);
         self.pending_self_revocation = Some(record);
         self.batman.reset();
@@ -1344,18 +1376,65 @@ impl<
                 "ingested revocation; resetting timers, revoking originators, and purging stale OGMs"
             );
             self.batman.reset_ogm_timers(now);
-            self.batman.revoke_originators(auth.macs_to_purge());
-            self.batman.purge_stale(now);
-            // And the shunned node's link-quality rows with them. The periodic
-            // tick prunes on the same predicate, but a management read landing
-            // between the two would still show the node an operator was just
-            // told is gone — which is exactly what it looked like from the
-            // dashboard.
-            let batman = &self.batman;
-            self.link_quality
-                .retain_live(|neighbor| batman.originator_table.contains_key(&neighbor));
+            self.purge_revoked(now);
         }
         newly
+    }
+
+    /// Tear down the routing state of every node a held revocation shuns.
+    fn purge_revoked(&mut self, now: core::time::Duration) {
+        let Some(auth) = self.auth.as_ref() else {
+            return;
+        };
+        self.batman.revoke_originators(auth.macs_to_purge());
+        self.batman.purge_stale(now);
+        // And the shunned node's link-quality rows with them. The periodic
+        // tick prunes on the same predicate, but a management read landing
+        // between the two would still show the node an operator was just told
+        // is gone — which is exactly what it looked like from the dashboard.
+        let batman = &self.batman;
+        self.link_quality
+            .retain_live(|neighbor| batman.originator_table.contains_key(&neighbor));
+    }
+
+    /// Give back revocation records this node stored before a restart, and
+    /// return how many were taken. Each is verified against the current trust
+    /// anchor as [`ingest_revocation`](Self::ingest_revocation) does, under
+    /// whatever clock posture the node has: a node with no clock enforces them
+    /// all. A restore is not a new purge, so it resets no Trickle timer and
+    /// each record gets only a small flood budget (design 03 §3.1.2).
+    ///
+    /// Takes nothing, returning 0, when auth is disabled: there is no anchor to
+    /// verify against. Offer the records again once
+    /// [`take_revocation_restore_needed`](Self::take_revocation_restore_needed)
+    /// says auth has been installed.
+    pub fn restore_revocations<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a wayfinder_auth::RevocationRecord>,
+        now: core::time::Duration,
+    ) -> usize {
+        let Some(auth) = self.auth.as_mut() else {
+            return 0;
+        };
+        let mut restored = 0;
+        for record in records {
+            restored += usize::from(auth.restore_revocation(record));
+        }
+        // A stored list never names this node, but the medium is not trusted to
+        // keep to that, and a record that does must act as it would on arrival.
+        if !self.apply_self_revocation() && restored > 0 {
+            self.purge_revoked(now);
+        }
+        restored
+    }
+
+    /// Take and clear the "restore needed" flag: `true` if
+    /// [`set_auth`](Self::set_auth) has installed auth on a router that had
+    /// none since the last call. A shell with a stored revocation list answers
+    /// it with [`restore_revocations`](Self::restore_revocations), and does so
+    /// before it saves the router's list again.
+    pub fn take_revocation_restore_needed(&mut self) -> bool {
+        core::mem::take(&mut self.revocation_restore_needed)
     }
     /// Process a received link-layer frame without any physical-layer
     /// metrics — equivalent to calling [`handle_frame_with_metrics`] with
