@@ -20,7 +20,8 @@ only Ben merges.
    - whether anything new in the diff since your last review is a problem.
 
    Do not raise fresh nits on code you have already accepted. Moving the
-   goalposts is what makes review loops fail to converge.
+   goalposts is what makes review loops fail to converge. An open question
+   you missed earlier (see step 4) is not a nit: raise it.
 2. Check out the branch in your worktree. If the diff is non-trivial logic,
    spans more than one area, or adds a wire format, follow the `mr-review`
    skill. Otherwise review it directly. In both cases, run the tests the PR
@@ -57,8 +58,21 @@ only Ben merges.
    is `🤖 **principal-engineer**: round <k>/<max>`. After that, a numbered list
    of required changes, each with a `file:line` and a short reason, then an
    optional "non-blocking" list.
-   - Approve when nothing **required** remains. Non-blocking notes do not
-     hold up approval.
+   - Approve only when nothing **required** remains **and nothing is left
+     undecided**. Non-blocking notes do not hold up approval. Open questions
+     do.
+   - **An open question is a required change.** It is any decision the PR
+     leaves for later or for someone else: "the implementer decides whether
+     …", "TBD", "to be settled in a follow-up", or a choice it lists without
+     making. The author settles it in the PR, with the reasoning (for a
+     design doc, in the doc). The other option is to take it out of scope
+     with a filed issue that the PR links, so that what the PR does say is
+     complete without it.
+   - **A decision only Ben can make is still an open question.** Require the
+     author to write the options and a recommended answer into the PR. Once
+     that is done you may approve, and the review must open its prose with
+     "Ben to confirm:" followed by each such decision. A decision with no
+     recommendation does not get an approval.
    - **The final round** (`round=<max>/<max>`) is when you decide whether
      there should be a 4th round. If the PR is still not approvable, append a
      decision to the marker, `next=restart` or `next=ben`:

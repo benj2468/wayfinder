@@ -269,6 +269,9 @@ reviews() { markers "$1" | grep -c . || true; }
 rounds() { markers "$1" | awk '/next=restart/ { n = 0; next } { n++ } END { print n + 0 }'; }
 restarts() { markers "$1" | grep -c 'next=restart' || true; }
 last_marker() { markers "$1" | tail -1; }
+# Only the sha: the marker goes on to `notes=` and `next=`, so a suffix strip
+# like `${m##*sha=}` would never equal the head and re-queues every approval.
+marker_sha() { sed -nE 's/.*sha=([0-9a-f]+).*/\1/p' <<<"$1"; }
 marker_notes() { # <marker line> → its non-blocking note count (0 if absent)
   local n
   n=$(sed -nE 's/.* notes=([0-9]+).*/\1/p' <<<"$1")
@@ -320,7 +323,7 @@ reconcile() {
     fi
     [[ $state == "$L_APPROVED" || $state == "$L_CHANGES" ]] || continue
     m=$(last_marker "$pr")
-    [[ -n $m && ${m##*sha=} != "$(pr_head "$pr")" ]] && set_state "$pr" "$L_REVIEW"
+    [[ -n $m && $(marker_sha "$m") != "$(pr_head "$pr")" ]] && set_state "$pr" "$L_REVIEW"
   done
   return 0
 }
