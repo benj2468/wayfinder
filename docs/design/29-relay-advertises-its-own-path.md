@@ -143,10 +143,11 @@ Not covered:
 
 ## 4. Correctness and edge cases
 
-- **Two-node loop.** If B's next hop to `orig` is A, every re-flood B sends
-  names A, so A learns no path through B from it. A switch of B's next hop is
-  covered from B's next re-flood; until then A may hold a path learned earlier,
-  which ages out as it does today.
+- **Two-node loop.** If node Q's next hop to `orig` is P, every re-flood Q
+  sends names P, so P learns no path through Q from it. A switch of Q's next hop
+  is covered from Q's next re-flood; until then P may hold a path learned
+  earlier, which ages out as it does today. §6 measures this after P loses its
+  own upstream.
 - **The copy's sender X is no longer named when `via` is Y.** X may now learn a
   path through this node. That path is real (it runs through Y), and its TQ is
   at most one hop below what X itself advertised. If Y's path runs through X,
@@ -233,6 +234,37 @@ withholding. The likely reason is that fewer alternate paths are learned before
 the failure; this has not been traced. The worst case is no higher. `rejoin_s`
 is bimodal on `main` as well (0.35 s or 3.1 s) and showed no clear difference.
 
+Losing an upstream, authenticated, seeds 0-9, `main` at `ea96355b`. A link is
+cut at 60 s and the following 40 s are watched. A *bounced* frame is a stream packet the neighbour
+`P` sends back to the relay that was forwarding through it. Two meshes:
+
+- **chain:** the §1 chain, `r1 - r2` cut, so `(relay, P) = (field, r3)`. It is
+  run without and with the one-way link. Without that link the chain has no
+  second path, so no relay can hear a copy from anyone but its next hop, and the
+  rules cannot differ.
+- **redundant:** two-way links only, `hq - a - y - r - field` plus
+  `hq - b1 - b2 - x - r`. `r` forwards through `y`; `a - y` is cut, so
+  `(relay, P) = (r, y)`. `hq` has two interfaces here, so every sequence number
+  from the `x` side reaches `r` first from `x`.
+
+| measurement (median; max in brackets) | `main` | B | D (§8) |
+|---|---|---|---|
+| chain: bounced frames | 0 | 0 | 0 |
+| chain + one-way: bounced frames | 3260 (3512), permanent loop | 0 | 13 (13) |
+| chain + one-way: `r3` names `field` for (s) | the whole 40 | never | 20.1 (22.6) |
+| redundant: seeds with bounced frames | 10 of 10 | **0 of 10** | 10 of 10 |
+| redundant: bounced frames | 816 (1536) | 0 | 924 (1104) |
+| redundant: `r` and `y` name each other for (s) | 4.1 (6.8) | 0 (0.15) | 4.4 (5.2) |
+| redundant: delivery over the 38 s of traffic | 0.79 | 0.81 | 0.78 |
+| redundant: delivery restored after (s) | 7.9 (10.8) | 7.1 (11.3) | 8.3 (9.1) |
+
+On the chain, delivery after the cut is zero under every rule, because the cut
+partitions it. The redundant row is a loop `main` has today: `r` re-floods the
+`x`-side copies naming `x`, so `y` records a path back through `r`, and falls
+back to it while `r` still points at `y`. B removes it. The median restore time
+improves by under a second and the worst seed is 0.5 s slower than on `main`, so
+the gain to claim is the loop, not the outage length.
+
 Tests: under B, `sim/tests/test_red_team.py` and `test_wormhole.py` pass
 unchanged (64 tests). Of 742 `batman`, `wayfinder` and `wayfinder-test` tests,
 736 pass, including the lazy-certificate-distribution ones. The six failures
@@ -250,28 +282,24 @@ Not measured: lazy distribution in the sim and the benchmarks.
 **B sends more on redundant meshes.** The frame layout and size do not change,
 and each node still re-floods an OGM at most once. What rises is how often
 nodes originate: re-floods per originated OGM are the same as on `main` (11.0
-on the 3x4 grid, about 48 on the 7x7), so the extra traffic is extra
-originations. That points to more Trickle resets; what triggers them has not
-been traced.
+on the 3x4 grid, about 48 on the 7x7).
 
-Measured on `main` at `d86abd6f`. **D** is the narrower rule of §8: B's
-withholding and clamp, with `PrevSender` left as `frame.src`. The grids are
-those of `failover.py` (3x4, 200/2000 ms Trickle, seeds 0-9) and `scale.py`
-(7x7, 1/10 s, seeds 0-2), with no data traffic. Figures are everything the
-nodes transmit, per node per second, as frames / frame bytes (no PHY overhead).
+Measured on `main` at `d86abd6f`. The grids are those of `failover.py` (3x4,
+200/2000 ms Trickle, seeds 0-9) and `scale.py` (7x7, 1/10 s, seeds 0-2), with
+no data traffic. Figures are everything the nodes transmit, per node per second,
+as frames / frame bytes (no PHY overhead).
 
 Long steady window (3x4: 60-600 s; 7x7: 60-300 s):
 
-| mesh | `main` | B | D |
-|---|---|---|---|
-| 3x4 open | 7.91 / 326 | 8.08 / 333 (+2%) | 7.91 / 326 (0%) |
-| 3x4 authenticated | 12.48 / 2379 | 12.71 / 2439 (+3%) | 12.49 / 2379 (0%) |
-| 7x7 open | 6.64 / 277 | 7.29 / 305 (+10%) | 6.64 / 277 (0%) |
-| 7x7 authenticated | 7.83 / 1851 | 8.70 / 2086 (+13%) | 8.23 / 1960 (+6%) |
+| mesh | `main` | B |
+|---|---|---|
+| 3x4 open | 7.91 / 326 | 8.08 / 333 (+2%) |
+| 3x4 authenticated | 12.48 / 2379 | 12.71 / 2439 (+3%) |
+| 7x7 open | 6.64 / 277 | 7.29 / 305 (+10%) |
+| 7x7 authenticated | 7.83 / 1851 | 8.70 / 2086 (+13%) |
 
 B, change in bytes against `main` around start-up and a failure (3x4: seeds
-0-9; 7x7: seeds 0-2; one relay off at 60 s, back at 120 s). D was not measured
-in these windows.
+0-9; 7x7: seeds 0-2; one relay off at 60 s, back at 120 s):
 
 | mesh | 0-20 s | 20-60 s | 60-180 s |
 |---|---|---|---|
@@ -280,25 +308,25 @@ in these windows.
 | 7x7 open | +43% | +28% | +12% |
 | 7x7 authenticated | +49% | +41% | +18% |
 
+**What resets Trickle.** On the 7x7 grids, 60-300 s, seeds 0-2, every reset
+latch in that window came from `purge_stale` dropping a single path while the
+originator stayed routable. None came from a new or evicted originator.
+
+| 7x7, latches across 49 nodes, per seed | `main` | B |
+|---|---|---|
+| open | 29, 19, 16 | 96, 87, 90 |
+| authenticated | 19, 33, 17 | 97, 102, 105 |
+
+The likely mechanism, inferred rather than traced: B no longer names the copy's
+sender, so that neighbour sometimes records a path through the relay, is not
+refreshed on it, and later prunes it. Whether pruning an alternate path should
+reset Trickle at all is a separate question (#145); this design does not
+change it.
+
 Where the loop of §1 exists, B saves far more than it costs. On the
 authenticated one-way chain, with `field -> hq` at 10 packets/s, each node
 sends 110.7 frames / 8444 bytes per second on `main` (and delivers nothing),
 against 18.1 / 2648 under B (delivering everything).
-
-D on the other measurements, authenticated:
-
-| measurement | `main` | B | D |
-|---|---|---|---|
-| §1 one-way link, seeds 0-39, lowest delivery | 0.00 | 1.00 | 1.00 |
-| wormhole 500 ms, seeds 0-4 | 1.00 | 1.00 | 1.00 |
-| wormhole 800 ms | 1.00 | 0.90-0.91 | 1.00 |
-| wormhole 1000-1500 ms | 0.00 | 1.00 | 1.00 |
-| wormhole 2000 ms | 1.00 | 1.00 | 1.00 |
-| failover, no keep-alives, mean / max (s) | 2.85 / 5.3 | 3.54 / 5.2 | 3.57 / 5.2 |
-| failover, `keepalive_ms=250`, mean / max (s) | 0.54 / 0.8 | 0.51 / 0.7 | 0.49 / 0.8 |
-
-Under D, `test_red_team.py` and `test_wormhole.py` pass (64 tests), and the
-same six tests fail as under B. Cold-start times were not measured for D.
 
 ## 7. Observability
 
@@ -324,13 +352,26 @@ node cannot tell one from an ordinary second path.
   needs that second field, and during failover the relay stays silent until it
   switches, while its downstream neighbours age the route out.
 - **D: keep `PrevSender = frame.src`; add only the withholding and the clamp.**
-  It fixes every case measured in §6, including 800 ms, and costs less airtime.
-  What it gives up is the second goal of §3: the `via` neighbour is not told
-  that the relay's route runs through it, so it records a path back through the
-  relay. The clamp makes that path worse than the neighbour's own, but the
-  neighbour can still fall back to it when its own path dies, as it can today.
-  That would be a two-node loop until the path ages out. It is an argument from
-  the code; no measured scenario shows it. §10 puts the choice to Ben.
+  Rejected: the `via` neighbour is not told that the relay's route runs through
+  it, so it records a path back and falls back to it when its own upstream dies.
+  On the redundant mesh of §6 that loops on 10 of 10 seeds, as `main` does.
+  D is cheaper and avoids B's 800 ms loss:
+
+  | authenticated | `main` | B | D |
+  |---|---|---|---|
+  | §1 one-way link, seeds 0-39, lowest delivery | 0.00 | 1.00 | 1.00 |
+  | wormhole 500 ms and 2000 ms, seeds 0-4 | 1.00 | 1.00 | 1.00 |
+  | wormhole 800 ms | 1.00 | 0.90-0.91 | 1.00 |
+  | wormhole 1000-1500 ms | 0.00 | 1.00 | 1.00 |
+  | failover, no keep-alives, mean / max (s) | 2.85 / 5.3 | 3.54 / 5.2 | 3.57 / 5.2 |
+  | failover, `keepalive_ms=250`, mean / max (s) | 0.54 / 0.8 | 0.51 / 0.7 | 0.49 / 0.8 |
+  | steady airtime, 7x7 open, bytes | 277 | 305 | 277 |
+  | steady airtime, 7x7 authenticated, bytes | 1851 | 2086 | 1960 |
+
+  (The `keepalive_ms=250` B figure is from the later of two prototype runs; the
+  first, in §6, gave 0.46 / 0.9.) The red-team and wormhole suites pass under D,
+  with the same six old tests failing as under B. Cold start and the start-up
+  airtime windows were not measured for D.
 - **Name `via` only when `frame.src` is unproven.** Measured the same as D on
   the one-way link, the wormhole latencies and the authenticated grids. It adds
   a condition for no measured gain over D.
@@ -370,37 +411,28 @@ measured in the same way.
    more than 0.2 s above `main`'s. The PR reports the mean and the cold-start
    table beside `main`'s.
 6. **Airtime**, the long steady windows of §6: no row's frames or bytes exceed
-   the accepted design's column (B or D) by more than 2% of `main`'s.
+   B's column by more than 2% of `main`'s.
+7. **Lost upstream**, the redundant mesh of §6, seeds 0-9: no bounced frames.
 
 Accepting this design accepts the costs measured in §6: a few hundred
 milliseconds of cold start, and a slower *mean* failover on an authenticated
-mesh without keep-alives (3.5 s against 2.9 s; the worst case is no higher). The
-recommendation is to accept both: they are bounded, and what they buy is a
-mesh that a single one-way link otherwise cuts permanently. The alternative is
-to hold the design until the failover cost is traced.
-The airtime cost depends on the choice in §10.
+mesh without keep-alives (3.5 s against 2.9 s; the worst case is no higher),
+and the airtime of §6 (up to 13% more bytes in steady state, up to 49% around
+start-up). The recommendation is to accept all three: they are bounded, and what
+they buy is a mesh that a single one-way link otherwise cuts permanently, and no
+fallback loop after a lost upstream. The alternative is to hold the design until
+the failover cost is traced.
 
-## 10. Decision for Ben: B or D
+## 10. Decision for Ben
 
-§2 describes B. The airtime measurements were taken after it was written, and
-they change the recommendation.
+**Accept B, the design of §2?** Recommended: yes. Its price is the three costs
+at the end of §9 and the 800 ms loss, which item 3 brings back to you once
+traced.
 
-| | B (§2) | D (§8) |
-|---|---|---|
-| fixes #120 and the §1 loop in every measured case | yes, but 0.90 at 800 ms | yes |
-| steady airtime, open mesh | up to +10% | unchanged |
-| steady airtime, authenticated mesh | up to +13% | up to +6% |
-| tells the `via` neighbour not to route back | yes | no, as today |
-
-**Recommendation: D.** It is the smaller change, and B's extra protection did
-not show in any measurement, while its airtime cost did, on the open meshes
-that gain least from this fix. Choose B if ruling out the two-node fallback
-loop by construction is worth that airtime; the extra originations should then
-be traced first.
-
-If D is chosen, §2 to §5 and the tests of §11 are rewritten for it before this
-design is marked Accepted: `PrevSender` keeps its meaning, and item 3 of §9
-(the 800 ms trace) is dropped.
+The one real alternative is D (§8). It costs less airtime (nothing extra on an
+open mesh) and has no 800 ms loss, but keeps the two-node fallback loop of §6.
+An earlier revision recommended D because no measurement had shown that loop.
+The redundant mesh of §6 now does.
 
 ## 11. Key file map
 
@@ -415,3 +447,5 @@ design is marked Accepted: `PrevSender` keeps its meaning, and item 3 of §9
     is sent, names Y and carries `tq = 0`.
 - Then a `wayfinder-test` scenario with a one-way link on an authenticated mesh.
   `TestSwitchConfig` has no one-way fabric yet.
+- And one for the lost upstream of §6: after `y` loses `a`, `y` never names `r`
+  while `r` names `y`.
