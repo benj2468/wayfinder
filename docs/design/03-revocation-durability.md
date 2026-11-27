@@ -116,16 +116,29 @@ to forget the revocation, or makes it forget (cutting power is enough). After
 this slice, a node that held a record and saved it enforces it again after a
 restart. It does **not** help a node that never heard the record (§3.4, §3.7).
 
-**The list is lost in two ways today.** A restart drops it, and so does
-`CentralRouter::set_auth`, which starts the new `OgmAuth` with an empty list
-(#131, reproduced). That path serves both an operator's `SetAuth` and the host
-driver's own certificate renewal. Persistence without a fix for it would then
-save the empty list over the good one, so both are fixed here.
+**The list is lost in two ways today.**
+
+- A restart drops it.
+- A node that is revoked itself goes inert, which drops the whole `OgmAuth`.
+  When it is re-admitted, `set_auth` has no previous list and starts empty.
+
+A certificate install on a running member (an operator's `SetAuth`, or the host
+driver's renewal) does **not** lose it. `set_auth` carries the list into the new
+`OgmAuth` (#134):
+
+- each record is re-verified, so a move to another mesh drops the old mesh's
+  records;
+- a record keeps what is left of its flood budget, asks for no Trickle reset
+  and is not logged as new;
+- a pending self-revocation is carried too, and still latches only if it cancels
+  the new certificate.
 
 #### 3.1.1 What is stored
 
 A **blob of its own**, holding only the other-node records (a record naming this
-node stays in `self_revocation`, design 16):
+node stays in `self_revocation`, design 16). One limit follows: a
+self-revocation that is not yet in force is held only in `OgmAuth`, so a restart
+still forgets this node's copy of it.
 
 ```
 version: u8 = 1 | count: u16 (big-endian) | count × RevocationRecord (92 bytes)
@@ -171,10 +184,16 @@ The router keeps owning the list and gains no I/O:
 
 - `OgmAuth` counts changes to the list (`revocations_generation`): a new record,
   a superseded one, an eviction, a prune.
+- `set_auth` carries that count into the new `OgmAuth` and advances it. A count
+  restarted from zero could equal the last one saved while the list differs, for
+  example after a move to another mesh.
 - A restore entry point verifies exactly as `ingest_revocation` does, but arms a
-  small flood budget and requests no Trickle reset.
-- `set_auth` offers the previous list to the new `OgmAuth`. Each record is
-  re-verified, so a move to another mesh drops the old mesh's records.
+  small flood budget, requests no Trickle reset and is not logged as new. #134's
+  carry-over already does this with a record's remaining budget, so both share
+  that path.
+- `set_auth` on a router with **no** auth state raises a take-and-clear "restore
+  needed" flag (like `trickle_reset_hint`), so a shell cannot miss such an
+  install.
 
 One synchronous `RevocationLog<S>` in `wayfinder-driver-core` wraps a
 `Persisted` list, so every shell shares the rules. The `Persisted` value is what
@@ -185,11 +204,15 @@ router's list stays visible and is retried.
 2. **Offer** the stored records to the router before the first frame, under
    whatever `Clocked` posture the node has. It never waits for a clock. A node
    with no auth state has no anchor to verify against, so its offer happens as
-   soon as auth is installed, and again on every later install on a node that
-   had none.
-3. **Save** when the generation changes, but only **after** the offer, and
-   **never while the router has no auth state**. Otherwise a node that boots
-   unenrolled, or goes inert, overwrites its list with nothing.
+   soon as auth is installed. The same applies to every later install on a node
+   that had none, including a re-admission after self-revocation.
+3. **Save** when the generation changes, but only **after** the offer (a pending
+   "restore needed" is served first), and **never while the router has no auth
+   state**. Otherwise a node that boots unenrolled, or goes inert, overwrites
+   its list with nothing.
+
+A node that goes inert keeps what was already saved. A change still waiting on
+the write budget (§3.1.4) at that moment is lost with the `OgmAuth`.
 
 **The clock posture.** Waiting for a clock would reopen the power-cut attack
 above: a board can sit at `Clocked::Unknown` after a reboot, enforcing nothing
@@ -230,11 +253,10 @@ budget is empty loses the newest changes.
 #### 3.1.5 Order of work
 
 1. Blob encode/decode and its fuzz target (`wayfinder-auth`).
-2. Router: change counter, restore, carry-over in `set_auth` (fixes #131).
+2. Router: change counter, restore and the "restore needed" flag. The
+   carry-over in `set_auth` already shipped (#134).
 3. `RevocationLog` and the host driver.
 4. Boards.
-
-Step 2 does not depend on step 1, so #131's fix can ship first on its own.
 
 ### 3.2 Addressing the CA
 
@@ -713,8 +735,11 @@ payload logging of reply contents beyond metadata.
   - a node restored under `Clocked::Unknown` refuses the revoked cert;
   - an expired record is pruned and the prune reaches the store;
   - a failed save is alarmed, leaves the record enforced, and is retried;
-  - `set_auth` under the same anchor keeps the list; under another, drops it;
+  - an install that changes the list (a move to another mesh) reaches the
+    store;
   - a node with no auth state never overwrites a stored list;
+  - a node re-admitted after self-revocation gets its stored list back, and does
+    not save over it first;
   - a record that fails verification on load is not enforced;
   - churn past capacity stays within the write budget.
 - **Unit — CA-pull trigger logic**: `stale` computed correctly for
