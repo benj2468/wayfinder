@@ -59,6 +59,10 @@ pub use pairwise::TAG_LEN;
 pub use pairwise::fanout_digest;
 pub use pairwise::frame_tag;
 pub use pairwise::verify_frame_tag;
+pub use revocation_log::REVOCATION_LOG_VERSION;
+pub use revocation_log::decode_revocation_log;
+pub use revocation_log::encode_revocation_log;
+pub use revocation_log::revocation_log_len;
 pub use revoke::REVOKE_VERSION;
 pub use revoke::RevocationRecord;
 

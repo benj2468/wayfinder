@@ -12,14 +12,84 @@
 //! [`version`](RevocationRecord::version) is checked. Re-verifying on load is
 //! why editing the store cannot forge a revocation (it can remove one).
 
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
+
+use crate::error::AuthError;
+use crate::revoke::RevocationRecord;
+
+/// Version byte of the stored list; the only version accepted.
+///
+/// Independent of [`REVOKE_VERSION`](crate::REVOKE_VERSION), which versions
+/// the records inside it.
+pub const REVOCATION_LOG_VERSION: u8 = 1;
+
+/// Bytes ahead of the first record: the version and the big-endian count.
+const HEADER_LEN: usize = 3;
+
+/// The encoded size of a list of `count` records, for sizing a buffer.
+///
+/// `None` if `count` does not fit the layout's 16-bit field, or the size does
+/// not fit a `usize`.
+#[must_use]
+pub const fn revocation_log_len(count: usize) -> Option<usize> {
+    if count > u16::MAX as usize {
+        return None;
+    }
+    match count.checked_mul(RevocationRecord::SERIALIZED_LEN) {
+        Some(body) => body.checked_add(HEADER_LEN),
+        None => None,
+    }
+}
+
+/// Encode `records`, in order, into the front of `out`, returning the number
+/// of bytes written.
+///
+/// `None` if `out` is too small or there are more records than the 16-bit
+/// count can say. `out` then holds a partial encoding that must not be stored.
+#[must_use]
+pub fn encode_revocation_log<'a>(
+    records: impl IntoIterator<Item = &'a RevocationRecord>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let (header, mut body) = out.split_at_mut_checked(HEADER_LEN)?;
+    let mut count: u16 = 0;
+    for record in records {
+        count = count.checked_add(1)?;
+        let (slot, rest) = body.split_at_mut_checked(RevocationRecord::SERIALIZED_LEN)?;
+        slot.copy_from_slice(record.as_bytes());
+        body = rest;
+    }
+    let [hi, lo] = count.to_be_bytes();
+    header.copy_from_slice(&[REVOCATION_LOG_VERSION, hi, lo]);
+    revocation_log_len(usize::from(count))
+}
+
+/// Decode a stored list, borrowing its records from `bytes` without copying.
+///
+/// Strict, so that a damaged blob is never read as a shorter list:
+/// [`AuthError::BadVersion`] for a version other than
+/// [`REVOCATION_LOG_VERSION`], and [`AuthError::Malformed`] if the header is
+/// cut short or the length is not exactly what `count` says.
+///
+/// A missing blob is the caller's to treat as an empty list; an empty slice is
+/// malformed.
+pub fn decode_revocation_log(bytes: &[u8]) -> Result<&[RevocationRecord], AuthError> {
+    let (&[version, hi, lo], body) = bytes
+        .split_first_chunk::<HEADER_LEN>()
+        .ok_or(AuthError::Malformed)?;
+    if version != REVOCATION_LOG_VERSION {
+        return Err(AuthError::BadVersion);
+    }
+    let count = usize::from(u16::from_be_bytes([hi, lo]));
+    <[RevocationRecord]>::ref_from_bytes_with_elems(body, count).map_err(|_| AuthError::Malformed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::authority::Authority;
-    use crate::error::AuthError;
-    use crate::revoke::RevocationRecord;
     use interfaces::frame::Mac;
-    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])

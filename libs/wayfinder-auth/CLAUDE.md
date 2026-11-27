@@ -127,6 +127,10 @@ when the network is up. Note that expiry is no longer enforced by *every*
 verifier — a node with no clock judges no window (see above), which is exactly
 why `cancels_under` makes sure the active path still works there. See `docs/design/03-revocation-durability.md`.
 
+`revocation_log.rs` is the byte layout a node **stores** its revocation list in
+(design 03 §3.1.1). It is versioned apart from the records, decodes strictly,
+and verifies nothing: whoever loads it re-verifies every record.
+
 ## Wire structs
 
 `MembershipCert`, `TrustAnchor`, `RevocationRecord` are `zerocopy` wire types
