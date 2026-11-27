@@ -2225,10 +2225,8 @@ mod keepalive_deprioritization {
 
     /// `next_hop` prefers a live, lower-TQ alternate path over a higher-TQ
     /// path whose relaying neighbor has missed its keep-alive budget — the
-    /// feature's core promise. The *cached* `lookup_route`/`max_tq`/
-    /// `best_next_hop` are deliberately left untouched (the same asymmetry
-    /// `path_stale` already has versus the cache), so this test locks in
-    /// both halves of that asymmetry.
+    /// feature's core promise. The reported `best_next_hop`/`max_tq` follow at
+    /// the next sweep, and again as soon as the keep-alive resumes (#117).
     #[test]
     fn next_hop_prefers_live_alternate_over_higher_tq_missed_keepalive_path() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
@@ -2260,13 +2258,17 @@ mod keepalive_deprioritization {
             "a missed keep-alive must lose to a live alternate even with lower raw TQ"
         );
 
-        // The cached fields are untouched by the keep-alive overlay — only
-        // the time-aware `next_hop` sees the deprioritization.
+        // The sweep brings the report into line with forwarding.
+        engine.purge_stale(t);
+        assert_eq!(engine.lookup_route(mac(9)), Some(mac(3)));
+        assert_eq!(engine.originator_table[&mac(9)].max_tq, 90);
+
+        // And a resumed heartbeat restores both, without waiting for a sweep.
+        feed_keepalive(&mut engine, 2, t);
+        assert_eq!(engine.next_hop(t, mac(9)), Some(mac(2)));
         assert_eq!(engine.lookup_route(mac(9)), Some(mac(2)));
-        let r = &engine.originator_table[&mac(9)];
-        assert_eq!(r.best_next_hop, Some(mac(2)));
         // 255 minus the per-hop OGM penalty (10) applied in `handle_ogm`.
-        assert_eq!(r.max_tq, 245);
+        assert_eq!(engine.originator_table[&mac(9)].max_tq, 245);
     }
 
     /// When every path to a destination has missed its keep-alive budget (or
@@ -3101,5 +3103,61 @@ mod protocol_version {
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.protocol, 0);
+    }
+}
+
+/// What the originator record reports (`best_next_hop` / `max_tq`, which the
+/// management API serves) is the hop [`BatmanEngine::next_hop`] forwards on
+/// (#117).
+mod reported_next_hop {
+    use core::time::Duration;
+
+    use super::*;
+
+    /// Feed one OGM for originator `orig` arriving via neighbor `via` at `now`.
+    fn feed_ogm(
+        engine: &mut BatmanEngine<8>,
+        orig: u8,
+        via: u8,
+        seqno: u32,
+        tq: u8,
+        now: Duration,
+    ) {
+        let ogm = make_ogm(orig, seqno, tq, 50);
+        let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(now, parse_link_frame(&frame), None, &mut reply, &mut ());
+    }
+
+    /// Assert the record for `orig` reports `hop`, and that forwarding agrees.
+    fn assert_reports(engine: &BatmanEngine<8>, now: Duration, orig: u8, hop: u8, tq: u8) {
+        assert_eq!(engine.next_hop(now, mac(orig)), Some(mac(hop)), "forwarded");
+        let record = &engine.originator_table[&mac(orig)];
+        assert_eq!(record.best_next_hop, Some(mac(hop)), "reported");
+        assert_eq!(record.max_tq, tq, "reported TQ");
+    }
+
+    /// Two equal paths: the report used to keep the first one heard while
+    /// forwarding took the other.
+    #[test]
+    fn equal_paths_report_the_one_forwarded_on() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 3, 1, 255, Duration::ZERO);
+
+        assert_reports(&engine, Duration::ZERO, 9, 3, 245);
+    }
+
+    /// The reported hop degrades below an alternate: the report must move with
+    /// forwarding rather than wait for the alternate to be heard again.
+    #[test]
+    fn a_degraded_hop_is_replaced_in_the_report_at_once() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 3, 1, 200, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 2, 2, 100, Duration::ZERO);
+
+        assert_reports(&engine, Duration::ZERO, 9, 3, 190);
     }
 }

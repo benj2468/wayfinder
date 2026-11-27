@@ -96,11 +96,10 @@ impl<
     /// Actively queries the BATMAN routing table for a given destination.
     /// Returns the immediate next-hop MAC address if a route exists.
     ///
-    /// This returns the cached `best_next_hop`, kept current by the periodic
-    /// [`purge_stale`](Self::purge_stale) sweep.  Forwarding decisions on the
-    /// receive hot path use the time-aware [`next_hop`](Self::next_hop) instead,
-    /// which additionally ignores paths that have gone stale since the last
-    /// sweep.
+    /// This returns the cached `best_next_hop`: what
+    /// [`next_hop`](Self::next_hop) answered when this record was last
+    /// refreshed. Forwarding asks `next_hop` itself, which also sees paths,
+    /// proofs and keep-alives that have lapsed since.
     ///
     /// Deliberately **not** `pub`: it takes no `now`, so it cannot answer the
     /// time-dependent question of whether the cached hop's proof is still
@@ -139,19 +138,47 @@ impl<
     ///
     /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
     pub fn next_hop(&self, now: core::time::Duration, destination: Mac) -> Option<Mac> {
-        let seed_ms = self.seed_interval_ms();
         let record = self.originator_table.get(&destination)?;
+        self.select_path(now, record).map(|p| p.neighbor_ident)
+    }
+
+    /// The one next-hop selection: what [`next_hop`](Self::next_hop) forwards
+    /// on and what [`refresh_selection`](Self::refresh_selection) caches for
+    /// reporting. Two rules here would let a node report a route its traffic
+    /// does not take (#117).
+    ///
+    /// Drops paths that are stale or whose neighbor holds no current proof,
+    /// then takes the highest [`effective_tq`](Self::effective_tq), a tie going
+    /// to the later path.
+    fn select_path<'a>(
+        &self,
+        now: core::time::Duration,
+        record: &'a OriginatorRecord,
+    ) -> Option<&'a NeighborStats> {
+        let seed_ms = self.seed_interval_ms();
         record
             .paths
             .iter()
             .filter(|p| !Self::path_stale(Millis::from_duration(now), p, seed_ms))
-            // The proof gate. Separate from `recompute_best`'s because this is
-            // the hot path: it recomputes from `paths` rather than reading the
-            // cached `best_next_hop`, so gating only the cache would leave
-            // forwarding open to exactly the next hop the cache refused.
             .filter(|p| self.proof_current(now, p.neighbor_ident))
             .max_by_key(|p| self.effective_tq(now, p))
-            .map(|p| p.neighbor_ident)
+    }
+
+    /// Re-derive `orig`'s cached `best_next_hop`/`max_tq` from
+    /// [`select_path`](Self::select_path).
+    ///
+    /// **Clears** both when no path is selectable, so a cached next hop never
+    /// outlives the path or proof behind it.
+    fn refresh_selection(&mut self, now: core::time::Duration, orig: Mac) {
+        let selected = self
+            .originator_table
+            .get(&orig)
+            .and_then(|record| self.select_path(now, record))
+            .map(|p| (p.neighbor_ident, p.last_tq));
+        if let Some(record) = self.originator_table.get_mut(&orig) {
+            record.best_next_hop = selected.map(|(hop, _)| hop);
+            record.max_tq = selected.map_or(0, |(_, tq)| tq);
+        }
     }
 
     /// The best next hop toward `destination` as of `now`, **ignoring the proof
@@ -220,36 +247,17 @@ impl<
         self.recompute_all_best(now);
     }
 
-    /// Recompute every record's cached `best_next_hop`/`max_tq` against the
-    /// current proof state.
+    /// [`refresh_selection`](Self::refresh_selection) for every record.
     ///
-    /// Run both after paths age out and the moment a neighbor proves itself:
-    /// a proof arriving is precisely when a route becomes usable, and waiting
-    /// for the next periodic sweep would leave the management API reporting no
-    /// route for a link that already works.
+    /// Run after paths age out, the moment a neighbor proves itself or loses
+    /// its proof, and when a missed keep-alive resumes: waiting for the next
+    /// OGM would leave the management API reporting a route that forwarding
+    /// has already left.
     fn recompute_all_best(&mut self, now: core::time::Duration) {
-        let seed_ms = self.seed_interval_ms();
-        // Snapshot which neighbors are selectable before taking the mutable
-        // borrow on the table, since the proof check reads `&self`.
-        let require_proof = self.require_proof;
-        let selectable: heapless::Vec<Mac, MAX_ORIGINATORS> = self
-            .proven
-            .iter()
-            .filter(|(_, (last, _))| {
-                !Self::is_stale(
-                    Millis::from_duration(now),
-                    *last,
-                    0,
-                    seed_ms,
-                    crate::MAX_MISSED_PROOFS,
-                )
-            })
-            .map(|(m, _)| *m)
-            .collect();
-        let is_selectable = |m: Mac| !require_proof || selectable.contains(&m);
-
-        for record in self.originator_table.values_mut() {
-            Self::recompute_best(record, &is_selectable);
+        let originators: heapless::Vec<Mac, MAX_ORIGINATORS> =
+            self.originator_table.keys().copied().collect();
+        for orig in originators {
+            self.refresh_selection(now, orig);
         }
     }
 
@@ -466,14 +474,9 @@ impl<
     /// is true for this path's relaying neighbor — guaranteeing such a path
     /// can never outrank any live alternative with a nonzero TQ, matching the
     /// deprioritization-not-eviction contract unconditionally. A **read-time
-    /// overlay** used only inside [`next_hop`](Self::next_hop)'s comparison —
-    /// it never mutates `path.last_tq` itself, so it is self-healing the
-    /// instant a keep-alive resumes and needs no periodic decay/reset.
-    /// Deliberately not used by
-    /// [`recompute_best`](Self::recompute_best)/[`purge_stale`](Self::purge_stale):
-    /// the cached `OriginatorRecord::max_tq`/`best_next_hop` stay driven by
-    /// OGM data alone, mirroring the same cache/hot-path asymmetry
-    /// [`path_stale`](Self::path_stale) already has.
+    /// overlay** used only for ranking: it never mutates `path.last_tq`, so it
+    /// is self-healing the instant a keep-alive resumes and needs no periodic
+    /// decay/reset.
     fn effective_tq(&self, now: core::time::Duration, path: &NeighborStats) -> u8 {
         if self.keepalive_missed(now, path.neighbor_ident) {
             0
@@ -663,38 +666,6 @@ impl<
         self.proven.retain(|_, (last, _)| recent(last));
         self.challenged.retain(|_, (last, _)| recent(last));
         self.keepalive.retain(|_, s| recent(&s.last_heard));
-    }
-
-    /// Recompute `best_next_hop` and `max_tq` from a record's current paths,
-    /// choosing the highest-TQ path that `selectable` admits — on an
-    /// authenticated mesh, one whose next-hop proof is current.  Called after
-    /// pruning so the cached best hop reflects only live paths.
-    ///
-    /// **Clears** both fields when no path is selectable — including when none
-    /// remain — so a cached next hop never outlives the proof behind it.
-    fn recompute_best(record: &mut OriginatorRecord, selectable: &dyn Fn(Mac) -> bool) {
-        let mut best: Option<&NeighborStats> = None;
-        for p in record.paths.iter() {
-            if !selectable(p.neighbor_ident) {
-                continue;
-            }
-            if best.is_none_or(|b| p.last_tq >= b.last_tq) {
-                best = Some(p);
-            }
-        }
-        match best {
-            Some(b) => {
-                record.max_tq = b.last_tq;
-                record.best_next_hop = Some(b.neighbor_ident);
-            }
-            // No selectable path: clear rather than leave the previous next hop
-            // standing. Keeping a stale one is how an unproven — possibly
-            // spoofed — neighbor would survive its own demotion.
-            None => {
-                record.max_tq = 0;
-                record.best_next_hop = None;
-            }
-        }
     }
 
     /// How many sequence-number high-waters this node has resynchronised,
@@ -1346,11 +1317,6 @@ impl<
 
         let incoming_seqno = u32::from_be(ogm.seqno);
 
-        // Whether the relaying neighbor may be *selected* as a next hop. Read
-        // before the mutable borrow on the originator table below, since the
-        // proof check needs `&self`.
-        let src_proven = self.proof_current(now, frame.src);
-
         // Find or create the originator's record, keyed by its MAC.
         // A freshly discovered originator is itself a topology change.
         let is_new_orig = !self.originator_table.contains_key(&orig_ident);
@@ -1385,7 +1351,7 @@ impl<
                 neighbor_ident: orig_ident,
                 // Deliberately not `Some(frame.src)`: a first-contact sender
                 // is exactly what must not be installed before the proof gate
-                // has had a chance to run. `recompute_best` below fills this in
+                // has had a chance to run. `refresh_selection` below fills this in
                 // if — and only if — the path is selectable.
                 best_next_hop: None,
                 max_tq: 0,
@@ -1555,31 +1521,9 @@ impl<
                 });
             }
 
-            // Update routing-table selection with hysteresis, under the proof
-            // gate.  Refresh the incumbent next hop's metric when we hear it
-            // again (its quality may have risen or fallen) — unless its proof
-            // has lapsed, in which case demote it here rather than waiting for
-            // the next `purge_stale`.  Promote a *different* sender only if it
-            // is proven, and only when there is no incumbent or its TQ is
-            // strictly better.  An equal-quality copy arriving via a different
-            // neighbor — the common case in a redundant mesh — is kept as an
-            // alternate path (above) without displacing the incumbent.
-            if record.best_next_hop == Some(frame.src) {
-                if src_proven {
-                    record.max_tq = computed_tq;
-                } else {
-                    // The incumbent's proof has lapsed. Demote it here rather
-                    // than waiting for the next `purge_stale`, so the cached
-                    // next hop the management API reports never outlives the
-                    // proof behind it.
-                    record.best_next_hop = None;
-                    record.max_tq = 0;
-                }
-            } else if src_proven && (record.best_next_hop.is_none() || computed_tq > record.max_tq)
-            {
-                record.max_tq = computed_tq;
-                record.best_next_hop = Some(frame.src);
-            }
+            // Re-select over the paths as they now stand. No hysteresis: the
+            // cache reports what forwarding does, and forwarding has none.
+            self.refresh_selection(now, orig_ident);
 
             // Fold this originator's multicast memberships (carried in the OGM's
             // TVLV tail) into the membership table.  The `record` borrow has
@@ -1740,7 +1684,11 @@ impl<
         };
         if frame.src != self.self_ident {
             if self.originator_table.contains_key(&frame.src) {
+                let resumed = self.keepalive_missed(now, frame.src);
                 self.note_keepalive(now, frame.src);
+                if resumed {
+                    self.recompute_all_best(now);
+                }
             } else {
                 trace!(neighbor = ?frame.src, "drop: keepalive from a neighbor with no OGM-established route");
             }
