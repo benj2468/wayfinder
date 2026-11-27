@@ -59,6 +59,8 @@ from wayfinder_sim.report import (
 from wayfinder_sim.scenario import Simulation
 from wayfinder_sim.security import Credential, Mesh
 from wayfinder_sim.topology import pair, shared_lan
+from wayfinder_sim.topology import path as topology_path
+from wayfinder_sim.wormhole import control_only
 
 MESH_ROOT_SEED = bytes([0xA5]) * 32
 """Fixed mesh root, so a run is reproducible and MACs are stable between
@@ -3282,6 +3284,49 @@ def attack_relayed_tq_inflation() -> Finding:
     )
 
 
+def attack_wormhole_blackhole(seed: int = 0) -> Finding:
+    """Two radios with no keys, one in earshot of `hq` and one in earshot of
+    `field` four hops away, repeating each other's traffic verbatim -- except
+    application data, which they swallow.
+
+    Nothing is forged: `field` hears `hq`'s genuine signed OGMs, and the
+    challenge it sends to make its next hop prove itself is carried to `hq`,
+    who answers it. Authentication says who built a frame and the proof says
+    who can answer now; neither says how far away they are. A design that
+    segregates by membership would not expect two non-members to decide where
+    a member's traffic goes.
+    """
+    chain = ["hq", "r1", "r2", "r3", "field"]
+    sim = Simulation(
+        [*_members(*chain), Node("eve_a"), Node("eve_b")],
+        [
+            *topology_path(chain, PerfectWire()),
+            pair("hq", "eve_a", PerfectWire()),
+            pair("field", "eve_b", PerfectWire()),
+        ],
+        seed=seed,
+        mesh=mesh(),
+    )
+    tunnel = sim.wormhole("eve_a", "eve_b", passes=control_only, at_s=30.0)
+    before = sim.stream("field", "hq", rate_hz=10.0, start_s=20.0, duration_s=9.0)
+    after = sim.stream("field", "hq", rate_hz=10.0, start_s=60.0, duration_s=30.0)
+    sim.run(until_s=29.5)
+    honest_hop, honest_tq = sim.next_hop("field", "hq"), sim.tq_to("field", "hq")
+    sim.run(until_s=95.0)
+    hop, tq = sim.next_hop("field", "hq"), sim.tq_to("field", "hq")
+    if honest_hop != "r3" or before.delivery_ratio() < 0.9:
+        raise RuntimeError("the mesh had not converged before the wormhole opened")
+
+    captured = hop == "hq" and after.delivery_ratio() < 0.5
+    return Finding(
+        "Wormhole draws a route and blackholes it",
+        GAP if captured else HELD,
+        f"before: field->hq via {honest_hop}, TQ {honest_tq}, delivery "
+        f"{before.delivery_ratio():.0%}; after: via {hop}, TQ {tq}, delivery "
+        f"{after.delivery_ratio():.0%} ({tunnel.withheld} data frames swallowed)",
+    )
+
+
 # --- small helpers ------------------------------------------------------
 
 
@@ -3346,6 +3391,8 @@ ATTACKS: list[Callable[[], Finding]] = [
     attack_broadcast_evict_then_reseed,
     attack_broadcast_dedup_table_exhaustion,
     attack_relayed_tq_inflation,
+    # --- relay attacks: no keys, no forging ---
+    attack_wormhole_blackhole,
 ]
 
 

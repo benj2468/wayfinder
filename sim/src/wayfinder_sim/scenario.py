@@ -36,6 +36,7 @@ from .node import Node
 from .recorder import Recorder
 from .security import Mesh
 from .traffic import Flow, decode_payload, encode_payload
+from .wormhole import FramePredicate, Wormhole
 
 Probe = Callable[["Simulation"], Any]
 """A function of the running `Simulation`, sampled once per recorder tick —
@@ -279,6 +280,8 @@ class Simulation:
         # name — what a compromised node's firmware watches for and discards.
         self._revocation_bytes: dict[str, list[bytes]] = {}
         self._flows: list[Flow] = []
+        # Each wormhole is listed under both of its ends.
+        self._wormholes: dict[str, Wormhole] = {}
         # Forwarding misbehaviour by node name, with the stream it draws from.
         self._insiders: dict[str, tuple[Insider, Random]] = {}
         self._insider_drops: dict[str, int] = {}
@@ -583,6 +586,37 @@ class Simulation:
         self.env.process(
             self._flood_proc(src, frame, rate_hz, start_s, duration_s, link)
         )
+
+    def wormhole(
+        self,
+        a: str,
+        b: str,
+        *,
+        passes: FramePredicate | None = None,
+        latency_ms: float = 0.0,
+        at_s: float = 0.0,
+        until_s: float | None = None,
+    ) -> Wormhole:
+        """Tunnel frames between the radios of nodes `a` and `b` from `at_s`
+        until `until_s` (see `wayfinder_sim.wormhole`).
+
+        Every frame the channel delivers to one end is re-emitted, byte for
+        byte, on all of the other end's links `latency_ms` later, unless
+        `passes` refuses it. The tunnel itself is out of band: it costs no
+        airtime and loses nothing. The returned record counts what it carried.
+
+        The two ends must not share a link, which would make the tunnel feed
+        itself, and a node can be an end of only one wormhole.
+        """
+        ends = [self._states[a], self._states[b]]
+        links = [{link.name for link in end.interfaces.values()} for end in ends]
+        if a == b or links[0] & links[1]:
+            raise ValueError(f"{a!r} and {b!r} are already in earshot")
+        if a in self._wormholes or b in self._wormholes:
+            raise ValueError(f"{a!r} or {b!r} already ends a wormhole")
+        tunnel = Wormhole(a, b, passes, latency_ms, at_s, until_s)
+        self._wormholes[a] = self._wormholes[b] = tunnel
+        return tunnel
 
     # --- failures ---------------------------------------------------------
 
@@ -1063,6 +1097,21 @@ class Simulation:
             record in frame for record in self._revocation_bytes.get(name, ())
         ):
             self._compromise_discards[name] = self._compromise_discards.get(name, 0) + 1
+            return
+        tunnel = self._wormholes.get(name)
+        if tunnel is not None and tunnel.is_open(self.env.now / 1000.0):
+            if tunnel.passes is not None and not tunnel.passes(frame):
+                tunnel.withheld += 1
+            else:
+                tunnel.tunnelled += 1
+                self.env.process(
+                    self._inject_proc(
+                        tunnel.far_end(name),
+                        frame,
+                        (self.env.now + tunnel.latency_ms) / 1000.0,
+                        None,
+                    )
+                )
             return
         dst_state.driver.push_rx(dst_iface, frame, metrics)
 
