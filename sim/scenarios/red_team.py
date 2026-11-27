@@ -3284,9 +3284,6 @@ def attack_relayed_tq_inflation() -> Finding:
     )
 
 
-# --- small helpers ------------------------------------------------------
-
-
 def attack_wormhole_blackhole(seed: int = 0) -> Finding:
     """Two radios with no keys, one in earshot of `hq` and one in earshot of
     `field` four hops away, repeating each other's traffic verbatim -- except
@@ -3328,6 +3325,9 @@ def attack_wormhole_blackhole(seed: int = 0) -> Finding:
         f"{before.delivery_ratio():.0%}; after: via {hop}, TQ {tq}, delivery "
         f"{after.delivery_ratio():.0%} ({tunnel.withheld} data frames swallowed)",
     )
+
+
+# --- small helpers ------------------------------------------------------
 
 
 def _drain(sim: Simulation, node: str) -> list[bytes]:

@@ -231,6 +231,20 @@ sim.run(until_s=25)
 tap.containing(b"MEETING AT DAWN")   # readable: payloads are never encrypted
 ```
 
+**`Simulation.misbehave`** is the insider: a member whose router, certificate
+and keys are genuine, whose firmware withholds some of what the router emits
+(`wayfinder_sim.insider.Insider`: `selective_forwarding`, `grayhole(share)`,
+`blackhole`).
+
+```python
+sim.misbehave("n12", Insider.selective_forwarding(), at_s=40.0)
+sim.insider_drops("n12")     # non-zero, or the attack never bit
+```
+
+`sim/scenarios/selective_forwarding.py` measures it on the field grid. Dropping
+only data leaves every advert-derived metric unchanged, so the mesh keeps
+routing into the radio; going wholly silent gets it routed around.
+
 #### Asking the right question about membership
 
 Use `admitted` (verified certificates) and `has_route` (learned routes), not

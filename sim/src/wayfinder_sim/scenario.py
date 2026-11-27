@@ -27,6 +27,7 @@ import wayfinder_py as wf
 
 from . import NoLinkError
 from .adversary import Wiretap
+from .insider import Insider
 from .interference import DEFAULT_CAPTURE_DB, Jammer, sum_dbm
 from .link import Link
 from .medium import EnergyModel, RadioStats
@@ -281,6 +282,9 @@ class Simulation:
         self._flows: list[Flow] = []
         # Each wormhole is listed under both of its ends.
         self._wormholes: dict[str, Wormhole] = {}
+        # Forwarding misbehaviour by node name, with the stream it draws from.
+        self._insiders: dict[str, tuple[Insider, Random]] = {}
+        self._insider_drops: dict[str, int] = {}
 
         for name in self._states:
             self.env.process(self._tick_proc(name))
@@ -413,6 +417,23 @@ class Simulation:
         exclusion should check this is non-zero: if the filter never fired,
         the node may have honoured the order and excluded itself."""
         return self._compromise_discards.get(node, 0)
+
+    def misbehave(self, node: str, insider: Insider, *, at_s: float = 0.0) -> None:
+        """From `at_s`, have `node` withhold the frames `insider` drops (see
+        `insider.py`). Its router runs unchanged and never learns that they
+        did not go out. The behaviour is the firmware, so it survives a
+        reboot. Of several calls for a node, the one with the latest `at_s`
+        wins, whatever order they were made in (a tie goes to the later call).
+
+        Only what the router emits is filtered — `inject` bypasses it."""
+        if node not in self._states:
+            raise KeyError(node)
+        self.env.process(self._misbehave_proc(node, insider, at_s))
+
+    def insider_drops(self, node: str) -> int:
+        """How many frames `node`'s misbehaviour has withheld. A scenario
+        blaming an outage on it should check this is non-zero."""
+        return self._insider_drops.get(node, 0)
 
     def knows_revoked(self, node: str, target: str) -> bool:
         """Whether `node` holds a revocation naming `target` right now."""
@@ -948,11 +969,26 @@ class Simulation:
         for iface, link in state.interfaces.items():
             frame = state.driver.poll_egress(iface)
             while frame is not None:
+                if self._withheld(name, frame):
+                    frame = state.driver.poll_egress(iface)
+                    continue
                 state.tx_frames += 1
                 state.tx_bytes += len(frame)
                 self._schedule_delivery(link, name, iface, frame)
                 frame = state.driver.poll_egress(iface)
         self._drain_local(state, name)
+
+    def _withheld(self, name: str, frame: bytes) -> bool:
+        entry = self._insiders.get(name)
+        if entry is None or not entry[0].drops(frame, entry[1]):
+            return False
+        self._insider_drops[name] = self._insider_drops.get(name, 0) + 1
+        return True
+
+    def _misbehave_proc(self, node: str, insider: Insider, at_s: float):
+        yield from self._wait_until(at_s)
+        # Its own stream, so a grayhole never shifts the channel's draws.
+        self._insiders[node] = (insider, Random(f"{self._seed}:insider:{node}"))
 
     def _drain_local(self, state: _NodeState, name: str) -> None:
         """Move what the router delivered locally into `state.inbox`,

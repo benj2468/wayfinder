@@ -52,13 +52,19 @@ around them.
     pick something that does not depend on it, and say so in your log.
 - **Take one bounded task per run.** Finish it or leave it cleanly. Do not
   start a second task.
-- **Lanes:** change files only inside your lane (see your role file). The
-  shared crates (`libs/batman`, `libs/wayfinder`, `libs/interfaces`,
-  `libs/wayfinder-driver-core` and the rest of `libs/`) change only through a
-  design doc that Ben accepts. If your task needs a change outside your lane,
-  write that design doc (`docs/design/`, `Status: Proposed`, following
-  `docs/design/README.md`) as the task and stop there. The orchestrator labels
-  any PR with out-of-lane files `needs-ben`.
+- **Lanes:** each role owns a lane (see its role file), and works inside
+  it.
+  - A *behaviour* change to a shared crate (`libs/batman`, `libs/wayfinder`,
+    `libs/interfaces`, `libs/wayfinder-driver-core` and the rest of `libs/`)
+    goes through a design doc that Ben accepts. If your task needs one, write
+    that doc (`docs/design/`, `Status: Proposed`, following
+    `docs/design/README.md`) as the task, and stop there.
+  - Small out-of-lane edits that a task strictly needs, such as tests, benches
+    or a workspace member line, are allowed. The PR is reviewed as usual, then
+    waits for Ben (`needs-ben`) with the out-of-lane files listed.
+  - Any PR touching keys, credentials or the wire (`wayfinder-auth`,
+    `wayfinder-linksec`, `wayfinder-tls-mgmt`, `wayfinder-protos`) also waits
+    for Ben, whoever wrote it.
 - **Test-first**, per `CLAUDE.md` and the `tdd` skill: the failing test is its
   own commit, and the implementation is a later commit on the same branch. The
   PR goes up only when the branch is green.

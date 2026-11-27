@@ -22,16 +22,13 @@ import dataclasses
 from collections.abc import Callable
 
 from . import forge
+from .insider import DATA_PACKET_TYPES
 
 FramePredicate = Callable[[bytes], bool]
 """Takes a whole link frame; true if the wormhole should carry it."""
 
-_PACKET_MCAST = 0x04
-"""`batman::wire::BatmanPacketType::Mcast`, which `forge` does not name."""
-
-_DATA_PACKET_TYPES = frozenset(
-    {forge.PACKET_BCAST, forge.PACKET_UNICAST, _PACKET_MCAST}
-)
+_ETHERTYPE = slice(forge.LINK_HEADER_LEN - 2, forge.LINK_HEADER_LEN)
+"""Where the link header carries the ethertype: its last two bytes."""
 
 
 def control_only(frame: bytes) -> bool:
@@ -39,10 +36,10 @@ def control_only(frame: bytes) -> bool:
     (unicast, broadcast, multicast): the blackholing wormhole."""
     if len(frame) <= forge.LINK_HEADER_LEN:
         return True
-    protocol = int.from_bytes(frame[12:14], "big")
+    protocol = int.from_bytes(frame[_ETHERTYPE], "big")
     return (
         protocol != forge.BATMAN_ETHERTYPE
-        or frame[forge.LINK_HEADER_LEN] not in _DATA_PACKET_TYPES
+        or frame[forge.LINK_HEADER_LEN] not in DATA_PACKET_TYPES
     )
 
 
