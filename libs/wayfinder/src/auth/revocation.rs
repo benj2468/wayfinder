@@ -1228,6 +1228,37 @@ mod carried_across_set_auth {
         assert!(router.take_self_revocation().is_some());
     }
 
+    /// Carried records are not news. An operator reading the log after a
+    /// routine renewal must see each purge, and this node's own revocation,
+    /// announced once: when it arrived.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_certificate_install_does_not_announce_carried_records_again() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let cert_issued_at_zero =
+            || member_issued_at(&authority, 2, mac(2), 0, 100_000, Clocked::At(100));
+        let mut router = CentralRouter::new(mac(2));
+        router.set_auth(cert_issued_at_zero());
+        let now = Duration::from_secs(100);
+        assert!(router.ingest_revocation(&authority.revoke(mac(9), 50, 100_000), now));
+        router.ingest_revocation(&authority.revoke(mac(2), 500, 100_000), now);
+
+        router.set_auth(cert_issued_at_zero());
+
+        logs_assert(|lines: &[&str]| {
+            for message in [
+                "ingested new revocation",
+                "mesh membership has been revoked",
+            ] {
+                let count = lines.iter().filter(|l| l.contains(message)).count();
+                if count != 1 {
+                    return Err(format!("{message:?} logged {count} times, expected once"));
+                }
+            }
+            Ok(())
+        });
+    }
+
     /// The control: a re-admission, a certificate issued after the record's
     /// instant, is not cancelled by the pending record.
     #[test]
