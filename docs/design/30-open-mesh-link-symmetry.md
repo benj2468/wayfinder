@@ -174,7 +174,7 @@ the bench fixtures were not tried.
 
 `CentralRouter` gains a current count of neighbours that are heard but verified
 on no interface: a one-way link, seen from the receiving end. It is derived from
-the table selection reads. The management API and TUI half is a follow-up issue.
+the table selection reads. The management API and TUI half is #143.
 
 ## 7. Alternatives
 
