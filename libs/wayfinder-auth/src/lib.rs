@@ -32,6 +32,7 @@ mod error;
 mod key;
 mod mac;
 mod pairwise;
+mod revocation_log;
 mod revoke;
 
 #[cfg(feature = "std")]

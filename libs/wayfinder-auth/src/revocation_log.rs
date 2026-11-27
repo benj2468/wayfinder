@@ -1,0 +1,147 @@
+//! The byte layout of a node's **stored** revocation list (design 03 §3.1.1).
+//!
+//! ```text
+//! version: u8 = 1 | count: u16 (big-endian) | count × RevocationRecord
+//! ```
+//!
+//! This is a storage format, not a wire format: it never crosses the mesh.
+//!
+//! **Decoding is not verification.** A decoded record must still pass
+//! [`TrustAnchor::verify_revocation`](crate::TrustAnchor::verify_revocation)
+//! before it is enforced, which is also where a record's own
+//! [`version`](RevocationRecord::version) is checked. Re-verifying on load is
+//! why editing the store cannot forge a revocation (it can remove one).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authority::Authority;
+    use crate::error::AuthError;
+    use crate::revoke::RevocationRecord;
+    use interfaces::frame::Mac;
+    use zerocopy::IntoBytes;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn record(n: u8) -> RevocationRecord {
+        Authority::from_seed(&[1u8; 32], 0xABCD).revoke(mac(n), 500, 1000)
+    }
+
+    /// An empty list is a header alone, and decodes back to no records.
+    #[test]
+    fn an_empty_list_round_trips() {
+        let mut out = [0u8; 8];
+        let len = encode_revocation_log(&[], &mut out).unwrap();
+        assert_eq!(&out[..len], &[1, 0, 0]);
+        assert!(decode_revocation_log(&out[..len]).unwrap().is_empty());
+    }
+
+    /// The stored layout is pinned byte for byte: version, big-endian count,
+    /// then each record's own bytes in order. A change here orphans every
+    /// list already on a disk or in flash.
+    #[test]
+    fn the_layout_is_pinned() {
+        let records = [record(7), record(8)];
+        let mut out = [0u8; 256];
+        let len = encode_revocation_log(&records, &mut out).unwrap();
+
+        assert_eq!(len, 3 + 2 * 92);
+        assert_eq!(&out[..3], &[1, 0, 2]);
+        assert_eq!(&out[3..95], records[0].as_bytes());
+        assert_eq!(&out[95..187], records[1].as_bytes());
+    }
+
+    /// Records come back unchanged, in order, and still verify.
+    #[test]
+    fn records_round_trip_and_still_verify() {
+        let anchor = Authority::from_seed(&[1u8; 32], 0xABCD).trust_anchor();
+        let mut out = [0u8; 256];
+        let len = encode_revocation_log(&[record(7), record(8)], &mut out).unwrap();
+
+        let decoded = decode_revocation_log(&out[..len]).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(anchor.verify_revocation(&decoded[0], 0), Ok(mac(7)));
+        assert_eq!(anchor.verify_revocation(&decoded[1], 0), Ok(mac(8)));
+    }
+
+    /// The encoder takes any iterator of records, so a caller whose list
+    /// holds them inside larger entries need not collect them first.
+    #[test]
+    fn encodes_from_a_mapped_iterator() {
+        let entries = [(record(7), 3u8)];
+        let mut out = [0u8; 95];
+        assert_eq!(
+            encode_revocation_log(entries.iter().map(|(r, _)| r), &mut out),
+            Some(95)
+        );
+    }
+
+    /// The largest blob per capacity profile matches design 03's table.
+    #[test]
+    fn blob_sizes_match_the_design() {
+        assert_eq!(revocation_log_len(0), Some(3));
+        assert_eq!(revocation_log_len(4), Some(371));
+        assert_eq!(revocation_log_len(8), Some(739));
+        assert_eq!(revocation_log_len(1024), Some(94_211));
+        assert_eq!(revocation_log_len(usize::from(u16::MAX) + 1), None);
+    }
+
+    /// A buffer one byte short is refused, for the header and for a record.
+    #[test]
+    fn a_short_buffer_is_refused() {
+        assert_eq!(encode_revocation_log(&[], &mut [0u8; 2]), None);
+        assert_eq!(encode_revocation_log(&[record(7)], &mut [0u8; 94]), None);
+    }
+
+    /// More records than the 16-bit count can say is refused, never wrapped.
+    #[test]
+    fn too_many_records_is_refused() {
+        let one = record(7);
+        let count = usize::from(u16::MAX) + 1;
+        let mut out = std::vec![0u8; 3 + count * 92];
+        assert_eq!(
+            encode_revocation_log(core::iter::repeat_n(&one, count), &mut out),
+            None
+        );
+    }
+
+    /// A version this build does not know is an error, not an empty list.
+    /// Erased flash (all ones) is one such version.
+    #[test]
+    fn an_unknown_version_is_refused() {
+        for version in [0u8, 2, 0xFF] {
+            assert_eq!(
+                decode_revocation_log(&[version, 0, 0]).map(<[_]>::len),
+                Err(AuthError::BadVersion),
+                "version {version}"
+            );
+        }
+    }
+
+    /// A length that disagrees with `count` is an error in both directions:
+    /// truncated, and with trailing bytes. Nothing is partially accepted.
+    #[test]
+    fn a_length_that_disagrees_with_the_count_is_refused() {
+        let mut out = [0u8; 256];
+        let len = encode_revocation_log(&[record(7), record(8)], &mut out).unwrap();
+
+        for bad in (0..len).chain([len + 1]) {
+            assert_eq!(
+                decode_revocation_log(&out[..bad]).map(<[_]>::len),
+                Err(AuthError::Malformed),
+                "length {bad}"
+            );
+        }
+        // The count itself damaged: claims more, then fewer, than are there.
+        for count in [3u16, 1, u16::MAX] {
+            out[1..3].copy_from_slice(&count.to_be_bytes());
+            assert_eq!(
+                decode_revocation_log(&out[..len]).map(<[_]>::len),
+                Err(AuthError::Malformed),
+                "count {count}"
+            );
+        }
+    }
+}
